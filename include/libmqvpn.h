@@ -39,7 +39,7 @@ extern "C" {
 
 #define MQVPN_VERSION_MAJOR 0
 #define MQVPN_VERSION_MINOR 14
-#define MQVPN_VERSION_PATCH 0
+#define MQVPN_VERSION_PATCH 2
 
 /* ─── ABI ─── */
 
