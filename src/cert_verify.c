@@ -81,7 +81,12 @@ verify_posix(const unsigned char *certs[], const size_t cert_len[], size_t certs
     }
 
     X509_VERIFY_PARAM *param = X509_STORE_CTX_get0_param(ctx);
-    if (param == NULL || X509_VERIFY_PARAM_set1_host(param, hostname, 0) != 1) {
+    if (param == NULL) {
+        set_error(error, error_len, "cannot configure certificate hostname");
+        goto cleanup;
+    }
+    X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
+    if (X509_VERIFY_PARAM_set1_host(param, hostname, strlen(hostname)) != 1) {
         set_error(error, error_len, "cannot configure certificate hostname");
         goto cleanup;
     }
