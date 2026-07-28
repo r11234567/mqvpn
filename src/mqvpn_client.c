@@ -46,6 +46,7 @@
 #include <xquic/xqc_http3.h>
 
 #include "flow_sched.h"
+#include "cert_verify.h"
 #include "hybrid/classifier.h"
 #ifdef MQVPN_HYBRID_TCP_LANE_ENABLED
 #  include "hybrid/lwip_glue.h"
@@ -1116,12 +1117,21 @@ static int
 cb_cert_verify(const unsigned char *certs[], const size_t cert_len[], size_t certs_len,
                void *conn_user_data)
 {
-    (void)certs;
-    (void)cert_len;
-    (void)certs_len;
     cli_conn_t *conn = (cli_conn_t *)conn_user_data;
-    if (conn && conn->client->config.insecure) return 0;
-    LOG_E(conn->client, "TLS certificate verification failed");
+    if (conn == NULL || conn->client == NULL) return -1;
+    if (conn->client->config.insecure) return 0;
+
+    char error[256] = {0};
+    const char *hostname = conn->client->config.tls_server_name;
+    if (hostname == NULL || hostname[0] == '\0') {
+        hostname = conn->client->config.server_host;
+    }
+    if (mqvpn_verify_cert_chain(certs, cert_len, certs_len, hostname, error,
+                                sizeof(error)) == 0) {
+        return 0;
+    }
+    LOG_E(conn->client, "TLS certificate verification failed: %s",
+          error[0] ? error : "unknown error");
     return -1;
 }
 
