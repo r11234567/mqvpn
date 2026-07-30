@@ -126,20 +126,21 @@ verify_windows(const unsigned char *certs[], const size_t cert_len[], size_t cer
     int result = -1;
 
     if (hostname == NULL || hostname[0] == '\0' || certs_len == 0 || certs[0] == NULL ||
-        cert_len[0] == 0 || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, hostname, -1,
-                                                hostname_w, ARRAYSIZE(hostname_w)) == 0) {
+        cert_len[0] == 0 ||
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, hostname, -1, hostname_w,
+                            ARRAYSIZE(hostname_w)) == 0) {
         set_error(error, error_len, "missing or invalid certificate hostname");
         goto cleanup;
     }
 
-    leaf = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-                                        certs[0], (DWORD)cert_len[0]);
+    leaf = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, certs[0],
+                                        (DWORD)cert_len[0]);
     if (leaf == NULL) {
         set_error(error, error_len, "invalid leaf certificate");
         goto cleanup;
     }
-    intermediates = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0,
-                                  CERT_STORE_CREATE_NEW_FLAG, NULL);
+    intermediates =
+        CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
     if (intermediates == NULL) {
         set_error(error, error_len, "cannot allocate intermediate store");
         goto cleanup;
@@ -175,7 +176,8 @@ verify_windows(const unsigned char *certs[], const size_t cert_len[], size_t cer
     CERT_CHAIN_POLICY_STATUS policy_status = {0};
     policy_status.cbSize = sizeof(policy_status);
     if (!CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, chain, &policy_para,
-                                          &policy_status) || policy_status.dwError != 0) {
+                                          &policy_status) ||
+        policy_status.dwError != 0) {
         set_error(error, error_len, "Windows certificate policy verification failed");
         goto cleanup;
     }
@@ -191,8 +193,9 @@ cleanup:
 #endif
 
 int
-mqvpn_verify_cert_chain(const unsigned char *certs[], const size_t cert_len[], size_t certs_len,
-                        const char *hostname, char *error, size_t error_len)
+mqvpn_verify_cert_chain(const unsigned char *certs[], const size_t cert_len[],
+                        size_t certs_len, const char *hostname, char *error,
+                        size_t error_len)
 {
 #ifdef _WIN32
     return verify_windows(certs, cert_len, certs_len, hostname, error, error_len);

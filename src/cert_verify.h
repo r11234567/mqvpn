@@ -12,7 +12,7 @@
  * platform trust store is used and hostname verification is mandatory.
  * Returns 0 on success and -1 on failure. */
 int mqvpn_verify_cert_chain(const unsigned char *certs[], const size_t cert_len[],
-                            size_t certs_len, const char *hostname,
-                            char *error, size_t error_len);
+                            size_t certs_len, const char *hostname, char *error,
+                            size_t error_len);
 
 #endif

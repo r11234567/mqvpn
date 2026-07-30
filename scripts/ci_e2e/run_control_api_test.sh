@@ -841,29 +841,34 @@ test_phase_d_security() {
         --control-port "$CTRL_PORT" \
         || return 1
 
-    # Open 8 connections that hold for ~4s (long enough for the retry loop below
-    # to register all 8 on the server before timing out).
+    # Open 8 connections that hold long enough for the listener to accept every
+    # one, then observe the server-side sockets instead of racing a fixed sleep.
     local d8_holders=()
     for i in $(seq 1 8); do
         ip netns exec "$NS_SERVER" bash -c "(sleep 4) | nc 127.0.0.1 $CTRL_PORT >/dev/null 2>&1" &
         d8_holders+=("$!")
     done
 
-    # The original "sleep 0.3 then send 9th" pattern races on busy hosts because
-    # we have no way to poll n_conns from the control API. Instead, retry the
-    # 9th connection up to 20 times (200 ms each = 4 s budget) until we observe
-    # either the expected "too many connections" error OR the budget runs out.
-    # This converges in ≤1 retry on a normal box but tolerates a slow netns boot.
-    local resp9=""
+    local established=0
     local attempts=0
-    while (( attempts < 20 )); do
-        resp9=$(ctrl_local '{"cmd":"x"}' || true)
-        if [[ "$resp9" == *"too many connections"* ]]; then
+    while (( attempts < 30 )); do
+        established=$(ip netns exec "$NS_SERVER" \
+            ss -Htn state established "sport = :$CTRL_PORT" 2>/dev/null | wc -l)
+        if (( established == 8 )); then
             break
         fi
-        sleep 0.2
+        sleep 0.1
         attempts=$((attempts + 1))
     done
+
+    local resp9=""
+    if (( established == 8 )); then
+        # Do not send request bytes on the rejected connection. Closing a TCP
+        # socket with unread peer data may reset it and discard the queued
+        # rejection response before netcat can read it.
+        resp9=$(ip netns exec "$NS_SERVER" \
+            nc -w 2 127.0.0.1 "$CTRL_PORT" </dev/null 2>/dev/null || true)
+    fi
     # Wait ONLY for the holder PIDs — bare `wait` would also wait on the
     # mqvpn server (which is also a backgrounded job in this shell) and hang
     # the test forever. Guard each `wait` with `|| true` because some `nc`
@@ -873,10 +878,13 @@ test_phase_d_security() {
         wait "$h" 2>/dev/null || true
     done
 
-    if [[ "$resp9" != *"too many connections"* ]]; then
-        echo "  D8 9th connection never got 'too many connections' (last resp: $resp9)"; return 1
+    if (( established != 8 )); then
+        echo "  D8 only $established/8 holder connections became established"; return 1
     fi
-    echo "  D8 max-conns enforcement (after $attempts retries): OK"
+    if [[ "$resp9" != *"too many connections"* ]]; then
+        echo "  D8 9th connection did not get 'too many connections' (resp: $resp9)"; return 1
+    fi
+    echo "  D8 max-conns enforcement: OK"
 
     # Server recovered: list_users succeeds
     sleep 1
