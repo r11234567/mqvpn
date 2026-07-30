@@ -41,6 +41,7 @@ mqvpn is an open-source VPN that combines multiple internet connections—such a
 - [Control API](#control-api)
 - [Benchmarks](#benchmarks)
 - [Architecture](#architecture)
+- [Security Maintenance](#security-maintenance)
 - [Building](#building)
   - [Android SDK](#android-sdk)
 - [Testing](#testing)
@@ -84,6 +85,7 @@ mqvpn is an open-source VPN that combines multiple internet connections—such a
 - **Dual-stack** — IPv4 + IPv6 inside the tunnel.
 - **Multi-Platform** — Available on Linux (server/client), Windows (client only), macOS (client only) and Android (client only) support.
 - **PSK auth** — Pre-shared key over TLS 1.3.
+- **Verified server identity** — Clients verify the server certificate chain and hostname by default; `--insecure` is an explicit testing-only bypass.
 - **DNS override** — Prevents DNS leaks. Uses `resolvectl` on systemd-resolved systems, falls back to resolv.conf.
 
 
@@ -531,6 +533,13 @@ Charts: [MinRTT](bench_results/hybrid_mode/hybrid_mode_asym_minrtt_1785306660.pn
 └─────────────────┘                          └─────────────────┘
      Client                                      Server
 ```
+
+## Security Maintenance
+
+This fork carries a secure-by-default client TLS verifier. See
+[Client TLS Certificate Verification](docs/client-certificate-verification.md)
+for its security invariants, platform behavior, validation procedure, and the
+checklist for preserving the patch while merging future upstream releases.
 
 ## Building
 
