@@ -288,7 +288,6 @@ svr_compute_egress_fd_budget(uint32_t configured_max)
         if (headroom < budget) budget = (int)headroom;
     }
 #endif
-    if (budget < 0) budget = 0;
     return budget;
 }
 

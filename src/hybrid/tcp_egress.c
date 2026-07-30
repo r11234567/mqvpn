@@ -1162,7 +1162,7 @@ svr_tcp_egress_on_relay_ready(mqvpn_server_t *server, svr_tcp_egress_flow_t *ef,
             svr_tcp_egress_try_uplink_fin(server, ef);
             return;
         }
-        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
             svr_tcp_egress_on_relay_error(server, ef, errno);
             return;
         }
