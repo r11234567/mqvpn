@@ -1,0 +1,2 @@
+- Verify server certificate chains and hostnames when insecure mode is disabled.
+- Sync Linux install/NAT fixes and documentation from upstream mqvpn 0.14.1.
