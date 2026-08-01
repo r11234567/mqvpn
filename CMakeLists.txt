@@ -92,24 +92,28 @@ endif()
 
 # ---------- nghttp2 (for HTTP/2 proxy support) ----------
 find_package(PkgConfig)
+set(MQVPN_ENABLE_H2_PROXY OFF)
+
 if(PKG_CONFIG_FOUND)
     pkg_check_modules(NGHTTP2 libnghttp2)
+    if(NGHTTP2_FOUND)
+        set(MQVPN_ENABLE_H2_PROXY ON)
+        message(STATUS "nghttp2 found via pkg-config: ${NGHTTP2_LIBRARIES}")
+    endif()
 endif()
 
-if(NOT NGHTTP2_FOUND)
+if(NOT MQVPN_ENABLE_H2_PROXY)
     find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h)
     find_library(NGHTTP2_LIB nghttp2)
-    if(NOT NGHTTP2_LIB)
-        message(WARNING "nghttp2 not found. HTTP/2 proxy support will be disabled. Install: apt install libnghttp2-dev")
-        set(MQVPN_ENABLE_H2_PROXY OFF)
-    else()
+    if(NGHTTP2_INCLUDE_DIR AND NGHTTP2_LIB)
         set(MQVPN_ENABLE_H2_PROXY ON)
         message(STATUS "nghttp2 found: ${NGHTTP2_LIB}")
+    else()
+        message(STATUS "nghttp2 not found. HTTP/2 proxy support will be disabled.")
     endif()
-else()
-    set(MQVPN_ENABLE_H2_PROXY ON)
-    message(STATUS "nghttp2 found via pkg-config")
 endif()
+
+message(STATUS "MQVPN_ENABLE_H2_PROXY: ${MQVPN_ENABLE_H2_PROXY}")
 
 # ---------- Hybrid mode TCP lane (lwIP) ----------
 option(MQVPN_ENABLE_HYBRID_TCP_LANE

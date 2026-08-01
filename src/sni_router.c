@@ -427,11 +427,11 @@ sni_router_match(const sni_router_t *router, const char *sni)
             size_t sni_len = strlen(sni);
             size_t suffix_len = strlen(suffix);
 
-            if (sni_len >= suffix_len) {
+            if (sni_len > suffix_len) {
                 const char *sni_suffix = sni + (sni_len - suffix_len);
                 if (strcmp(sni_suffix, suffix) == 0) {
                     /* Ensure there's a dot before the suffix in SNI */
-                    if (sni_len == suffix_len || sni[sni_len - suffix_len - 1] == '.') {
+                    if (sni[sni_len - suffix_len - 1] == '.') {
                         return 1;
                     }
                 }

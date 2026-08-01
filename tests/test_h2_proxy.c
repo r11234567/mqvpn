@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 mp0rta and mqvpn contributors
 
+#undef NDEBUG  // Ensure assert() is enabled in tests
+
 #include "../src/h2_proxy.h"
 
 #include <arpa/inet.h>
