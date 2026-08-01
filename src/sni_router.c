@@ -6,7 +6,9 @@
 #ifdef _WIN32
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  ifndef ssize_t
 typedef int ssize_t;
+#  endif
 #  define close closesocket
 #else
 #  include <arpa/inet.h>
