@@ -90,6 +90,27 @@ if(NOT ANDROID_CROSS_COMPILE)
     endif()
 endif()
 
+# ---------- nghttp2 (for HTTP/2 proxy support) ----------
+find_package(PkgConfig)
+if(PKG_CONFIG_FOUND)
+    pkg_check_modules(NGHTTP2 libnghttp2)
+endif()
+
+if(NOT NGHTTP2_FOUND)
+    find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h)
+    find_library(NGHTTP2_LIB nghttp2)
+    if(NOT NGHTTP2_LIB)
+        message(WARNING "nghttp2 not found. HTTP/2 proxy support will be disabled. Install: apt install libnghttp2-dev")
+        set(MQVPN_ENABLE_H2_PROXY OFF)
+    else()
+        set(MQVPN_ENABLE_H2_PROXY ON)
+        message(STATUS "nghttp2 found: ${NGHTTP2_LIB}")
+    endif()
+else()
+    set(MQVPN_ENABLE_H2_PROXY ON)
+    message(STATUS "nghttp2 found via pkg-config")
+endif()
+
 # ---------- Hybrid mode TCP lane (lwIP) ----------
 option(MQVPN_ENABLE_HYBRID_TCP_LANE
        "Build the hybrid-mode lwIP TCP lane" ON)
@@ -228,6 +249,8 @@ set(MQVPN_LIB_SOURCES
     src/reorder_tx.c
     src/reorder_rx.c
     src/hybrid/classifier.c
+    src/sni_router.c
+    src/h2_proxy.c
 )
 
 # ---------- lwIP (hybrid mode TCP lane — see MQVPN_HYBRID_TCP_LANE_BUILD) ----------
@@ -392,6 +415,12 @@ target_include_directories(mqvpn_lib
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
     PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR} ${BORINGSSL_INCLUDE_DIR}
 )
+if(MQVPN_ENABLE_H2_PROXY)
+    if(NGHTTP2_INCLUDE_DIR)
+        target_include_directories(mqvpn_lib PRIVATE ${NGHTTP2_INCLUDE_DIR})
+    endif()
+    target_compile_definitions(mqvpn_lib PRIVATE MQVPN_H2_PROXY_ENABLED)
+endif()
 if(ANDROID_CROSS_COMPILE)
     # Android NDK: pthread is in libc, no separate -lpthread
     target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB})
@@ -399,6 +428,13 @@ elseif(WIN32)
     target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} ws2_32 crypt32)
 else()
     target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} pthread)
+endif()
+if(MQVPN_ENABLE_H2_PROXY)
+    if(NGHTTP2_LIB)
+        target_link_libraries(mqvpn_lib ${NGHTTP2_LIB})
+    elseif(NGHTTP2_LIBRARIES)
+        target_link_libraries(mqvpn_lib ${NGHTTP2_LIBRARIES})
+    endif()
 endif()
 if(MQVPN_HYBRID_TCP_LANE_BUILD)
     target_link_libraries(mqvpn_lib lwip_core)
@@ -767,7 +803,22 @@ if(BUILD_TESTING)
     # gate + PTB token bucket, extracted from mqvpn_client.c/mqvpn_server.c) —
     # links reorder_tx.c (for the peek it wraps) + icmp.c (for the PTB send).
     add_executable(test_reorder_gate tests/test_reorder_gate.c src/reorder_tx.c src/icmp.c src/log.c)
-    set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_classifier test_icmp test_reorder_gate)
+
+    # SNI router test
+    add_executable(test_sni_router tests/test_sni_router.c src/sni_router.c src/log.c)
+    target_link_libraries(test_sni_router ${SSL_LIB} ${CRYPTO_LIB})
+
+    # HTTP/2 proxy test (conditional on nghttp2 availability)
+    if(MQVPN_ENABLE_H2_PROXY)
+        add_executable(test_h2_proxy tests/test_h2_proxy.c src/h2_proxy.c src/log.c)
+        target_link_libraries(test_h2_proxy ${NGHTTP2_LIB} ${SSL_LIB} ${CRYPTO_LIB})
+        if(NGHTTP2_INCLUDE_DIR)
+            target_include_directories(test_h2_proxy PRIVATE ${NGHTTP2_INCLUDE_DIR})
+        endif()
+        set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_classifier test_icmp test_reorder_gate test_sni_router test_h2_proxy)
+    else()
+        set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_classifier test_icmp test_reorder_gate test_sni_router)
+    endif()
 
     # test_tcp_lane #include's BOTH src/hybrid/tcp_lane.c AND
     # src/hybrid/tcp_lane_uplink.c (Task 12 split the uplink relay out of
