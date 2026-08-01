@@ -807,6 +807,7 @@ if(BUILD_TESTING)
     # SNI router test
     add_executable(test_sni_router tests/test_sni_router.c src/sni_router.c src/log.c)
     target_link_libraries(test_sni_router ${SSL_LIB} ${CRYPTO_LIB})
+    target_include_directories(test_sni_router PRIVATE ${BORINGSSL_INCLUDE_DIR})
 
     # HTTP/2 proxy test (conditional on nghttp2 availability)
     if(MQVPN_ENABLE_H2_PROXY)

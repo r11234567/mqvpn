@@ -215,8 +215,8 @@ jobs:
         run: |
           echo "Checking for common security issues..."
 
-          # Check for unsafe string functions
-          if grep -rn "strcpy\|strcat\|sprintf\|gets" src/sni_router.c src/h2_proxy.c; then
+          # Check for unsafe string functions (excluding strerror which is safe)
+          if grep -rn "strcpy\|strcat\|sprintf\|gets\b" src/sni_router.c src/h2_proxy.c; then
             echo "ERROR: Found unsafe string functions"
             exit 1
           fi
