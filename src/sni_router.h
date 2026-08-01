@@ -15,10 +15,10 @@
 #include <stdint.h>
 
 #ifdef _WIN32
-#    include <winsock2.h>
-#    include <ws2tcpip.h>
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
 #else
-#    include <sys/socket.h>
+#  include <sys/socket.h>
 #endif
 
 #ifdef __cplusplus
