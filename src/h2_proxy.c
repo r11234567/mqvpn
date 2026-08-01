@@ -70,8 +70,8 @@ struct h2_proxy_s {
 /* ─── Logging helpers ─── */
 
 #define LOG_ERROR 0
-#define LOG_WARN 1
-#define LOG_INFO 2
+#define LOG_WARN  1
+#define LOG_INFO  2
 #define LOG_DEBUG 3
 
 static void
@@ -106,8 +106,7 @@ set_tcp_nodelay(int fd)
 static h2_backend_conn_t *
 backend_conn_create(h2_proxy_t *proxy)
 {
-    if (proxy->conn_count >= proxy->config.max_connections)
-        return NULL;
+    if (proxy->conn_count >= proxy->config.max_connections) return NULL;
 
     h2_backend_conn_t *conn = calloc(1, sizeof(*conn));
     if (!conn) return NULL;
@@ -126,8 +125,7 @@ backend_conn_create(h2_proxy_t *proxy)
         return NULL;
     }
 
-    memcpy(&conn->addr, &proxy->config.backend_addr,
-           sizeof(proxy->config.backend_addr));
+    memcpy(&conn->addr, &proxy->config.backend_addr, sizeof(proxy->config.backend_addr));
     conn->addrlen = proxy->config.backend_addrlen;
     conn->last_active = (uint64_t)time(NULL);
 
@@ -145,10 +143,10 @@ backend_conn_create(h2_proxy_t *proxy)
     nghttp2_session_callbacks_new(&callbacks);
 
     /* We'll set callbacks for data handling later */
-    nghttp2_session_callbacks_set_send_callback(callbacks, NULL); /* TODO */
-    nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, NULL); /* TODO */
+    nghttp2_session_callbacks_set_send_callback(callbacks, NULL);               /* TODO */
+    nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, NULL);      /* TODO */
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, NULL); /* TODO */
-    nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, NULL); /* TODO */
+    nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, NULL);    /* TODO */
 
     if (nghttp2_session_client_new(&conn->session, callbacks, conn) != 0) {
         nghttp2_session_callbacks_del(callbacks);
@@ -161,9 +159,7 @@ backend_conn_create(h2_proxy_t *proxy)
 
     /* Send initial connection preface and SETTINGS */
     nghttp2_settings_entry iv[1] = {
-        {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
-         proxy->config.max_streams_per_conn}
-    };
+        {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, proxy->config.max_streams_per_conn}};
     nghttp2_submit_settings(conn->session, NGHTTP2_FLAG_NONE, iv, 1);
 
     conn->is_connected = (ret == 0);
@@ -240,8 +236,7 @@ backend_conn_get_available(h2_proxy_t *proxy)
 /* ─── Stream management ─── */
 
 static h2_proxy_stream_t *
-stream_create(h2_proxy_t *proxy, xqc_h3_request_t *h3_request,
-              void *h3_user_data)
+stream_create(h2_proxy_t *proxy, xqc_h3_request_t *h3_request, void *h3_user_data)
 {
     h2_proxy_stream_t *stream = calloc(1, sizeof(*stream));
     if (!stream) return NULL;
@@ -298,8 +293,8 @@ stream_destroy(h2_proxy_stream_t *stream)
 /* ─── nghttp2 callbacks ─── */
 
 static ssize_t
-send_callback(nghttp2_session *session, const uint8_t *data, size_t length,
-              int flags, void *user_data)
+send_callback(nghttp2_session *session, const uint8_t *data, size_t length, int flags,
+              void *user_data)
 {
     (void)session;
     (void)flags;
@@ -332,17 +327,15 @@ on_frame_recv_callback(nghttp2_session *session, const nghttp2_frame *frame,
     case NGHTTP2_DATA:
         /* Data frame - handled by on_data_chunk_recv_callback */
         break;
-    default:
-        break;
+    default: break;
     }
 
     return 0;
 }
 
 static int
-on_data_chunk_recv_callback(nghttp2_session *session, uint8_t flags,
-                            int32_t stream_id, const uint8_t *data,
-                            size_t len, void *user_data)
+on_data_chunk_recv_callback(nghttp2_session *session, uint8_t flags, int32_t stream_id,
+                            const uint8_t *data, size_t len, void *user_data)
 {
     (void)session;
     (void)flags;
@@ -357,8 +350,8 @@ on_data_chunk_recv_callback(nghttp2_session *session, uint8_t flags,
 }
 
 static int
-on_stream_close_callback(nghttp2_session *session, int32_t stream_id,
-                        uint32_t error_code, void *user_data)
+on_stream_close_callback(nghttp2_session *session, int32_t stream_id, uint32_t error_code,
+                         void *user_data)
 {
     (void)session;
     (void)stream_id;
@@ -373,8 +366,7 @@ on_stream_close_callback(nghttp2_session *session, int32_t stream_id,
 /* ─── Public API ─── */
 
 h2_proxy_t *
-h2_proxy_create(const h2_proxy_config_t *config,
-                const h2_proxy_callbacks_t *callbacks)
+h2_proxy_create(const h2_proxy_config_t *config, const h2_proxy_callbacks_t *callbacks)
 {
     if (!config || !callbacks) return NULL;
 
@@ -414,8 +406,7 @@ h2_proxy_handle_request(h2_proxy_t *proxy, xqc_h3_request_t *h3_request,
     h2_log(proxy, LOG_INFO, "h2_proxy: handling HTTP/3 request");
 
     /* Create stream context */
-    h2_proxy_stream_t *stream = stream_create(proxy, h3_request,
-                                              h3_stream_user_data);
+    h2_proxy_stream_t *stream = stream_create(proxy, h3_request, h3_stream_user_data);
     if (!stream) {
         h2_log(proxy, LOG_ERROR, "h2_proxy: failed to create stream");
         return -1;
@@ -441,8 +432,7 @@ h2_proxy_handle_request(h2_proxy_t *proxy, xqc_h3_request_t *h3_request,
 }
 
 int
-h2_proxy_on_h3_body(h2_proxy_stream_t *stream, const uint8_t *data,
-                    size_t len, int fin)
+h2_proxy_on_h3_body(h2_proxy_stream_t *stream, const uint8_t *data, size_t len, int fin)
 {
     if (!stream || stream->closed) return -1;
 
@@ -467,18 +457,16 @@ h2_proxy_on_h3_close(h2_proxy_stream_t *stream)
 
     /* Close backend stream if exists */
     if (stream->backend_conn && stream->backend_stream_id >= 0) {
-        nghttp2_submit_rst_stream(stream->backend_conn->session,
-                                 NGHTTP2_FLAG_NONE,
-                                 stream->backend_stream_id,
-                                 NGHTTP2_NO_ERROR);
+        nghttp2_submit_rst_stream(stream->backend_conn->session, NGHTTP2_FLAG_NONE,
+                                  stream->backend_stream_id, NGHTTP2_NO_ERROR);
     }
 
     stream_destroy(stream);
 }
 
 void
-h2_proxy_on_backend_ready(h2_proxy_t *proxy, int fd, void *fd_ctx,
-                          int readable, int writable)
+h2_proxy_on_backend_ready(h2_proxy_t *proxy, int fd, void *fd_ctx, int readable,
+                          int writable)
 {
     if (!proxy) return;
 
@@ -519,8 +507,7 @@ h2_proxy_on_backend_ready(h2_proxy_t *proxy, int fd, void *fd_ctx,
 
         if (nread < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                h2_log(proxy, LOG_ERROR, "h2_proxy: recv error: %s",
-                       strerror(errno));
+                h2_log(proxy, LOG_ERROR, "h2_proxy: recv error: %s", strerror(errno));
                 backend_conn_destroy(proxy, conn);
             }
             return;

@@ -16,20 +16,18 @@
 #include <unistd.h>
 
 /* QUIC version 1 Initial Salt (RFC 9001) */
-static const uint8_t QUIC_V1_INITIAL_SALT[20] = {
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3,
-    0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
-    0xcc, 0xbb, 0x7f, 0x0a
-};
+static const uint8_t QUIC_V1_INITIAL_SALT[20] = {0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34,
+                                                 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8,
+                                                 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a};
 
 /* Connection tracking entry */
 struct sni_connection_state_s {
-    uint8_t cid[20];                    /* Connection ID */
+    uint8_t cid[20]; /* Connection ID */
     size_t cid_len;
     struct sockaddr_storage peer_addr;
     socklen_t peer_addrlen;
-    uint64_t last_seen;                 /* Timestamp in seconds */
-    int is_accepted;                    /* 1 = accept, 0 = fallback */
+    uint64_t last_seen; /* Timestamp in seconds */
+    int is_accepted;    /* 1 = accept, 0 = fallback */
     struct sni_connection_state_s *next;
 };
 
@@ -38,7 +36,7 @@ struct sni_router_s {
     sni_router_config_t config;
     sni_connection_state_t **conn_table; /* Hash table */
     size_t table_size;
-    int fallback_fd;                     /* Socket for fallback forwarding */
+    int fallback_fd; /* Socket for fallback forwarding */
 };
 
 /* ─── Helper functions ─── */
@@ -55,16 +53,14 @@ hash_cid(const uint8_t *cid, size_t len)
 }
 
 static int
-addr_equal(const struct sockaddr *a, socklen_t a_len,
-           const struct sockaddr *b, socklen_t b_len)
+addr_equal(const struct sockaddr *a, socklen_t a_len, const struct sockaddr *b,
+           socklen_t b_len)
 {
-    if (a_len != b_len || a->sa_family != b->sa_family)
-        return 0;
+    if (a_len != b_len || a->sa_family != b->sa_family) return 0;
     if (a->sa_family == AF_INET) {
         const struct sockaddr_in *a4 = (const struct sockaddr_in *)a;
         const struct sockaddr_in *b4 = (const struct sockaddr_in *)b;
-        return a4->sin_port == b4->sin_port &&
-               a4->sin_addr.s_addr == b4->sin_addr.s_addr;
+        return a4->sin_port == b4->sin_port && a4->sin_addr.s_addr == b4->sin_addr.s_addr;
     } else if (a->sa_family == AF_INET6) {
         const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)a;
         const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
@@ -99,30 +95,22 @@ decode_varint(const uint8_t *data, size_t len, uint64_t *out)
     uint8_t prefix = first >> 6;
 
     switch (prefix) {
-    case 0: /* 1 byte */
-        *out = first & 0x3F;
-        return 1;
+    case 0: /* 1 byte */ *out = first & 0x3F; return 1;
     case 1: /* 2 bytes */
         if (len < 2) return 0;
         *out = ((uint64_t)(first & 0x3F) << 8) | data[1];
         return 2;
     case 2: /* 4 bytes */
         if (len < 4) return 0;
-        *out = ((uint64_t)(first & 0x3F) << 24) |
-               ((uint64_t)data[1] << 16) |
-               ((uint64_t)data[2] << 8) |
-               data[3];
+        *out = ((uint64_t)(first & 0x3F) << 24) | ((uint64_t)data[1] << 16) |
+               ((uint64_t)data[2] << 8) | data[3];
         return 4;
     case 3: /* 8 bytes */
         if (len < 8) return 0;
-        *out = ((uint64_t)(first & 0x3F) << 56) |
-               ((uint64_t)data[1] << 48) |
-               ((uint64_t)data[2] << 40) |
-               ((uint64_t)data[3] << 32) |
-               ((uint64_t)data[4] << 24) |
-               ((uint64_t)data[5] << 16) |
-               ((uint64_t)data[6] << 8) |
-               data[7];
+        *out = ((uint64_t)(first & 0x3F) << 56) | ((uint64_t)data[1] << 48) |
+               ((uint64_t)data[2] << 40) | ((uint64_t)data[3] << 32) |
+               ((uint64_t)data[4] << 24) | ((uint64_t)data[5] << 16) |
+               ((uint64_t)data[6] << 8) | data[7];
         return 8;
     }
     return 0;
@@ -130,9 +118,8 @@ decode_varint(const uint8_t *data, size_t len, uint64_t *out)
 
 /* Parse QUIC Initial header and extract DCID */
 static int
-parse_initial_header(const uint8_t *pkt, size_t len,
-                    uint8_t *dcid_out, size_t *dcid_len_out,
-                    size_t *payload_offset_out)
+parse_initial_header(const uint8_t *pkt, size_t len, uint8_t *dcid_out,
+                     size_t *dcid_len_out, size_t *payload_offset_out)
 {
     if (len < 5) return -1;
 
@@ -173,14 +160,13 @@ parse_initial_header(const uint8_t *pkt, size_t len,
 
 /* Derive Initial Secrets per RFC 9001 */
 static int
-derive_initial_secrets(const uint8_t *dcid, size_t dcid_len,
-                      uint8_t *client_secret, uint8_t *server_secret)
+derive_initial_secrets(const uint8_t *dcid, size_t dcid_len, uint8_t *client_secret,
+                       uint8_t *server_secret)
 {
     uint8_t initial_secret[32];
 
     /* Initial Secret = HKDF-Extract(salt, dcid) */
-    if (HKDF_extract(initial_secret, NULL, EVP_sha256(),
-                     dcid, dcid_len,
+    if (HKDF_extract(initial_secret, NULL, EVP_sha256(), dcid, dcid_len,
                      QUIC_V1_INITIAL_SALT, sizeof(QUIC_V1_INITIAL_SALT)) == 0) {
         return -1;
     }
@@ -192,16 +178,15 @@ derive_initial_secrets(const uint8_t *dcid, size_t dcid_len,
     /* Build HkdfLabel structure */
     uint8_t client_info[256];
     size_t client_info_len = 0;
-    client_info[client_info_len++] = 0; /* length high byte */
+    client_info[client_info_len++] = 0;  /* length high byte */
     client_info[client_info_len++] = 32; /* length low byte */
     client_info[client_info_len++] = (uint8_t)client_label_len;
     memcpy(client_info + client_info_len, client_label, client_label_len);
     client_info_len += client_label_len;
     client_info[client_info_len++] = 0; /* context length */
 
-    if (HKDF_expand(client_secret, 32, EVP_sha256(),
-                    initial_secret, 32,
-                    client_info, client_info_len) == 0) {
+    if (HKDF_expand(client_secret, 32, EVP_sha256(), initial_secret, 32, client_info,
+                    client_info_len) == 0) {
         return -1;
     }
 
@@ -218,9 +203,8 @@ derive_initial_secrets(const uint8_t *dcid, size_t dcid_len,
     server_info_len += server_label_len;
     server_info[server_info_len++] = 0;
 
-    if (HKDF_expand(server_secret, 32, EVP_sha256(),
-                    initial_secret, 32,
-                    server_info, server_info_len) == 0) {
+    if (HKDF_expand(server_secret, 32, EVP_sha256(), initial_secret, 32, server_info,
+                    server_info_len) == 0) {
         return -1;
     }
 
@@ -229,8 +213,8 @@ derive_initial_secrets(const uint8_t *dcid, size_t dcid_len,
 
 /* Extract SNI from TLS ClientHello */
 static int
-extract_sni_from_client_hello(const uint8_t *data, size_t len,
-                              char *sni_out, size_t sni_cap)
+extract_sni_from_client_hello(const uint8_t *data, size_t len, char *sni_out,
+                              size_t sni_cap)
 {
     /* Basic TLS handshake validation */
     if (len < 43 || data[0] != 0x01) return -1; /* Not ClientHello */
@@ -304,9 +288,8 @@ extract_sni_from_client_hello(const uint8_t *data, size_t len,
 /* Simplified decryption - for Initial packets, we only need to find CRYPTO frame
  * This is a minimal implementation focused on SNI extraction */
 static int
-find_crypto_frame_in_initial(const uint8_t *pkt, size_t len,
-                             const uint8_t *dcid, size_t dcid_len,
-                             char *sni_out, size_t sni_cap)
+find_crypto_frame_in_initial(const uint8_t *pkt, size_t len, const uint8_t *dcid,
+                             size_t dcid_len, char *sni_out, size_t sni_cap)
 {
     uint8_t client_secret[32];
     uint8_t server_secret[32];
@@ -324,8 +307,7 @@ find_crypto_frame_in_initial(const uint8_t *pkt, size_t len,
     for (size_t i = 20; i < len - 43; i++) {
         if (pkt[i] == 0x01 && i + 43 < len) {
             /* Potential ClientHello start */
-            if (extract_sni_from_client_hello(pkt + i, len - i,
-                                             sni_out, sni_cap) == 0) {
+            if (extract_sni_from_client_hello(pkt + i, len - i, sni_out, sni_cap) == 0) {
                 return 0;
             }
         }
@@ -338,15 +320,15 @@ find_crypto_frame_in_initial(const uint8_t *pkt, size_t len,
 
 static sni_connection_state_t *
 conn_lookup(sni_router_t *router, const uint8_t *cid, size_t cid_len,
-           const struct sockaddr *peer, socklen_t peer_len)
+            const struct sockaddr *peer, socklen_t peer_len)
 {
     uint32_t hash = hash_cid(cid, cid_len);
     size_t idx = hash % router->table_size;
 
     for (sni_connection_state_t *c = router->conn_table[idx]; c; c = c->next) {
         if (c->cid_len == cid_len && memcmp(c->cid, cid, cid_len) == 0 &&
-            addr_equal((struct sockaddr *)&c->peer_addr, c->peer_addrlen,
-                      peer, peer_len)) {
+            addr_equal((struct sockaddr *)&c->peer_addr, c->peer_addrlen, peer,
+                       peer_len)) {
             return c;
         }
     }
@@ -355,8 +337,8 @@ conn_lookup(sni_router_t *router, const uint8_t *cid, size_t cid_len,
 
 static void
 conn_insert(sni_router_t *router, const uint8_t *cid, size_t cid_len,
-           const struct sockaddr *peer, socklen_t peer_len,
-           int is_accepted, uint64_t now_sec)
+            const struct sockaddr *peer, socklen_t peer_len, int is_accepted,
+            uint64_t now_sec)
 {
     uint32_t hash = hash_cid(cid, cid_len);
     size_t idx = hash % router->table_size;
@@ -380,8 +362,7 @@ conn_insert(sni_router_t *router, const uint8_t *cid, size_t cid_len,
 sni_router_t *
 sni_router_create(const sni_router_config_t *config)
 {
-    if (!config || !config->allowed_snis || config->n_allowed_snis == 0)
-        return NULL;
+    if (!config || !config->allowed_snis || config->n_allowed_snis == 0) return NULL;
 
     sni_router_t *router = calloc(1, sizeof(*router));
     if (!router) return NULL;
@@ -389,8 +370,7 @@ sni_router_create(const sni_router_config_t *config)
     memcpy(&router->config, config, sizeof(*config));
 
     /* Allocate hash table */
-    router->table_size = config->max_tracked_conns > 0 ?
-                        config->max_tracked_conns : 4096;
+    router->table_size = config->max_tracked_conns > 0 ? config->max_tracked_conns : 4096;
     router->conn_table = calloc(router->table_size, sizeof(sni_connection_state_t *));
     if (!router->conn_table) {
         free(router);
@@ -425,8 +405,7 @@ sni_router_destroy(sni_router_t *router)
     }
     free(router->conn_table);
 
-    if (router->fallback_fd >= 0)
-        close(router->fallback_fd);
+    if (router->fallback_fd >= 0) close(router->fallback_fd);
 
     free(router);
 }
@@ -440,8 +419,7 @@ sni_router_match(const sni_router_t *router, const char *sni)
         const char *pattern = router->config.allowed_snis[i];
 
         /* Exact match */
-        if (strcmp(pattern, sni) == 0)
-            return 1;
+        if (strcmp(pattern, sni) == 0) return 1;
 
         /* Wildcard match (*.example.com) */
         if (pattern[0] == '*' && pattern[1] == '.') {
@@ -453,8 +431,7 @@ sni_router_match(const sni_router_t *router, const char *sni)
                 const char *sni_suffix = sni + (sni_len - suffix_len);
                 if (strcmp(sni_suffix, suffix) == 0) {
                     /* Ensure there's a dot before the suffix in SNI */
-                    if (sni_len == suffix_len ||
-                        sni[sni_len - suffix_len - 1] == '.') {
+                    if (sni_len == suffix_len || sni[sni_len - suffix_len - 1] == '.') {
                         return 1;
                     }
                 }
@@ -467,8 +444,8 @@ sni_router_match(const sni_router_t *router, const char *sni)
 
 sni_route_result_t
 sni_router_inspect(sni_router_t *router, const uint8_t *pkt, size_t len,
-                  const struct sockaddr *peer, socklen_t peer_len,
-                  char *sni_out, size_t sni_cap)
+                   const struct sockaddr *peer, socklen_t peer_len, char *sni_out,
+                   size_t sni_cap)
 {
     if (!router || !pkt || len == 0) return SNI_ROUTE_ERROR;
 
@@ -485,8 +462,8 @@ sni_router_inspect(sni_router_t *router, const uint8_t *pkt, size_t len,
 
         /* Try to extract SNI */
         char sni[256];
-        if (find_crypto_frame_in_initial(pkt, len, dcid, dcid_len,
-                                        sni, sizeof(sni)) == 0) {
+        if (find_crypto_frame_in_initial(pkt, len, dcid, dcid_len, sni, sizeof(sni)) ==
+            0) {
             /* SNI extracted successfully */
             if (sni_out && sni_cap > 0) {
                 snprintf(sni_out, sni_cap, "%s", sni);
@@ -496,8 +473,7 @@ sni_router_inspect(sni_router_t *router, const uint8_t *pkt, size_t len,
             int matched = sni_router_match(router, sni);
 
             /* Store in connection tracking */
-            conn_insert(router, dcid, dcid_len, peer, peer_len,
-                       matched, now_sec);
+            conn_insert(router, dcid, dcid_len, peer, peer_len, matched, now_sec);
 
             return matched ? SNI_ROUTE_ACCEPT : SNI_ROUTE_FALLBACK;
         }
@@ -513,8 +489,8 @@ sni_router_inspect(sni_router_t *router, const uint8_t *pkt, size_t len,
     size_t dummy_offset;
 
     if (parse_initial_header(pkt, len, dcid, &dcid_len, &dummy_offset) == 0) {
-        sni_connection_state_t *conn = conn_lookup(router, dcid, dcid_len,
-                                                   peer, peer_len);
+        sni_connection_state_t *conn =
+            conn_lookup(router, dcid, dcid_len, peer, peer_len);
         if (conn) {
             conn->last_seen = now_sec;
             return conn->is_accepted ? SNI_ROUTE_ACCEPT : SNI_ROUTE_FALLBACK;
@@ -527,16 +503,16 @@ sni_router_inspect(sni_router_t *router, const uint8_t *pkt, size_t len,
 
 int
 sni_router_fallback(sni_router_t *router, const uint8_t *pkt, size_t len,
-                   const struct sockaddr *peer, socklen_t peer_len)
+                    const struct sockaddr *peer, socklen_t peer_len)
 {
     if (!router || !pkt || len == 0) return -1;
 
-    (void)peer;      /* Currently unused - could be used for logging */
+    (void)peer; /* Currently unused - could be used for logging */
     (void)peer_len;
 
     ssize_t sent = sendto(router->fallback_fd, pkt, len, 0,
-                         (struct sockaddr *)&router->config.fallback_addr,
-                         router->config.fallback_addrlen);
+                          (struct sockaddr *)&router->config.fallback_addr,
+                          router->config.fallback_addrlen);
 
     return (sent == (ssize_t)len) ? 0 : -1;
 }

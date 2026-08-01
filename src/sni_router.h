@@ -87,8 +87,7 @@ void sni_router_destroy(sni_router_t *router);
  */
 sni_route_result_t sni_router_inspect(sni_router_t *router, const uint8_t *pkt,
                                       size_t len, const struct sockaddr *peer,
-                                      socklen_t peer_len, char *sni_out,
-                                      size_t sni_cap);
+                                      socklen_t peer_len, char *sni_out, size_t sni_cap);
 
 /*
  * Forward packet to fallback upstream.

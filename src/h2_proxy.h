@@ -98,8 +98,8 @@ int h2_proxy_handle_request(h2_proxy_t *proxy, xqc_h3_request_t *h3_request,
  * Handle data received from HTTP/3 client.
  * Called from xqc_h3_request_read_notify callback.
  */
-int h2_proxy_on_h3_body(h2_proxy_stream_t *stream, const uint8_t *data,
-                        size_t len, int fin);
+int h2_proxy_on_h3_body(h2_proxy_stream_t *stream, const uint8_t *data, size_t len,
+                        int fin);
 
 /*
  * Handle HTTP/3 stream close.
@@ -111,8 +111,8 @@ void h2_proxy_on_h3_close(h2_proxy_stream_t *stream);
  * Handle backend socket ready for read/write.
  * Called from event loop when backend fd has events.
  */
-void h2_proxy_on_backend_ready(h2_proxy_t *proxy, int fd, void *fd_ctx,
-                               int readable, int writable);
+void h2_proxy_on_backend_ready(h2_proxy_t *proxy, int fd, void *fd_ctx, int readable,
+                               int writable);
 
 /*
  * Periodic maintenance - clean up idle connections, timeouts, etc.
