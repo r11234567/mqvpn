@@ -4,10 +4,10 @@
 #include "sni_router.h"
 
 #ifdef _WIN32
-#    include <winsock2.h>
-#    include <ws2tcpip.h>
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
 #else
-#    include <arpa/inet.h>
+#  include <arpa/inet.h>
 #endif
 
 #include <assert.h>
@@ -21,7 +21,7 @@
 #include <time.h>
 
 #ifndef _WIN32
-#    include <unistd.h>
+#  include <unistd.h>
 #endif
 
 /* QUIC version 1 Initial Salt (RFC 9001) */
