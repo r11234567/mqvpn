@@ -806,13 +806,14 @@ if(BUILD_TESTING)
 
     # SNI router test
     add_executable(test_sni_router tests/test_sni_router.c src/sni_router.c src/log.c)
-    target_link_libraries(test_sni_router ${SSL_LIB} ${CRYPTO_LIB})
+    target_link_libraries(test_sni_router ${SSL_LIB} ${CRYPTO_LIB} stdc++)
     target_include_directories(test_sni_router PRIVATE ${BORINGSSL_INCLUDE_DIR})
 
     # HTTP/2 proxy test (conditional on nghttp2 availability)
     if(MQVPN_ENABLE_H2_PROXY)
         add_executable(test_h2_proxy tests/test_h2_proxy.c src/h2_proxy.c src/log.c)
-        target_link_libraries(test_h2_proxy ${NGHTTP2_LIB} ${SSL_LIB} ${CRYPTO_LIB})
+        target_link_libraries(test_h2_proxy ${NGHTTP2_LIB} ${SSL_LIB} ${CRYPTO_LIB} stdc++)
+        target_include_directories(test_h2_proxy PRIVATE ${XQUIC_INCLUDE_DIR} ${BORINGSSL_INCLUDE_DIR})
         if(NGHTTP2_INCLUDE_DIR)
             target_include_directories(test_h2_proxy PRIVATE ${NGHTTP2_INCLUDE_DIR})
         endif()
