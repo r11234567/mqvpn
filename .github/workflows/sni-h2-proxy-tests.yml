@@ -2,7 +2,13 @@ name: SNI Routing and H2 Proxy Tests
 
 on:
   push:
-    branches: [main, feature/sni-routing-and-h2-proxy]
+    paths:
+      - 'src/sni_router.*'
+      - 'src/h2_proxy.*'
+      - 'tests/test_sni_router.c'
+      - 'tests/test_h2_proxy.c'
+      - '.github/workflows/sni-h2-proxy-tests.yml'
+      - 'CMakeLists.txt'
   pull_request:
     branches: [main]
   workflow_dispatch:
