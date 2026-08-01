@@ -110,8 +110,8 @@ test_fallback(void)
     inet_pton(AF_INET, "192.168.1.100", &peer.sin_addr);
 
     /* Don't assert on return value - it's expected to fail without a listener */
-    (void)sni_router_fallback(router, pkt, sizeof(pkt),
-                              (struct sockaddr *)&peer, sizeof(peer));
+    (void)sni_router_fallback(router, pkt, sizeof(pkt), (struct sockaddr *)&peer,
+                              sizeof(peer));
 
     sni_router_destroy(router);
 

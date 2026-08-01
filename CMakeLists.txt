@@ -250,8 +250,12 @@ set(MQVPN_LIB_SOURCES
     src/reorder_rx.c
     src/hybrid/classifier.c
     src/sni_router.c
-    src/h2_proxy.c
 )
+
+# Add H2 proxy only if nghttp2 is available
+if(MQVPN_ENABLE_H2_PROXY)
+    list(APPEND MQVPN_LIB_SOURCES src/h2_proxy.c)
+endif()
 
 # ---------- lwIP (hybrid mode TCP lane — see MQVPN_HYBRID_TCP_LANE_BUILD) ----------
 # Deliberately single-mode: no pre-built LWIP_BUILD_DIR variant (unlike

@@ -259,8 +259,7 @@ extract_sni_from_client_hello(const uint8_t *data, size_t len, char *sni_out,
             }
 
             /* Server Name List Length */
-            uint16_t list_len = ((uint16_t)data[pos] << 8) | data[pos + 1];
-            pos += 2;
+            pos += 2;  /* Skip list length, we only parse the first name */
 
             if (pos + 3 > ext_end) return -1;
 
