@@ -94,8 +94,9 @@ endif()
 # Default: disabled. Only enable if explicitly found.
 set(MQVPN_ENABLE_H2_PROXY OFF)
 
-# Only search for nghttp2 on platforms that typically have it
-if(NOT IOS AND NOT ANDROID_CROSS_COMPILE)
+# Only search for nghttp2 on desktop Linux and Windows
+# Skip on mobile/embedded platforms (iOS, Android, Darwin CI which often lacks it)
+if(NOT IOS AND NOT ANDROID_CROSS_COMPILE AND NOT APPLE)
     find_package(PkgConfig)
     if(PKG_CONFIG_FOUND)
         pkg_check_modules(NGHTTP2 libnghttp2)
@@ -119,7 +120,7 @@ if(NOT IOS AND NOT ANDROID_CROSS_COMPILE)
 endif()
 
 if(NOT MQVPN_ENABLE_H2_PROXY)
-    message(STATUS "nghttp2 not found or disabled. HTTP/2 proxy support will be disabled.")
+    message(STATUS "nghttp2 disabled or not found. HTTP/2 proxy support will be disabled.")
 endif()
 
 message(STATUS "MQVPN_ENABLE_H2_PROXY: ${MQVPN_ENABLE_H2_PROXY}")

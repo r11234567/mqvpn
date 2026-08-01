@@ -6,8 +6,11 @@
 #ifdef _WIN32
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+typedef int ssize_t;
+#  define close closesocket
 #else
 #  include <arpa/inet.h>
+#  include <unistd.h>
 #endif
 
 #include <assert.h>
@@ -19,10 +22,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-#ifndef _WIN32
-#  include <unistd.h>
-#endif
 
 /* QUIC version 1 Initial Salt (RFC 9001) */
 static const uint8_t QUIC_V1_INITIAL_SALT[20] = {0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34,
