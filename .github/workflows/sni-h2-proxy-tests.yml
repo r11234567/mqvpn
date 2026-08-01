@@ -60,7 +60,7 @@ jobs:
           cd third_party/xquic
           mkdir -p build && cd build
           cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
-                -DSSL_PATH=../third_party/boringssl \
+                -DSSL_PATH=${GITHUB_WORKSPACE}/third_party/xquic/third_party/boringssl \
                 -DXQC_ENABLE_BBR2=ON \
                 -DXQC_ENABLE_FEC=ON \
                 -DXQC_ENABLE_XOR=ON ..
@@ -148,7 +148,7 @@ jobs:
           cd third_party/xquic
           mkdir -p build && cd build
           cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
-                -DSSL_PATH=../third_party/boringssl \
+                -DSSL_PATH=${GITHUB_WORKSPACE}/third_party/xquic/third_party/boringssl \
                 -DXQC_ENABLE_BBR2=ON \
                 -DXQC_ENABLE_FEC=ON \
                 -DXQC_ENABLE_XOR=ON ..
