@@ -3,31 +3,22 @@
 
 #include "sni_router.h"
 
-// Include OpenSSL headers first to avoid typedef conflicts on Windows
+#include <assert.h>
+#include <errno.h>
 #include <openssl/aes.h>
 #include <openssl/evp.h>
 #include <openssl/hkdf.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
-#  include <winsock2.h>
-#  include <ws2tcpip.h>
-// ssize_t may be defined by BoringSSL on Windows, only define if missing
-#  if !defined(ssize_t) && !defined(_SSIZE_T_DEFINED)
-typedef int ssize_t;
-#    define _SSIZE_T_DEFINED
-#  endif
 #  define close closesocket
 #else
 #  include <arpa/inet.h>
 #  include <unistd.h>
 #endif
-
-#include <assert.h>
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
 
 /* QUIC version 1 Initial Salt (RFC 9001) */
 static const uint8_t QUIC_V1_INITIAL_SALT[20] = {0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34,
