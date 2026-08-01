@@ -3,11 +3,18 @@
 
 #include "sni_router.h"
 
+// Include OpenSSL headers first to avoid typedef conflicts on Windows
+#include <openssl/aes.h>
+#include <openssl/evp.h>
+#include <openssl/hkdf.h>
+
 #ifdef _WIN32
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
-#  ifndef ssize_t
+// ssize_t may be defined by BoringSSL on Windows, only define if missing
+#  if !defined(ssize_t) && !defined(_SSIZE_T_DEFINED)
 typedef int ssize_t;
+#    define _SSIZE_T_DEFINED
 #  endif
 #  define close closesocket
 #else
@@ -17,9 +24,6 @@ typedef int ssize_t;
 
 #include <assert.h>
 #include <errno.h>
-#include <openssl/aes.h>
-#include <openssl/evp.h>
-#include <openssl/hkdf.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
