@@ -3,9 +3,13 @@
 
 #include "sni_router.h"
 
-#include <assert.h>
-#include <errno.h>
-#include <openssl/aes.h>
+#ifdef X509_NAME
+/* Windows CryptoAPI defines X509_NAME as a macro, which corrupts BoringSSL's
+ * X509_NAME typedef when Windows headers are included first. */
+#  undef X509_NAME
+#endif
+
+#include <limits.h>
 #include <openssl/evp.h>
 #include <openssl/hkdf.h>
 #include <stdio.h>
@@ -14,10 +18,14 @@
 #include <time.h>
 
 #ifdef _WIN32
-#  define close closesocket
+typedef SOCKET sni_socket_t;
+#  define SNI_INVALID_SOCKET INVALID_SOCKET
 #else
 #  include <arpa/inet.h>
+#  include <sys/types.h>
 #  include <unistd.h>
+typedef int sni_socket_t;
+#  define SNI_INVALID_SOCKET (-1)
 #endif
 
 /* QUIC version 1 Initial Salt (RFC 9001) */
@@ -41,7 +49,7 @@ struct sni_router_s {
     sni_router_config_t config;
     sni_connection_state_t **conn_table; /* Hash table */
     size_t table_size;
-    int fallback_fd; /* Socket for fallback forwarding */
+    sni_socket_t fallback_fd; /* Socket for fallback forwarding */
 };
 
 /* ─── Helper functions ─── */
@@ -72,6 +80,14 @@ addr_equal(const struct sockaddr *a, socklen_t a_len, const struct sockaddr *b,
         return a6->sin6_port == b6->sin6_port &&
                memcmp(&a6->sin6_addr, &b6->sin6_addr, 16) == 0;
     }
+    return 0;
+}
+
+static int
+addr_len_valid(int family, socklen_t len)
+{
+    if (family == AF_INET) return len >= (socklen_t)sizeof(struct sockaddr_in);
+    if (family == AF_INET6) return len >= (socklen_t)sizeof(struct sockaddr_in6);
     return 0;
 }
 
@@ -366,7 +382,11 @@ conn_insert(sni_router_t *router, const uint8_t *cid, size_t cid_len,
 sni_router_t *
 sni_router_create(const sni_router_config_t *config)
 {
-    if (!config || !config->allowed_snis || config->n_allowed_snis == 0) return NULL;
+    if (!config || !config->allowed_snis || config->n_allowed_snis == 0 ||
+        !addr_len_valid(config->fallback_addr.ss_family, config->fallback_addrlen) ||
+        config->fallback_addrlen > (socklen_t)sizeof(config->fallback_addr)) {
+        return NULL;
+    }
 
     sni_router_t *router = calloc(1, sizeof(*router));
     if (!router) return NULL;
@@ -384,7 +404,7 @@ sni_router_create(const sni_router_config_t *config)
     /* Create fallback socket */
     int family = config->fallback_addr.ss_family;
     router->fallback_fd = socket(family, SOCK_DGRAM, 0);
-    if (router->fallback_fd < 0) {
+    if (router->fallback_fd == SNI_INVALID_SOCKET) {
         free(router->conn_table);
         free(router);
         return NULL;
@@ -409,7 +429,13 @@ sni_router_destroy(sni_router_t *router)
     }
     free(router->conn_table);
 
-    if (router->fallback_fd >= 0) close(router->fallback_fd);
+    if (router->fallback_fd != SNI_INVALID_SOCKET) {
+#ifdef _WIN32
+        closesocket(router->fallback_fd);
+#else
+        close(router->fallback_fd);
+#endif
+    }
 
     free(router);
 }
@@ -421,6 +447,7 @@ sni_router_match(const sni_router_t *router, const char *sni)
 
     for (size_t i = 0; i < router->config.n_allowed_snis; i++) {
         const char *pattern = router->config.allowed_snis[i];
+        if (!pattern) continue;
 
         /* Exact match */
         if (strcmp(pattern, sni) == 0) return 1;
@@ -451,7 +478,11 @@ sni_router_inspect(sni_router_t *router, const uint8_t *pkt, size_t len,
                    const struct sockaddr *peer, socklen_t peer_len, char *sni_out,
                    size_t sni_cap)
 {
-    if (!router || !pkt || len == 0) return SNI_ROUTE_ERROR;
+    if (!router || !pkt || len == 0 || !peer ||
+        !addr_len_valid(peer->sa_family, peer_len) ||
+        peer_len > (socklen_t)sizeof(struct sockaddr_storage)) {
+        return SNI_ROUTE_ERROR;
+    }
 
     uint64_t now_sec = (uint64_t)time(NULL);
 
@@ -514,11 +545,18 @@ sni_router_fallback(sni_router_t *router, const uint8_t *pkt, size_t len,
     (void)peer; /* Currently unused - could be used for logging */
     (void)peer_len;
 
+#ifdef _WIN32
+    if (len > INT_MAX) return -1;
+    int sent = sendto(router->fallback_fd, (const char *)pkt, (int)len, 0,
+                      (struct sockaddr *)&router->config.fallback_addr,
+                      router->config.fallback_addrlen);
+    return sent == (int)len ? 0 : -1;
+#else
     ssize_t sent = sendto(router->fallback_fd, pkt, len, 0,
                           (struct sockaddr *)&router->config.fallback_addr,
                           router->config.fallback_addrlen);
-
-    return (sent == (ssize_t)len) ? 0 : -1;
+    return sent == (ssize_t)len ? 0 : -1;
+#endif
 }
 
 void
@@ -526,7 +564,9 @@ sni_router_cleanup(sni_router_t *router, uint64_t now_sec)
 {
     if (!router) return;
 
-    uint64_t cutoff = now_sec - router->config.conn_timeout_sec;
+    uint64_t cutoff = now_sec > router->config.conn_timeout_sec
+                          ? now_sec - router->config.conn_timeout_sec
+                          : 0;
 
     for (size_t i = 0; i < router->table_size; i++) {
         sni_connection_state_t **pp = &router->conn_table[i];

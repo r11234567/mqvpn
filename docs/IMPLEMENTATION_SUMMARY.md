@@ -2,38 +2,49 @@
 
 ## 📋 项目概述
 
-为mqvpn添加了两个流量分流功能，实现同一端口上基于SNI的智能路由和HTTP/2协议代理。
+本分支添加了SNI路由与HTTP/2代理的API、构建入口和原型实现。经2026-08-01
+代码复核，这两个模块尚未接入`mqvpn_server.c`，也尚未形成可部署的端到端功能。
 
-## ✅ 完成的工作
+> **当前状态：实验性原型。** `sni_router.c`尚未实现QUIC Initial包的
+> Header Protection移除和AEAD解密；`h2_proxy.c`尚未实现H3/H2 header、body和
+> response转发。不得把当前模块用于生产流量分流。
+
+## 当前实现
 
 ### 核心功能实现
 
-#### 1. SNI路由模块 (1200+ 行代码)
+#### 1. SNI路由模块
 **文件**: `src/sni_router.[ch]`
 
 **实现细节**:
-- QUIC Initial包解析（RFC 9001标准）
+- QUIC长包头的部分字段解析
 - Initial Secrets派生（基于Connection ID）
-- TLS ClientHello解析和SNI提取
+- 明文TLS ClientHello解析器和SNI匹配
 - 连接跟踪（哈希表，O(1)查找）
 - Fallback转发机制
 - 支持精确匹配和通配符（`*.example.com`）
 
-**性能指标**:
-- Initial包解析：~10-20μs
-- SNI提取：~5-10μs
-- 后续包查表：<1μs
+**未完成**:
+- QUIC Header Protection移除和Initial payload AEAD解密
+- CRYPTO frame重组与分片ClientHello处理
+- 与服务端收包和转发路径集成
+- 真实QUIC报文端到端测试和性能基准
 
-#### 2. HTTP/2代理模块 (600+ 行代码)
+#### 2. HTTP/2代理模块
 **文件**: `src/h2_proxy.[ch]`
 
 **实现细节**:
-- 基于nghttp2库实现
-- QUIC/HTTP3 → TCP/HTTP2协议转换
-- 连接池管理（可配置最大连接数）
-- 流多路复用支持
-- 非阻塞I/O架构
-- 事件驱动设计
+- nghttp2会话、连接池和统计结构骨架
+- POSIX非阻塞TCP连接管理
+- H3侧和事件循环侧的API定义
+
+**未完成**:
+- nghttp2实际回调注册
+- H3 request header/body到H2的提交
+- H2 response到H3的回传和流关闭
+- backend TLS
+- 与`mqvpn_server.c`和事件循环集成
+- Windows socket实现（构建系统现仅在Linux探测并启用nghttp2）
 
 **架构**:
 ```
@@ -48,10 +59,11 @@ Client (HTTP/3) → mqvpn (代理) → Backend (HTTP/2)
 **文件**: `tests/test_sni_router.c`, `tests/test_h2_proxy.c`
 
 - SNI匹配测试（精确、通配符、不匹配）
-- 连接跟踪测试
-- Fallback机制测试
-- HTTP/2代理生命周期测试
-- 连接池管理测试
+- cleanup API空表调用测试
+- UDP fallback API冒烟调用
+- HTTP/2代理配置、生命周期和初始统计测试
+
+当前测试不覆盖真实QUIC解密、连接跟踪命中、H3/H2转发或端到端代理行为。
 
 #### CI/CD集成
 **文件**: `.github/workflows/sni-h2-proxy-tests.yml`
@@ -63,9 +75,10 @@ Client (HTTP/3) → mqvpn (代理) → Backend (HTTP/2)
 
 **检查项**:
 - ✅ 代码格式（clang-format 18.1.3）
-- ✅ 编译警告（`-Wall -Wextra -Werror`）
+- ✅ 新增C文件格式检查
 - ✅ 不安全函数检测
-- ✅ NULL检查验证
+- ⚠️ 工作流中的“integration-test”目前只构建并生成证书，不发送测试流量
+- ⚠️ H2测试失败被shell命令忽略，不能作为功能正确性门禁
 
 #### 本地验证脚本
 **文件**: `scripts/check_sni_h2_feature.sh`
@@ -134,6 +147,11 @@ Client (HTTP/3) → mqvpn (代理) → Backend (HTTP/2)
 ### 第二轮CI失败
 4. ✅ BoringSSL头文件路径 → 添加`BORINGSSL_INCLUDE_DIR`到测试目标
 
+### Windows全局CI失败
+5. ✅ 修复Windows SDK的`X509_NAME`宏与BoringSSL类型名冲突
+6. ✅ fallback socket在Windows使用`SOCKET`，避免64位句柄截断
+7. ✅ 按Winsock的`sendto`签名检查并转换`size_t`长度
+
 ## 📊 代码统计
 
 ```
@@ -150,11 +168,10 @@ Bash                1       75+         10+
 
 ## 🎯 技术亮点
 
-### 1. 标准遵循
-- **RFC 9001**: QUIC Initial包加密
-- **RFC 9114**: HTTP/3协议
-- **RFC 9297**: HTTP Datagrams
-- **nghttp2**: 成熟的HTTP/2实现
+### 1. 标准相关基础
+- **RFC 9001**: 已实现Initial secret派生，报文解密尚未实现
+- **TLS 1.3**: 已有明文ClientHello SNI解析器
+- **nghttp2**: 已建立会话管理骨架，协议桥接尚未实现
 
 ### 2. 性能优化
 - 连接跟踪避免重复解析
@@ -164,14 +181,14 @@ Bash                1       75+         10+
 
 ### 3. 安全考虑
 - 无unsafe字符串函数
-- 完整的错误处理
-- 资源限制（连接数、超时）
-- 输入验证
+- 基础分配和socket错误处理
+- 可配置哈希表大小和超时字段
+- 部分输入边界检查
 
 ### 4. 可维护性
 - 清晰的模块化设计
 - 完整的文档
-- 全面的测试覆盖
+- API级冒烟测试
 - 遵循项目代码规范
 
 ## 📈 Git提交历史
@@ -185,7 +202,7 @@ c4db45f style: Apply clang-format to SNI router and H2 proxy modules
 14edd59 feat: Add SNI routing and HTTP/2 proxy support
 ```
 
-## 🚀 部署指南
+## 构建与原型验证
 
 ### 构建
 ```bash
@@ -200,7 +217,7 @@ sudo apt-get install libnghttp2-dev
 ./build.sh
 ```
 
-### 配置示例
+### API草案示例
 
 **服务器端**:
 ```c
@@ -239,10 +256,13 @@ ctest --output-on-failure
 ../scripts/check_sni_h2_feature.sh
 ```
 
-## 📝 后续工作建议
+## 📝 上线前必需工作
 
 ### 短期（1-2周）
+- [ ] 完成QUIC Initial Header Protection和AEAD解密
+- [ ] 解析并重组CRYPTO frame，不扫描密文寻找ClientHello
 - [ ] 完善HTTP/2代理的header转换逻辑
+- [ ] 实现request/response body和关闭状态双向转发
 - [ ] 添加端到端集成测试
 - [ ] 性能基准测试和优化
 - [ ] 集成到主服务器代码（mqvpn_server.c）
@@ -290,10 +310,9 @@ Apache-2.0 License
 
 ---
 
-**实施完成时间**: 2026-08-01  
-**代码质量**: ✅ 所有检查通过  
-**文档完整性**: ✅ 完整  
-**测试覆盖**: ✅ 核心功能全覆盖  
-**CI状态**: 🔄 等待GitHub Actions验证
+**最近复核时间**: 2026-08-01
+**实现状态**: ⚠️ 实验性原型，核心数据路径未完成
+**测试覆盖**: ⚠️ API冒烟测试，不含协议和端到端覆盖
+**CI状态**: 🔄 Windows兼容修复待GitHub Actions验证
 
 **Co-Authored-By**: Claude Opus 5 (1M context) <noreply@anthropic.com>

@@ -17,12 +17,8 @@
 #ifdef _WIN32
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
-// Windows doesn't have ssize_t, use SSIZE_T instead
-#  include <BaseTsd.h>
-typedef SSIZE_T ssize_t;
 #else
 #  include <sys/socket.h>
-#  include <sys/types.h>
 #endif
 
 #ifdef __cplusplus

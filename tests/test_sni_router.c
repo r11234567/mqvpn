@@ -22,11 +22,12 @@ test_sni_match(void)
     };
 
     /* Setup fallback address */
-    struct sockaddr_in *fallback = (struct sockaddr_in *)&config.fallback_addr;
-    fallback->sin_family = AF_INET;
-    fallback->sin_port = htons(443);
-    inet_pton(AF_INET, "127.0.0.1", &fallback->sin_addr);
-    config.fallback_addrlen = sizeof(*fallback);
+    struct sockaddr_in fallback = {0};
+    fallback.sin_family = AF_INET;
+    fallback.sin_port = htons(443);
+    inet_pton(AF_INET, "127.0.0.1", &fallback.sin_addr);
+    memcpy(&config.fallback_addr, &fallback, sizeof(fallback));
+    config.fallback_addrlen = sizeof(fallback);
 
     sni_router_t *router = sni_router_create(&config);
     assert(router != NULL);
@@ -63,11 +64,12 @@ test_connection_tracking(void)
         .conn_timeout_sec = 2,
     };
 
-    struct sockaddr_in *fallback = (struct sockaddr_in *)&config.fallback_addr;
-    fallback->sin_family = AF_INET;
-    fallback->sin_port = htons(443);
-    inet_pton(AF_INET, "127.0.0.1", &fallback->sin_addr);
-    config.fallback_addrlen = sizeof(*fallback);
+    struct sockaddr_in fallback = {0};
+    fallback.sin_family = AF_INET;
+    fallback.sin_port = htons(443);
+    inet_pton(AF_INET, "127.0.0.1", &fallback.sin_addr);
+    memcpy(&config.fallback_addr, &fallback, sizeof(fallback));
+    config.fallback_addrlen = sizeof(fallback);
 
     sni_router_t *router = sni_router_create(&config);
     assert(router != NULL);
@@ -85,6 +87,38 @@ test_connection_tracking(void)
 }
 
 static void
+test_invalid_inputs(void)
+{
+    const char *allowed[] = {NULL, "vpn.example.com"};
+    sni_router_config_t config = {
+        .allowed_snis = allowed,
+        .n_allowed_snis = 2,
+        .max_tracked_conns = 100,
+        .conn_timeout_sec = 60,
+    };
+
+    assert(sni_router_create(&config) == NULL);
+
+    struct sockaddr_in fallback = {0};
+    fallback.sin_family = AF_INET;
+    fallback.sin_port = htons(443);
+    inet_pton(AF_INET, "127.0.0.1", &fallback.sin_addr);
+    memcpy(&config.fallback_addr, &fallback, sizeof(fallback));
+    config.fallback_addrlen = sizeof(fallback);
+
+    sni_router_t *router = sni_router_create(&config);
+    assert(router != NULL);
+    assert(sni_router_match(router, "vpn.example.com") == 1);
+
+    uint8_t pkt[1200] = {0xC0};
+    assert(sni_router_inspect(router, pkt, sizeof(pkt), NULL, 0, NULL, 0) ==
+           SNI_ROUTE_ERROR);
+
+    sni_router_destroy(router);
+    printf("test_invalid_inputs: PASS\n");
+}
+
+static void
 test_fallback(void)
 {
     const char *allowed[] = {"vpn.example.com"};
@@ -95,11 +129,12 @@ test_fallback(void)
         .conn_timeout_sec = 60,
     };
 
-    struct sockaddr_in *fallback = (struct sockaddr_in *)&config.fallback_addr;
-    fallback->sin_family = AF_INET;
-    fallback->sin_port = htons(8443);
-    inet_pton(AF_INET, "127.0.0.1", &fallback->sin_addr);
-    config.fallback_addrlen = sizeof(*fallback);
+    struct sockaddr_in fallback = {0};
+    fallback.sin_family = AF_INET;
+    fallback.sin_port = htons(8443);
+    inet_pton(AF_INET, "127.0.0.1", &fallback.sin_addr);
+    memcpy(&config.fallback_addr, &fallback, sizeof(fallback));
+    config.fallback_addrlen = sizeof(fallback);
 
     sni_router_t *router = sni_router_create(&config);
     assert(router != NULL);
@@ -125,6 +160,7 @@ main(void)
 {
     test_sni_match();
     test_connection_tracking();
+    test_invalid_inputs();
     test_fallback();
 
     printf("\nAll SNI router tests passed!\n");
