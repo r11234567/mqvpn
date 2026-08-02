@@ -130,6 +130,15 @@ jobs:
       - name: Unit tests (ctest)
         run: cd build && ctest --output-on-failure
 
+      # Keep the new server routing surface visible in the main CI workflow.
+      # The full ctest run above also executes these tests, but this focused
+      # gate makes failures attributable and prevents them being accidentally
+      # lost when the general test list is reorganized.
+      - name: Server SNI fallback and H2 proxy regressions
+        run: |
+          ctest --test-dir build --output-on-failure \
+                -R '^(test_sni_router|test_h2_proxy)$'
+
       - name: Stage artifacts
         run: cp third_party/xquic/build/libxquic.so build/
 
@@ -226,6 +235,14 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: cd build && ctest --output-on-failure
+
+      - name: Server SNI fallback and H2 proxy regressions (sanitizer)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ctest --test-dir build --output-on-failure \
+                -R '^(test_sni_router|test_h2_proxy)$'
 
       - name: Fuzz tcp_lane (short budget)
         run: |
@@ -483,7 +500,7 @@ jobs:
           MSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: cd build && ctest --output-on-failure
 
-  netns-tests:
+  client-tls-validation:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -493,7 +510,7 @@ jobs:
       - name: Install runtime dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libevent-dev iptables iperf3
+          sudo apt-get install -y libevent-dev libnghttp2-14 iptables iproute2 iputils-ping openssl
 
       - name: Download build artifacts
         uses: actions/download-artifact@v8
@@ -504,8 +521,32 @@ jobs:
       - name: Make binary executable
         run: chmod +x build/mqvpn
 
-      - name: Smoke test (netns)
+      # run_test first proves the same self-signed endpoint is reachable with
+      # --insecure, then starts a fresh strict client and requires the
+      # certificate to be rejected before a tunnel can be created.
+      - name: Reject an untrusted server certificate without --insecure
         run: sudo scripts/ci_e2e/run_test.sh
+
+  netns-tests:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libevent-dev libnghttp2-14 iptables iperf3
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: build
+          path: build
+
+      - name: Make binary executable
+        run: chmod +x build/mqvpn
 
       - name: Multi-client test (netns)
         run: sudo scripts/ci_e2e/test_multiclient.sh
