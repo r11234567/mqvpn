@@ -437,6 +437,88 @@ test_fallback_bidirectional(void)
     close(backend);
 }
 
+static size_t
+build_server_initial(uint8_t *packet, size_t cap, const uint8_t *dcid, size_t dcid_len,
+                     const uint8_t *scid, size_t scid_len)
+{
+    size_t pos = 0;
+    assert(dcid_len <= 20 && scid_len <= 20 && cap >= 64);
+    packet[pos++] = 0xc0;
+    packet[pos++] = 0;
+    packet[pos++] = 0;
+    packet[pos++] = 0;
+    packet[pos++] = 1;
+    packet[pos++] = (uint8_t)dcid_len;
+    if (dcid_len > 0) memcpy(packet + pos, dcid, dcid_len);
+    pos += dcid_len;
+    packet[pos++] = (uint8_t)scid_len;
+    if (scid_len > 0) memcpy(packet + pos, scid, scid_len);
+    pos += scid_len;
+    packet[pos++] = 0;
+    pos += encode_varint(packet + pos, 17);
+    memset(packet + pos, 0, 17);
+    return pos + 17;
+}
+
+static size_t
+build_client_initial_with_dcid(uint8_t *packet, size_t cap, const uint8_t *dcid,
+                               size_t dcid_len)
+{
+    return build_server_initial(packet, cap, dcid, dcid_len, NULL, 0);
+}
+
+static void
+test_server_initial_cid_routing(void)
+{
+    int backend = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(backend >= 0);
+    struct sockaddr_in backend_addr = {0};
+    backend_addr.sin_family = AF_INET;
+    backend_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(backend, (struct sockaddr *)&backend_addr, sizeof(backend_addr)) == 0);
+    struct timeval timeout = {.tv_sec = 2};
+    assert(setsockopt(backend, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    socklen_t backend_addr_len = sizeof(backend_addr);
+    assert(getsockname(backend, (struct sockaddr *)&backend_addr, &backend_addr_len) ==
+           0);
+
+    static const uint8_t server_scid[] = {0x11, 0x12, 0x13, 0x14, 0x15, 0x16};
+    uint8_t packet[1200], server_initial[128], received[1200];
+    size_t packet_len = decode_hex(RFC9001_CLIENT_INITIAL, packet, sizeof(packet));
+    size_t server_initial_len =
+        build_server_initial(server_initial, sizeof(server_initial), NULL, 0, server_scid,
+                             sizeof(server_scid));
+    struct sockaddr_in peer = test_peer();
+    const char *allowed[] = {"vpn.example.com"};
+    test_ctx_t ctx = {0};
+    sni_router_t *router = create_router_at(allowed, 1, &ctx, backend_addr.sin_port);
+    assert(router != NULL);
+    assert(sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
+                              sizeof(peer), accept_packet, &ctx) == SNI_ROUTE_FALLBACK);
+
+    struct sockaddr_storage router_addr;
+    socklen_t router_addr_len = sizeof(router_addr);
+    ssize_t received_len = recvfrom(backend, received, sizeof(received), 0,
+                                    (struct sockaddr *)&router_addr, &router_addr_len);
+    assert(received_len == (ssize_t)packet_len);
+    ssize_t sent_len = sendto(backend, server_initial, server_initial_len, 0,
+                              (struct sockaddr *)&router_addr, router_addr_len);
+    assert(sent_len == (ssize_t)server_initial_len);
+    sni_router_on_fd_readable(router, ctx.registered_fd, ctx.registered_ctx);
+    assert(ctx.sent_client == 1);
+
+    size_t next_len = build_client_initial_with_dcid(packet, sizeof(packet), server_scid,
+                                                     sizeof(server_scid));
+    assert(sni_router_process(router, packet, next_len, (struct sockaddr *)&peer,
+                              sizeof(peer), accept_packet, &ctx) == SNI_ROUTE_FALLBACK);
+    received_len = recvfrom(backend, received, sizeof(received), 0,
+                            (struct sockaddr *)&router_addr, &router_addr_len);
+    assert(received_len == (ssize_t)next_len);
+
+    sni_router_destroy(router);
+    close(backend);
+}
+
 static void
 test_retry_dcid_routing(const char *initial_hex, const char *retry_hex, int forge_tag)
 {
@@ -605,6 +687,7 @@ main(void)
     test_sni_routing();
     test_fail_open_delivers_once();
     test_fallback_bidirectional();
+    test_server_initial_cid_routing();
     test_retry_routing();
     test_fragmented_client_hello_out_of_order();
     test_pending_timeout_fails_open();

@@ -68,10 +68,10 @@ typedef struct sni_connection_state_s {
     size_t initial_dcid_len;
     uint8_t initial_scid[20];
     size_t initial_scid_len;
-    uint8_t retry_scid[20];
-    size_t retry_scid_len;
+    uint8_t server_scid[20];
+    size_t server_scid_len;
     uint32_t version;
-    int have_retry_scid;
+    int have_server_scid;
     uint64_t largest_initial_pn;
     int have_largest_initial_pn;
     uint64_t last_seen;
@@ -1016,13 +1016,13 @@ sni_router_match(const sni_router_t *router, const char *sni)
 }
 
 static int
-connection_matches_retry_initial(const sni_connection_state_t *conn,
-                                 const initial_header_t *header)
+connection_matches_server_scid(const sni_connection_state_t *conn,
+                               const initial_header_t *header)
 {
-    if (conn->decision != SNI_ROUTE_FALLBACK || !conn->have_retry_scid) return 0;
+    if (conn->decision != SNI_ROUTE_FALLBACK || !conn->have_server_scid) return 0;
     if (conn->version != header->version) return 0;
-    if (conn->retry_scid_len != header->dcid_len) return 0;
-    return memcmp(conn->retry_scid, header->dcid, header->dcid_len) == 0;
+    if (conn->server_scid_len != header->dcid_len) return 0;
+    return memcmp(conn->server_scid, header->dcid, header->dcid_len) == 0;
 }
 
 sni_route_result_t
@@ -1038,9 +1038,9 @@ sni_router_process(sni_router_t *router, const uint8_t *pkt, size_t len,
     sni_connection_state_t *conn = connection_lookup(router, peer);
     initial_header_t h;
     int parsed = parse_initial_header(pkt, len, &h);
-    int retry_initial = 0;
-    if (conn && parsed == 0) retry_initial = connection_matches_retry_initial(conn, &h);
-    if (conn && parsed == 0 && !retry_initial &&
+    int known_server_dcid = 0;
+    if (conn && parsed == 0) known_server_dcid = connection_matches_server_scid(conn, &h);
+    if (conn && parsed == 0 && !known_server_dcid &&
         (conn->initial_dcid_len != h.dcid_len ||
          memcmp(conn->initial_dcid, h.dcid, h.dcid_len) != 0)) {
         if (conn->decision == SNI_ROUTE_PENDING) {
@@ -1148,12 +1148,25 @@ sni_router_on_fd_readable(sni_router_t *router, sni_socket_t fd, void *fd_ctx)
 #endif
         if (n == 0) break;
         conn->last_seen = wall_time_sec();
-        if (conn->decision == SNI_ROUTE_FALLBACK && !conn->have_retry_scid) {
+        if (conn->decision == SNI_ROUTE_FALLBACK && !conn->have_server_scid) {
+            /* RFC 9000 Section 7.2: the client uses the server Initial SCID as
+             * the DCID of its subsequent Initial packets. */
+            initial_header_t initial;
+            if (parse_initial_header(buf, (size_t)n, &initial) == 0 &&
+                initial.version == conn->version &&
+                initial.dcid_len == conn->initial_scid_len &&
+                memcmp(initial.dcid, conn->initial_scid, initial.dcid_len) == 0) {
+                memcpy(conn->server_scid, initial.scid, initial.scid_len);
+                conn->server_scid_len = initial.scid_len;
+                conn->have_server_scid = 1;
+            }
+        }
+        if (conn->decision == SNI_ROUTE_FALLBACK && !conn->have_server_scid) {
             retry_header_t retry;
             if (validate_retry(conn, buf, (size_t)n, &retry) == 0) {
-                memcpy(conn->retry_scid, retry.scid, retry.scid_len);
-                conn->retry_scid_len = retry.scid_len;
-                conn->have_retry_scid = 1;
+                memcpy(conn->server_scid, retry.scid, retry.scid_len);
+                conn->server_scid_len = retry.scid_len;
+                conn->have_server_scid = 1;
             }
         }
         if (router->callbacks.send_client(

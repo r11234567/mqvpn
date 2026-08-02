@@ -36,8 +36,9 @@ QUIC/TLS，然后按 HTTP/3 请求类型继续分流。CONNECT-IP 判断保持�
 - DNS 名称精确匹配和仅匹配一个最左标签的 `*.example.com` 通配符。
 - 基于客户端地址的有界连接表、超时清理和 pending packet 上限。
 - 每个 fallback 连接使用 connected UDP socket，支持上游回包转发给原客户端。
-- 校验 RFC 9001/RFC 9369 Retry Integrity Tag，并将合法 Retry 的服务端 SCID
-  关联为同一 fallback 连接的新 DCID；伪造 Retry 不会改变路由状态。
+- 对 fallback socket 返回的 server Initial 记录服务端 SCID，关联客户端随后
+  使用的新 DCID；对 Retry 仍校验 RFC 9001/RFC 9369 Integrity Tag，伪造 Retry
+  不会改变路由状态。
 - 对解密失败、未知 QUIC 版本、资源不足和 pending 超限执行 fail-open，交给原
   xquic 路径处理，避免路由器把合法 VPN 流量静默丢弃。
 
@@ -95,9 +96,10 @@ API 为 `mqvpn_config_set_proxy()`。
 - RFC 9000：QUIC long header、varint、packet number 和 frame 编码。
 - RFC 9001：QUIC v1 Initial protection、TLS over QUIC 和 Retry Integrity Tag。
 - RFC 9369：QUIC v2 version、Initial salt、v2 HKDF labels 和 Retry Integrity Tag。
-- RFC 9000 18.2：仓库内回移 xquic 上游 `782e80c`，使服务端握手 SCID 计入
-  `active_connection_id_limit`，避免标准客户端以
-  `CONNECTION_ID_LIMIT_ERROR` 关闭普通 HTTP/3 连接。
+- RFC 9000 7.2/18.2：关联 server Initial 的 SCID，使客户端收到服务端首个
+  Initial 后切换 DCID 仍留在同一 fallback socket；仓库内回移 xquic 上游
+  `782e80c`，使服务端握手 SCID 计入 `active_connection_id_limit`，避免标准客户端
+  以 `CONNECTION_ID_LIMIT_ERROR` 关闭普通 HTTP/3 连接。
 - RFC 6066 / RFC 8446：TLS ClientHello `server_name`。
 - RFC 9525：DNS 标识比较及单标签通配符边界。
 - RFC 9113：HTTP/2、connection-specific field 禁止项和流生命周期。
@@ -143,8 +145,9 @@ nghttp2 依赖。
 
 - 只识别 QUIC v1 和 v2 Initial；其他版本 fail-open 到 mqvpn。
 - ECH 隐藏真实 SNI 时无法按内层名称匹配，将走配置的 QUIC fallback。
-- fallback tracking 以客户端 IP/port 为键。Retry 引起的 DCID 切换已经关联；决定
-  完成后的 QUIC connection migration/NAT rebinding 仍无法关联到旧 fallback socket。
+- fallback tracking 以客户端 IP/port 为键。server Initial/Retry 引起的 DCID
+  切换已经关联；决定完成后的 QUIC connection migration/NAT rebinding 仍无法
+  关联到旧 fallback socket。
 - 单个监听器目前只有一个 `QuicFallback` 和一个 `Http2Backend`。
 - H2 upstream TLS 尚未实现；需要由同机 nginx 或其他可信 sidecar 提供 h2c。
 - 当前采用有界内存缓冲；超过上限会终止受影响的代理流/后端连接，而不是无限制

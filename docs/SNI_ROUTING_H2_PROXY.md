@@ -198,7 +198,8 @@ pre-release，并用发布产物执行本机整体部署验证。
 
 ## 已知限制
 
-- fallback 连接以源 IP/port 关联；QUIC migration 或 NAT rebinding 后的新地址不
+- fallback 连接以源 IP/port 关联，且记录服务端首个 Initial 的 SCID 以关联客户端
+  后续 DCID；QUIC migration 或 NAT rebinding 后的新地址不
   会自动关联旧 fallback socket。
 - 同一监听端口当前只有一个 QUIC fallback 和一个 H2 backend。
 - ECH 内层 SNI 不可见，因此无法按内层名称进入 mqvpn。
