@@ -3,8 +3,8 @@
 ## 状态
 
 本分支已经把 SNI 分流和 HTTP/3 到 HTTP/2 回落接入 Linux 服务端主路径，
-不再是独立原型。Windows 会编译 SNI 模块以防止跨平台回归，但 Windows 服务端
-reactor 和 H2 代理当前不启用该功能。macOS、iOS 和 Android 也不启用代理集成。
+不再是独立原型。Windows 构建是 client-only，不编译 POSIX server-side SNI/H2
+模块；macOS、iOS 和 Android 也不启用代理集成。
 
 当前实现对应两级路由：
 
@@ -103,13 +103,14 @@ API 为 `mqvpn_config_set_proxy()`。
 
 `.github/workflows/sni-h2-proxy-tests.yml` 包含三个 job：
 
-1. Linux protocol regression：严格格式和 warning 检查，RFC v1/v2 fixed vector、
+1. Linux format-check：clang-format 18.1.3 检查本分支涉及的 C/H 文件。
+2. Linux protocol regression：RFC v1/v2 fixed vector、
    SNI exact/wildcard、乱序 ClientHello、双向 UDP fallback、真实 nghttp2 双向代理、
    config parity、server 和 CONNECT-IP/TCP egress 回归。
-2. Linux ASan/UBSan：SNI 和 H2 协议测试，包含 H3 提前关闭后的 nghttp2 生命周期。
-3. Windows MSVC：完整构建和 smoke run，SNI translation unit 使用 `/W4 /WX`。
+3. Linux ASan/UBSan：SNI 和 H2 协议测试，包含 H3 提前关闭后的 nghttp2 生命周期。
 
-全局 `CI` 和 Linux release job 安装 `libnghttp2-dev`，因此 Linux 正式产物不会因
+全局 `CI` 的 Windows job 负责 client-only 构建；Linux CI 和 release job 安装
+`libnghttp2-dev`，因此 Linux 正式产物不会因
 构建机缺少 nghttp2 而静默删除 H2 功能。DEB 使用 `dpkg-shlibdeps` 生成运行时
 nghttp2 依赖。
 

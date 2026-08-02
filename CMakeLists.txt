@@ -262,8 +262,13 @@ set(MQVPN_LIB_SOURCES
     src/reorder_tx.c
     src/reorder_rx.c
     src/hybrid/classifier.c
-    src/sni_router.c
 )
+
+# SNI inspection and fallback use the POSIX server reactor; Windows builds are
+# client-only and must not pull this server-side translation unit in.
+if(NOT WIN32)
+    list(APPEND MQVPN_LIB_SOURCES src/sni_router.c)
+endif()
 
 # Add H2 proxy only if nghttp2 is available
 if(MQVPN_ENABLE_H2_PROXY)
@@ -272,16 +277,13 @@ endif()
 
 # Keep the protocol boundary strict even though the legacy target still has
 # warnings in unrelated translation units.
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+if(NOT WIN32 AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set_source_files_properties(src/sni_router.c
         PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
     if(MQVPN_ENABLE_H2_PROXY)
         set_source_files_properties(src/h2_proxy.c
             PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
     endif()
-elseif(MSVC)
-    set_source_files_properties(src/sni_router.c
-        PROPERTIES COMPILE_OPTIONS "/W4;/WX")
 endif()
 
 # ---------- lwIP (hybrid mode TCP lane — see MQVPN_HYBRID_TCP_LANE_BUILD) ----------
@@ -852,14 +854,14 @@ if(BUILD_TESTING)
     # links reorder_tx.c (for the peek it wraps) + icmp.c (for the PTB send).
     add_executable(test_reorder_gate tests/test_reorder_gate.c src/reorder_tx.c src/icmp.c src/log.c)
 
-    # SNI router test
-    add_executable(test_sni_router tests/test_sni_router.c src/sni_router.c src/log.c)
-    target_link_libraries(test_sni_router ${SSL_LIB} ${CRYPTO_LIB} stdc++)
-    target_include_directories(test_sni_router PRIVATE ${BORINGSSL_INCLUDE_DIR})
-    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(test_sni_router PRIVATE -Wall -Wextra -Werror)
-    elseif(MSVC)
-        target_compile_options(test_sni_router PRIVATE /W4 /WX)
+    # SNI router test (Linux/POSIX server path only)
+    if(NOT WIN32)
+        add_executable(test_sni_router tests/test_sni_router.c src/sni_router.c src/log.c)
+        target_link_libraries(test_sni_router ${SSL_LIB} ${CRYPTO_LIB} stdc++)
+        target_include_directories(test_sni_router PRIVATE ${BORINGSSL_INCLUDE_DIR})
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(test_sni_router PRIVATE -Wall -Wextra -Werror)
+        endif()
     endif()
 
     # HTTP/2 proxy test (conditional on nghttp2 availability)
@@ -879,9 +881,13 @@ if(BUILD_TESTING)
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
             target_compile_options(test_h2_proxy PRIVATE -Wall -Wextra -Werror)
         endif()
-        set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_classifier test_icmp test_reorder_gate test_sni_router test_h2_proxy)
-    else()
-        set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_classifier test_icmp test_reorder_gate test_sni_router)
+    endif()
+    set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_classifier test_icmp test_reorder_gate)
+    if(NOT WIN32)
+        list(APPEND MQVPN_UNIT_TESTS test_sni_router)
+    endif()
+    if(MQVPN_ENABLE_H2_PROXY)
+        list(APPEND MQVPN_UNIT_TESTS test_h2_proxy)
     endif()
 
     # test_tcp_lane #include's BOTH src/hybrid/tcp_lane.c AND

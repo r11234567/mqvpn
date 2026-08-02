@@ -168,7 +168,7 @@ CMake 在 Linux 找到 nghttp2 后定义 `MQVPN_H2_PROXY_ENABLED`。启用了 `[
 当前平台矩阵：
 
 - Linux：SNI、UDP fallback、H3/H2 和 reactor 集成全部启用。
-- Windows：SNI module 参与 MSVC warning-as-error 编译；服务 reactor 不启用代理。
+- Windows：client-only 构建，不编译 POSIX server-side SNI/H2 模块。
 - macOS/iOS/Android：不启用该代理路径。
 
 ## 测试
@@ -183,7 +183,7 @@ CMake 在 Linux 找到 nghttp2 后定义 `MQVPN_H2_PROXY_ENABLED`。启用了 `[
 - loopback 上真实 nghttp2 client/server，覆盖 request body、103、200、response
   body/FIN 以及 H3 提前关闭。
 - config INI/JSON parity、server、CONNECT-IP 和 Hybrid TCP egress regression。
-- ASan/UBSan protocol jobs 和 Windows MSVC build。
+- ASan/UBSan protocol jobs；Windows client 构建由全局 CI 覆盖。
 
 该 workflow 通过后，再运行全局 CI 和 gitleaks；随后才运行 release/build，创建
 pre-release，并用发布产物执行本机整体部署验证。
