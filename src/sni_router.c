@@ -36,6 +36,7 @@
 #define SNI_DEFAULT_PENDING_PACKETS 8u
 #define QUIC_AEAD_TAG_LEN           16u
 #define QUIC_HP_SAMPLE_LEN          16u
+#define QUIC_RETRY_TAG_LEN          16u
 
 static const uint8_t QUIC_V1_INITIAL_SALT[20] = {0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34,
                                                  0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8,
@@ -43,6 +44,16 @@ static const uint8_t QUIC_V1_INITIAL_SALT[20] = {0x38, 0x76, 0x2c, 0xf7, 0xf5, 0
 static const uint8_t QUIC_V2_INITIAL_SALT[20] = {0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6,
                                                  0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26,
                                                  0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9};
+static const uint8_t QUIC_V1_RETRY_KEY[16] = {0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66,
+                                              0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54,
+                                              0xe3, 0x68, 0xc8, 0x4e};
+static const uint8_t QUIC_V1_RETRY_NONCE[12] = {0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63,
+                                                0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb};
+static const uint8_t QUIC_V2_RETRY_KEY[16] = {0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac,
+                                              0x48, 0xe2, 0x60, 0xfb, 0xcb, 0xce,
+                                              0xad, 0x7c, 0xcc, 0x92};
+static const uint8_t QUIC_V2_RETRY_NONCE[12] = {0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c,
+                                                0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a};
 
 typedef struct pending_packet_s {
     uint8_t *data;
@@ -55,6 +66,12 @@ typedef struct sni_connection_state_s {
     socklen_t peer_addrlen;
     uint8_t initial_dcid[20];
     size_t initial_dcid_len;
+    uint8_t initial_scid[20];
+    size_t initial_scid_len;
+    uint8_t retry_scid[20];
+    size_t retry_scid_len;
+    uint32_t version;
+    int have_retry_scid;
     uint64_t largest_initial_pn;
     int have_largest_initial_pn;
     uint64_t last_seen;
@@ -95,6 +112,14 @@ typedef struct {
     size_t pn_offset;
     size_t packet_end;
 } initial_header_t;
+
+typedef struct {
+    uint32_t version;
+    uint8_t dcid[20];
+    size_t dcid_len;
+    uint8_t scid[20];
+    size_t scid_len;
+} retry_header_t;
 
 static int deliver_pending(sni_router_t *router, sni_connection_state_t *conn,
                            sni_router_accept_fn accept_fn, void *accept_ctx);
@@ -264,6 +289,94 @@ parse_initial_header(const uint8_t *pkt, size_t len, initial_header_t *out)
     out->pn_offset = pos;
     out->packet_end = pos + (size_t)protected_len;
     return 0;
+}
+
+static int
+parse_retry_header(const uint8_t *pkt, size_t len, retry_header_t *out)
+{
+    if (!pkt || !out || len < 5 + 1 + 1 + QUIC_RETRY_TAG_LEN ||
+        (pkt[0] & 0xc0u) != 0xc0u) {
+        return -1;
+    }
+
+    uint32_t version = ((uint32_t)pkt[1] << 24) | ((uint32_t)pkt[2] << 16) |
+                       ((uint32_t)pkt[3] << 8) | pkt[4];
+    if (version != QUIC_V1 && version != QUIC_V2) return -1;
+    unsigned packet_type = (pkt[0] >> 4) & 0x03u;
+    if ((version == QUIC_V1 && packet_type != 3) ||
+        (version == QUIC_V2 && packet_type != 0)) {
+        return -1;
+    }
+
+    size_t pos = 5;
+    size_t dcid_len = pkt[pos++];
+    if (dcid_len > sizeof(out->dcid) || dcid_len > len - pos) return -1;
+    const uint8_t *dcid = pkt + pos;
+    pos += dcid_len;
+    if (pos >= len) return -1;
+
+    size_t scid_len = pkt[pos++];
+    if (scid_len > sizeof(out->scid) || scid_len > len - pos ||
+        len - pos - scid_len < QUIC_RETRY_TAG_LEN) {
+        return -1;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->version = version;
+    out->dcid_len = dcid_len;
+    memcpy(out->dcid, dcid, dcid_len);
+    out->scid_len = scid_len;
+    memcpy(out->scid, pkt + pos, scid_len);
+    return 0;
+}
+
+static int
+constant_time_equal(const uint8_t *a, const uint8_t *b, size_t len)
+{
+    uint8_t different = 0;
+    for (size_t i = 0; i < len; i++)
+        different |= a[i] ^ b[i];
+    return different == 0;
+}
+
+static int
+validate_retry(const sni_connection_state_t *conn, const uint8_t *pkt, size_t len,
+               retry_header_t *retry)
+{
+    if (parse_retry_header(pkt, len, retry) != 0 || retry->version != conn->version ||
+        retry->dcid_len != conn->initial_scid_len ||
+        memcmp(retry->dcid, conn->initial_scid, retry->dcid_len) != 0) {
+        return -1;
+    }
+
+    const uint8_t *key = retry->version == QUIC_V2 ? QUIC_V2_RETRY_KEY
+                                                    : QUIC_V1_RETRY_KEY;
+    const uint8_t *nonce = retry->version == QUIC_V2 ? QUIC_V2_RETRY_NONCE
+                                                      : QUIC_V1_RETRY_NONCE;
+    size_t retry_without_tag_len = len - QUIC_RETRY_TAG_LEN;
+    if (retry_without_tag_len > SIZE_MAX - 1 - conn->initial_dcid_len) return -1;
+    size_t pseudo_len = 1 + conn->initial_dcid_len + retry_without_tag_len;
+    uint8_t *pseudo = malloc(pseudo_len);
+    if (!pseudo) return -1;
+    pseudo[0] = (uint8_t)conn->initial_dcid_len;
+    memcpy(pseudo + 1, conn->initial_dcid, conn->initial_dcid_len);
+    memcpy(pseudo + 1 + conn->initial_dcid_len, pkt, retry_without_tag_len);
+
+    uint8_t calculated[QUIC_RETRY_TAG_LEN];
+    size_t calculated_len = 0;
+    static const uint8_t empty = 0;
+    EVP_AEAD_CTX *aead = EVP_AEAD_CTX_new(EVP_aead_aes_128_gcm(), key, 16,
+                                          QUIC_RETRY_TAG_LEN);
+    int ok = aead &&
+             EVP_AEAD_CTX_seal(aead, calculated, &calculated_len, sizeof(calculated),
+                               nonce, 12, &empty, 0, pseudo, pseudo_len) == 1;
+    EVP_AEAD_CTX_free(aead);
+    free(pseudo);
+    if (!ok || calculated_len != QUIC_RETRY_TAG_LEN) return -1;
+    return constant_time_equal(calculated, pkt + retry_without_tag_len,
+                               QUIC_RETRY_TAG_LEN)
+               ? 0
+               : -1;
 }
 
 static int
@@ -761,6 +874,9 @@ connection_create(sni_router_t *router, const struct sockaddr *peer, socklen_t p
     conn->last_seen = wall_time_sec();
     conn->initial_dcid_len = h->dcid_len;
     memcpy(conn->initial_dcid, h->dcid, h->dcid_len);
+    conn->initial_scid_len = h->scid_len;
+    memcpy(conn->initial_scid, h->scid, h->scid_len);
+    conn->version = h->version;
     size_t idx = hash_peer(peer) % router->table_size;
     conn->next = router->conn_table[idx];
     router->conn_table[idx] = conn;
@@ -905,7 +1021,12 @@ sni_router_process(sni_router_t *router, const uint8_t *pkt, size_t len,
     sni_connection_state_t *conn = connection_lookup(router, peer);
     initial_header_t h;
     int parsed = parse_initial_header(pkt, len, &h);
-    if (conn && parsed == 0 &&
+    int retry_initial =
+        conn && conn->decision == SNI_ROUTE_FALLBACK && conn->have_retry_scid &&
+        parsed == 0 && conn->version == h.version &&
+        conn->retry_scid_len == h.dcid_len &&
+        memcmp(conn->retry_scid, h.dcid, h.dcid_len) == 0;
+    if (conn && parsed == 0 && !retry_initial &&
         (conn->initial_dcid_len != h.dcid_len ||
          memcmp(conn->initial_dcid, h.dcid, h.dcid_len) != 0)) {
         if (conn->decision == SNI_ROUTE_PENDING) {
@@ -1013,6 +1134,14 @@ sni_router_on_fd_readable(sni_router_t *router, sni_socket_t fd, void *fd_ctx)
 #endif
         if (n == 0) break;
         conn->last_seen = wall_time_sec();
+        if (conn->decision == SNI_ROUTE_FALLBACK && !conn->have_retry_scid) {
+            retry_header_t retry;
+            if (validate_retry(conn, buf, (size_t)n, &retry) == 0) {
+                memcpy(conn->retry_scid, retry.scid, retry.scid_len);
+                conn->retry_scid_len = retry.scid_len;
+                conn->have_retry_scid = 1;
+            }
+        }
         if (router->callbacks.send_client(
                 buf, (size_t)n, (struct sockaddr *)&conn->peer_addr, conn->peer_addrlen,
                 router->callbacks.user_ctx) != 0)

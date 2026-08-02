@@ -1,0 +1,102 @@
+From 782e80ce3ca073a476a1f5140b33da98a9fdd334 Mon Sep 17 00:00:00 2001
+From: dreamwind1985 <tmliliang@qq.com>
+Date: Wed, 8 Jul 2026 14:14:15 +0800
+Subject: [PATCH] Fix active_connection_id_limit peer CID accounting
+
+Backport the runtime portion of upstream xquic commit 782e80c. RFC 9000
+Section 18.2 includes the peer's handshake CID in the advertised limit;
+only a locally generated initial DCID is excluded.
+---
+ src/transport/xqc_cid.c  | 12 +++++++++---
+ src/transport/xqc_cid.h  | 15 ++++++++++++---
+ src/transport/xqc_conn.c | 12 +++++++++---
+ 3 files changed, 30 insertions(+), 9 deletions(-)
+
+diff --git a/src/transport/xqc_cid.c b/src/transport/xqc_cid.c
+index 7139d77..c76c7bc 100644
+--- a/src/transport/xqc_cid.c
++++ b/src/transport/xqc_cid.c
+@@ -282,9 +282,15 @@ xqc_cid_set_insert_cid(xqc_cid_set_t *cid_set,
+     }
+ 
+     /*
+-     * RFC 9000 §5.1.1: "The value of the active_connection_id_limit transport
+-     * parameter does not include the connection ID negotiated during the
+-     * handshake."  Subtract original (handshake) CIDs from the active count.
++     * RFC 9000 §18.2: active_connection_id_limit is "the maximum number
++     * of connection IDs from the peer that an endpoint is willing to
++     * store."  The limit applies only to peer-supplied CIDs; locally
++     * chosen CIDs (tracked by original_cid_cnt) are excluded.
++     *
++     * After processing a NEW_CONNECTION_ID frame, if the number of
++     * active peer-supplied CIDs exceeds the advertised limit, the
++     * endpoint MUST close the connection with CONNECTION_ID_LIMIT_ERROR
++     * (RFC 9000 §5.1.1).
+      */
+     uint64_t countable = xqc_cid_set_countable_cnt(inner_set);
+     if (countable >= limit) {
+diff --git a/src/transport/xqc_cid.h b/src/transport/xqc_cid.h
+index 978131f..0add126 100644
+--- a/src/transport/xqc_cid.h
++++ b/src/transport/xqc_cid.h
+@@ -133,9 +133,18 @@ xqc_cid_set_mark_original(xqc_cid_set_t *cid_set, xqc_cid_t *cid, uint64_t path_
+ }
+ 
+ /*
+- * Return the number of CIDs that count toward active_connection_id_limit.
+- * Per RFC 9000 §5.1.1, handshake (original) CIDs are excluded.
+- * Uses saturating subtraction to avoid uint64_t underflow.
++ * Return the number of "from the peer" CIDs that count toward
++ * active_connection_id_limit.
++ *
++ * Per RFC 9000 §18.2: active_connection_id_limit is "the maximum number
++ * of connection IDs from the peer that an endpoint is willing to store.
++ * This value includes the connection ID received during the handshake,
++ * that received in the preferred_address transport parameter, and those
++ * received in NEW_CONNECTION_ID frames."
++ *
++ * original_cid_cnt tracks CIDs chosen locally (not from the peer), such
++ * as the client's self-generated initial DCID.  These are excluded from
++ * the count since the limit only applies to peer-supplied CIDs.
+  */
+ static inline uint64_t
+ xqc_cid_set_countable_cnt(xqc_cid_set_inner_t *inner_set)
+diff --git a/src/transport/xqc_conn.c b/src/transport/xqc_conn.c
+index 89b19cb..983cba9 100644
+--- a/src/transport/xqc_conn.c
++++ b/src/transport/xqc_conn.c
+@@ -1038,7 +1038,15 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
+                                XQC_INITIAL_PATH_ID)) {
+         goto fail;
+     }
+-    xqc_cid_set_mark_original(&xc->dcid_set, dcid, XQC_INITIAL_PATH_ID);
++    /*
++     * Only the client's self-generated initial DCID is NOT from the peer
++     * and should be excluded from the active_connection_id_limit count
++     * (RFC 9000 §18.2).  The server's dcid (client's SCID) IS from the
++     * peer and must count toward the limit.
++     */
++    if (type == XQC_CONN_TYPE_CLIENT) {
++        xqc_cid_set_mark_original(&xc->dcid_set, dcid, XQC_INITIAL_PATH_ID);
++    }
+     xqc_cid_copy(&(xc->dcid_set.current_dcid), dcid);
+     xqc_hex_dump(xc->dcid_set.current_dcid_str, dcid->cid_buf, dcid->cid_len);
+     xc->dcid_set.current_dcid_str[dcid->cid_len * 2] = '\0';
+@@ -1048,7 +1056,6 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
+                                XQC_INITIAL_PATH_ID)) {
+         goto fail;
+     }
+-    xqc_cid_set_mark_original(&xc->scid_set, scid, XQC_INITIAL_PATH_ID);
+     xqc_cid_copy(&(xc->scid_set.user_scid), scid);
+     xqc_hex_dump(xc->scid_set.original_scid_str, scid->cid_buf, scid->cid_len);
+     xc->scid_set.original_scid_str[scid->cid_len * 2] = '\0';
+@@ -5095,7 +5102,6 @@ xqc_conn_confirm_cid(xqc_connection_t *c, xqc_packet_t *pkt)
+                         xqc_cid_set_get_used_cnt(&c->dcid_set, XQC_INITIAL_PATH_ID));
+                 return ret;
+             }
+-            xqc_cid_set_mark_original(&c->dcid_set, &pkt->pkt_scid, XQC_INITIAL_PATH_ID);
+         }
+ 
+         if (XQC_OK != xqc_cid_is_equal(&c->dcid_set.current_dcid, &pkt->pkt_scid)) {
+-- 
+2.43.0

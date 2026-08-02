@@ -27,6 +27,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
       - name: Cleanup stale state
         run: |
           sudo pkill -f 'mqvpn.*ci-bench' || true
