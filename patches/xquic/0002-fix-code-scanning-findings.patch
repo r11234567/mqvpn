@@ -1,0 +1,200 @@
+From: r11234567 <noreply@github.com>
+Date: Sun, 2 Aug 2026 14:00:00 +0200
+Subject: [PATCH] Harden parser bounds and allocation failures
+
+Fix the actionable findings reported while xquic was included in mqvpn's
+CodeQL database. Keep the changes as a downstream patch until they can be
+submitted to and released by xquic.
+
+diff --git a/src/common/utils/var_buf/xqc_var_buf.c b/src/common/utils/var_buf/xqc_var_buf.c
+--- a/src/common/utils/var_buf/xqc_var_buf.c
++++ b/src/common/utils/var_buf/xqc_var_buf.c
+@@ -116,6 +116,11 @@ xqc_int_t
+ xqc_var_buf_reduce(xqc_var_buf_t *buf)
+ {
+-    uint64_t capacity = xqc_pow2_upper(buf->data_len - buf->consumed_len);
++    if (buf->consumed_len > buf->data_len) {
++        return -XQC_EPARAM;
++    }
++
++    size_t remaining = buf->data_len - buf->consumed_len;
++    uint64_t capacity = xqc_pow2_upper(remaining);
+     if (capacity == XQC_POW2_UPPER_ERROR) {
+         return -XQC_EPARAM;
+     }
+@@ -130,15 +135,15 @@ xqc_var_buf_reduce(xqc_var_buf_t *buf)
+     }
+ 
+     if (buf->data != NULL && buf->buf_len > 0) {
+-        if (buf->data_len - buf->consumed_len > 0) {
+-            memcpy(new_data, buf->data + buf->consumed_len, buf->data_len - buf->consumed_len);
++        if (remaining > 0) {
++            memcpy(new_data, buf->data + buf->consumed_len, remaining);
+         }
+         xqc_free(buf->data);
+     }
+ 
+     buf->data = new_data;
+     buf->buf_len = capacity;
+-    buf->data_len -= buf->consumed_len;
++    buf->data_len = remaining;
+     buf->consumed_len = 0;
+ 
+     return XQC_OK;
+diff --git a/src/http3/qpack/xqc_prefixed_str.c b/src/http3/qpack/xqc_prefixed_str.c
+--- a/src/http3/qpack/xqc_prefixed_str.c
++++ b/src/http3/qpack/xqc_prefixed_str.c
+@@ -31,6 +31,9 @@ xqc_prefixed_str_t *
+ xqc_prefixed_str_pctx_create(size_t capacity)
+ {
+     xqc_prefixed_str_t *pctx = xqc_malloc(sizeof(xqc_prefixed_str_t));
++    if (pctx == NULL) {
++        return NULL;
++    }
+     memset(pctx, 0, sizeof(xqc_prefixed_str_t));
+ 
+     pctx->value = xqc_var_buf_create(capacity);
+diff --git a/src/transport/fec_schemes/xqc_galois_calculation.c b/src/transport/fec_schemes/xqc_galois_calculation.c
+--- a/src/transport/fec_schemes/xqc_galois_calculation.c
++++ b/src/transport/fec_schemes/xqc_galois_calculation.c
+@@ -78,7 +78,7 @@ xqc_submatrix(int row_min, int row_max,
+     int col_max_sub, int col_max_matrix,
+     unsigned char *submatrix, unsigned char *matrix)
+ {
+-    xqc_memset(submatrix, 0, col_max_sub * row_max);
++    xqc_memset(submatrix, 0, (size_t)col_max_sub * (size_t)row_max);
+     for (int row_i = row_min; row_i < row_max; row_i++) {
+         for (int col_i = col_min; col_i < col_max; col_i++) {
+             *(submatrix + (row_i - row_min) * col_max_sub + col_i - col_min) = *(matrix + row_i * col_max_matrix + col_i);
+diff --git a/src/transport/scheduler/xqc_scheduler_rap.h b/src/transport/scheduler/xqc_scheduler_rap.h
+--- a/src/transport/scheduler/xqc_scheduler_rap.h
++++ b/src/transport/scheduler/xqc_scheduler_rap.h
+@@ -2,8 +2,8 @@
+  * @copyright Copyright (c) 2022, Alibaba Group Holding Limited
+  */
+ 
+-#ifndef _XQC_SCHEDULER_MINRTT_H_INCLUDED_
+-#define _XQC_SCHEDULER_MINRTT_H_INCLUDED_
++#ifndef _XQC_SCHEDULER_RAP_H_INCLUDED_
++#define _XQC_SCHEDULER_RAP_H_INCLUDED_
+ 
+ #include <xquic/xquic_typedef.h>
+ #include <xquic/xquic.h>
+diff --git a/src/transport/xqc_conn.c b/src/transport/xqc_conn.c
+--- a/src/transport/xqc_conn.c
++++ b/src/transport/xqc_conn.c
+@@ -6567,6 +6567,12 @@ xqc_conn_tls_transport_params_cb(const uint8_t *tp, size_t len, void *user_data)
+            first node and copy the sr token to that cid */
+         xqc_cid_set_inner_t *inner_set =
+             xqc_get_path_cid_set(&conn->dcid_set, XQC_INITIAL_PATH_ID);
++        if (inner_set == NULL) {
++            xqc_log(conn->log, XQC_LOG_ERROR,
++                    "|initial dcid set missing while sr token present|");
++            XQC_CONN_ERR(conn, TRA_INTERNAL_ERROR);
++            return;
++        }
+         node = inner_set->cid_list.next;
+         if (NULL != node) {
+             cid_node = xqc_list_entry(node, xqc_cid_inner_t, list);
+@@ -7458,6 +7464,9 @@ xqc_ping_record_t *
+ xqc_conn_create_ping_record(xqc_connection_t *conn)
+ {
+     xqc_ping_record_t *pr = xqc_calloc(1, sizeof(xqc_ping_record_t));
++    if (pr == NULL) {
++        return NULL;
++    }
+     xqc_init_list_head(&pr->list);
+     xqc_list_add_tail(&pr->list, &conn->ping_notification_list);
+     return pr;
+diff --git a/src/transport/xqc_frame.c b/src/transport/xqc_frame.c
+--- a/src/transport/xqc_frame.c
++++ b/src/transport/xqc_frame.c
+@@ -1129,6 +1129,11 @@ xqc_process_new_conn_id_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
+          * connection IDs.
+          */
+         inner_set = xqc_get_path_cid_set(&conn->dcid_set, XQC_INITIAL_PATH_ID);
++        if (inner_set == NULL) {
++            xqc_log(conn->log, XQC_LOG_ERROR, "|initial dcid set missing|");
++            XQC_CONN_ERR(conn, TRA_INTERNAL_ERROR);
++            return -XQC_EPROTO;
++        }
+         xqc_list_for_each_safe(pos, next, &inner_set->cid_list)
+         {
+             inner_cid = xqc_list_entry(pos, xqc_cid_inner_t, list);
+@@ -2282,6 +2287,11 @@ xqc_process_mp_new_conn_id_frame(xqc_connection_t *conn, xqc_packet_in_t *packet
+          * connection IDs.
+          */
+         inner_set = xqc_get_path_cid_set(&conn->dcid_set, path_id);
++        if (inner_set == NULL) {
++            xqc_log(conn->log, XQC_LOG_ERROR, "|dcid set missing|path:%ui|", path_id);
++            XQC_CONN_ERR(conn, TRA_INTERNAL_ERROR);
++            return -XQC_EPROTO;
++        }
+         xqc_list_for_each_safe(pos, next, &inner_set->cid_list)
+         {
+             inner_cid = xqc_list_entry(pos, xqc_cid_inner_t, list);
+diff --git a/src/transport/xqc_frame_parser.c b/src/transport/xqc_frame_parser.c
+--- a/src/transport/xqc_frame_parser.c
++++ b/src/transport/xqc_frame_parser.c
+@@ -475,9 +475,8 @@ xqc_parse_crypto_frame(xqc_packet_in_t *packet_in, xqc_connection_t *conn,
+     }
+     frame->data_length = length;
+     p += vlen;
+-    if (p + length > end) {
++    if (length > (uint64_t)(end - p)) {
+         return -XQC_EILLEGAL_FRAME;
+-        ;
+     }
+     if (frame->data_length > 0) {
+         frame->data = xqc_malloc(frame->data_length);
+diff --git a/src/transport/xqc_multipath.c b/src/transport/xqc_multipath.c
+--- a/src/transport/xqc_multipath.c
++++ b/src/transport/xqc_multipath.c
+@@ -255,12 +255,20 @@ xqc_path_create(xqc_connection_t *conn, xqc_cid_t *scid, xqc_cid_t *dcid, uint64
+     path->app_path_status_recv_seq_num = 0;
+     path->path_id = path_id;
+ 
++    for (xqc_send_type_t type = 0; type < XQC_SEND_TYPE_N; type++) {
++        xqc_init_list_head(&path->path_schedule_buf[type]);
++    }
++    xqc_init_list_head(&path->path_reinj_tmp_buf);
++
+     path->path_pn_ctl = xqc_pn_ctl_create(conn);
+     if (path->path_pn_ctl == NULL) {
+         goto err;
+     }
+     if (conn->local_settings.extended_ack_features & XQC_ACK_EXT_FEATURE_BIT_RECV_TS) {
+         path->recv_ts_info = xqc_recv_timestamps_info_create();
++        if (path->recv_ts_info == NULL) {
++            goto err;
++        }
+     }
+ 
+     path->path_send_ctl = xqc_send_ctl_create(path);
+@@ -268,11 +276,6 @@ xqc_path_create(xqc_connection_t *conn, xqc_cid_t *scid, xqc_cid_t *dcid, uint64
+         goto err;
+     }
+ 
+-    for (xqc_send_type_t type = 0; type < XQC_SEND_TYPE_N; type++) {
+-        xqc_init_list_head(&path->path_schedule_buf[type]);
+-    }
+-    xqc_init_list_head(&path->path_reinj_tmp_buf);
+-
+     /* cid & path_id init */
+     if (scid == NULL) {
+         if (xqc_get_unused_cid(&conn->scid_set, &path->path_scid, path_id) != XQC_OK) {
+diff --git a/src/transport/xqc_recv_timestamps_info.c b/src/transport/xqc_recv_timestamps_info.c
+--- a/src/transport/xqc_recv_timestamps_info.c
++++ b/src/transport/xqc_recv_timestamps_info.c
+@@ -25,6 +25,9 @@ xqc_recv_timestamps_info_create()
+ {
+     xqc_recv_timestamps_info_t *ts_info =
+                     xqc_calloc(1, sizeof(xqc_recv_timestamps_info_t));
++    if (ts_info == NULL) {
++        return NULL;
++    }
+     ts_info->is_first_pkt = 1;
+     return ts_info;
+ }
+-- 
+2.43.0
