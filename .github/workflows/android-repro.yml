@@ -51,6 +51,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
       - name: Check toolchain pins are in sync
         # The gate is only meaningful if it builds with the same toolchain as
         # the release. These values are declared per workflow (reusable

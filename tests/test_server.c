@@ -33,6 +33,7 @@
 
 #include "libmqvpn.h"
 #include "mqvpn_internal.h"
+#include "server_h3_settings.h"
 
 /* Test infrastructure */
 
@@ -237,6 +238,17 @@ TEST(server_egress_fd_budget)
     ASSERT_EQ(mqvpn_server_egress_fd_budget(NULL) <= 0, 1);
 
     mqvpn_server_destroy(s);
+}
+
+TEST(server_h3_settings_avoid_qpack_blocking)
+{
+    xqc_h3_conn_settings_t settings;
+    mqvpn_server_init_h3_settings(&settings);
+    ASSERT_EQ(settings.qpack_dec_max_table_capacity, 0);
+    ASSERT_EQ(settings.qpack_blocked_streams, 0);
+    ASSERT_EQ(settings.qpack_enc_max_table_capacity, 16 * 1024);
+    ASSERT_EQ(settings.enable_connect_protocol, 1);
+    ASSERT_EQ(settings.h3_datagram, 1);
 }
 
 /* Lifecycle tests */
@@ -929,6 +941,7 @@ main(void)
     run_server_new_destroy();
     run_server_destroy_null();
     run_server_egress_fd_budget();
+    run_server_h3_settings_avoid_qpack_blocking();
 
     /* Lifecycle */
     run_server_lifecycle();

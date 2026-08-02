@@ -598,6 +598,13 @@ main(int argc, char *argv[])
             /* INI [Hybrid]; always valid (mqvpn_config_defaults seeds the
              * disabled defaults even with no [Hybrid] section). */
             .hybrid = file_cfg.hybrid,
+            .proxy_enabled = file_cfg.proxy_enabled,
+            .proxy_sni = file_cfg.proxy_sni,
+            .proxy_quic_fallback = file_cfg.proxy_quic_fallback,
+            .proxy_h2_backend = file_cfg.proxy_h2_backend,
+            .proxy_h2_backend_tls = file_cfg.proxy_h2_backend_tls,
+            .proxy_max_connections = file_cfg.proxy_max_connections,
+            .proxy_idle_timeout_sec = file_cfg.proxy_idle_timeout_sec,
         };
         for (int i = 0; i < eff_n_users; i++) {
             cfg.user_names[i] = eff_user_names[i];

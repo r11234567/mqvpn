@@ -20,6 +20,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -77,7 +81,7 @@ jobs:
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
           # v4: bumped with the BoringSSL cache — libxquic.so absorbs it.
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-v4
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v4
 
       - name: Build xquic (CodeQL traced)
         if: steps.xquic-cache.outputs.cache-hit != 'true'

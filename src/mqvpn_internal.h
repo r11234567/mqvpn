@@ -93,6 +93,14 @@ struct mqvpn_config_s {
      * consumer reads cfg->hybrid. */
     mqvpn_hybrid_config_t hybrid;
 
+    int proxy_enabled;
+    char proxy_sni[280];
+    char proxy_quic_fallback[280];
+    char proxy_h2_backend[280];
+    int proxy_h2_backend_tls;
+    uint32_t proxy_max_connections;
+    uint32_t proxy_idle_timeout_sec;
+
     uint64_t recv_rate_limit; /* 0 = off; client-only, see libmqvpn.h */
 };
 

@@ -1,0 +1,169 @@
+name: SNI and H2 Protocol Tests
+
+on:
+  push:
+    paths:
+      - 'src/sni_router.*'
+      - 'src/h2_proxy.*'
+      - 'src/mqvpn_server.c'
+      - 'src/mqvpn_config.c'
+      - 'src/config.*'
+      - 'src/main.c'
+      - 'src/vpn_server.h'
+      - 'src/platform/linux/platform_linux.c'
+      - 'src/platform/linux/server_socket_policy.h'
+      - 'src/server_h3_settings.h'
+      - 'include/libmqvpn.h'
+      - 'tests/test_sni_router.c'
+      - 'tests/test_h2_proxy.c'
+      - 'tests/test_linux_server_socket.c'
+      - 'tests/test_server.c'
+      - 'tests/test_config.c'
+      - 'patches/xquic/**'
+      - 'scripts/apply_xquic_patches.sh'
+      - '.github/workflows/sni-h2-proxy-tests.yml'
+      - 'CMakeLists.txt'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  format-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check changed C sources and headers
+        run: |
+          pipx install clang-format==18.1.3
+          clang-format --dry-run --Werror \
+            include/libmqvpn.h \
+            src/config.c src/config.h src/h2_proxy.c src/h2_proxy.h src/main.c \
+            src/mqvpn_config.c src/mqvpn_internal.h src/mqvpn_server.c \
+            src/platform/linux/platform_linux.c \
+            src/platform/linux/server_socket_policy.h src/server_h3_settings.h \
+            src/sni_router.c src/sni_router.h \
+            src/vpn_server.h tests/test_config.c tests/test_h2_proxy.c \
+            tests/test_linux_server_socket.c tests/test_sni_router.c
+
+  protocol-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libevent-dev libnghttp2-dev golang iptables
+
+      - name: Resolve dependency pins
+        id: pins
+        shell: bash
+        run: |
+          echo "xquic=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+          echo "bssl=$(git -C third_party/xquic/third_party/boringssl rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL
+        id: bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl/build
+          key: proxy-bssl-${{ steps.pins.outputs.bssl }}-linux-gcc-release-v1
+
+      - name: Build BoringSSL
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S third_party/xquic/third_party/boringssl \
+                -B third_party/xquic/third_party/boringssl/build \
+                -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          cmake --build third_party/xquic/third_party/boringssl/build \
+                --target ssl crypto -j2
+
+      - name: Cache xquic
+        id: xquic-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: proxy-xquic-${{ steps.pins.outputs.xquic }}-bssl-${{ steps.pins.outputs.bssl }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-linux-gcc-release-v1
+
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S third_party/xquic -B third_party/xquic/build \
+                -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+                -DSSL_PATH="$GITHUB_WORKSPACE/third_party/xquic/third_party/boringssl" \
+                -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON
+          cmake --build third_party/xquic/build -j2
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+                -DXQUIC_BUILD_DIR="$GITHUB_WORKSPACE/third_party/xquic/build"
+          cmake --build build -j2
+
+      - name: RFC, proxy, config, and MASQUE regressions
+        run: |
+          ctest --test-dir build --output-on-failure \
+                -R '^(test_sni_router|test_h2_proxy|test_config|test_server|test_linux_server_socket|test_tcp_egress)$'
+
+      - name: Initial-path runtime ceiling
+        run: timeout 5s ./build/tests/test_sni_router
+
+  protocol-sanitizers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libevent-dev libnghttp2-dev golang
+
+      - name: Build BoringSSL and configure xquic
+        run: |
+          CC=clang CXX=clang++ cmake -S third_party/xquic/third_party/boringssl \
+              -B third_party/xquic/third_party/boringssl/build \
+              -DCMAKE_BUILD_TYPE=Debug -DBUILD_SHARED_LIBS=OFF \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          cmake --build third_party/xquic/third_party/boringssl/build \
+                --target ssl crypto -j2
+          cmake -S third_party/xquic -B third_party/xquic/build \
+              -DCMAKE_BUILD_TYPE=Debug -DSSL_TYPE=boringssl \
+              -DSSL_PATH="$GITHUB_WORKSPACE/third_party/xquic/third_party/boringssl" \
+              -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON
+
+      - name: Build protocol tests with ASan and UBSan
+        run: |
+          CC=clang cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug \
+              -DBUILD_TESTING=ON \
+              -DXQUIC_BUILD_DIR="$GITHUB_WORKSPACE/third_party/xquic/build" \
+              -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
+              -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
+          cmake --build build-sanitize --target test_sni_router test_h2_proxy -j2
+
+      - name: Run sanitized protocol tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ./build-sanitize/tests/test_sni_router
+          ./build-sanitize/tests/test_h2_proxy

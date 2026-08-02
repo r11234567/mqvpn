@@ -5,7 +5,7 @@
  * libmqvpn — Multipath QUIC VPN library
  *
  * Public API header (single file).
- * Version: 0.14.3 (callback ABI version 2)
+ * Version: 0.14.4 (callback ABI version 2)
  *
  * Thread safety: All functions must be called from a single thread
  * (the "tick thread"). Debug builds assert this via MQVPN_ASSERT_TICK_THREAD.
@@ -39,7 +39,7 @@ extern "C" {
 
 #define MQVPN_VERSION_MAJOR 0
 #define MQVPN_VERSION_MINOR 14
-#define MQVPN_VERSION_PATCH 3
+#define MQVPN_VERSION_PATCH 4
 
 /* ─── ABI ─── */
 
@@ -596,6 +596,14 @@ MQVPN_API int mqvpn_config_set_subnet6(mqvpn_config_t *cfg, const char *cidr6);
 MQVPN_API int mqvpn_config_set_tls_cert(mqvpn_config_t *cfg, const char *cert,
                                         const char *key);
 MQVPN_API int mqvpn_config_set_max_clients(mqvpn_config_t *cfg, int max);
+/* Enable Linux server-side QUIC SNI routing and H3-to-H2 proxying. `sni_csv`
+ * is a comma-separated list of DNS names or left-most single-label wildcards.
+ * Endpoints use host:port syntax. The HTTP/2 upstream is h2c only;
+ * http2_backend_tls != 0 is rejected when the server starts. */
+MQVPN_API int mqvpn_config_set_proxy(mqvpn_config_t *cfg, int enabled,
+                                     const char *sni_csv, const char *quic_fallback,
+                                     const char *http2_backend, int http2_backend_tls,
+                                     uint32_t max_connections, uint32_t idle_timeout_sec);
 
 /* ─── Client API ─── */
 
@@ -763,13 +771,10 @@ MQVPN_API int mqvpn_server_on_socket_recv(mqvpn_server_t *server, const uint8_t 
 MQVPN_API void mqvpn_server_on_egress_fd_ready(mqvpn_server_t *server, int fd,
                                                void *fd_ctx, int readable, int writable);
 
-/* Upper bound on concurrent egress TCP fds the server will ever open
- * (min(rlimit_nofile - reserve, configured cap)). Computed once at
- * mqvpn_server_new and frozen for the server's lifetime: platforms size
- * their fd->event registries from this, and the server's own admission cap
- * uses the same snapshot, so the two bounds cannot drift (a runtime
- * setrlimit changes neither). Returns 0 on NULL server; a value <= 0 means
- * "treat tcp_egress as disabled — do not allocate a registry". */
+/* Upper bound on concurrent server egress fds across hybrid TCP, SNI QUIC
+ * fallback, and HTTP/2 upstream sockets. Computed once at mqvpn_server_new,
+ * clamped to rlimit headroom, and frozen for the server lifetime so platform
+ * registry capacity and core admission cannot drift. Returns 0 for NULL. */
 MQVPN_API int mqvpn_server_egress_fd_budget(mqvpn_server_t *server);
 
 MQVPN_API int mqvpn_server_on_tun_packet(mqvpn_server_t *server, const uint8_t *pkt,

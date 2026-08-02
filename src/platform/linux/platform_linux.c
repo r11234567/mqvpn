@@ -19,6 +19,7 @@
 #include "log.h"
 #include "mqvpn_internal.h" /* mqvpn_config_apply_reorder (INI reorder bridge) */
 #include "netlink_mon.h"
+#include "server_socket_policy.h"
 
 #include <stdio.h>
 #include <inttypes.h>
@@ -715,9 +716,8 @@ typedef struct server_platform_ctx_s {
     int shutting_down;
     ctrl_socket_t *ctrl;
 
-    /* Egress fd registry (hybrid TCP lane, D1). Sized once at server start
-     * from mqvpn_server_egress_fd_budget() so the platform's registry and
-     * the core's own fd cap can never drift apart. */
+    /* Shared egress fd registry for hybrid TCP, SNI fallback, and H2 upstream
+     * sockets. It is sized once from the core's frozen admission budget. */
     egress_fd_slot_t *egress_fds;
     int n_egress_fds;
 } server_platform_ctx_t;
@@ -864,9 +864,9 @@ svr_on_socket_read(evutil_socket_t fd, short what, void *arg)
     svr_schedule_next_tick(sp);
 }
 
-/* ─── Egress fd registry (hybrid TCP lane, D1) ───
+/* ─── Shared egress fd registry ───
  *
- * The core (src/hybrid/tcp_egress.c) owns every egress fd's socket()/
+ * The core modules own every egress fd's socket()/
  * connect()/send()/recv()/close() syscalls directly; these callbacks only
  * (un)register the platform's interest in an already-open fd. Linear scan
  * is fine — register/unregister fire on state-change, not per-packet. */
@@ -1012,8 +1012,6 @@ svr_create_udp_socket(const char *addr, int port, struct sockaddr_storage *out_a
 
     memset(out_addr, 0, sizeof(*out_addr));
     if (af == AF_INET6) {
-        int v6only = 1;
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
         struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)out_addr;
         sin6->sin6_family = AF_INET6;
         sin6->sin6_port = htons((uint16_t)port);
@@ -1021,6 +1019,12 @@ svr_create_udp_socket(const char *addr, int port, struct sockaddr_storage *out_a
             sin6->sin6_addr = addr6;
         else
             sin6->sin6_addr = in6addr_any;
+        int v6only = mqvpn_linux_server_ipv6_v6only(&sin6->sin6_addr);
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) != 0) {
+            LOG_ERR("setsockopt(IPV6_V6ONLY=%d): %s", v6only, strerror(errno));
+            close(fd);
+            return -1;
+        }
         *out_addrlen = sizeof(struct sockaddr_in6);
     } else {
         struct sockaddr_in *sin = (struct sockaddr_in *)out_addr;
@@ -1089,6 +1093,14 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
     mqvpn_config_apply_reorder(lib_cfg,
                                &cfg->reorder); /* INI [Reorder]/[ReorderRule] bridge */
     mqvpn_config_apply_hybrid(lib_cfg, &cfg->hybrid); /* INI [Hybrid] bridge */
+    if (mqvpn_config_set_proxy(lib_cfg, cfg->proxy_enabled, cfg->proxy_sni,
+                               cfg->proxy_quic_fallback, cfg->proxy_h2_backend,
+                               cfg->proxy_h2_backend_tls, cfg->proxy_max_connections,
+                               cfg->proxy_idle_timeout_sec) != MQVPN_OK) {
+        LOG_ERR("invalid [Proxy] configuration");
+        mqvpn_config_free(lib_cfg);
+        return 1;
+    }
 
     mqvpn_config_set_log_level(lib_cfg, (mqvpn_log_level_t)cfg->log_level);
 
@@ -1109,8 +1121,8 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
         return 1;
     }
 
-    /* Egress fd registry (hybrid TCP lane, D1). Sized from the same budget
-     * tcp_egress.c will itself enforce, so the two caps cannot drift. */
+    /* Shared egress fd registry, sized from the same frozen budget enforced
+     * by the core's feature admission limits. */
     sp.n_egress_fds = mqvpn_server_egress_fd_budget(sp.server);
     if (sp.n_egress_fds > 0) {
         sp.egress_fds = calloc((size_t)sp.n_egress_fds, sizeof(*sp.egress_fds));

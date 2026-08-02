@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(mqvpn VERSION 0.14.3 LANGUAGES C)
+project(mqvpn VERSION 0.14.4 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -89,6 +89,40 @@ if(NOT ANDROID_CROSS_COMPILE)
         endif()
     endif()
 endif()
+
+# ---------- nghttp2 (for HTTP/2 proxy support) ----------
+# Default: disabled. Only enable if explicitly found.
+set(MQVPN_ENABLE_H2_PROXY OFF)
+
+# h2_proxy.c currently uses POSIX socket APIs and headers, so only enable it on Linux.
+if(NOT WIN32 AND NOT IOS AND NOT ANDROID_CROSS_COMPILE AND NOT APPLE)
+    find_package(PkgConfig)
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(NGHTTP2 libnghttp2)
+        if(NGHTTP2_FOUND AND NGHTTP2_LIBRARIES)
+            set(MQVPN_ENABLE_H2_PROXY ON)
+            message(STATUS "nghttp2 found via pkg-config: ${NGHTTP2_LIBRARIES}")
+        endif()
+    endif()
+
+    if(NOT MQVPN_ENABLE_H2_PROXY)
+        find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h)
+        find_library(NGHTTP2_LIB nghttp2)
+        if(NGHTTP2_INCLUDE_DIR AND NGHTTP2_LIB)
+            # Verify the library actually exists
+            if(EXISTS "${NGHTTP2_LIB}")
+                set(MQVPN_ENABLE_H2_PROXY ON)
+                message(STATUS "nghttp2 found: ${NGHTTP2_LIB}")
+            endif()
+        endif()
+    endif()
+endif()
+
+if(NOT MQVPN_ENABLE_H2_PROXY)
+    message(STATUS "nghttp2 disabled or not found. HTTP/2 proxy support will be disabled.")
+endif()
+
+message(STATUS "MQVPN_ENABLE_H2_PROXY: ${MQVPN_ENABLE_H2_PROXY}")
 
 # ---------- Hybrid mode TCP lane (lwIP) ----------
 option(MQVPN_ENABLE_HYBRID_TCP_LANE
@@ -229,6 +263,28 @@ set(MQVPN_LIB_SOURCES
     src/reorder_rx.c
     src/hybrid/classifier.c
 )
+
+# SNI inspection and fallback use the POSIX server reactor; Windows builds are
+# client-only and must not pull this server-side translation unit in.
+if(NOT WIN32)
+    list(APPEND MQVPN_LIB_SOURCES src/sni_router.c)
+endif()
+
+# Add H2 proxy only if nghttp2 is available
+if(MQVPN_ENABLE_H2_PROXY)
+    list(APPEND MQVPN_LIB_SOURCES src/h2_proxy.c)
+endif()
+
+# Keep the protocol boundary strict even though the legacy target still has
+# warnings in unrelated translation units.
+if(NOT WIN32 AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(src/sni_router.c
+        PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+    if(MQVPN_ENABLE_H2_PROXY)
+        set_source_files_properties(src/h2_proxy.c
+            PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+    endif()
+endif()
 
 # ---------- lwIP (hybrid mode TCP lane — see MQVPN_HYBRID_TCP_LANE_BUILD) ----------
 # Deliberately single-mode: no pre-built LWIP_BUILD_DIR variant (unlike
@@ -392,6 +448,14 @@ target_include_directories(mqvpn_lib
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
     PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR} ${BORINGSSL_INCLUDE_DIR}
 )
+if(MQVPN_ENABLE_H2_PROXY)
+    if(NGHTTP2_INCLUDE_DIR)
+        target_include_directories(mqvpn_lib PRIVATE ${NGHTTP2_INCLUDE_DIR})
+    elseif(NGHTTP2_INCLUDE_DIRS)
+        target_include_directories(mqvpn_lib PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+    endif()
+    target_compile_definitions(mqvpn_lib PRIVATE MQVPN_H2_PROXY_ENABLED)
+endif()
 if(ANDROID_CROSS_COMPILE)
     # Android NDK: pthread is in libc, no separate -lpthread
     target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB})
@@ -399,6 +463,13 @@ elseif(WIN32)
     target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} ws2_32 crypt32)
 else()
     target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} pthread)
+endif()
+if(MQVPN_ENABLE_H2_PROXY)
+    if(NGHTTP2_LIB)
+        target_link_libraries(mqvpn_lib ${NGHTTP2_LIB})
+    elseif(NGHTTP2_LIBRARIES)
+        target_link_libraries(mqvpn_lib ${NGHTTP2_LIBRARIES})
+    endif()
 endif()
 if(MQVPN_HYBRID_TCP_LANE_BUILD)
     target_link_libraries(mqvpn_lib lwip_core)
@@ -680,8 +751,23 @@ target_include_directories(mqvpn_shared
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
     PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR} ${BORINGSSL_INCLUDE_DIR}
 )
+if(MQVPN_ENABLE_H2_PROXY)
+    if(NGHTTP2_INCLUDE_DIR)
+        target_include_directories(mqvpn_shared PRIVATE ${NGHTTP2_INCLUDE_DIR})
+    elseif(NGHTTP2_INCLUDE_DIRS)
+        target_include_directories(mqvpn_shared PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+    endif()
+    target_compile_definitions(mqvpn_shared PRIVATE MQVPN_H2_PROXY_ENABLED)
+endif()
 # Shared lib needs shared xquic (static .a lacks -fPIC)
 target_link_libraries(mqvpn_shared xquic ${SSL_LIB} ${CRYPTO_LIB} pthread)
+if(MQVPN_ENABLE_H2_PROXY)
+    if(NGHTTP2_LIB)
+        target_link_libraries(mqvpn_shared ${NGHTTP2_LIB})
+    elseif(NGHTTP2_LIBRARIES)
+        target_link_libraries(mqvpn_shared ${NGHTTP2_LIBRARIES})
+    endif()
+endif()
 if(MQVPN_HYBRID_TCP_LANE_BUILD)
     target_link_libraries(mqvpn_shared lwip_core)
     target_compile_definitions(mqvpn_shared PRIVATE MQVPN_HYBRID_TCP_LANE_ENABLED)
@@ -767,7 +853,42 @@ if(BUILD_TESTING)
     # gate + PTB token bucket, extracted from mqvpn_client.c/mqvpn_server.c) —
     # links reorder_tx.c (for the peek it wraps) + icmp.c (for the PTB send).
     add_executable(test_reorder_gate tests/test_reorder_gate.c src/reorder_tx.c src/icmp.c src/log.c)
+
+    # SNI router test (Linux/POSIX server path only)
+    if(NOT WIN32)
+        add_executable(test_sni_router tests/test_sni_router.c src/sni_router.c src/log.c)
+        target_link_libraries(test_sni_router ${SSL_LIB} ${CRYPTO_LIB} stdc++)
+        target_include_directories(test_sni_router PRIVATE ${BORINGSSL_INCLUDE_DIR})
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(test_sni_router PRIVATE -Wall -Wextra -Werror)
+        endif()
+    endif()
+
+    # HTTP/2 proxy test (conditional on nghttp2 availability)
+    if(MQVPN_ENABLE_H2_PROXY)
+        add_executable(test_h2_proxy tests/test_h2_proxy.c src/h2_proxy.c src/log.c)
+        if(NGHTTP2_LIBRARIES)
+            target_link_libraries(test_h2_proxy ${NGHTTP2_LIBRARIES} ${SSL_LIB} ${CRYPTO_LIB} stdc++)
+        else()
+            target_link_libraries(test_h2_proxy ${NGHTTP2_LIB} ${SSL_LIB} ${CRYPTO_LIB} stdc++)
+        endif()
+        target_include_directories(test_h2_proxy PRIVATE ${XQUIC_INCLUDE_DIR} ${BORINGSSL_INCLUDE_DIR})
+        if(NGHTTP2_INCLUDE_DIR)
+            target_include_directories(test_h2_proxy PRIVATE ${NGHTTP2_INCLUDE_DIR})
+        elseif(NGHTTP2_INCLUDE_DIRS)
+            target_include_directories(test_h2_proxy PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+        endif()
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(test_h2_proxy PRIVATE -Wall -Wextra -Werror)
+        endif()
+    endif()
     set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_classifier test_icmp test_reorder_gate)
+    if(NOT WIN32)
+        list(APPEND MQVPN_UNIT_TESTS test_sni_router)
+    endif()
+    if(MQVPN_ENABLE_H2_PROXY)
+        list(APPEND MQVPN_UNIT_TESTS test_h2_proxy)
+    endif()
 
     # test_tcp_lane #include's BOTH src/hybrid/tcp_lane.c AND
     # src/hybrid/tcp_lane_uplink.c (Task 12 split the uplink relay out of
@@ -882,13 +1003,22 @@ if(BUILD_TESTING)
     # Server API test (links libmqvpn + xquic)
     add_executable(test_server tests/test_server.c)
     target_link_libraries(test_server mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} dl m stdc++)
-    target_include_directories(test_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(test_server PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR})
     target_compile_definitions(test_server PRIVATE
         TEST_CERT_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.crt"
         TEST_KEY_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.key"
     )
     set_target_properties(test_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_server COMMAND test_server)
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test_linux_server_socket tests/test_linux_server_socket.c)
+        target_include_directories(test_linux_server_socket PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        set_target_properties(test_linux_server_socket PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+        add_test(NAME test_linux_server_socket COMMAND test_linux_server_socket)
+    endif()
 
     # Pre-accept type-confusion DoS regression: drives a raw xquic client with
     # a bogus ALPN at the server to prove an unauthenticated pre-handshake
