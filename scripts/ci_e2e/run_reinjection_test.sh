@@ -646,14 +646,18 @@ EOF
     # NS_CLIENT on the tunnel address, iperf3 client sends from NS_SERVER.
     # Mirrors tests/test_e2e_reorder.sh's run_inner_udp_workload, direction
     # reversed per this task's server-is-sender convention.
-    ip netns exec "$NS_CLIENT" iperf3 -s -B "$tunnel_client_ip" -p "$udp_port" -1 \
-        >/dev/null 2>&1 &
+    local iperf_server_log="${LOG_DIR}/dgram_iperf_server.log"
+    local iperf_client_log="${LOG_DIR}/dgram_iperf_client.log"
+    timeout --signal=TERM --kill-after=5s 20s \
+        ip netns exec "$NS_CLIENT" iperf3 -s -B "$tunnel_client_ip" -p "$udp_port" -1 \
+        >"$iperf_server_log" 2>&1 &
     local iperf_srv_pid=$!
     sleep 1
 
     local udp_ok=1
-    if ! ip netns exec "$NS_SERVER" iperf3 -c "$tunnel_client_ip" -p "$udp_port" \
-            -u -b 20M -l 1200 -t 6 >/dev/null 2>&1; then
+    if ! timeout --signal=TERM --kill-after=5s 20s \
+            ip netns exec "$NS_SERVER" iperf3 -c "$tunnel_client_ip" -p "$udp_port" \
+            -u -b 20M -l 1200 -t 6 >"$iperf_client_log" 2>&1; then
         udp_ok=0
     fi
     kill "$iperf_srv_pid" 2>/dev/null || true
@@ -661,6 +665,10 @@ EOF
 
     if (( udp_ok != 1 )); then
         echo "  FAIL: inner UDP workload (server -> client) did not complete"
+        echo "  --- iperf3 client log (last 20 lines) ---"
+        tail -20 "$iperf_client_log" 2>/dev/null || true
+        echo "  --- iperf3 server log (last 20 lines) ---"
+        tail -20 "$iperf_server_log" 2>/dev/null || true
         return 1
     fi
     echo "  dgram: inner UDP workload (server -> client) completed: OK"
