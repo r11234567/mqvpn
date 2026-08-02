@@ -742,6 +742,30 @@ jobs:
           test -f "$SRC" || { echo "APK not found at $SRC"; ls -R android/app/build/outputs/apk/ || true; exit 1; }
           cp "$SRC" "mqvpn_${VERSION}_android.apk"
 
+      - name: Record Android signer identity
+        run: |
+          set -euo pipefail
+          apk=$(ls mqvpn_*_android.apk)
+          build_tools=$(ls -d "${ANDROID_HOME:?}"/build-tools/* 2>/dev/null | sort -V | tail -1)
+          [ -n "$build_tools" ] \
+            || { echo "::error::apksigner not found - no Android build-tools on this runner"; exit 1; }
+          digests=$("$build_tools/apksigner" verify --print-certs "$apk" \
+                    | sed -n 's/.*certificate SHA-256 digest: //p')
+          signers=$(printf '%s\n' "$digests" | grep -c . || true)
+          [ "$signers" = "1" ] \
+            || { echo "::error::expected exactly one APK signer, found $signers"; exit 1; }
+          case "$digests" in
+            (*[!0-9a-f]*|'') echo "::error::invalid APK signer digest: ${digests:-none}"; exit 1 ;;
+          esac
+          [ "${#digests}" = "64" ] \
+            || { echo "::error::invalid APK signer digest length"; exit 1; }
+          if [[ "$GITHUB_REF" == refs/tags/v* && "$GITHUB_REPOSITORY" = "mp0rta/mqvpn" ]]; then
+            canonical=$(printf '%s' "$UPLOAD_CERT_SHA256" | tr -d ':' | tr 'A-Z' 'a-z')
+            [ "$digests" = "$canonical" ] \
+              || { echo "::error::canonical APK signer mismatch: got $digests"; exit 1; }
+          fi
+          printf '%s\n' "$digests" > android-signer.sha256
+
       - name: Verify license assets in APK
         run: |
           set -e
@@ -760,7 +784,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-android
-          path: mqvpn_*_android.apk
+          path: |
+            mqvpn_*_android.apk
+            android-signer.sha256
 
   # Reproducibility is a release-time contract, not just a PR check: F-Droid
   # rebuilds the tagged commit and byte-compares it against the APK we sign
@@ -805,13 +831,24 @@ jobs:
           [ -n "$build_tools" ] \
             || { echo "::error::apksigner not found — no Android build-tools on this runner"; exit 1; }
           export PATH="$build_tools:$PATH"
-          # The signer must be the canonical upload certificate. The keystore
-          # preflight in build-android runs in a different job, and this job
-          # only sees a downloaded artifact, so check the signature actually
-          # on the APK we are about to publish. apksigner prints the digest
-          # lowercase without separators; UPLOAD_CERT_SHA256 is in keytool's
-          # colon-separated form.
-          expected=$(printf '%s' "$UPLOAD_CERT_SHA256" | tr -d ':' | tr 'A-Z' 'a-z')
+          # Bind publication to the signer identity recorded by build-android.
+          # Fork builds intentionally use a fresh ephemeral key, while the
+          # canonical repository is additionally pinned to its stable upload
+          # certificate so an incorrectly signed official release cannot pass.
+          signer_file=artifacts/android-signer.sha256
+          test -f "$signer_file" \
+            || { echo "::error::APK signer identity artifact missing"; exit 1; }
+          expected=$(tr -d '\r\n' < "$signer_file")
+          case "$expected" in
+            (*[!0-9a-f]*|'') echo "::error::invalid recorded APK signer digest"; exit 1 ;;
+          esac
+          [ "${#expected}" = "64" ] \
+            || { echo "::error::invalid recorded APK signer digest length"; exit 1; }
+          if [ "$GITHUB_REPOSITORY" = "mp0rta/mqvpn" ]; then
+            canonical=$(printf '%s' "$UPLOAD_CERT_SHA256" | tr -d ':' | tr 'A-Z' 'a-z')
+            [ "$expected" = "$canonical" ] \
+              || { echo "::error::recorded canonical APK signer mismatch: got $expected"; exit 1; }
+          fi
           digests=$(apksigner verify --print-certs "$signed" \
                     | sed -n 's/.*certificate SHA-256 digest: //p')
           # Exactly one signer: an extra co-signer would still graft and still
@@ -826,7 +863,7 @@ jobs:
           "$RUNNER_TEMP/apksigcopier-venv/bin/pip" install --quiet \
             --require-hashes -r .github/requirements-apksigcopier.txt
           "$RUNNER_TEMP/apksigcopier-venv/bin/apksigcopier" compare "$signed" --unsigned "$repro"
-          echo "Published APK is signed by the upload key and grafts onto the independent rebuild"
+          echo "Published APK signer matches the Android build and grafts onto the independent rebuild"
 
       - name: Generate SHA256SUMS
         run: |
