@@ -1,12 +1,20 @@
-name: SNI Routing and H2 Proxy Tests
+name: SNI and H2 Protocol Tests
 
 on:
   push:
     paths:
       - 'src/sni_router.*'
       - 'src/h2_proxy.*'
+      - 'src/mqvpn_server.c'
+      - 'src/mqvpn_config.c'
+      - 'src/config.*'
+      - 'src/main.c'
+      - 'src/vpn_server.h'
+      - 'src/platform/linux/platform_linux.c'
+      - 'include/libmqvpn.h'
       - 'tests/test_sni_router.c'
       - 'tests/test_h2_proxy.c'
+      - 'tests/test_config.c'
       - '.github/workflows/sni-h2-proxy-tests.yml'
       - 'CMakeLists.txt'
   pull_request:
@@ -14,222 +22,197 @@ on:
   workflow_dispatch:
 
 jobs:
-  test-sni-router:
+  protocol-regression:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev libnghttp2-dev
-
-      - name: Resolve BoringSSL pin
-        id: bssl-pin
-        run: echo "sha=$(git -C third_party/xquic/third_party/boringssl rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache BoringSSL
-        id: bssl-cache
-        uses: actions/cache@v6
-        with:
-          path: third_party/xquic/third_party/boringssl
-          key: bssl-${{ steps.bssl-pin.outputs.sha }}-linux-gcc-fpic-v2
-
-      - name: Build BoringSSL
-        if: steps.bssl-cache.outputs.cache-hit != 'true'
-        run: |
-          cd third_party/xquic/third_party/boringssl
-          mkdir -p build && cd build
-          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
-          make -j$(nproc) ssl crypto
-
-      - name: Compute xquic SHA
-        id: xqsha
-        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
-
-      - name: Cache xquic
-        id: xquic-cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            third_party/xquic/build
-            third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-release-v2
-
-      - name: Build xquic
-        if: steps.xquic-cache.outputs.cache-hit != 'true'
-        run: |
-          cd third_party/xquic
-          mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
-                -DSSL_PATH=${GITHUB_WORKSPACE}/third_party/xquic/third_party/boringssl \
-                -DXQC_ENABLE_BBR2=ON \
-                -DXQC_ENABLE_FEC=ON \
-                -DXQC_ENABLE_XOR=ON ..
-          make -j$(nproc)
-
-      - name: Build mqvpn with SNI router and H2 proxy
-        run: |
-          mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release \
-                -DXQUIC_BUILD_DIR=../third_party/xquic/build \
-                -DBUILD_TESTING=ON ..
-          make -j$(nproc)
-
-      - name: Run SNI router tests
-        run: |
-          cd build/tests
-          ./test_sni_router
-
-      - name: Run H2 proxy tests
-        run: |
-          cd build/tests
-          ./test_h2_proxy || echo "H2 proxy test skipped (nghttp2 may not be available)"
-
-      - name: Check code compiles without warnings
-        run: |
-          cd build
-          # Only check our new files with -Werror, not the entire project
-          # (existing code has warnings we don't want to fix in this PR)
-          make test_sni_router test_h2_proxy 2>&1 | tee build.log
-          if grep -i "error:" build.log | grep -E "sni_router|h2_proxy"; then
-            echo "Build failed with errors in SNI router or H2 proxy code"
-            exit 1
-          fi
-          echo "SNI router and H2 proxy modules compiled successfully"
-
-  integration-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev libnghttp2-dev iptables iproute2 nginx
-
-      - name: Resolve BoringSSL pin
-        id: bssl-pin
-        run: echo "sha=$(git -C third_party/xquic/third_party/boringssl rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache BoringSSL
-        id: bssl-cache
-        uses: actions/cache@v6
-        with:
-          path: third_party/xquic/third_party/boringssl
-          key: bssl-${{ steps.bssl-pin.outputs.sha }}-linux-gcc-fpic-v2
-
-      - name: Build BoringSSL
-        if: steps.bssl-cache.outputs.cache-hit != 'true'
-        run: |
-          cd third_party/xquic/third_party/boringssl
-          mkdir -p build && cd build
-          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
-          make -j$(nproc) ssl crypto
-
-      - name: Compute xquic SHA
-        id: xqsha
-        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
-
-      - name: Cache xquic
-        id: xquic-cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            third_party/xquic/build
-            third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-release-v2
-
-      - name: Build xquic
-        if: steps.xquic-cache.outputs.cache-hit != 'true'
-        run: |
-          cd third_party/xquic
-          mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
-                -DSSL_PATH=${GITHUB_WORKSPACE}/third_party/xquic/third_party/boringssl \
-                -DXQC_ENABLE_BBR2=ON \
-                -DXQC_ENABLE_FEC=ON \
-                -DXQC_ENABLE_XOR=ON ..
-          make -j$(nproc)
-
-      - name: Build mqvpn
-        run: |
-          mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release \
-                -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
-          make -j$(nproc)
-
-      - name: Setup test certificates
-        run: |
-          mkdir -p /tmp/mqvpn-test-certs
-          cd /tmp/mqvpn-test-certs
-
-          # Generate CA
-          openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-            -keyout ca-key.pem -out ca-cert.pem \
-            -subj "/CN=Test CA"
-
-          # Generate server cert for vpn.example.com
-          openssl req -newkey rsa:2048 -nodes \
-            -keyout server-key.pem -out server-req.pem \
-            -subj "/CN=vpn.example.com"
-
-          openssl x509 -req -in server-req.pem -days 365 \
-            -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial \
-            -out server-cert.pem
-
-      - name: Test SNI routing configuration
-        run: |
-          echo "Testing SNI router configuration parsing..."
-          # This is a placeholder - actual integration test would require
-          # setting up proper QUIC clients and servers
-          ./build/mqvpn --genkey > /tmp/test-key.txt
-          echo "SNI routing module compiled successfully"
-
-  static-analysis:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Check code formatting
+      - name: Check formatting
         run: |
           pipx install clang-format==18.1.3
-          FILES=$(find src -name 'sni_router.[ch]' -o -name 'h2_proxy.[ch]')
-          FAIL=0
-          for f in $FILES; do
-            if ! clang-format --dry-run --Werror "$f" 2>/dev/null; then
-              echo "needs formatting: $f"
-              FAIL=1
-            fi
-          done
-          if [ "$FAIL" -ne 0 ]; then
-            echo ""
-            echo "Fix: clang-format -i src/sni_router.[ch] src/h2_proxy.[ch]"
-            exit 1
-          fi
+          clang-format --dry-run --Werror \
+            src/sni_router.c src/sni_router.h src/h2_proxy.c src/h2_proxy.h \
+            tests/test_sni_router.c tests/test_h2_proxy.c
 
-      - name: Check for common issues
+      - name: Install dependencies
         run: |
-          echo "Checking for common security issues..."
+          sudo apt-get update
+          sudo apt-get install -y cmake libevent-dev libnghttp2-dev golang iptables
 
-          # Check for unsafe string functions (excluding strerror which is safe)
-          if grep -rn "strcpy\|strcat\|sprintf\|gets\b" src/sni_router.c src/h2_proxy.c; then
-            echo "ERROR: Found unsafe string functions"
-            exit 1
-          fi
+      - name: Resolve dependency pins
+        id: pins
+        shell: bash
+        run: |
+          echo "xquic=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+          echo "bssl=$(git -C third_party/xquic/third_party/boringssl rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
-          # Check for proper error handling
-          if ! grep -q "if.*==.*NULL" src/sni_router.c; then
-            echo "WARNING: Limited NULL checks in sni_router.c"
-          fi
+      - name: Cache BoringSSL
+        id: bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl/build
+          key: proxy-bssl-${{ steps.pins.outputs.bssl }}-linux-gcc-release-v1
 
-          echo "Static analysis passed"
+      - name: Build BoringSSL
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S third_party/xquic/third_party/boringssl \
+                -B third_party/xquic/third_party/boringssl/build \
+                -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          cmake --build third_party/xquic/third_party/boringssl/build \
+                --target ssl crypto -j2
+
+      - name: Cache xquic
+        id: xquic-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: proxy-xquic-${{ steps.pins.outputs.xquic }}-bssl-${{ steps.pins.outputs.bssl }}-linux-gcc-release-v1
+
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S third_party/xquic -B third_party/xquic/build \
+                -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+                -DSSL_PATH="$GITHUB_WORKSPACE/third_party/xquic/third_party/boringssl" \
+                -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON
+          cmake --build third_party/xquic/build -j2
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+                -DXQUIC_BUILD_DIR=third_party/xquic/build
+          cmake --build build -j2
+
+      - name: RFC, proxy, config, and MASQUE regressions
+        run: |
+          ctest --test-dir build --output-on-failure \
+                -R '^(test_sni_router|test_h2_proxy|test_config|test_server|test_tcp_egress)$'
+
+      - name: Initial-path runtime ceiling
+        run: timeout 5s ./build/tests/test_sni_router
+
+  protocol-sanitizers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libevent-dev libnghttp2-dev golang
+
+      - name: Build BoringSSL and xquic
+        run: |
+          CC=clang CXX=clang++ cmake -S third_party/xquic/third_party/boringssl \
+              -B third_party/xquic/third_party/boringssl/build \
+              -DCMAKE_BUILD_TYPE=Debug -DBUILD_SHARED_LIBS=OFF \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          cmake --build third_party/xquic/third_party/boringssl/build \
+                --target ssl crypto -j2
+          CC=clang cmake -S third_party/xquic -B third_party/xquic/build \
+              -DCMAKE_BUILD_TYPE=Debug -DSSL_TYPE=boringssl \
+              -DSSL_PATH="$GITHUB_WORKSPACE/third_party/xquic/third_party/boringssl" \
+              -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON
+          cmake --build third_party/xquic/build -j2
+
+      - name: Build protocol tests with ASan and UBSan
+        run: |
+          CC=clang cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug \
+              -DBUILD_TESTING=ON -DXQUIC_BUILD_DIR=third_party/xquic/build \
+              -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
+              -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
+          cmake --build build-sanitize --target test_sni_router test_h2_proxy -j2
+
+      - name: Run sanitized protocol tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ./build-sanitize/tests/test_sni_router
+          ./build-sanitize/tests/test_h2_proxy
+
+  windows-build:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: ilammy/setup-nasm@v1
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 'stable'
+
+      - name: Install libevent
+        run: vcpkg install libevent:x64-windows-static
+
+      - name: Resolve dependency pins
+        id: windows-pins
+        shell: bash
+        run: |
+          echo "xquic=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+          echo "bssl=$(git -C third_party/xquic/third_party/boringssl rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL
+        id: windows-bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-${{ steps.windows-pins.outputs.bssl }}-windows-msvc-v1
+
+      - name: Build BoringSSL
+        if: steps.windows-bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S third_party/xquic/third_party/boringssl `
+                -B third_party/xquic/third_party/boringssl/build `
+                -G "Visual Studio 17 2022" -A x64 -DBUILD_SHARED_LIBS=0
+          cmake --build third_party/xquic/third_party/boringssl/build `
+                --target ssl crypto --config Release
+
+      - name: Cache xquic
+        id: windows-xquic-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.windows-pins.outputs.xquic }}-windows-msvc-release-bssl-${{ steps.windows-pins.outputs.bssl }}-v4
+
+      - name: Build xquic
+        if: steps.windows-xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S third_party/xquic -B third_party/xquic/build `
+                -G "Visual Studio 17 2022" -A x64 `
+                -DCMAKE_C_STANDARD=11 -DSSL_TYPE=boringssl `
+                -DSSL_PATH="${{ github.workspace }}/third_party/xquic/third_party/boringssl" `
+                -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_UNLIMITED=ON `
+                -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON
+          cmake --build third_party/xquic/build --config Release
+
+      - name: Build mqvpn with strict MSVC protocol warnings
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+                -DCMAKE_C_STANDARD=11 `
+                -DXQUIC_BUILD_DIR="${{ github.workspace }}/third_party/xquic/build/Release" `
+                -DBORINGSSL_BUILD_DIR="${{ github.workspace }}/third_party/xquic/third_party/boringssl/build/Release" `
+                -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+                -DVCPKG_TARGET_TRIPLET=x64-windows-static
+          cmake --build build --config Release
+
+      - name: Smoke run
+        run: build/Release/mqvpn.exe --version

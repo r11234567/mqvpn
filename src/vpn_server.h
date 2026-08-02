@@ -38,6 +38,13 @@ typedef struct mqvpn_server_cfg_s {
     mqvpn_reorder_config_t
         reorder;                  /* INI [Reorder]/[ReorderRule] (mode OFF by default) */
     mqvpn_hybrid_config_t hybrid; /* INI [Hybrid] (disabled by default) */
+    int proxy_enabled;
+    const char *proxy_sni;
+    const char *proxy_quic_fallback;
+    const char *proxy_h2_backend;
+    int proxy_h2_backend_tls;
+    uint32_t proxy_max_connections;
+    uint32_t proxy_idle_timeout_sec;
 } mqvpn_server_cfg_t;
 
 #endif /* MQVPN_VPN_SERVER_H */

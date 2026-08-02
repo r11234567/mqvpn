@@ -270,6 +270,20 @@ if(MQVPN_ENABLE_H2_PROXY)
     list(APPEND MQVPN_LIB_SOURCES src/h2_proxy.c)
 endif()
 
+# Keep the protocol boundary strict even though the legacy target still has
+# warnings in unrelated translation units.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(src/sni_router.c
+        PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+    if(MQVPN_ENABLE_H2_PROXY)
+        set_source_files_properties(src/h2_proxy.c
+            PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+    endif()
+elseif(MSVC)
+    set_source_files_properties(src/sni_router.c
+        PROPERTIES COMPILE_OPTIONS "/W4;/WX")
+endif()
+
 # ---------- lwIP (hybrid mode TCP lane — see MQVPN_HYBRID_TCP_LANE_BUILD) ----------
 # Deliberately single-mode: no pre-built LWIP_BUILD_DIR variant (unlike
 # xquic's two-mode pattern above) — lwIP is a handful of .c files, always
@@ -842,6 +856,11 @@ if(BUILD_TESTING)
     add_executable(test_sni_router tests/test_sni_router.c src/sni_router.c src/log.c)
     target_link_libraries(test_sni_router ${SSL_LIB} ${CRYPTO_LIB} stdc++)
     target_include_directories(test_sni_router PRIVATE ${BORINGSSL_INCLUDE_DIR})
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_sni_router PRIVATE -Wall -Wextra -Werror)
+    elseif(MSVC)
+        target_compile_options(test_sni_router PRIVATE /W4 /WX)
+    endif()
 
     # HTTP/2 proxy test (conditional on nghttp2 availability)
     if(MQVPN_ENABLE_H2_PROXY)
@@ -856,6 +875,9 @@ if(BUILD_TESTING)
             target_include_directories(test_h2_proxy PRIVATE ${NGHTTP2_INCLUDE_DIR})
         elseif(NGHTTP2_INCLUDE_DIRS)
             target_include_directories(test_h2_proxy PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+        endif()
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(test_h2_proxy PRIVATE -Wall -Wextra -Werror)
         endif()
         set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_classifier test_icmp test_reorder_gate test_sni_router test_h2_proxy)
     else()

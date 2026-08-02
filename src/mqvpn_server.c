@@ -35,6 +35,7 @@
 #  include <sys/time.h>
 #  include <sys/resource.h>
 #  include <arpa/inet.h>
+#  include <netdb.h>
 #  include <pthread.h>
 #endif
 #ifndef _WIN32
@@ -56,6 +57,12 @@
 #include "reorder_gate.h"
 #include "reorder_rx.h"
 #include "reorder_tx.h"
+#ifndef _WIN32
+#  include "sni_router.h"
+#endif
+#ifdef MQVPN_H2_PROXY_ENABLED
+#  include "h2_proxy.h"
+#endif
 #ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
 #  include "hybrid/tcp_egress.h"
 #endif
@@ -70,6 +77,19 @@
 
 typedef struct svr_conn_s svr_conn_t;
 typedef struct svr_stream_s svr_stream_t;
+static ssize_t svr_do_send(mqvpn_server_t *s, const unsigned char *buf, size_t size,
+                           const struct sockaddr *peer, socklen_t peerlen);
+#ifndef _MSC_VER
+static void server_log(mqvpn_server_t *s, mqvpn_log_level_t level, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+#else
+static void server_log(mqvpn_server_t *s, mqvpn_log_level_t level, const char *fmt, ...);
+#endif
+
+#define LOG_D(s, ...) server_log(s, MQVPN_LOG_DEBUG, __VA_ARGS__)
+#define LOG_I(s, ...) server_log(s, MQVPN_LOG_INFO, __VA_ARGS__)
+#define LOG_W(s, ...) server_log(s, MQVPN_LOG_WARN, __VA_ARGS__)
+#define LOG_E(s, ...) server_log(s, MQVPN_LOG_ERROR, __VA_ARGS__)
 
 /* ─── Internal types ─── */
 
@@ -122,6 +142,9 @@ static void svr_conn_free(svr_conn_t *conn);
 typedef enum {
     SVR_STREAM_ROLE_UNKNOWN = 0,
     SVR_STREAM_ROLE_CONNECT_IP,
+#ifdef MQVPN_H2_PROXY_ENABLED
+    SVR_STREAM_ROLE_H2_PROXY,
+#endif
 #ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
     SVR_STREAM_ROLE_CONNECT_TCP,
 #endif
@@ -142,6 +165,9 @@ struct svr_stream_s {
      * ever calling xqc_h3_request_set_user_data() a second time. */
     void *tcp_egress_flow; /* svr_tcp_egress_flow_t*, opaque here — only
                             * tcp_egress.c casts it. */
+#endif
+#ifdef MQVPN_H2_PROXY_ENABLED
+    h2_proxy_stream_t *h2_proxy_stream;
 #endif
 };
 
@@ -195,20 +221,23 @@ struct mqvpn_server_s {
      * mqvpn_server_uptime_seconds() uses (now_us() - boot_us) / 1e6. */
     uint64_t boot_us;
 
-    /* Egress fd budget, computed ONCE in mqvpn_server_new and intentionally
-     * frozen: the platform sizes its fd->event registry from this value at
-     * startup, so admission (tcp_egress.c's 503 cap check) must use the
-     * same snapshot — recomputing per call would let a runtime setrlimit
-     * grow admission past the fixed registry (flows admitted but never
-     * polled). min(rlimit_nofile - reserve, config.hybrid.tcp_max_global_flows
-     * [TcpMaxGlobalFlows / "tcp_max_global_flows"]) — see
-     * svr_compute_egress_fd_budget. */
+    /* Frozen egress registry budget shared by hybrid TCP, QUIC fallback, and
+     * HTTP/2 backend sockets. tcp_egress_fd_budget is the hybrid admission
+     * slice after reserving the proxy's worst-case socket demand. */
     int egress_fd_budget;
+    int tcp_egress_fd_budget;
 
     /* Log filtering */
     mqvpn_log_level_t log_level;
 
     int started;
+
+#ifndef _WIN32
+    sni_router_t *sni_router;
+#endif
+#ifdef MQVPN_H2_PROXY_ENABLED
+    h2_proxy_t *h2_proxy;
+#endif
 
 #ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
     /* Connect-stage bookkeeping for src/hybrid/tcp_egress.c: STORAGE only.
@@ -266,13 +295,9 @@ now_us(void)
 #endif
 }
 
-/* One-shot at mqvpn_server_new (rlimit-derived headroom under the
- * config-supplied cap, config.hybrid.tcp_max_global_flows — TcpMaxGlobalFlows
- * in INI/JSON, MQVPN_TCP_MAX_GLOBAL_FLOWS_DEFAULT if unset); the result is
- * stored in s->egress_fd_budget and intentionally never recomputed — see
- * that field's comment for the admission/registry non-divergence rationale.
- * `configured_max` is a plain uint32_t (not the whole config struct) so this
- * stays a pure, easily-unit-testable function of its input. */
+/* One-shot rlimit clamp used for both the platform registry and each feature's
+ * admission limit. `configured_max` is deliberately a scalar so the clamp is
+ * a pure, easily-unit-testable function. */
 static int
 svr_compute_egress_fd_budget(uint32_t configured_max)
 {
@@ -291,6 +316,241 @@ svr_compute_egress_fd_budget(uint32_t configured_max)
     return budget;
 }
 
+static int
+svr_process_xquic(mqvpn_server_t *s, const uint8_t *pkt, size_t len,
+                  const struct sockaddr *peer, socklen_t peer_len)
+{
+    xqc_int_t ret = xqc_engine_packet_process(
+        s->engine, pkt, len, (struct sockaddr *)&s->local_addr, s->local_addrlen, peer,
+        peer_len, (xqc_usec_t)now_us(), s);
+    if (ret != XQC_OK) LOG_D(s, "packet_process: %d", ret);
+    return 0;
+}
+
+#ifndef _WIN32
+static int
+svr_parse_endpoint(const char *endpoint, char *host, size_t host_cap, char *port,
+                   size_t port_cap)
+{
+    if (!endpoint || !host || !port || host_cap == 0 || port_cap == 0) return -1;
+    const char *host_start = endpoint;
+    const char *host_end;
+    const char *port_start;
+    if (endpoint[0] == '[') {
+        host_start++;
+        host_end = strchr(host_start, ']');
+        if (!host_end || host_end[1] != ':') return -1;
+        port_start = host_end + 2;
+    } else {
+        host_end = strrchr(endpoint, ':');
+        if (!host_end) return -1;
+        port_start = host_end + 1;
+    }
+    size_t host_len = (size_t)(host_end - host_start);
+    size_t port_len = strlen(port_start);
+    if (host_len == 0 || host_len >= host_cap || port_len == 0 || port_len >= port_cap)
+        return -1;
+    for (size_t i = 0; i < port_len; i++)
+        if (port_start[i] < '0' || port_start[i] > '9') return -1;
+    char *end = NULL;
+    long port_number = strtol(port_start, &end, 10);
+    if (!end || *end != '\0' || port_number <= 0 || port_number > 65535) return -1;
+    memcpy(host, host_start, host_len);
+    host[host_len] = '\0';
+    memcpy(port, port_start, port_len + 1);
+    return 0;
+}
+
+static int
+svr_resolve_endpoint(const char *endpoint, int socktype, int protocol,
+                     struct sockaddr_storage *addr, socklen_t *addr_len)
+{
+    char host[256], port[6];
+    if (svr_parse_endpoint(endpoint, host, sizeof(host), port, sizeof(port)) != 0)
+        return -1;
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = socktype;
+    hints.ai_protocol = protocol;
+    struct addrinfo *result = NULL;
+    if (getaddrinfo(host, port, &hints, &result) != 0) return -1;
+    int rc = -1;
+    for (const struct addrinfo *ai = result; ai; ai = ai->ai_next) {
+        if (ai->ai_addrlen <= sizeof(*addr)) {
+            memset(addr, 0, sizeof(*addr));
+            memcpy(addr, ai->ai_addr, ai->ai_addrlen);
+            *addr_len = (socklen_t)ai->ai_addrlen;
+            rc = 0;
+            break;
+        }
+    }
+    freeaddrinfo(result);
+    return rc;
+}
+
+static int
+svr_sni_accept(const uint8_t *pkt, size_t len, const struct sockaddr *peer,
+               socklen_t peer_len, void *user_ctx)
+{
+    mqvpn_server_t *s = user_ctx;
+    return svr_process_xquic(s, pkt, len, peer, peer_len);
+}
+
+static void
+svr_sni_register_fd(sni_socket_t fd, void *fd_ctx, void *user_ctx)
+{
+    mqvpn_server_t *s = user_ctx;
+    if (s->cbs.egress_fd_register)
+        s->cbs.egress_fd_register(fd, 1, 0, fd_ctx, s->user_ctx);
+}
+
+static void
+svr_sni_unregister_fd(sni_socket_t fd, void *user_ctx)
+{
+    mqvpn_server_t *s = user_ctx;
+    if (s->cbs.egress_fd_unregister) s->cbs.egress_fd_unregister(fd, s->user_ctx);
+}
+
+static int
+svr_sni_send_client(const uint8_t *pkt, size_t len, const struct sockaddr *peer,
+                    socklen_t peer_len, void *user_ctx)
+{
+    mqvpn_server_t *s = user_ctx;
+    return svr_do_send(s, pkt, len, peer, peer_len) == (ssize_t)len ? 0 : -1;
+}
+
+static int
+svr_sni_router_init(mqvpn_server_t *s)
+{
+    if (!s->config.proxy_enabled) return 0;
+    if (s->config.proxy_max_connections == 0 || s->config.proxy_max_connections > 65535 ||
+        s->config.proxy_idle_timeout_sec == 0 ||
+        s->config.proxy_idle_timeout_sec > 86400) {
+        LOG_E(s, "invalid [Proxy] connection limits");
+        return -1;
+    }
+    if (!s->cbs.egress_fd_register || !s->cbs.egress_fd_unregister) {
+        LOG_E(s, "[Proxy] requires egress fd callbacks");
+        return -1;
+    }
+
+    char sni_storage[sizeof(s->config.proxy_sni)];
+    memcpy(sni_storage, s->config.proxy_sni, sizeof(sni_storage));
+    sni_storage[sizeof(sni_storage) - 1] = '\0';
+    const char *allowed[16];
+    size_t allowed_count = 0;
+    char *cursor = sni_storage;
+    while (*cursor && allowed_count < sizeof(allowed) / sizeof(allowed[0])) {
+        while (*cursor == ',' || *cursor == ' ' || *cursor == '\t')
+            cursor++;
+        if (!*cursor) break;
+        char *start = cursor;
+        while (*cursor && *cursor != ',')
+            cursor++;
+        char *end = cursor;
+        int has_comma = *cursor == ',';
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
+            end--;
+        *end = '\0';
+        if (has_comma) cursor++;
+        if (*start) allowed[allowed_count++] = start;
+    }
+    if (allowed_count == 0 || *cursor) {
+        LOG_E(s, "invalid [Proxy] SNI list (maximum 16 names)");
+        return -1;
+    }
+
+    sni_router_config_t config;
+    memset(&config, 0, sizeof(config));
+    config.allowed_snis = allowed;
+    config.n_allowed_snis = allowed_count;
+    if (svr_resolve_endpoint(s->config.proxy_quic_fallback, SOCK_DGRAM, IPPROTO_UDP,
+                             &config.fallback_addr, &config.fallback_addrlen) != 0) {
+        LOG_E(s, "invalid [Proxy] QuicFallback endpoint");
+        return -1;
+    }
+    config.max_tracked_conns = s->config.proxy_max_connections;
+    config.conn_timeout_sec = s->config.proxy_idle_timeout_sec;
+    sni_router_callbacks_t callbacks = {
+        .register_fd = svr_sni_register_fd,
+        .unregister_fd = svr_sni_unregister_fd,
+        .send_client = svr_sni_send_client,
+        .user_ctx = s,
+    };
+    s->sni_router = sni_router_create(&config, &callbacks);
+    if (!s->sni_router) {
+        LOG_E(s, "failed to initialize [Proxy] SNI router");
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+#ifdef MQVPN_H2_PROXY_ENABLED
+static void
+svr_h2_log(int level, const char *message, void *user_ctx)
+{
+    mqvpn_server_t *s = user_ctx;
+    mqvpn_log_level_t mapped = level <= 0   ? MQVPN_LOG_ERROR
+                               : level == 1 ? MQVPN_LOG_WARN
+                               : level == 2 ? MQVPN_LOG_INFO
+                                            : MQVPN_LOG_DEBUG;
+    server_log(s, mapped, "%s", message);
+}
+
+static void
+svr_h2_register_fd(int fd, int want_read, int want_write, void *fd_ctx, void *user_ctx)
+{
+    mqvpn_server_t *s = user_ctx;
+    if (s->cbs.egress_fd_register)
+        s->cbs.egress_fd_register(fd, want_read, want_write, fd_ctx, s->user_ctx);
+}
+
+static void
+svr_h2_unregister_fd(int fd, void *user_ctx)
+{
+    mqvpn_server_t *s = user_ctx;
+    if (s->cbs.egress_fd_unregister) s->cbs.egress_fd_unregister(fd, s->user_ctx);
+}
+
+static int
+svr_h2_proxy_init(mqvpn_server_t *s)
+{
+    struct sockaddr_storage backend_addr;
+    socklen_t backend_addrlen = 0;
+    if (s->config.proxy_h2_backend_tls) {
+        LOG_E(s, "[Proxy] Http2BackendTLS is not supported; use an h2c upstream");
+        return -1;
+    }
+    if (svr_resolve_endpoint(s->config.proxy_h2_backend, SOCK_STREAM, IPPROTO_TCP,
+                             &backend_addr, &backend_addrlen) != 0) {
+        LOG_E(s, "invalid [Proxy] Http2Backend endpoint");
+        return -1;
+    }
+    h2_proxy_config_t config;
+    memset(&config, 0, sizeof(config));
+    config.backend_addr = backend_addr;
+    config.backend_addrlen = backend_addrlen;
+    config.max_connections = s->config.proxy_max_connections;
+    config.max_streams_per_conn = 100;
+    config.conn_timeout_sec = s->config.proxy_idle_timeout_sec;
+    config.max_buffered_body = 1024 * 1024;
+    h2_proxy_callbacks_t callbacks = {
+        .log = svr_h2_log,
+        .register_fd = svr_h2_register_fd,
+        .unregister_fd = svr_h2_unregister_fd,
+        .user_ctx = s,
+    };
+    s->h2_proxy = h2_proxy_create(&config, &callbacks);
+    if (!s->h2_proxy) {
+        LOG_E(s, "failed to initialize [Proxy] HTTP/2 backend");
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 static int64_t
 now_ms_mono(void)
 {
@@ -306,11 +566,6 @@ now_ms_mono(void)
 #endif
 }
 
-#ifndef _MSC_VER
-static void server_log(mqvpn_server_t *s, mqvpn_log_level_t level, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
-#endif
-
 #include "mqvpn_conn_settings.h"
 
 static void
@@ -324,11 +579,6 @@ server_log(mqvpn_server_t *s, mqvpn_log_level_t level, const char *fmt, ...)
     va_end(ap);
     s->cbs.log(level, buf, s->user_ctx);
 }
-
-#define LOG_D(s, ...) server_log(s, MQVPN_LOG_DEBUG, __VA_ARGS__)
-#define LOG_I(s, ...) server_log(s, MQVPN_LOG_INFO, __VA_ARGS__)
-#define LOG_W(s, ...) server_log(s, MQVPN_LOG_WARN, __VA_ARGS__)
-#define LOG_E(s, ...) server_log(s, MQVPN_LOG_ERROR, __VA_ARGS__)
 
 #ifndef NDEBUG
 #  ifdef _WIN32
@@ -1010,6 +1260,12 @@ cb_request_close(xqc_h3_request_t *h3_request, void *strm_user_data)
             svr_tcp_egress_flow_destroy(stream->conn->server, stream->tcp_egress_flow);
         }
 #endif
+#ifdef MQVPN_H2_PROXY_ENABLED
+        if (stream->h2_proxy_stream) {
+            h2_proxy_on_h3_close(stream->h2_proxy_stream);
+            stream->h2_proxy_stream = NULL;
+        }
+#endif
         free(stream->capsule_buf);
         free(stream);
     }
@@ -1245,7 +1501,7 @@ svr_get_tcp_egress_ctx(mqvpn_server_t *s, svr_tcp_egress_srv_ctx_t *out)
     out->tcp_max_flows = s->config.hybrid.tcp_max_flows;
     out->tcp_connect_timeout_sec = s->config.hybrid.tcp_connect_timeout_sec;
     out->tcp_idle_timeout_sec = s->config.hybrid.tcp_idle_timeout_sec;
-    out->global_fd_budget = s->egress_fd_budget; /* frozen at server_new */
+    out->global_fd_budget = s->tcp_egress_fd_budget; /* frozen at server_new */
 }
 
 int
@@ -1414,6 +1670,14 @@ cb_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t flag,
             return svr_tcp_egress_on_request(s, stream, h3_request, &hdrs);
         }
 #endif
+#ifdef MQVPN_H2_PROXY_ENABLED
+        if (s->h2_proxy) {
+            stream->role = SVR_STREAM_ROLE_H2_PROXY;
+            stream->h2_proxy_stream =
+                h2_proxy_handle_request(s->h2_proxy, h3_request, headers, fin, stream);
+            return 0;
+        }
+#endif
         /* Unrecognized request: explicit 501, replacing the historical
          * silent fall-through. Role stays UNKNOWN — no body is expected. */
         svr_masque_send_501(h3_request);
@@ -1441,10 +1705,36 @@ cb_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t flag,
     }
 #endif
 
-    if (flag & XQC_REQ_NOTIFY_READ_BODY) {
+    if ((flag & XQC_REQ_NOTIFY_READ_BODY)
+#ifdef MQVPN_H2_PROXY_ENABLED
+        || (stream->role == SVR_STREAM_ROLE_H2_PROXY &&
+            (flag & XQC_REQ_NOTIFY_READ_EMPTY_FIN))
+#endif
+    ) {
         switch (stream->role) {
         case SVR_STREAM_ROLE_CONNECT_IP:
             return svr_connect_ip_on_body(s, stream, h3_request);
+#ifdef MQVPN_H2_PROXY_ENABLED
+        case SVR_STREAM_ROLE_H2_PROXY: {
+            unsigned char body[16384];
+            for (;;) {
+                ssize_t read =
+                    xqc_h3_request_recv_body(h3_request, body, sizeof(body), &fin);
+                if (read == -XQC_EAGAIN) return 0;
+                if (read < 0) return -1;
+                if (read > 0 && stream->h2_proxy_stream &&
+                    h2_proxy_on_h3_body(stream->h2_proxy_stream, body, (size_t)read,
+                                        fin) != 0)
+                    return -1;
+                if (fin || read == 0) {
+                    if (fin && read == 0 && stream->h2_proxy_stream &&
+                        h2_proxy_on_h3_body(stream->h2_proxy_stream, NULL, 0, 1) != 0)
+                        return -1;
+                    return 0;
+                }
+            }
+        }
+#endif
 #ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
         case SVR_STREAM_ROLE_CONNECT_TCP:
             /* Handled above in the CONNECT_TCP-scoped block
@@ -1480,6 +1770,10 @@ cb_request_write(xqc_h3_request_t *h3_request, void *strm_user_data)
 #else
     (void)stream;
 #endif
+#ifdef MQVPN_H2_PROXY_ENABLED
+    if (stream && stream->role == SVR_STREAM_ROLE_H2_PROXY && stream->h2_proxy_stream)
+        return h2_proxy_on_h3_writable(stream->h2_proxy_stream);
+#endif
     return 0;
 }
 
@@ -1512,6 +1806,14 @@ cb_request_closing_notify(xqc_h3_request_t *h3_request, xqc_int_t err,
     }
 #else
     (void)strm_user_data;
+#endif
+#ifdef MQVPN_H2_PROXY_ENABLED
+    svr_stream_t *h2_stream = (svr_stream_t *)strm_user_data;
+    if (h2_stream && h2_stream->role == SVR_STREAM_ROLE_H2_PROXY &&
+        h2_stream->h2_proxy_stream) {
+        h2_proxy_on_h3_close(h2_stream->h2_proxy_stream);
+        h2_stream->h2_proxy_stream = NULL;
+    }
 #endif
 }
 
@@ -1734,8 +2036,29 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
      * scalars possibly sanitized just above) — the budget computation MUST
      * read the applied config, not `cfg` directly, so a future refactor that
      * changes what memcpy copies can't silently desync the two. */
-    s->egress_fd_budget =
-        svr_compute_egress_fd_budget(s->config.hybrid.tcp_max_global_flows);
+    uint32_t configured_tcp_fds = s->config.hybrid.tcp_max_global_flows;
+    s->tcp_egress_fd_budget = svr_compute_egress_fd_budget(configured_tcp_fds);
+    s->egress_fd_budget = s->tcp_egress_fd_budget;
+#ifndef _WIN32
+    if (s->config.proxy_enabled) {
+        uint64_t requested = (uint64_t)s->config.proxy_max_connections * 2;
+        if (s->config.hybrid.enabled) requested += configured_tcp_fds;
+        uint32_t requested_u32 =
+            requested > UINT32_MAX ? UINT32_MAX : (uint32_t)requested;
+        s->egress_fd_budget = svr_compute_egress_fd_budget(requested_u32);
+
+        uint32_t proxy_cap = (uint32_t)(s->egress_fd_budget / 2);
+        if (s->config.proxy_max_connections > proxy_cap)
+            s->config.proxy_max_connections = proxy_cap;
+        int proxy_reserve = (int)(s->config.proxy_max_connections * 2u);
+        if (s->config.hybrid.enabled) {
+            int remaining = s->egress_fd_budget - proxy_reserve;
+            if (s->tcp_egress_fd_budget > remaining) s->tcp_egress_fd_budget = remaining;
+        } else {
+            s->tcp_egress_fd_budget = 0;
+        }
+    }
+#endif
 
     /* Initialize address pool */
     if (cfg->subnet[0] == '\0') {
@@ -1877,13 +2200,39 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
     };
     xqc_h3_engine_set_local_settings(s->engine, &h3s);
 
+#ifndef _WIN32
+    if (svr_sni_router_init(s) != 0) goto cleanup;
+#  ifdef MQVPN_H2_PROXY_ENABLED
+    if (s->config.proxy_enabled && svr_h2_proxy_init(s) != 0) goto cleanup;
+#  else
+    if (s->config.proxy_enabled) {
+        LOG_E(s, "[Proxy] requires a build with nghttp2 support");
+        goto cleanup;
+    }
+#  endif
+#else
+    if (s->config.proxy_enabled) {
+        LOG_E(s, "[Proxy] is not supported by the Windows platform reactor");
+        goto cleanup;
+    }
+#endif
+
     return s;
 
 cleanup:
+#ifdef MQVPN_H2_PROXY_ENABLED
+    h2_proxy_destroy(s->h2_proxy);
+    s->h2_proxy = NULL;
+#endif
+#ifndef _WIN32
+    sni_router_destroy(s->sni_router);
+    s->sni_router = NULL;
+#endif
     if (s->engine) {
         xqc_engine_destroy(s->engine);
         s->engine = NULL;
     }
+
     free(s);
     return NULL;
 }
@@ -1893,11 +2242,21 @@ mqvpn_server_destroy(mqvpn_server_t *s)
 {
     if (!s) return;
 
+#ifndef _WIN32
+    sni_router_destroy(s->sni_router);
+    s->sni_router = NULL;
+#endif
+
     /* Step 1: xqc_engine_destroy triggers h3_conn_close → session free */
     if (s->engine) {
         xqc_engine_destroy(s->engine);
         s->engine = NULL;
     }
+
+#ifdef MQVPN_H2_PROXY_ENABLED
+    h2_proxy_destroy(s->h2_proxy);
+    s->h2_proxy = NULL;
+#endif
 
 #ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
     /* Step 2: Defensive sweep — destroy any egress flows not torn down by
@@ -1997,13 +2356,14 @@ mqvpn_server_on_socket_recv(mqvpn_server_t *s, const uint8_t *pkt, size_t len,
     ASSERT_TICK_THREAD(s);
     if (!s->engine) return MQVPN_ERR_ENGINE;
 
-    uint64_t recv_time = now_us();
-    xqc_int_t ret = xqc_engine_packet_process(
-        s->engine, pkt, len, (struct sockaddr *)&s->local_addr, s->local_addrlen, peer,
-        peer_len, (xqc_usec_t)recv_time, s);
-    if (ret != XQC_OK) {
-        LOG_D(s, "packet_process: %d", ret);
+#ifndef _WIN32
+    if (s->sni_router) {
+        sni_route_result_t route = sni_router_process(s->sni_router, pkt, len, peer,
+                                                      peer_len, svr_sni_accept, s);
+        return route == SNI_ROUTE_ERROR ? MQVPN_ERR_ENGINE : MQVPN_OK;
     }
+#endif
+    (void)svr_process_xquic(s, pkt, len, peer, peer_len);
     return MQVPN_OK;
 }
 
@@ -2011,6 +2371,18 @@ void
 mqvpn_server_on_egress_fd_ready(mqvpn_server_t *s, int fd, void *fd_ctx, int readable,
                                 int writable)
 {
+#ifdef MQVPN_H2_PROXY_ENABLED
+    if (s && s->h2_proxy && h2_proxy_owns_fd(s->h2_proxy, fd, fd_ctx)) {
+        h2_proxy_on_backend_ready(s->h2_proxy, fd, fd_ctx, readable, writable);
+        return;
+    }
+#endif
+#ifndef _WIN32
+    if (s && s->sni_router && sni_router_owns_fd(s->sni_router, fd, fd_ctx)) {
+        if (readable) sni_router_on_fd_readable(s->sni_router, fd, fd_ctx);
+        return;
+    }
+#endif
 #ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
     svr_tcp_egress_fd_ready(s, fd, fd_ctx, readable, writable);
 #else
@@ -2025,10 +2397,8 @@ mqvpn_server_on_egress_fd_ready(mqvpn_server_t *s, int fd, void *fd_ctx, int rea
 int
 mqvpn_server_egress_fd_budget(mqvpn_server_t *s)
 {
-    /* Frozen snapshot from mqvpn_server_new — see svr_compute_egress_fd_
-     * budget and the egress_fd_budget field comment for why this must not
-     * recompute per call. Fed by config.hybrid.tcp_max_global_flows
-     * (TcpMaxGlobalFlows in INI/JSON). */
+    /* Frozen snapshot from mqvpn_server_new; the Linux reactor allocates its
+     * registry from exactly this value. */
     if (!s) return 0;
     return s->egress_fd_budget;
 }
@@ -2218,6 +2588,13 @@ mqvpn_server_tick(mqvpn_server_t *s)
     ASSERT_TICK_THREAD(s);
 
     if (s->engine) xqc_engine_main_logic(s->engine);
+
+#ifndef _WIN32
+    if (s->sni_router) sni_router_cleanup(s->sni_router, now_us() / 1000000);
+#endif
+#ifdef MQVPN_H2_PROXY_ENABLED
+    if (s->h2_proxy) h2_proxy_tick(s->h2_proxy, now_us() / 1000000);
+#endif
 
     /* §5/§11.1: drive reorder RX gap timeouts + idle eviction for every active
      * session. Sessions are indexed by pool offset (1..MAX); the slot is set

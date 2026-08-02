@@ -1,354 +1,211 @@
-# SNI路由和HTTP/2代理功能
+# SNI 分流与 HTTP/3 到 HTTP/2 回落
 
-本分支添加了两个新的流量分流功能，用于实现更灵活的流量路由。
+## 目标
 
-## 功能概述
+该功能允许一个 UDP 监听地址同时承载 mqvpn 和另一个 QUIC 服务，并在 mqvpn
+连接内部继续区分 MASQUE CONNECT-IP、Hybrid TCP 和普通 HTTP 请求。
 
-### 1. SNI路由模块 (SNI Router)
+它不是“先终止所有 TLS 再按 SNI 转发”。第一层只解密公开可派生密钥保护的
+QUIC Initial，读取 ClientHello SNI：
 
-**位置**: `src/sni_router.[ch]`
+- SNI 不匹配：原始 UDP datagram 双向转发到 `QuicFallback`，mqvpn 不终止 TLS。
+- SNI 匹配：datagram 交给 xquic，由 mqvpn 完成 QUIC/TLS/H3。
 
-**功能**: 
-- 在QUIC Initial包阶段检查SNI（Server Name Indication）
-- 根据配置的SNI模式路由流量
-- 不匹配的SNI自动转发到fallback上游服务器
-- 支持精确匹配和通配符匹配（如 `*.example.com`）
+第二层只发生在匹配 SNI 的连接中：
 
-**实现原理**:
-- 解析QUIC Initial包头，提取DCID（Destination Connection ID）
-- 使用RFC 9001定义的Initial Secrets派生密钥
-- 从CRYPTO frame中提取TLS ClientHello
-- 解析ClientHello中的SNI扩展
-- 维护连接跟踪表，后续包直接查表
+- Extended CONNECT `:protocol=connect-ip` 使用现有 RFC 9484 VPN 实现。
+- `:protocol=mqvpn-tcp` 且 Hybrid 已启用时使用现有 TCP lane。
+- 其他 HTTP/3 request 转换为 HTTP/2 并发送到 `Http2Backend`。
 
-**使用场景**:
-- 同一端口服务多个域名，根据SNI分流到不同后端
-- MQVPN专用域名走VPN隧道，其他域名透明转发
-- 实现基于域名的流量隔离
+## 配置
 
-### 2. HTTP/2代理模块 (H2 Proxy)
+```ini
+[Proxy]
+Enabled = true
+SNI = vpn.example.com,*.edge.example
+QuicFallback = 127.0.0.1:4443
+Http2Backend = 127.0.0.1:8080
+Http2BackendTLS = false
+MaxConnections = 64
+IdleTimeoutSec = 60
+```
 
-**位置**: `src/h2_proxy.[ch]`
+字段说明：
 
-**功能**:
-- 对于通过SNI检查但不是MASQUE协议的连接，转换为HTTP/2代理
-- 协议转换：QUIC/HTTP3 → TCP/HTTP2
-- 连接池管理和复用
-- 流多路复用支持
+| 字段 | 含义 |
+| --- | --- |
+| `Enabled` | 启用 Linux 服务端两级代理路径，默认 `false` |
+| `SNI` | 最多 16 个逗号分隔 DNS 名称或 `*.example.com` 模式 |
+| `QuicFallback` | SNI 不匹配时的 UDP `host:port`，IPv6 使用 `[addr]:port` |
+| `Http2Backend` | 普通 H3 request 的 prior-knowledge h2c `host:port` |
+| `Http2BackendTLS` | 当前必须为 `false`；`true` 会让服务启动失败 |
+| `MaxConnections` | SNI tracking/fallback 和 H2 pool 的各自上限，默认 64 |
+| `IdleTimeoutSec` | 无活动连接清理时间，默认 60，最大 86400 |
 
-**实现原理**:
-- 检查HTTP/3请求的`:protocol`头
-- 如果不是`connect-ip`（MASQUE），启用代理模式
-- 建立或复用到后端HTTP/2服务器的连接
-- 使用nghttp2库处理HTTP/2协议
-- 双向流式转发请求和响应
+JSON 配置使用 `enabled`、`sni`、`quic_fallback`、`http2_backend`、
+`http2_backend_tls`、`max_connections` 和 `idle_timeout_sec`。
 
-**使用场景**:
-- 同一SNI下混合VPN和普通HTTP流量
-- 对非VPN流量进行协议转换和加速
-- 实现透明的HTTP/3到HTTP/2网关
-
-## 配置说明
-
-### SNI路由配置
+公共 API：
 
 ```c
-// 服务器端配置示例
-sni_router_config_t config = {
-    .allowed_snis = (const char *[]){"vpn.example.com", "*.internal.net"},
-    .n_allowed_snis = 2,
-    
-    // Fallback上游地址
-    .fallback_addr = {...},  // 其他域名转发的目标
-    .fallback_addrlen = sizeof(struct sockaddr_in),
-    
-    // 连接跟踪
-    .max_tracked_conns = 4096,
-    .conn_timeout_sec = 60,
-};
-
-sni_router_t *router = sni_router_create(&config);
+int rc = mqvpn_config_set_proxy(cfg, 1,
+                                "vpn.example.com,*.edge.example",
+                                "127.0.0.1:4443",
+                                "127.0.0.1:8080",
+                                0, 64, 60);
 ```
 
-### HTTP/2代理配置
+## SNI 路由协议处理
 
-```c
-// HTTP/2后端配置
-h2_proxy_config_t config = {
-    // 后端服务器地址
-    .backend_addr = {...},
-    .backend_addrlen = sizeof(struct sockaddr_in),
-    
-    // 连接池配置
-    .max_connections = 10,
-    .max_streams_per_conn = 100,
-    .conn_timeout_sec = 60,
-    
-    // 是否使用TLS连接后端
-    .backend_tls = 0,
-    
-    // 路径前缀
-    .path_prefix = "/",
-    
-    // 启用连接复用
-    .enable_connection_reuse = 1,
-};
+### Initial 解密
 
-h2_proxy_t *proxy = h2_proxy_create(&config, &callbacks);
-```
+路由器接受 RFC 9001 QUIC v1 和 RFC 9369 QUIC v2 Initial：
 
-## 构建说明
+1. 校验 long header、版本、DCID/SCID、token 和 payload length。
+2. 用版本对应 Initial salt 和 DCID 派生 client Initial secret。
+3. 使用 AES header protection key 恢复首字节和 packet number。
+4. 按 RFC 9000 packet-number reconstruction 恢复完整 packet number。
+5. 使用 AES-128-GCM 解密 payload。
+6. 读取 ACK/CRYPTO/PADDING/PING，按 CRYPTO offset 重组 ClientHello。
+7. 从 TLS `server_name` extension 取出 host_name。
 
-### 依赖项
+RFC 规定 Initial protection 的秘密可由线上的 DCID 推导，所以这一步不破坏后续
+TLS 机密性。Handshake 和 1-RTT 数据不会被 SNI router 解密。
 
-**必需**:
-- BoringSSL (已包含在xquic子模块中)
-- OpenSSL HKDF支持 (用于Initial Secrets派生)
+### 匹配规则
 
-**可选**:
-- nghttp2 (用于HTTP/2代理功能)
+- DNS 名称使用 ASCII 不区分大小写比较。
+- 精确模式只匹配完整名称。
+- `*.example.com` 只匹配一个最左标签，如 `api.example.com`。
+- 它不匹配 `example.com` 或 `dev.api.example.com`。
+- 不接受中间通配符、空标签、超长标签和尾随点模式。
 
-### 安装依赖
+该边界与 RFC 9525 的服务标识通配符约束一致。这里执行的是路由选择，不替代
+证书名称验证。
+
+### Fail-open 与 fallback
+
+路由器在完整 SNI 决定前保存少量 Initial datagram。决定后按原顺序回放给 xquic
+或 UDP fallback。下列情况交给 xquic，而不是静默丢包：
+
+- QUIC 版本不是 v1/v2。
+- Initial 格式、AEAD 或 CRYPTO frame 不能安全解析。
+- 内存分配、pending queue 或 tracking table 资源不足。
+- 未决连接超时或被新连接驱逐。
+
+可解析且 ClientHello 不含可匹配 SNI（包括使用 ECH 的情况）会明确选择
+`QuicFallback`。
+
+fallback 为每个客户端创建一个 connected nonblocking UDP socket。上行 datagram
+保持原字节；回包通过主监听 socket 发回原客户端。已决定连接的查找是哈希表
+操作，不会对每个后续 packet 重做 Initial 密码运算。
+
+## HTTP/3 到 HTTP/2 转换
+
+### 请求
+
+H3 pseudo-fields 和普通 fields 交给 nghttp2 编码。以下 connection-specific
+fields 不会转发：
+
+- `connection`
+- `keep-alive`
+- `proxy-connection`
+- `transfer-encoding`
+- `upgrade`
+
+`TE` 只有值为 `trailers` 时允许。request body 由有界 buffer 接收，nghttp2 在
+流量窗口允许时读取；H3 FIN 映射为 H2 END_STREAM。
+
+### 响应
+
+nghttp2 解码的 informational headers、final headers、DATA、trailers 和
+END_STREAM 按顺序发送回 H3。响应必须有合法的 `:status`；101 不允许用于 H2。
+后端在 final response 前失败时尽量发送仅含 `:status=502` 的 H3 response。
+
+H3 流提前关闭会提交 H2 `RST_STREAM(CANCEL)`，并先解除 nghttp2 stream
+user-data，避免延迟 close callback 访问已经释放的 H3 proxy stream。
+
+### 连接池
+
+- 后端 socket 为 nonblocking TCP，启用 `TCP_NODELAY`。
+- 一个 H2 connection 默认最多并发 100 stream。
+- pool 最多创建 `MaxConnections` 个 connection。
+- 空闲且无 stream 的 connection 在 `IdleTimeoutSec` 后关闭。
+- Linux reactor 根据 read/write interest 更新 libevent registration。
+
+后端目前必须直接支持 prior-knowledge h2c。常见部署方式是在 mqvpn 同机启动
+nginx 或其他网关的 h2c listener；后端 TLS 和证书校验尚未实现。
+
+## 资源限制
+
+| 资源 | 上限 |
+| --- | --- |
+| SNI patterns | 16 |
+| ClientHello 重组 | 默认 64 KiB，硬上限 1 MiB |
+| 未决 Initial datagram | 默认 8，硬上限 64 / connection |
+| H2 response field section | 32 KiB、256 fields |
+| H2 request/response body buffer | 当前 server integration 每方向 1 MiB / stream |
+| tracked/fallback 和 H2 pool | 各自 `MaxConnections` |
+
+服务器启动时以 `RLIMIT_NOFILE - 64` 为总 fd headroom，并为最坏情况下的
+fallback、H2 和启用的 Hybrid TCP 连接统一计算 reactor registry。若 headroom
+不足，实际代理 connection cap 会收窄；不足以容纳一对代理 fd 时启动失败。
+
+## 构建与平台
+
+Linux 构建需要 nghttp2 development headers：
 
 ```bash
-# Ubuntu/Debian
-sudo apt-get install libnghttp2-dev
-
-# macOS
-brew install nghttp2
-
-# 如果不安装nghttp2，HTTP/2代理功能会被禁用，但SNI路由仍可用
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DXQUIC_BUILD_DIR=third_party/xquic/build
+cmake --build build
 ```
 
-### 编译
+CMake 在 Linux 找到 nghttp2 后定义 `MQVPN_H2_PROXY_ENABLED`。启用了 `[Proxy]`
+但产物没有该能力时，服务启动会明确失败。release workflow 安装
+`libnghttp2-dev`；DEB 的运行时依赖由 `dpkg-shlibdeps` 生成。
 
-```bash
-# 克隆仓库
-git clone -b feature/sni-routing-and-h2-proxy <repo-url>
-cd mqvpn
+当前平台矩阵：
 
-# 初始化子模块
-git submodule update --init --recursive
-
-# 构建
-./build.sh
-
-# 或者手动构建
-mkdir -p build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release \
-      -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
-make -j$(nproc)
-```
-
-### 检查功能是否启用
-
-```bash
-# 查看编译日志
-cmake .. 2>&1 | grep -E "nghttp2|H2_PROXY"
-
-# 如果看到以下输出，说明HTTP/2代理已启用：
-# -- nghttp2 found: /usr/lib/x86_64-linux-gnu/libnghttp2.so
-# -- MQVPN_H2_PROXY_ENABLED
-
-# 如果看到以下输出，说明HTTP/2代理被禁用：
-# -- nghttp2 not found. HTTP/2 proxy support will be disabled.
-```
+- Linux：SNI、UDP fallback、H3/H2 和 reactor 集成全部启用。
+- Windows：SNI module 参与 MSVC warning-as-error 编译；服务 reactor 不启用代理。
+- macOS/iOS/Android：不启用该代理路径。
 
 ## 测试
 
-### 单元测试
+`SNI and H2 Protocol Tests` workflow 是该功能的第一道门禁：
 
-```bash
-cd build
+- RFC 9001 Appendix A.2 v1 1200-byte Client Initial fixed vector。
+- RFC 9369 Appendix A.2 v2 1200-byte Client Initial fixed vector。
+- 每个截断长度、AEAD tag corruption、精确/通配符路由。
+- 乱序 fragmented ClientHello、pending timeout fail-open。
+- loopback 上真实双向 UDP fallback。
+- loopback 上真实 nghttp2 client/server，覆盖 request body、103、200、response
+  body/FIN 以及 H3 提前关闭。
+- config INI/JSON parity、server、CONNECT-IP 和 Hybrid TCP egress regression。
+- ASan/UBSan protocol jobs 和 Windows MSVC build。
 
-# 运行SNI路由测试
-./tests/test_sni_router
-
-# 运行HTTP/2代理测试（需要nghttp2）
-./tests/test_h2_proxy
-
-# 运行所有测试
-ctest --output-on-failure
-```
-
-### CI测试
-
-GitHub Actions会自动运行以下测试：
-- 代码格式检查（clang-format）
-- 编译检查（无警告）
-- 单元测试
-- 静态分析（检查不安全的函数调用）
-
-查看测试状态：
-```bash
-# 在GitHub仓库页面查看Actions标签
-# 或者通过CLI
-gh run list --branch feature/sni-routing-and-h2-proxy
-```
-
-## 性能考虑
-
-### SNI路由性能
-
-**开销**:
-- Initial包解析：~10-20μs
-- SNI提取：~5-10μs
-- 连接跟踪查找：O(1)哈希表，<1μs
-
-**优化**:
-- 连接跟踪避免重复解析
-- 非Initial包直接查表，无解析开销
-- 哈希表自动清理过期连接
-
-### HTTP/2代理性能
-
-**开销**:
-- 协议转换：~50-100μs每请求
-- 连接池查找：O(1)
-- 流复用减少连接建立开销
-
-**优化**:
-- 连接复用减少TCP握手
-- nghttp2的零拷贝优化
-- 异步I/O避免阻塞
-
-## 安全考虑
-
-### SNI路由安全
-
-1. **Initial Secrets是公开的**
-   - 基于Connection ID派生，任何人都可以解密Initial包
-   - 这是QUIC协议设计的一部分，用于防止中间盒干扰
-   - 后续包使用握手密钥加密，无法解密
-
-2. **SNI明文传输**
-   - TLS 1.3的SNI在ClientHello中明文传输
-   - 这是TLS协议的已知限制
-   - 可考虑使用ECH (Encrypted ClientHello) 扩展
-
-3. **连接跟踪资源消耗**
-   - 限制最大跟踪连接数（默认4096）
-   - 自动清理过期连接（默认60秒超时）
-   - 防止内存耗尽攻击
-
-### HTTP/2代理安全
-
-1. **后端验证**
-   - 支持TLS连接到后端（`backend_tls = 1`）
-   - 验证后端证书（如果启用TLS）
-
-2. **资源限制**
-   - 限制并发连接数
-   - 限制每连接的并发流数
-   - 防止资源耗尽
-
-3. **错误处理**
-   - 所有网络调用都有错误检查
-   - 避免使用不安全的字符串函数
-   - 输入验证
+该 workflow 通过后，再运行全局 CI 和 gitleaks；随后才运行 release/build，创建
+pre-release，并用发布产物执行本机整体部署验证。
 
 ## 已知限制
 
-1. **SNI分片**
-   - 当前实现假设ClientHello在单个Initial包中
-   - 分片的ClientHello会fallback到ACCEPT（向后兼容）
+- fallback 连接以源 IP/port 关联；QUIC migration 或 NAT rebinding 后的新地址不
+  会自动关联旧 fallback socket。
+- 同一监听端口当前只有一个 QUIC fallback 和一个 H2 backend。
+- ECH 内层 SNI 不可见，因此无法按内层名称进入 mqvpn。
+- H2 upstream TLS 未实现。
+- 有界 buffer 达到上限时关闭受影响的代理流/连接；当前没有跨 H2/H3 的零拷贝
+  backpressure bridge。
 
-2. **HTTP/2代理实现**
-   - 当前是基础实现，用于演示架构
-   - 需要完善header转换逻辑
-   - 需要完善流控制和背压处理
+## RFC 参考
 
-3. **连接跟踪**
-   - 仅跟踪Initial包的DCID
-   - 连接迁移（Connection Migration）可能导致跟踪失效
-
-## 下一步工作
-
-### 短期（1-2周）
-
-- [ ] 完善HTTP/2代理的header转换
-- [ ] 添加更多集成测试
-- [ ] 性能基准测试
-- [ ] 文档完善
-
-### 中期（1-2月）
-
-- [ ] 支持ClientHello分片
-- [ ] 添加Prometheus指标
-- [ ] 支持热重载配置
-- [ ] 添加管理API
-
-### 长期（3-6月）
-
-- [ ] 支持ECH (Encrypted ClientHello)
-- [ ] 支持连接迁移的跟踪
-- [ ] HTTP/3代理（避免协议降级）
-- [ ] 分布式连接跟踪
-
-## 贡献指南
-
-### 代码规范
-
-- 遵循项目现有的代码风格
-- 使用`clang-format -i`格式化代码
-- 每个公开函数都要有文档注释
-- 错误处理要完整
-
-### 提交代码
-
-1. Fork仓库
-2. 创建功能分支：`git checkout -b feature/my-feature`
-3. 提交更改：`git commit -am 'feat: Add some feature'`
-4. 推送分支：`git push origin feature/my-feature`
-5. 创建Pull Request
-
-### 测试要求
-
-- 新功能必须有单元测试
-- 所有测试必须通过
-- 代码覆盖率不能降低
-- CI检查必须通过
-
-## 常见问题
-
-### Q: SNI路由会影响延迟吗？
-
-A: 影响极小（<50μs）。只有Initial包需要解析，后续包直接查表。
-
-### Q: 不安装nghttp2会怎样？
-
-A: HTTP/2代理功能会被禁用，但SNI路由仍然可用。编译时会有警告信息。
-
-### Q: 可以同时使用多个fallback目标吗？
-
-A: 当前版本只支持单个fallback目标。多目标负载均衡可以通过在fallback目标前部署Nginx实现。
-
-### Q: 如何调试SNI路由问题？
-
-A: 
-```bash
-# 启用debug日志
-./mqvpn --mode server --log-level debug ...
-
-# 使用tcpdump抓包
-sudo tcpdump -i any -w /tmp/capture.pcap udp port 443
-
-# 使用Wireshark分析Initial包
-wireshark /tmp/capture.pcap
-```
-
-## 参考资料
-
-- [RFC 9001 - QUIC TLS](https://www.rfc-editor.org/rfc/rfc9001.html)
-- [RFC 9114 - HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html)
-- [nghttp2 Documentation](https://nghttp2.org/documentation/)
-- [BoringSSL HKDF API](https://commondatastorage.googleapis.com/chromium-boringssl-docs/hkdf.h.html)
-
-## 许可证
-
-Apache-2.0
-
-## 联系方式
-
-- 项目Issues: GitHub Issues
-- 讨论: GitHub Discussions
+- RFC 9000, QUIC: A UDP-Based Multiplexed and Secure Transport
+- RFC 9001, Using TLS to Secure QUIC
+- RFC 9369, QUIC Version 2
+- RFC 6066, TLS Extensions: `server_name`
+- RFC 8446, TLS 1.3
+- RFC 9525, Service Identity in TLS
+- RFC 9113, HTTP/2
+- RFC 9114, HTTP/3
+- RFC 9484, Proxying IP in HTTP

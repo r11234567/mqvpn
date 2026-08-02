@@ -87,6 +87,15 @@ typedef struct mqvpn_file_config_s {
      * Seeded with mqvpn_hybrid_config_default() in mqvpn_config_defaults(). */
     mqvpn_hybrid_config_t hybrid;
 
+    /* [Proxy] — server-side QUIC SNI routing and H3-to-H2 fallback. */
+    int proxy_enabled;
+    char proxy_sni[280];
+    char proxy_quic_fallback[280];
+    char proxy_h2_backend[280];
+    int proxy_h2_backend_tls;
+    uint32_t proxy_max_connections;
+    uint32_t proxy_idle_timeout_sec;
+
     /* [Advanced] — cross-cutting QUIC transport knobs. recv_rate_limit:
      * conn-level receive-rate cap in bytes/sec, 0 = library default (off).
      * CLIENT-ONLY by policy — see mqvpn_conn_settings.c. */

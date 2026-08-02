@@ -98,6 +98,9 @@ test_defaults(void)
     ASSERT_EQ_STR(cfg.server_addr, "", "default server_addr");
     ASSERT_EQ_STR(cfg.auth_key, "", "default auth_key");
     ASSERT_EQ_STR(cfg.server_auth_key, "", "default server_auth_key");
+    ASSERT_EQ_INT(cfg.proxy_enabled, 0, "default proxy disabled");
+    ASSERT_EQ_INT((int)cfg.proxy_max_connections, 64, "default proxy connections");
+    ASSERT_EQ_INT((int)cfg.proxy_idle_timeout_sec, 60, "default proxy timeout");
 }
 
 static void
@@ -1642,6 +1645,48 @@ test_advanced_recv_rate_limit(void)
     ASSERT_EQ_INT(cfg.recv_rate_limit == 0, 1, "over-max json rejected → default 0");
 }
 
+static void
+test_proxy_config(void)
+{
+    const char *ini = "[Proxy]\n"
+                      "Enabled = true\n"
+                      "SNI = vpn.example.com,*.edge.example\n"
+                      "QuicFallback = 127.0.0.1:4443\n"
+                      "Http2Backend = 127.0.0.1:8080\n"
+                      "Http2BackendTLS = false\n"
+                      "MaxConnections = 128\n"
+                      "IdleTimeoutSec = 90\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t ini_cfg;
+    mqvpn_config_defaults(&ini_cfg);
+    ASSERT_EQ_INT(mqvpn_config_load(&ini_cfg, path), 0, "proxy ini load");
+    unlink(path);
+
+    mqvpn_file_config_t json_cfg;
+    mqvpn_config_defaults(&json_cfg);
+    ASSERT_EQ_INT(mqvpn_config_load_json_filecfg(
+                      &json_cfg, "{\"proxy\":{"
+                                 "\"enabled\":true,"
+                                 "\"sni\":\"vpn.example.com,*.edge.example\","
+                                 "\"quic_fallback\":\"127.0.0.1:4443\","
+                                 "\"http2_backend\":\"127.0.0.1:8080\","
+                                 "\"http2_backend_tls\":false,"
+                                 "\"max_connections\":128,"
+                                 "\"idle_timeout_sec\":90}}"),
+                  0, "proxy json load");
+
+    ASSERT_EQ_INT(ini_cfg.proxy_enabled, json_cfg.proxy_enabled, "proxy enabled parity");
+    ASSERT_EQ_STR(ini_cfg.proxy_sni, json_cfg.proxy_sni, "proxy SNI parity");
+    ASSERT_EQ_STR(ini_cfg.proxy_quic_fallback, json_cfg.proxy_quic_fallback,
+                  "proxy QUIC endpoint parity");
+    ASSERT_EQ_STR(ini_cfg.proxy_h2_backend, json_cfg.proxy_h2_backend,
+                  "proxy H2 endpoint parity");
+    ASSERT_EQ_INT((int)ini_cfg.proxy_max_connections, (int)json_cfg.proxy_max_connections,
+                  "proxy max parity");
+    ASSERT_EQ_INT((int)ini_cfg.proxy_idle_timeout_sec,
+                  (int)json_cfg.proxy_idle_timeout_sec, "proxy timeout parity");
+}
+
 /* ── [Hybrid] EgressAllow/EgressDeny lists + TcpConnectTimeoutSec ───────── */
 
 static void
@@ -2164,6 +2209,7 @@ main(void)
     test_hybrid_defaults_when_absent();
     test_hybrid_section_parse();
     test_advanced_recv_rate_limit();
+    test_proxy_config();
     test_hybrid_egress_acl_ini();
     test_hybrid_egress_acl_ini_invalid_ignored();
     test_hybrid_egress_acl_ini_v6();

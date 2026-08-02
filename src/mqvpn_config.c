@@ -126,6 +126,8 @@ mqvpn_config_new(void)
     cfg->max_clients = 64;
     cfg->listen_port = 443;
     cfg->init_max_path_id = 0; /* 0 = use xquic default (8) */
+    cfg->proxy_max_connections = 64;
+    cfg->proxy_idle_timeout_sec = 60;
 
     /* §16: reorder shim defaults (mode OFF until explicitly enabled). */
     mqvpn_reorder_config_default(&cfg->reorder);
@@ -494,6 +496,34 @@ mqvpn_config_set_max_clients(mqvpn_config_t *cfg, int max)
 {
     if (!cfg) return MQVPN_ERR_INVALID_ARG;
     cfg->max_clients = max;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_proxy(mqvpn_config_t *cfg, int enabled, const char *sni_csv,
+                       const char *quic_fallback, const char *http2_backend,
+                       int http2_backend_tls, uint32_t max_connections,
+                       uint32_t idle_timeout_sec)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    if (enabled && (!sni_csv || !sni_csv[0] || !quic_fallback || !quic_fallback[0] ||
+                    !http2_backend || !http2_backend[0]))
+        return MQVPN_ERR_INVALID_ARG;
+    if ((sni_csv && strlen(sni_csv) >= sizeof(cfg->proxy_sni)) ||
+        (quic_fallback && strlen(quic_fallback) >= sizeof(cfg->proxy_quic_fallback)) ||
+        (http2_backend && strlen(http2_backend) >= sizeof(cfg->proxy_h2_backend)))
+        return MQVPN_ERR_INVALID_ARG;
+    if (max_connections > 65535 || idle_timeout_sec > 86400) return MQVPN_ERR_INVALID_ARG;
+
+    cfg->proxy_enabled = enabled != 0;
+    snprintf(cfg->proxy_sni, sizeof(cfg->proxy_sni), "%s", sni_csv ? sni_csv : "");
+    snprintf(cfg->proxy_quic_fallback, sizeof(cfg->proxy_quic_fallback), "%s",
+             quic_fallback ? quic_fallback : "");
+    snprintf(cfg->proxy_h2_backend, sizeof(cfg->proxy_h2_backend), "%s",
+             http2_backend ? http2_backend : "");
+    cfg->proxy_h2_backend_tls = http2_backend_tls != 0;
+    cfg->proxy_max_connections = max_connections ? max_connections : 64;
+    cfg->proxy_idle_timeout_sec = idle_timeout_sec ? idle_timeout_sec : 60;
     return MQVPN_OK;
 }
 
