@@ -349,10 +349,15 @@ validate_retry(const sni_connection_state_t *conn, const uint8_t *pkt, size_t le
         return -1;
     }
 
-    const uint8_t *key = retry->version == QUIC_V2 ? QUIC_V2_RETRY_KEY
-                                                    : QUIC_V1_RETRY_KEY;
-    const uint8_t *nonce = retry->version == QUIC_V2 ? QUIC_V2_RETRY_NONCE
-                                                      : QUIC_V1_RETRY_NONCE;
+    const uint8_t *key;
+    const uint8_t *nonce;
+    if (retry->version == QUIC_V2) {
+        key = QUIC_V2_RETRY_KEY;
+        nonce = QUIC_V2_RETRY_NONCE;
+    } else {
+        key = QUIC_V1_RETRY_KEY;
+        nonce = QUIC_V1_RETRY_NONCE;
+    }
     size_t retry_without_tag_len = len - QUIC_RETRY_TAG_LEN;
     if (retry_without_tag_len > SIZE_MAX - 1 - conn->initial_dcid_len) return -1;
     size_t pseudo_len = 1 + conn->initial_dcid_len + retry_without_tag_len;
@@ -365,12 +370,14 @@ validate_retry(const sni_connection_state_t *conn, const uint8_t *pkt, size_t le
     uint8_t calculated[QUIC_RETRY_TAG_LEN];
     size_t calculated_len = 0;
     static const uint8_t empty = 0;
-    EVP_AEAD_CTX *aead = EVP_AEAD_CTX_new(EVP_aead_aes_128_gcm(), key, 16,
-                                          QUIC_RETRY_TAG_LEN);
-    int ok = aead &&
-             EVP_AEAD_CTX_seal(aead, calculated, &calculated_len, sizeof(calculated),
+    const EVP_AEAD *algorithm = EVP_aead_aes_128_gcm();
+    EVP_AEAD_CTX *aead = EVP_AEAD_CTX_new(algorithm, key, 16, QUIC_RETRY_TAG_LEN);
+    int ok = 0;
+    if (aead) {
+        ok = EVP_AEAD_CTX_seal(aead, calculated, &calculated_len, sizeof(calculated),
                                nonce, 12, &empty, 0, pseudo, pseudo_len) == 1;
-    EVP_AEAD_CTX_free(aead);
+        EVP_AEAD_CTX_free(aead);
+    }
     free(pseudo);
     if (!ok || calculated_len != QUIC_RETRY_TAG_LEN) return -1;
     return constant_time_equal(calculated, pkt + retry_without_tag_len,
@@ -1021,11 +1028,13 @@ sni_router_process(sni_router_t *router, const uint8_t *pkt, size_t len,
     sni_connection_state_t *conn = connection_lookup(router, peer);
     initial_header_t h;
     int parsed = parse_initial_header(pkt, len, &h);
-    int retry_initial =
-        conn && conn->decision == SNI_ROUTE_FALLBACK && conn->have_retry_scid &&
-        parsed == 0 && conn->version == h.version &&
-        conn->retry_scid_len == h.dcid_len &&
-        memcmp(conn->retry_scid, h.dcid, h.dcid_len) == 0;
+    int retry_initial = 0;
+    if (conn && parsed == 0) {
+        retry_initial = conn->decision == SNI_ROUTE_FALLBACK &&
+                        conn->have_retry_scid && conn->version == h.version &&
+                        conn->retry_scid_len == h.dcid_len &&
+                        memcmp(conn->retry_scid, h.dcid, h.dcid_len) == 0;
+    }
     if (conn && parsed == 0 && !retry_initial &&
         (conn->initial_dcid_len != h.dcid_len ||
          memcmp(conn->initial_dcid, h.dcid, h.dcid_len) != 0)) {

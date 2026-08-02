@@ -198,60 +198,6 @@ protect_rfc9001_initial(uint8_t *packet, size_t cap, uint8_t packet_number,
 }
 
 static size_t
-build_retry(uint8_t *packet, size_t cap, uint32_t version, const uint8_t *odcid,
-            size_t odcid_len, const uint8_t *dcid, size_t dcid_len, const uint8_t *scid,
-            size_t scid_len)
-{
-    static const uint8_t v1_key[16] = {0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66,
-                                       0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54,
-                                       0xe3, 0x68, 0xc8, 0x4e};
-    static const uint8_t v1_nonce[12] = {0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63,
-                                         0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb};
-    static const uint8_t v2_key[16] = {0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac,
-                                       0x48, 0xe2, 0x60, 0xfb, 0xcb, 0xce,
-                                       0xad, 0x7c, 0xcc, 0x92};
-    static const uint8_t v2_nonce[12] = {0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c,
-                                         0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a};
-    static const uint8_t token[] = {0xa1, 0xa2, 0xa3, 0xa4};
-    const uint8_t *key = version == 0x6b3343cfu ? v2_key : v1_key;
-    const uint8_t *nonce = version == 0x6b3343cfu ? v2_nonce : v1_nonce;
-    size_t pos = 0;
-
-    assert(odcid_len <= 20 && dcid_len <= 20 && scid_len <= 20);
-    assert(cap >= 5 + 1 + dcid_len + 1 + scid_len + sizeof(token) + 16);
-    packet[pos++] = version == 0x6b3343cfu ? 0xc0 : 0xf0;
-    packet[pos++] = (uint8_t)(version >> 24);
-    packet[pos++] = (uint8_t)(version >> 16);
-    packet[pos++] = (uint8_t)(version >> 8);
-    packet[pos++] = (uint8_t)version;
-    packet[pos++] = (uint8_t)dcid_len;
-    memcpy(packet + pos, dcid, dcid_len);
-    pos += dcid_len;
-    packet[pos++] = (uint8_t)scid_len;
-    memcpy(packet + pos, scid, scid_len);
-    pos += scid_len;
-    memcpy(packet + pos, token, sizeof(token));
-    pos += sizeof(token);
-
-    uint8_t pseudo[128];
-    size_t pseudo_len = 1 + odcid_len + pos;
-    assert(pseudo_len <= sizeof(pseudo));
-    pseudo[0] = (uint8_t)odcid_len;
-    memcpy(pseudo + 1, odcid, odcid_len);
-    memcpy(pseudo + 1 + odcid_len, packet, pos);
-
-    EVP_AEAD_CTX *aead = EVP_AEAD_CTX_new(EVP_aead_aes_128_gcm(), key, 16, 16);
-    assert(aead != NULL);
-    static const uint8_t empty = 0;
-    size_t tag_len = 0;
-    assert(EVP_AEAD_CTX_seal(aead, packet + pos, &tag_len, cap - pos, nonce, 12, &empty,
-                             0, pseudo, pseudo_len) == 1);
-    EVP_AEAD_CTX_free(aead);
-    assert(tag_len == 16);
-    return pos + tag_len;
-}
-
-static size_t
 build_crypto_initial(uint8_t *packet, size_t cap, uint8_t packet_number,
                      uint64_t crypto_offset, const uint8_t *crypto, size_t crypto_len)
 {
@@ -492,7 +438,7 @@ test_fallback_bidirectional(void)
 }
 
 static void
-test_retry_dcid_routing(const char *initial_hex, uint32_t version, int forge_tag)
+test_retry_dcid_routing(const char *initial_hex, const char *retry_hex, int forge_tag)
 {
     int backend = socket(AF_INET, SOCK_DGRAM, 0);
     assert(backend >= 0);
@@ -508,20 +454,12 @@ test_retry_dcid_routing(const char *initial_hex, uint32_t version, int forge_tag
 
     uint8_t packet[1200];
     size_t packet_len = decode_hex(initial_hex, packet, sizeof(packet));
-    size_t odcid_len = packet[5];
-    assert(odcid_len == 8);
-    uint8_t odcid[20];
-    memcpy(odcid, packet + 6, odcid_len);
-    size_t scid_len_offset = 6 + odcid_len;
-    size_t client_scid_len = packet[scid_len_offset];
-    assert(client_scid_len <= 20);
-    const uint8_t *client_scid = packet + scid_len_offset + 1;
+    assert(packet[5] == 8);
 
     struct sockaddr_in peer = test_peer();
     const char *allowed[] = {"vpn.example.com"};
     test_ctx_t ctx = {0};
-    sni_router_t *router =
-        create_router_at(allowed, 1, &ctx, backend_addr.sin_port);
+    sni_router_t *router = create_router_at(allowed, 1, &ctx, backend_addr.sin_port);
     assert(router != NULL);
     assert(sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
                               sizeof(peer), accept_packet, &ctx) == SNI_ROUTE_FALLBACK);
@@ -533,19 +471,19 @@ test_retry_dcid_routing(const char *initial_hex, uint32_t version, int forge_tag
                                     (struct sockaddr *)&router_addr, &router_addr_len);
     assert(received_len == (ssize_t)packet_len);
 
-    static const uint8_t retry_scid[] = {0x21, 0x22, 0x23, 0x24,
-                                         0x25, 0x26, 0x27, 0x28};
     uint8_t retry[128];
-    size_t retry_len = build_retry(retry, sizeof(retry), version, odcid, odcid_len,
-                                   client_scid, client_scid_len, retry_scid,
-                                   sizeof(retry_scid));
+    size_t retry_len = decode_hex(retry_hex, retry, sizeof(retry));
+    size_t retry_scid_len_offset = 6 + retry[5];
+    size_t retry_scid_len = retry[retry_scid_len_offset];
+    const uint8_t *retry_scid = retry + retry_scid_len_offset + 1;
+    assert(retry_scid_len == packet[5]);
     if (forge_tag) retry[retry_len - 1] ^= 1;
     assert(sendto(backend, retry, retry_len, 0, (struct sockaddr *)&router_addr,
                   router_addr_len) == (ssize_t)retry_len);
     sni_router_on_fd_readable(router, ctx.registered_fd, ctx.registered_ctx);
     assert(ctx.sent_client == 1);
 
-    memcpy(packet + 6, retry_scid, sizeof(retry_scid));
+    memcpy(packet + 6, retry_scid, retry_scid_len);
     sni_route_result_t routed =
         sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
                            sizeof(peer), accept_packet, &ctx);
@@ -563,8 +501,7 @@ test_retry_dcid_routing(const char *initial_hex, uint32_t version, int forge_tag
         sni_router_cleanup(router, UINT64_MAX);
         assert(ctx.unregistered == 1);
         assert(sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
-                                  sizeof(peer), accept_packet,
-                                  &ctx) == SNI_ROUTE_ACCEPT);
+                                  sizeof(peer), accept_packet, &ctx) == SNI_ROUTE_ACCEPT);
         assert(ctx.accepted == 1);
     }
 
@@ -575,9 +512,14 @@ test_retry_dcid_routing(const char *initial_hex, uint32_t version, int forge_tag
 static void
 test_retry_routing(void)
 {
-    test_retry_dcid_routing(RFC9001_CLIENT_INITIAL, 0x00000001u, 0);
-    test_retry_dcid_routing(RFC9369_CLIENT_INITIAL, 0x6b3343cfu, 0);
-    test_retry_dcid_routing(RFC9001_CLIENT_INITIAL, 0x00000001u, 1);
+    static const char rfc9001_retry[] =
+        "ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba";
+    static const char rfc9369_retry[] =
+        "cf6b3343cf0008f067a5502a4262b5746f6b656ec8646ce8bfe33952d955543665dcc7b6";
+
+    test_retry_dcid_routing(RFC9001_CLIENT_INITIAL, rfc9001_retry, 0);
+    test_retry_dcid_routing(RFC9369_CLIENT_INITIAL, rfc9369_retry, 0);
+    test_retry_dcid_routing(RFC9001_CLIENT_INITIAL, rfc9001_retry, 1);
 }
 
 static void
