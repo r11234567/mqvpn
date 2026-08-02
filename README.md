@@ -37,6 +37,7 @@ mqvpn is an open-source VPN that combines multiple internet connections—such a
 - [Schedulers](#schedulers)
 - [Reorder buffer (datagram lane)](#reorder-buffer-datagram-lane)
 - [Hybrid mode (TCP lane)](#hybrid-mode-tcp-lane)
+- [Server fallback proxy](#server-fallback-proxy)
 - [systemd](#systemd)
 - [Control API](#control-api)
 - [Benchmarks](#benchmarks)
@@ -86,6 +87,7 @@ mqvpn is an open-source VPN that combines multiple internet connections—such a
 - **Multi-Platform** — Available on Linux (server/client), Windows (client only), macOS (client only) and Android (client only) support.
 - **PSK auth** — Pre-shared key over TLS 1.3.
 - **Verified server identity** — Clients verify the server certificate chain and hostname by default; `--insecure` is an explicit testing-only bypass.
+- **Shared-port fallback proxy** — A Linux server can route unmatched QUIC SNI to another QUIC service and proxy ordinary matched HTTP/3 requests to an h2c backend.
 - **DNS override** — Prevents DNS leaks. Uses `resolvectl` on systemd-resolved systems, falls back to resolv.conf.
 
 
@@ -196,6 +198,17 @@ User = bob:bob-secret
 [Multipath]
 Scheduler = wlb
 # CC = bbr2                     # Congestion control (bbr2|bbr|cubic|none, default: bbr2)
+
+# Optional Linux-only shared-port routing. Keep disabled unless both backends
+# below are configured. See docs/server-fallback-proxy.md.
+[Proxy]
+Enabled = false
+# SNI = vpn.example.com,*.edge.example
+# QuicFallback = 127.0.0.1:4443
+# Http2Backend = 127.0.0.1:8080
+# Http2BackendTLS = false
+# MaxConnections = 64
+# IdleTimeoutSec = 60
 ```
 
 ```ini
@@ -239,7 +252,16 @@ Server example:
     ],
     "max_clients": 64,
     "scheduler": "wlb",
-    "cc": "bbr2"
+    "cc": "bbr2",
+    "proxy": {
+        "enabled": false,
+        "sni": "vpn.example.com,*.edge.example",
+        "quic_fallback": "127.0.0.1:4443",
+        "http2_backend": "127.0.0.1:8080",
+        "http2_backend_tls": false,
+        "max_connections": 64,
+        "idle_timeout_sec": 60
+    }
 }
 ```
 
@@ -363,6 +385,22 @@ Disabled by default; existing users see no behavior change. See
 [docs/control-api.md §9](docs/control-api.md#9-hybrid-mode-configuration-keys)
 for the full `[Hybrid]` config key reference and the `get_stats` counters
 this mode exposes.
+
+## Server fallback proxy
+
+On Linux, one mqvpn UDP listener can also front another QUIC service. The
+router reads SNI from QUIC v1/v2 Initial packets without terminating the
+fallback connection's TLS:
+
+- configured SNI names stay in mqvpn; CONNECT-IP and Hybrid TCP keep their
+  existing behavior, while ordinary HTTP/3 requests go to an h2c backend;
+- unmatched SNI names are forwarded as raw UDP datagrams to `QuicFallback`.
+
+The feature is disabled by default and requires both a UDP QUIC fallback and a
+prior-knowledge h2c backend. `Http2BackendTLS=true` is intentionally rejected.
+See [Server fallback proxy](docs/server-fallback-proxy.md) for the complete
+configuration, nginx example, routing rules, security properties, and current
+limitations.
 
 ## systemd
 

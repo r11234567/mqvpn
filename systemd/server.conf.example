@@ -23,6 +23,17 @@ MaxClients = 64
 Scheduler = wlb
 # CC = bbr2                     # Congestion control (bbr2|bbr|cubic|none)
 
+# [Proxy]
+# Optional Linux-only QUIC SNI routing and HTTP/3-to-h2c proxy. Disabled by
+# default. See the "Server fallback proxy" guide for backend requirements.
+# Enabled = false
+# SNI = vpn.example.com,*.edge.example
+# QuicFallback = 127.0.0.1:4443
+# Http2Backend = 127.0.0.1:8080
+# Http2BackendTLS = false
+# MaxConnections = 64
+# IdleTimeoutSec = 60
+
 # [Control]
 # Local-only TCP control/admin API (add/remove users, query stats).
 # Uncomment to enable. No authentication — bind 127.0.0.1 only unless you

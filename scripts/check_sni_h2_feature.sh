@@ -52,7 +52,7 @@ echo "  Include guards present"
 # Check 5: Documentation exists
 echo ""
 echo "✓ Checking documentation..."
-if [ ! -f "docs/SNI_ROUTING_H2_PROXY.md" ]; then
+if [ ! -f "docs/server-fallback-proxy.md" ]; then
     echo "✗ Documentation missing"
     exit 1
 fi
