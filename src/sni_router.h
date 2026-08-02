@@ -34,6 +34,7 @@ typedef int (*sni_router_accept_fn)(const uint8_t *pkt, size_t len,
                                     void *user_ctx);
 
 typedef struct {
+    sni_router_accept_fn accept_packet;
     void (*register_fd)(sni_socket_t fd, void *fd_ctx, void *user_ctx);
     void (*unregister_fd)(sni_socket_t fd, void *user_ctx);
     int (*send_client)(const uint8_t *pkt, size_t len, const struct sockaddr *peer,
@@ -60,8 +61,7 @@ void sni_router_destroy(sni_router_t *router);
  * buffered until enough CRYPTO data is available to parse ClientHello. */
 sni_route_result_t sni_router_process(sni_router_t *router, const uint8_t *pkt,
                                       size_t len, const struct sockaddr *peer,
-                                      socklen_t peer_len, sni_router_accept_fn accept_fn,
-                                      void *accept_ctx);
+                                      socklen_t peer_len);
 
 int sni_router_owns_fd(const sni_router_t *router, sni_socket_t fd, void *fd_ctx);
 void sni_router_on_fd_readable(sni_router_t *router, sni_socket_t fd, void *fd_ctx);

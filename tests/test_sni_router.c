@@ -280,6 +280,7 @@ create_router_at(const char *const *allowed, size_t allowed_count, test_ctx_t *c
     config.fallback_addrlen = sizeof(fallback);
 
     sni_router_callbacks_t callbacks = {
+        .accept_packet = accept_packet,
         .register_fd = register_fd,
         .unregister_fd = unregister_fd,
         .send_client = send_client,
@@ -358,8 +359,7 @@ test_sni_routing(void)
     sni_router_t *router = create_router(accepted_snis, 1, &accept_ctx);
     assert(router != NULL);
     assert(sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
-                              sizeof(peer), accept_packet,
-                              &accept_ctx) == SNI_ROUTE_ACCEPT);
+                              sizeof(peer)) == SNI_ROUTE_ACCEPT);
     assert(accept_ctx.accepted == 1);
     sni_router_destroy(router);
 
@@ -368,8 +368,7 @@ test_sni_routing(void)
     router = create_router(fallback_snis, 1, &fallback_ctx);
     assert(router != NULL);
     assert(sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
-                              sizeof(peer), accept_packet,
-                              &fallback_ctx) == SNI_ROUTE_FALLBACK);
+                              sizeof(peer)) == SNI_ROUTE_FALLBACK);
     assert(fallback_ctx.accepted == 0);
     assert(fallback_ctx.registered == 1);
     assert(sni_router_owns_fd(router, 123, &fallback_ctx) == 0);
@@ -389,7 +388,7 @@ test_fail_open_delivers_once(void)
     sni_router_t *router = create_router(allowed, 1, &ctx);
     assert(router != NULL);
     assert(sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
-                              sizeof(peer), accept_packet, &ctx) == SNI_ROUTE_ACCEPT);
+                              sizeof(peer)) == SNI_ROUTE_ACCEPT);
     assert(ctx.accepted == 1);
     sni_router_destroy(router);
 }
@@ -417,7 +416,7 @@ test_fallback_bidirectional(void)
     sni_router_t *router = create_router_at(allowed, 1, &ctx, backend_addr.sin_port);
     assert(router != NULL);
     assert(sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
-                              sizeof(peer), accept_packet, &ctx) == SNI_ROUTE_FALLBACK);
+                              sizeof(peer)) == SNI_ROUTE_FALLBACK);
 
     uint8_t received[1200];
     struct sockaddr_storage router_addr;
@@ -494,7 +493,7 @@ test_server_initial_cid_routing(void)
     sni_router_t *router = create_router_at(allowed, 1, &ctx, backend_addr.sin_port);
     assert(router != NULL);
     assert(sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
-                              sizeof(peer), accept_packet, &ctx) == SNI_ROUTE_FALLBACK);
+                              sizeof(peer)) == SNI_ROUTE_FALLBACK);
 
     struct sockaddr_storage router_addr;
     socklen_t router_addr_len = sizeof(router_addr);
@@ -510,7 +509,7 @@ test_server_initial_cid_routing(void)
     size_t next_len = build_client_initial_with_dcid(packet, sizeof(packet), server_scid,
                                                      sizeof(server_scid));
     assert(sni_router_process(router, packet, next_len, (struct sockaddr *)&peer,
-                              sizeof(peer), accept_packet, &ctx) == SNI_ROUTE_FALLBACK);
+                              sizeof(peer)) == SNI_ROUTE_FALLBACK);
     received_len = recvfrom(backend, received, sizeof(received), 0,
                             (struct sockaddr *)&router_addr, &router_addr_len);
     assert(received_len == (ssize_t)next_len);
@@ -544,7 +543,7 @@ test_retry_dcid_routing(const char *initial_hex, const char *retry_hex, int forg
     sni_router_t *router = create_router_at(allowed, 1, &ctx, backend_addr.sin_port);
     assert(router != NULL);
     assert(sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
-                              sizeof(peer), accept_packet, &ctx) == SNI_ROUTE_FALLBACK);
+                              sizeof(peer)) == SNI_ROUTE_FALLBACK);
 
     uint8_t received[1200];
     struct sockaddr_storage router_addr;
@@ -566,9 +565,8 @@ test_retry_dcid_routing(const char *initial_hex, const char *retry_hex, int forg
     assert(ctx.sent_client == 1);
 
     memcpy(packet + 6, retry_scid, retry_scid_len);
-    sni_route_result_t routed =
-        sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
-                           sizeof(peer), accept_packet, &ctx);
+    sni_route_result_t routed = sni_router_process(
+        router, packet, packet_len, (struct sockaddr *)&peer, sizeof(peer));
     if (forge_tag) {
         assert(routed == SNI_ROUTE_ACCEPT);
         assert(ctx.accepted == 1);
@@ -583,7 +581,7 @@ test_retry_dcid_routing(const char *initial_hex, const char *retry_hex, int forg
         sni_router_cleanup(router, UINT64_MAX);
         assert(ctx.unregistered == 1);
         assert(sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
-                                  sizeof(peer), accept_packet, &ctx) == SNI_ROUTE_ACCEPT);
+                                  sizeof(peer)) == SNI_ROUTE_ACCEPT);
         assert(ctx.accepted == 1);
     }
 
@@ -630,10 +628,10 @@ test_fragmented_client_hello_out_of_order(void)
     sni_router_t *router = create_router(allowed, 1, &ctx);
     assert(router != NULL);
     assert(sni_router_process(router, later, later_len, (struct sockaddr *)&peer,
-                              sizeof(peer), accept_packet, &ctx) == SNI_ROUTE_PENDING);
+                              sizeof(peer)) == SNI_ROUTE_PENDING);
     assert(ctx.accepted == 0);
     assert(sni_router_process(router, earlier, earlier_len, (struct sockaddr *)&peer,
-                              sizeof(peer), accept_packet, &ctx) == SNI_ROUTE_ACCEPT);
+                              sizeof(peer)) == SNI_ROUTE_ACCEPT);
     assert(ctx.accepted == 2);
     sni_router_destroy(router);
 }
@@ -655,7 +653,7 @@ test_pending_timeout_fails_open(void)
     sni_router_t *router = create_router(allowed, 1, &ctx);
     assert(router != NULL);
     assert(sni_router_process(router, fragment, fragment_len, (struct sockaddr *)&peer,
-                              sizeof(peer), accept_packet, &ctx) == SNI_ROUTE_PENDING);
+                              sizeof(peer)) == SNI_ROUTE_PENDING);
     assert(ctx.accepted == 0);
     sni_router_cleanup(router, UINT64_MAX);
     assert(ctx.accepted == 1);

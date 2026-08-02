@@ -492,6 +492,7 @@ svr_sni_router_init(mqvpn_server_t *s)
     config.max_tracked_conns = s->config.proxy_max_connections;
     config.conn_timeout_sec = s->config.proxy_idle_timeout_sec;
     sni_router_callbacks_t callbacks = {
+        .accept_packet = svr_sni_accept,
         .register_fd = svr_sni_register_fd,
         .unregister_fd = svr_sni_unregister_fd,
         .send_client = svr_sni_send_client,
@@ -2371,8 +2372,8 @@ mqvpn_server_on_socket_recv(mqvpn_server_t *s, const uint8_t *pkt, size_t len,
 
 #ifndef _WIN32
     if (s->sni_router) {
-        sni_route_result_t route = sni_router_process(s->sni_router, pkt, len, peer,
-                                                      peer_len, svr_sni_accept, s);
+        sni_route_result_t route =
+            sni_router_process(s->sni_router, pkt, len, peer, peer_len);
         return route == SNI_ROUTE_ERROR ? MQVPN_ERR_ENGINE : MQVPN_OK;
     }
 #endif

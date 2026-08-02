@@ -86,8 +86,6 @@ typedef struct sni_connection_state_s {
     pending_packet_t *pending_head;
     pending_packet_t *pending_tail;
     uint32_t pending_count;
-    sni_router_accept_fn accept_fn;
-    void *accept_ctx;
 
     sni_socket_t fallback_fd;
     struct sni_connection_state_s *next;
@@ -121,8 +119,7 @@ typedef struct {
     size_t scid_len;
 } retry_header_t;
 
-static int deliver_pending(sni_router_t *router, sni_connection_state_t *conn,
-                           sni_router_accept_fn accept_fn, void *accept_ctx);
+static int deliver_pending(sni_router_t *router, sni_connection_state_t *conn);
 
 static uint64_t
 wall_time_sec(void)
@@ -859,9 +856,9 @@ evict_oldest(sni_router_t *router)
         for (sni_connection_state_t *c = router->conn_table[i]; c; c = c->next)
             if (!oldest || c->last_seen < oldest->last_seen) oldest = c;
     if (oldest) {
-        if (oldest->decision == SNI_ROUTE_PENDING && oldest->accept_fn) {
+        if (oldest->decision == SNI_ROUTE_PENDING) {
             oldest->decision = SNI_ROUTE_ACCEPT;
-            (void)deliver_pending(router, oldest, oldest->accept_fn, oldest->accept_ctx);
+            (void)deliver_pending(router, oldest);
         }
         connection_remove(router, oldest);
     }
@@ -892,14 +889,14 @@ connection_create(sni_router_t *router, const struct sockaddr *peer, socklen_t p
 }
 
 static int
-deliver_pending(sni_router_t *router, sni_connection_state_t *conn,
-                sni_router_accept_fn accept_fn, void *accept_ctx)
+deliver_pending(sni_router_t *router, sni_connection_state_t *conn)
 {
     int result = 0;
     for (pending_packet_t *p = conn->pending_head; p; p = p->next) {
         int rc = conn->decision == SNI_ROUTE_ACCEPT
-                     ? accept_fn(p->data, p->len, (struct sockaddr *)&conn->peer_addr,
-                                 conn->peer_addrlen, accept_ctx)
+                     ? router->callbacks.accept_packet(
+                           p->data, p->len, (struct sockaddr *)&conn->peer_addr,
+                           conn->peer_addrlen, router->callbacks.user_ctx)
                      : fallback_send(router, conn, p->data, p->len);
         if (rc != 0) result = -1;
     }
@@ -916,12 +913,13 @@ deliver_pending(sni_router_t *router, sni_connection_state_t *conn,
 static sni_route_result_t
 accept_pending_and_current(sni_router_t *router, sni_connection_state_t *conn,
                            const uint8_t *pkt, size_t len, const struct sockaddr *peer,
-                           socklen_t peer_len, int current_is_pending,
-                           sni_router_accept_fn accept_fn, void *accept_ctx)
+                           socklen_t peer_len, int current_is_pending)
 {
     conn->decision = SNI_ROUTE_ACCEPT;
-    int result = deliver_pending(router, conn, accept_fn, accept_ctx);
-    if (!current_is_pending && accept_fn(pkt, len, peer, peer_len, accept_ctx) != 0)
+    int result = deliver_pending(router, conn);
+    if (!current_is_pending &&
+        router->callbacks.accept_packet(pkt, len, peer, peer_len,
+                                        router->callbacks.user_ctx) != 0)
         result = -1;
     return result == 0 ? SNI_ROUTE_ACCEPT : SNI_ROUTE_ERROR;
 }
@@ -932,7 +930,7 @@ sni_router_create(const sni_router_config_t *config,
 {
     if (!config || !callbacks || !config->allowed_snis || config->n_allowed_snis == 0 ||
         !addr_len_valid(config->fallback_addr.ss_family, config->fallback_addrlen) ||
-        !callbacks->send_client) {
+        !callbacks->accept_packet || !callbacks->send_client) {
         return NULL;
     }
     sni_router_t *router = calloc(1, sizeof(*router));
@@ -1027,11 +1025,9 @@ connection_matches_server_scid(const sni_connection_state_t *conn,
 
 sni_route_result_t
 sni_router_process(sni_router_t *router, const uint8_t *pkt, size_t len,
-                   const struct sockaddr *peer, socklen_t peer_len,
-                   sni_router_accept_fn accept_fn, void *accept_ctx)
+                   const struct sockaddr *peer, socklen_t peer_len)
 {
-    if (!router || !pkt || !len || !peer || !accept_fn ||
-        !addr_len_valid(peer->sa_family, peer_len) ||
+    if (!router || !pkt || !len || !peer || !addr_len_valid(peer->sa_family, peer_len) ||
         peer_len > (socklen_t)sizeof(struct sockaddr_storage))
         return SNI_ROUTE_ERROR;
 
@@ -1045,15 +1041,17 @@ sni_router_process(sni_router_t *router, const uint8_t *pkt, size_t len,
          memcmp(conn->initial_dcid, h.dcid, h.dcid_len) != 0)) {
         if (conn->decision == SNI_ROUTE_PENDING) {
             conn->decision = SNI_ROUTE_ACCEPT;
-            (void)deliver_pending(router, conn, accept_fn, accept_ctx);
+            (void)deliver_pending(router, conn);
         }
         connection_remove(router, conn);
         conn = NULL;
     }
     if (conn && conn->decision == SNI_ROUTE_ACCEPT) {
         conn->last_seen = wall_time_sec();
-        return accept_fn(pkt, len, peer, peer_len, accept_ctx) == 0 ? SNI_ROUTE_ACCEPT
-                                                                    : SNI_ROUTE_ERROR;
+        return router->callbacks.accept_packet(pkt, len, peer, peer_len,
+                                               router->callbacks.user_ctx) == 0
+                   ? SNI_ROUTE_ACCEPT
+                   : SNI_ROUTE_ERROR;
     }
     if (conn && conn->decision == SNI_ROUTE_FALLBACK) {
         conn->last_seen = wall_time_sec();
@@ -1063,27 +1061,24 @@ sni_router_process(sni_router_t *router, const uint8_t *pkt, size_t len,
 
     if (parsed != 0) {
         if (conn)
-            return accept_pending_and_current(router, conn, pkt, len, peer, peer_len, 0,
-                                              accept_fn, accept_ctx);
-        return accept_fn(pkt, len, peer, peer_len, accept_ctx) == 0 ? SNI_ROUTE_ACCEPT
-                                                                    : SNI_ROUTE_ERROR;
+            return accept_pending_and_current(router, conn, pkt, len, peer, peer_len, 0);
+        return router->callbacks.accept_packet(pkt, len, peer, peer_len,
+                                               router->callbacks.user_ctx) == 0
+                   ? SNI_ROUTE_ACCEPT
+                   : SNI_ROUTE_ERROR;
     }
     if (!conn) {
         conn = connection_create(router, peer, peer_len, &h);
         if (!conn) return SNI_ROUTE_ERROR;
     }
-    conn->accept_fn = accept_fn;
-    conn->accept_ctx = accept_ctx;
     conn->last_seen = wall_time_sec();
     if (pending_append(router, conn, pkt, len) != 0) {
-        return accept_pending_and_current(router, conn, pkt, len, peer, peer_len, 0,
-                                          accept_fn, accept_ctx);
+        return accept_pending_and_current(router, conn, pkt, len, peer, peer_len, 0);
     }
 
     uint8_t *plaintext = malloc(len);
     if (!plaintext)
-        return accept_pending_and_current(router, conn, pkt, len, peer, peer_len, 1,
-                                          accept_fn, accept_ctx);
+        return accept_pending_and_current(router, conn, pkt, len, peer, peer_len, 1);
     size_t plaintext_len = 0;
     uint64_t pn = 0;
     int decrypted = decrypt_initial_with_state(pkt, len, plaintext, len, &plaintext_len,
@@ -1092,8 +1087,7 @@ sni_router_process(sni_router_t *router, const uint8_t *pkt, size_t len,
     if (decrypted != 0 ||
         collect_crypto_frames(router, conn, plaintext, plaintext_len) != 0) {
         free(plaintext);
-        return accept_pending_and_current(router, conn, pkt, len, peer, peer_len, 1,
-                                          accept_fn, accept_ctx);
+        return accept_pending_and_current(router, conn, pkt, len, peer, peer_len, 1);
     }
     free(plaintext);
     if (!conn->have_largest_initial_pn || pn > conn->largest_initial_pn) {
@@ -1107,8 +1101,7 @@ sni_router_process(sni_router_t *router, const uint8_t *pkt, size_t len,
     conn->decision = hello > 0 && sni_router_match(router, sni) ? SNI_ROUTE_ACCEPT
                                                                 : SNI_ROUTE_FALLBACK;
     sni_route_result_t decision = conn->decision;
-    return deliver_pending(router, conn, accept_fn, accept_ctx) == 0 ? decision
-                                                                     : SNI_ROUTE_ERROR;
+    return deliver_pending(router, conn) == 0 ? decision : SNI_ROUTE_ERROR;
 }
 
 int
@@ -1188,9 +1181,9 @@ sni_router_cleanup(sni_router_t *router, uint64_t now_sec)
         while (*pp) {
             sni_connection_state_t *c = *pp;
             if (c->last_seen < cutoff) {
-                if (c->decision == SNI_ROUTE_PENDING && c->accept_fn) {
+                if (c->decision == SNI_ROUTE_PENDING) {
                     c->decision = SNI_ROUTE_ACCEPT;
-                    (void)deliver_pending(router, c, c->accept_fn, c->accept_ctx);
+                    (void)deliver_pending(router, c);
                 }
                 *pp = c->next;
                 router->conn_count--;
