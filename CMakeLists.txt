@@ -1003,13 +1003,22 @@ if(BUILD_TESTING)
     # Server API test (links libmqvpn + xquic)
     add_executable(test_server tests/test_server.c)
     target_link_libraries(test_server mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} dl m stdc++)
-    target_include_directories(test_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(test_server PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR})
     target_compile_definitions(test_server PRIVATE
         TEST_CERT_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.crt"
         TEST_KEY_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.key"
     )
     set_target_properties(test_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_server COMMAND test_server)
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test_linux_server_socket tests/test_linux_server_socket.c)
+        target_include_directories(test_linux_server_socket PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        set_target_properties(test_linux_server_socket PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+        add_test(NAME test_linux_server_socket COMMAND test_linux_server_socket)
+    endif()
 
     # Pre-accept type-confusion DoS regression: drives a raw xquic client with
     # a bogus ALPN at the server to prove an unauthenticated pre-handshake

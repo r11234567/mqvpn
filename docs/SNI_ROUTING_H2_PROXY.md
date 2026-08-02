@@ -116,6 +116,11 @@ fields 不会转发：
 `TE` 只有值为 `trailers` 时允许。request body 由有界 buffer 接收，nghttp2 在
 流量窗口允许时读取；H3 FIN 映射为 H2 END_STREAM。
 
+服务端对入站请求通告 QPACK dynamic table capacity 和 blocked streams 均为 0。
+RFC 9204 允许这两个值为 0，静态表和 literal 编码仍可使用。普通回落请求通常每个
+短连接只有一次，避免请求依赖独立 encoder stream 比动态表带来的少量 header 压缩
+更重要，也不会影响 CONNECT-IP 的数据面吞吐。
+
 ### 响应
 
 nghttp2 解码的 informational headers、final headers、DATA、trailers 和
@@ -168,6 +173,8 @@ CMake 在 Linux 找到 nghttp2 后定义 `MQVPN_H2_PROXY_ENABLED`。启用了 `[
 当前平台矩阵：
 
 - Linux：SNI、UDP fallback、H3/H2 和 reactor 集成全部启用。
+- Linux 使用 `[::]:PORT` 监听时创建一个 IPv4/IPv6 双栈 UDP socket；绑定具体
+  IPv6 地址时仍保持 IPv6-only，避免意外占用对应 IPv4 端口。
 - Windows：client-only 构建，不编译 POSIX server-side SNI/H2 模块。
 - macOS/iOS/Android：不启用该代理路径。
 
@@ -183,6 +190,7 @@ CMake 在 Linux 找到 nghttp2 后定义 `MQVPN_H2_PROXY_ENABLED`。启用了 `[
 - loopback 上真实 nghttp2 client/server，覆盖 request body、103、200、response
   body/FIN 以及 H3 提前关闭。
 - config INI/JSON parity、server、CONNECT-IP 和 Hybrid TCP egress regression。
+- Linux `[::]` wildcard socket 同时接收 IPv4-mapped 和原生 IPv6 datagram。
 - ASan/UBSan protocol jobs；Windows client 构建由全局 CI 覆盖。
 
 该 workflow 通过后，再运行全局 CI 和 gitleaks；随后才运行 release/build，创建

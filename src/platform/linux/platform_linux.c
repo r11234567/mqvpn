@@ -19,6 +19,7 @@
 #include "log.h"
 #include "mqvpn_internal.h" /* mqvpn_config_apply_reorder (INI reorder bridge) */
 #include "netlink_mon.h"
+#include "server_socket_policy.h"
 
 #include <stdio.h>
 #include <inttypes.h>
@@ -1011,8 +1012,6 @@ svr_create_udp_socket(const char *addr, int port, struct sockaddr_storage *out_a
 
     memset(out_addr, 0, sizeof(*out_addr));
     if (af == AF_INET6) {
-        int v6only = 1;
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
         struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)out_addr;
         sin6->sin6_family = AF_INET6;
         sin6->sin6_port = htons((uint16_t)port);
@@ -1020,6 +1019,12 @@ svr_create_udp_socket(const char *addr, int port, struct sockaddr_storage *out_a
             sin6->sin6_addr = addr6;
         else
             sin6->sin6_addr = in6addr_any;
+        int v6only = mqvpn_linux_server_ipv6_v6only(&sin6->sin6_addr);
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) != 0) {
+            LOG_ERR("setsockopt(IPV6_V6ONLY=%d): %s", v6only, strerror(errno));
+            close(fd);
+            return -1;
+        }
         *out_addrlen = sizeof(struct sockaddr_in6);
     } else {
         struct sockaddr_in *sin = (struct sockaddr_in *)out_addr;

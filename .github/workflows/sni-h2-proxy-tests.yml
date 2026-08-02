@@ -11,9 +11,13 @@ on:
       - 'src/main.c'
       - 'src/vpn_server.h'
       - 'src/platform/linux/platform_linux.c'
+      - 'src/platform/linux/server_socket_policy.h'
+      - 'src/server_h3_settings.h'
       - 'include/libmqvpn.h'
       - 'tests/test_sni_router.c'
       - 'tests/test_h2_proxy.c'
+      - 'tests/test_linux_server_socket.c'
+      - 'tests/test_server.c'
       - 'tests/test_config.c'
       - 'patches/xquic/**'
       - 'scripts/apply_xquic_patches.sh'
@@ -37,9 +41,11 @@ jobs:
             include/libmqvpn.h \
             src/config.c src/config.h src/h2_proxy.c src/h2_proxy.h src/main.c \
             src/mqvpn_config.c src/mqvpn_internal.h src/mqvpn_server.c \
-            src/platform/linux/platform_linux.c src/sni_router.c src/sni_router.h \
+            src/platform/linux/platform_linux.c \
+            src/platform/linux/server_socket_policy.h src/server_h3_settings.h \
+            src/sni_router.c src/sni_router.h \
             src/vpn_server.h tests/test_config.c tests/test_h2_proxy.c \
-            tests/test_sni_router.c
+            tests/test_linux_server_socket.c tests/test_sni_router.c
 
   protocol-regression:
     runs-on: ubuntu-latest
@@ -110,7 +116,7 @@ jobs:
       - name: RFC, proxy, config, and MASQUE regressions
         run: |
           ctest --test-dir build --output-on-failure \
-                -R '^(test_sni_router|test_h2_proxy|test_config|test_server|test_tcp_egress)$'
+                -R '^(test_sni_router|test_h2_proxy|test_config|test_server|test_linux_server_socket|test_tcp_egress)$'
 
       - name: Initial-path runtime ceiling
         run: timeout 5s ./build/tests/test_sni_router

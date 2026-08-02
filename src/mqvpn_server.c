@@ -12,6 +12,7 @@
 #include "mqvpn_scheduler.h"
 #include "mqvpn_sched_names.h"
 #include "mqvpn_server_internal.h"
+#include "server_h3_settings.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +73,24 @@
 #define PACKET_BUF_SIZE  65536
 #define MASQUE_FRAME_BUF (PACKET_BUF_SIZE + 16)
 #define MAX_CAPSULE_BUF  65536
+
+void
+mqvpn_server_init_h3_settings(xqc_h3_conn_settings_t *settings)
+{
+    memset(settings, 0, sizeof(*settings));
+    settings->max_field_section_size = 32 * 1024;
+    settings->qpack_enc_max_table_capacity = 16 * 1024;
+
+    /* RFC 9204 permits both values to be zero. CONNECT-IP sends one request
+     * per tunnel and ordinary proxy request headers are small, so dynamic
+     * request compression has little value and can block the request stream
+     * behind QPACK encoder instructions. Static-table and literal compression
+     * remain available. */
+    settings->qpack_dec_max_table_capacity = 0;
+    settings->qpack_blocked_streams = 0;
+    settings->enable_connect_protocol = 1;
+    settings->h3_datagram = 1;
+}
 
 /* ─── Forward declarations ─── */
 
@@ -2190,14 +2209,8 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
     };
     if (xqc_h3_ctx_init(s->engine, &h3_cbs) != XQC_OK) goto cleanup;
 
-    xqc_h3_conn_settings_t h3s = {
-        .max_field_section_size = 32 * 1024,
-        .qpack_blocked_streams = 64,
-        .qpack_enc_max_table_capacity = 16 * 1024,
-        .qpack_dec_max_table_capacity = 16 * 1024,
-        .enable_connect_protocol = 1,
-        .h3_datagram = 1,
-    };
+    xqc_h3_conn_settings_t h3s;
+    mqvpn_server_init_h3_settings(&h3s);
     xqc_h3_engine_set_local_settings(s->engine, &h3s);
 
 #ifndef _WIN32

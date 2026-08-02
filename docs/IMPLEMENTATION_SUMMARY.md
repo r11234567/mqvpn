@@ -132,6 +132,10 @@ nghttp2 依赖。
 - 默认 ClientHello 重组上限 64 KiB、pending Initial 上限 8 packet。
 - H2 每个流每方向 body buffer 上限 1 MiB，response field section 上限 32 KiB，
   response field 数上限 256。
+- 入站 H3 request 使用 QPACK 静态表/literal（dynamic table 和 blocked streams 为
+  0），避免短连接请求因 encoder stream 时序阻塞；这不改变 CONNECT-IP 数据面。
+- Linux `[::]` wildcard 使用单个双栈 UDP socket，同时服务 A/AAAA；具体 IPv6
+  地址监听仍为 IPv6-only。
 - 没有写入未经基准验证的固定微秒延迟数字。发布前以 Actions correctness gate 和
   部署后的实际 workload 验证为准。
 
