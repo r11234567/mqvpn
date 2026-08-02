@@ -206,6 +206,6 @@ missing intermediate, and malformed DER chain whenever the verifier is changed.
 ## Release policy for this fork
 
 Publish each release under a new immutable semantic version tag such as
-`v0.14.4`. Never move an existing tag, replace an older release, or reuse a
+`vX.Y.Z`. Never move an existing tag, replace an older release, or reuse a
 mutable `latest` tag. GitHub's "Latest" release marker may point to the newest
 immutable release without changing any previous tag or artifact.
