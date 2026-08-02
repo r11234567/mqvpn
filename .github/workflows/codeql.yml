@@ -63,7 +63,7 @@ jobs:
           make -j$(nproc) ssl crypto
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@v4.37.3
         with:
           languages: c-cpp
           queries: security-and-quality
@@ -103,6 +103,6 @@ jobs:
           make -j$(nproc)
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@v4.37.3
         with:
           category: "/language:c-cpp"
