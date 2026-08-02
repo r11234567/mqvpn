@@ -1015,6 +1015,16 @@ sni_router_match(const sni_router_t *router, const char *sni)
     return 0;
 }
 
+static int
+connection_matches_retry_initial(const sni_connection_state_t *conn,
+                                 const initial_header_t *header)
+{
+    if (conn->decision != SNI_ROUTE_FALLBACK || !conn->have_retry_scid) return 0;
+    if (conn->version != header->version) return 0;
+    if (conn->retry_scid_len != header->dcid_len) return 0;
+    return memcmp(conn->retry_scid, header->dcid, header->dcid_len) == 0;
+}
+
 sni_route_result_t
 sni_router_process(sni_router_t *router, const uint8_t *pkt, size_t len,
                    const struct sockaddr *peer, socklen_t peer_len,
@@ -1029,12 +1039,7 @@ sni_router_process(sni_router_t *router, const uint8_t *pkt, size_t len,
     initial_header_t h;
     int parsed = parse_initial_header(pkt, len, &h);
     int retry_initial = 0;
-    if (conn && parsed == 0) {
-        retry_initial = conn->decision == SNI_ROUTE_FALLBACK &&
-                        conn->have_retry_scid && conn->version == h.version &&
-                        conn->retry_scid_len == h.dcid_len &&
-                        memcmp(conn->retry_scid, h.dcid, h.dcid_len) == 0;
-    }
+    if (conn && parsed == 0) retry_initial = connection_matches_retry_initial(conn, &h);
     if (conn && parsed == 0 && !retry_initial &&
         (conn->initial_dcid_len != h.dcid_len ||
          memcmp(conn->initial_dcid, h.dcid, h.dcid_len) != 0)) {
