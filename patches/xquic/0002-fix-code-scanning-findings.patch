@@ -41,19 +41,6 @@ diff --git a/src/common/utils/var_buf/xqc_var_buf.c b/src/common/utils/var_buf/x
      buf->consumed_len = 0;
  
      return XQC_OK;
-diff --git a/src/http3/qpack/xqc_prefixed_str.c b/src/http3/qpack/xqc_prefixed_str.c
---- a/src/http3/qpack/xqc_prefixed_str.c
-+++ b/src/http3/qpack/xqc_prefixed_str.c
-@@ -31,6 +31,9 @@ xqc_prefixed_str_t *
- xqc_prefixed_str_pctx_create(size_t capacity)
- {
-     xqc_prefixed_str_t *pctx = xqc_malloc(sizeof(xqc_prefixed_str_t));
-+    if (pctx == NULL) {
-+        return NULL;
-+    }
-     memset(pctx, 0, sizeof(xqc_prefixed_str_t));
- 
-     pctx->value = xqc_var_buf_create(capacity);
 diff --git a/src/transport/fec_schemes/xqc_galois_calculation.c b/src/transport/fec_schemes/xqc_galois_calculation.c
 --- a/src/transport/fec_schemes/xqc_galois_calculation.c
 +++ b/src/transport/fec_schemes/xqc_galois_calculation.c

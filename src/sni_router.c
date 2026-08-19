@@ -24,6 +24,7 @@
 #  include <arpa/inet.h>
 #  include <errno.h>
 #  include <fcntl.h>
+#  include <sys/uio.h>
 #  include <unistd.h>
 #  define SNI_INVALID_SOCKET (-1)
 #endif
@@ -37,6 +38,12 @@
 #define QUIC_AEAD_TAG_LEN           16u
 #define QUIC_HP_SAMPLE_LEN          16u
 #define QUIC_RETRY_TAG_LEN          16u
+#define PP2_HEADER_LEN              16u
+#define PP2_INET_ADDR_LEN           12u
+#define PP2_INET6_ADDR_LEN          36u
+
+static const uint8_t PP2_SIGNATURE[12] = {0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d,
+                                          0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a};
 
 static const uint8_t QUIC_V1_INITIAL_SALT[20] = {0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34,
                                                  0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8,
@@ -86,6 +93,7 @@ typedef struct sni_connection_state_s {
     pending_packet_t *pending_head;
     pending_packet_t *pending_tail;
     uint32_t pending_count;
+    int fallback_proxy_sent;
 
     sni_socket_t fallback_fd;
     struct sni_connection_state_s *next;
@@ -799,6 +807,56 @@ fallback_send(sni_router_t *router, sni_connection_state_t *conn, const uint8_t 
 {
     if (conn->fallback_fd == SNI_INVALID_SOCKET && fallback_open(router, conn) != 0)
         return -1;
+    if (router->config.fallback_proxy_protocol && !conn->fallback_proxy_sent) {
+        uint8_t header[PP2_HEADER_LEN + PP2_INET6_ADDR_LEN];
+        size_t header_len = 0;
+        const struct sockaddr *src = (const struct sockaddr *)&conn->peer_addr;
+        const struct sockaddr *dst =
+            (const struct sockaddr *)&router->config.fallback_addr;
+        memcpy(header, PP2_SIGNATURE, sizeof(PP2_SIGNATURE));
+        header[12] = 0x21;
+        if (src->sa_family == AF_INET && dst->sa_family == AF_INET) {
+            const struct sockaddr_in *src4 = (const struct sockaddr_in *)src;
+            const struct sockaddr_in *dst4 = (const struct sockaddr_in *)dst;
+            header[13] = 0x12;
+            header[14] = 0;
+            header[15] = PP2_INET_ADDR_LEN;
+            memcpy(header + PP2_HEADER_LEN, &src4->sin_addr, 4);
+            memcpy(header + PP2_HEADER_LEN + 4, &dst4->sin_addr, 4);
+            memcpy(header + PP2_HEADER_LEN + 8, &src4->sin_port, 2);
+            memcpy(header + PP2_HEADER_LEN + 10, &dst4->sin_port, 2);
+            header_len = PP2_HEADER_LEN + PP2_INET_ADDR_LEN;
+        } else if (src->sa_family == AF_INET6 && dst->sa_family == AF_INET6) {
+            const struct sockaddr_in6 *src6 = (const struct sockaddr_in6 *)src;
+            const struct sockaddr_in6 *dst6 = (const struct sockaddr_in6 *)dst;
+            header[13] = 0x22;
+            header[14] = 0;
+            header[15] = PP2_INET6_ADDR_LEN;
+            memcpy(header + PP2_HEADER_LEN, &src6->sin6_addr, 16);
+            memcpy(header + PP2_HEADER_LEN + 16, &dst6->sin6_addr, 16);
+            memcpy(header + PP2_HEADER_LEN + 32, &src6->sin6_port, 2);
+            memcpy(header + PP2_HEADER_LEN + 34, &dst6->sin6_port, 2);
+            header_len = PP2_HEADER_LEN + PP2_INET6_ADDR_LEN;
+        } else {
+            return -1;
+        }
+#ifdef _WIN32
+        WSABUF bufs[2] = {{.buf = (CHAR *)header, .len = (ULONG)header_len},
+                          {.buf = (CHAR *)pkt, .len = (ULONG)len}};
+        DWORD sent = 0;
+        if (WSASend(conn->fallback_fd, bufs, 2, &sent, 0, NULL, NULL) != 0 ||
+            sent != header_len + len)
+            return -1;
+#else
+        struct iovec iov[2] = {{.iov_base = header, .iov_len = header_len},
+                               {.iov_base = (void *)pkt, .iov_len = len}};
+        struct msghdr msg = {.msg_iov = iov, .msg_iovlen = 2};
+        ssize_t n = sendmsg(conn->fallback_fd, &msg, 0);
+        if (n != (ssize_t)(header_len + len)) return -1;
+#endif
+        conn->fallback_proxy_sent = 1;
+        return 0;
+    }
 #ifdef _WIN32
     if (len > INT_MAX) return -1;
     int n = send(conn->fallback_fd, (const char *)pkt, (int)len, 0);

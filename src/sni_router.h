@@ -51,6 +51,7 @@ typedef struct {
     uint32_t conn_timeout_sec;
     uint32_t max_client_hello_bytes;
     uint32_t max_pending_packets;
+    int fallback_proxy_protocol;
 } sni_router_config_t;
 
 sni_router_t *sni_router_create(const sni_router_config_t *config,

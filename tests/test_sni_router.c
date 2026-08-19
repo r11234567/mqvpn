@@ -265,8 +265,9 @@ accept_packet(const uint8_t *pkt, size_t len, const struct sockaddr *peer,
 }
 
 static sni_router_t *
-create_router_at(const char *const *allowed, size_t allowed_count, test_ctx_t *ctx,
-                 uint16_t fallback_port)
+create_router_at_with_proxy(const char *const *allowed, size_t allowed_count,
+                            test_ctx_t *ctx, uint16_t fallback_port,
+                            int fallback_proxy_protocol)
 {
     struct sockaddr_in fallback = {0};
     fallback.sin_family = AF_INET;
@@ -278,6 +279,7 @@ create_router_at(const char *const *allowed, size_t allowed_count, test_ctx_t *c
     config.n_allowed_snis = allowed_count;
     memcpy(&config.fallback_addr, &fallback, sizeof(fallback));
     config.fallback_addrlen = sizeof(fallback);
+    config.fallback_proxy_protocol = fallback_proxy_protocol;
 
     sni_router_callbacks_t callbacks = {
         .accept_packet = accept_packet,
@@ -287,6 +289,13 @@ create_router_at(const char *const *allowed, size_t allowed_count, test_ctx_t *c
         .user_ctx = ctx,
     };
     return sni_router_create(&config, &callbacks);
+}
+
+static sni_router_t *
+create_router_at(const char *const *allowed, size_t allowed_count, test_ctx_t *ctx,
+                 uint16_t fallback_port)
+{
+    return create_router_at_with_proxy(allowed, allowed_count, ctx, fallback_port, 0);
 }
 
 static sni_router_t *
@@ -432,6 +441,55 @@ test_fallback_bidirectional(void)
     sni_router_on_fd_readable(router, ctx.registered_fd, ctx.registered_ctx);
     assert(ctx.sent_client == 1);
 
+    sni_router_destroy(router);
+    close(backend);
+}
+
+static void
+test_fallback_proxy_protocol_v2(void)
+{
+    int backend = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(backend >= 0);
+    struct sockaddr_in backend_addr = {0};
+    backend_addr.sin_family = AF_INET;
+    backend_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(backend, (struct sockaddr *)&backend_addr, sizeof(backend_addr)) == 0);
+    struct timeval timeout = {.tv_sec = 2};
+    assert(setsockopt(backend, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    socklen_t backend_addr_len = sizeof(backend_addr);
+    assert(getsockname(backend, (struct sockaddr *)&backend_addr, &backend_addr_len) ==
+           0);
+
+    uint8_t packet[1200];
+    size_t packet_len = decode_hex(RFC9001_CLIENT_INITIAL, packet, sizeof(packet));
+    struct sockaddr_in peer = test_peer();
+    const char *allowed[] = {"vpn.example.com"};
+    test_ctx_t ctx = {0};
+    sni_router_t *router =
+        create_router_at_with_proxy(allowed, 1, &ctx, backend_addr.sin_port, 1);
+    assert(router != NULL);
+    assert(sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
+                              sizeof(peer)) == SNI_ROUTE_FALLBACK);
+
+    uint8_t received[1400];
+    struct sockaddr_storage router_addr;
+    socklen_t router_addr_len = sizeof(router_addr);
+    ssize_t received_len = recvfrom(backend, received, sizeof(received), 0,
+                                    (struct sockaddr *)&router_addr, &router_addr_len);
+    static const uint8_t signature[] = {0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d,
+                                        0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a};
+    assert(received_len == (ssize_t)(28 + packet_len));
+    assert(memcmp(received, signature, sizeof(signature)) == 0);
+    assert(received[12] == 0x21 && received[13] == 0x12);
+    assert(received[14] == 0 && received[15] == 12);
+    assert(memcmp(received + 16, &peer.sin_addr, 4) == 0);
+    assert(memcmp(received + 28, packet, packet_len) == 0);
+
+    static const uint8_t reply[] = {1, 2, 3, 4};
+    assert(sendto(backend, reply, sizeof(reply), 0, (struct sockaddr *)&router_addr,
+                  router_addr_len) == (ssize_t)sizeof(reply));
+    sni_router_on_fd_readable(router, ctx.registered_fd, ctx.registered_ctx);
+    assert(ctx.sent_client == 1);
     sni_router_destroy(router);
     close(backend);
 }
@@ -685,6 +743,7 @@ main(void)
     test_sni_routing();
     test_fail_open_delivers_once();
     test_fallback_bidirectional();
+    test_fallback_proxy_protocol_v2();
     test_server_initial_cid_routing();
     test_retry_routing();
     test_fragmented_client_hello_out_of_order();

@@ -62,9 +62,6 @@ jobs:
                 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
           make -j$(nproc) ssl crypto
 
-      # Build xquic before CodeQL is initialized. It is an independently
-      # maintained submodule and its findings belong in that repository;
-      # mqvpn carries reviewed fixes through patches/xquic instead.
       - name: Cache xquic (Release)
         id: xquic-cache
         uses: actions/cache@v6
@@ -89,16 +86,19 @@ jobs:
                 -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
           make -j$(nproc)
 
+      # Initialize after the third-party dependency has been built. CodeQL
+      # then traces only the mqvpn build below; xquic is vendored code and
+      # its findings belong upstream, not in this repository's alert set.
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4.37.3
         with:
           languages: c-cpp
+          queries: security-and-quality
 
       - name: Build mqvpn (CodeQL traced)
         run: |
           mkdir -p build && cd build
           cmake -DCMAKE_BUILD_TYPE=Release \
-                -DBUILD_TESTING=OFF \
                 -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
           make -j$(nproc)
 

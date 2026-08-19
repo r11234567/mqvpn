@@ -129,9 +129,10 @@ server {
     }
 }
 
-# Raw QUIC destination for SNI names not claimed by mqvpn.
+# Raw QUIC destination for SNI names not claimed by mqvpn. mqvpn sends a
+# PROXY protocol v2 UDP header before the first fallback datagram.
 server {
-    listen 127.0.0.1:4443 quic reuseport;
+    listen 127.0.0.1:4443 quic reuseport proxy_protocol;
     server_name public.example.com;
 
     ssl_certificate     /etc/letsencrypt/live/public.example.com/fullchain.pem;
@@ -195,9 +196,10 @@ For fallback connections, mqvpn tracks a backend Retry or server Initial SCID
 so that the client's subsequent DCID change remains on the same connected UDP
 socket. Backend replies are returned through the public mqvpn listener.
 
-The fallback backend sees mqvpn as the UDP peer, not the original client
-address. Applications that require the original source address need a
-different forwarding design; PROXY protocol encapsulation is not used here.
+mqvpn sends a PROXY protocol v2 UDP header before the first datagram of every
+fallback session. Configure the fallback listener to accept PROXY protocol;
+Nginx and CrowdSec then receive the original client address instead of the
+mqvpn loopback address. Subsequent datagrams are unchanged QUIC packets.
 
 ## HTTP/3 to HTTP/2 translation
 

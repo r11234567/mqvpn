@@ -49,6 +49,8 @@ typedef struct mqvpn_server_cfg_s {
     int proxy_h2_backend_tls;
     uint32_t proxy_max_connections;
     uint32_t proxy_idle_timeout_sec;
+    int udp_gso; /* [Advanced] UdpGso; default 1 */
+    int udp_gro; /* [Advanced] UdpGro; default 1 */
 } mqvpn_server_cfg_t;
 
 #endif /* MQVPN_VPN_SERVER_H */

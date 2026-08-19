@@ -1,12 +1,13 @@
 name: Performance Tests
 
-# Security: manual trigger only.
-# Never runs on pushes or PRs — prevents untrusted code execution and avoids
-# indefinitely queued jobs when the optional self-hosted runner is offline.
+# Security: only push to main and manual trigger.
+# Never runs on PRs — prevents fork code execution on self-hosted runner.
 # Runner requires: cmake gcc make git libevent-dev golang iptables
 #                  iproute2 iperf3 python3 jq openssl
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
