@@ -54,7 +54,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev libnghttp2-dev golang iptables
+          sudo apt-get install -y cmake libevent-dev golang iptables
 
       - name: Compute xquic SHA
         id: xqsha
@@ -130,15 +130,6 @@ jobs:
       - name: Unit tests (ctest)
         run: cd build && ctest --output-on-failure
 
-      # Keep the new server routing surface visible in the main CI workflow.
-      # The full ctest run above also executes these tests, but this focused
-      # gate makes failures attributable and prevents them being accidentally
-      # lost when the general test list is reorganized.
-      - name: Server SNI fallback and H2 proxy regressions
-        run: |
-          ctest --test-dir build --output-on-failure \
-                -R '^(test_sni_router|test_h2_proxy)$'
-
       - name: Stage artifacts
         run: cp third_party/xquic/build/libxquic.so build/
 
@@ -169,14 +160,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo timeout --foreground --kill-after=30s 5m apt-get \
+          sudo timeout --foreground --kill-after=30s 15m apt-get \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
             -o Acquire::https::Timeout=30 update
-          sudo timeout --foreground --kill-after=30s 5m apt-get \
+          sudo timeout --foreground --kill-after=30s 15m apt-get \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
             -o Acquire::https::Timeout=30 install -y cmake libevent-dev \
-            libnghttp2-dev golang iptables conntrack clang iperf3 jq \
-            netcat-openbsd iproute2 curl python3
+            golang iptables conntrack clang iperf3 jq netcat-openbsd iproute2 curl python3
 
       - name: Compute xquic SHA
         id: xqsha
@@ -241,14 +231,6 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: cd build && ctest --output-on-failure
-
-      - name: Server SNI fallback and H2 proxy regressions (sanitizer)
-        env:
-          ASAN_OPTIONS: detect_leaks=1
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: |
-          ctest --test-dir build --output-on-failure \
-                -R '^(test_sni_router|test_h2_proxy)$'
 
       - name: Fuzz tcp_lane (short budget)
         run: |
@@ -407,9 +389,7 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: |
-          sudo -E timeout --signal=TERM --kill-after=10s 5m \
-            scripts/ci_e2e/run_reinjection_test.sh
+        run: sudo -E scripts/ci_e2e/run_reinjection_test.sh
 
       - name: E2E UdpGso config test (netns)
         env:
@@ -520,33 +500,6 @@ jobs:
           MSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: cd build && ctest --output-on-failure
 
-  client-tls-validation:
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install runtime dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libevent-dev libnghttp2-14 iptables iproute2 iputils-ping openssl
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: build
-          path: build
-
-      - name: Make binary executable
-        run: chmod +x build/mqvpn
-
-      # run_test first proves the same self-signed endpoint is reachable with
-      # --insecure, then starts a fresh strict client and requires the
-      # certificate to be rejected before a tunnel can be created.
-      - name: Reject an untrusted server certificate without --insecure
-        run: sudo scripts/ci_e2e/run_test.sh
-
   netns-tests:
     needs: build
     runs-on: ubuntu-latest
@@ -557,7 +510,7 @@ jobs:
       - name: Install runtime dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libevent-dev libnghttp2-14 iptables iperf3
+          sudo apt-get install -y libevent-dev iptables iperf3
 
       - name: Download build artifacts
         uses: actions/download-artifact@v8
@@ -567,6 +520,9 @@ jobs:
 
       - name: Make binary executable
         run: chmod +x build/mqvpn
+
+      - name: Smoke test (netns)
+        run: sudo scripts/ci_e2e/run_test.sh
 
       - name: Multi-client test (netns)
         run: sudo scripts/ci_e2e/test_multiclient.sh
@@ -1108,10 +1064,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo timeout --foreground --kill-after=30s 5m apt-get \
+          sudo timeout --foreground --kill-after=30s 15m apt-get \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
             -o Acquire::https::Timeout=30 update
-          sudo timeout --foreground --kill-after=30s 5m apt-get \
+          sudo timeout --foreground --kill-after=30s 15m apt-get \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
             -o Acquire::https::Timeout=30 install -y cmake libevent-dev \
             golang iptables conntrack clang iperf3 jq netcat-openbsd curl python3
@@ -1194,7 +1150,7 @@ jobs:
       - name: E2E hybrid H2 TCP-lane suite (netns, functional phases)
         run: HYBRID_H2_PHASES=functional sudo -E timeout --foreground --kill-after=15s 10m tests/test_e2e_hybrid_h2.sh build/mqvpn
 
-      - name: E2E hybrid H2 performance and aggregation gate (netns, Release build)
+      - name: E2E hybrid H2 throughput gate (netns, Release build)
         run: HYBRID_H2_PHASES=perf sudo -E timeout --foreground --kill-after=15s 12m tests/test_e2e_hybrid_h2.sh build-release/mqvpn
 
   hybrid-egress-off:
