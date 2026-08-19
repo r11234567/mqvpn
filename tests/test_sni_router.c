@@ -483,7 +483,7 @@ test_fallback_proxy_protocol_v2(void)
     assert(received[12] == 0x21 && received[13] == 0x12);
     assert(received[14] == 0 && received[15] == 12);
     assert(memcmp(received + 16, &peer.sin_addr, 4) == 0);
-    assert(memcmp(received + 24, packet, packet_len) == 0);
+    assert(memcmp(received + 28, packet, packet_len) == 0);
 
     static const uint8_t reply[] = {1, 2, 3, 4};
     assert(sendto(backend, reply, sizeof(reply), 0, (struct sockaddr *)&router_addr,
