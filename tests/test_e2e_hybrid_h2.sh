@@ -322,10 +322,11 @@ trap 'cleanup_bg_procs; cleanup_http_server; bench_cleanup; rm -rf "$HTTP_DOCROO
 fail=0
 
 # ─── Phase filter ─────────────────────────────────────────────────────────
-# "all" (default) runs everything; "perf" runs ONLY Test 2's throughput
-# comparison. CI uses both: a DEBUG build for the functional phases (asserts
-# must stay live — see the NDEBUG note in AGENTS.md) and a RELEASE build for
-# the throughput gate.
+# "all" (default) runs everything; "functional" runs the protocol and
+# lifecycle assertions; "perf" runs the throughput and multipath aggregation
+# measurements. CI uses a DEBUG build for the functional phases (asserts must
+# stay live — see the NDEBUG note in AGENTS.md) and a RELEASE build for the
+# performance phases.
 #
 # The split is not cosmetic. Test 2 gates the RATIO of two code paths, and RAW
 # barely touches this project's own code (classifier + datagram, then the
@@ -345,9 +346,9 @@ fail=0
 # phase treats it as a hard failure.
 HYBRID_H2_PHASES="${HYBRID_H2_PHASES:-all}"
 case "$HYBRID_H2_PHASES" in
-    all | perf) ;;
+    all | functional | perf) ;;
     *)
-        echo "error: HYBRID_H2_PHASES must be 'all' or 'perf' (got '$HYBRID_H2_PHASES')" >&2
+        echo "error: HYBRID_H2_PHASES must be 'all', 'functional', or 'perf' (got '$HYBRID_H2_PHASES')" >&2
         exit 2
         ;;
 esac
@@ -791,7 +792,7 @@ time.sleep(${hold})
 # re-indented: it contains python/awk heredocs whose bodies are
 # indentation-sensitive, so re-indenting ~800 lines would risk changing what
 # those scripts do while burying the actual change. The closing `fi` is marked.
-if [ "$HYBRID_H2_PHASES" = all ]; then
+if [ "$HYBRID_H2_PHASES" != perf ]; then
 
 # ─── Test 1: curl body correctness, Enabled=true / Tcp=stream ─────────────
 echo ""
@@ -1027,9 +1028,12 @@ bench_stop_vpn
 
 fi # ← end of functional phases, part 1 (opened before Test 1)
 
+# ─── Performance phases: Tests 2 and 3 ────────────────────────────────────
+# Skipped by the DEBUG functional CI arm. "all" retains its historical
+# diagnostic behavior; "perf" is the RELEASE hard gate.
+if [ "$HYBRID_H2_PHASES" != functional ]; then
+
 # ─── Test 2: single-path throughput, stream lane within 20% of RAW ───────
-# Runs in BOTH phase modes: as diagnostics under "all" (Debug), as the hard
-# gate under "perf" (Release). See the HYBRID_H2_PHASES block near the top.
 echo ""
 echo "=== Test 2: single-path throughput (stream lane vs RAW) ==="
 IPERF_DURATION_T2=6
@@ -1073,10 +1077,6 @@ else
     echo "FAIL: RAW_MBPS=0 — iperf3 RAW baseline measurement failed, cannot compute degradation"
     fail=1
 fi
-
-# ─── Functional phases, part 2 of 2 (Tests 3-6, 8) ────────────────────────
-# Same guard and same non-re-indentation rationale as part 1.
-if [ "$HYBRID_H2_PHASES" = all ]; then
 
 # ─── Test 3: multipath aggregation, stream lane >= 1.5x best single path ──
 echo ""
@@ -1217,6 +1217,12 @@ else
     echo "FAIL: BEST_SINGLE_MBPS=0 — baseline iperf3 measurement failed, cannot compute ratio"
     fail=1
 fi
+
+fi # ← end of performance phases (opened before Test 2)
+
+# ─── Functional phases, part 2 of 2 (Tests 4-6, 8) ─────────────────────────
+# Same guard and same non-re-indentation rationale as part 1.
+if [ "$HYBRID_H2_PHASES" != perf ]; then
 
 # ─── Test 4/5 setup: rebuild single-path topology ─────────────────────────
 # Tests 4 and 5 prove close-mapping correctness, not scheduling — same
@@ -1842,7 +1848,7 @@ V6_SOURCE_PID=""; V6_SINK_PID=""
 
 bench_stop_vpn
 
-fi # ← end of functional phases, part 2 (opened before Test 3)
+fi # ← end of functional phases, part 2 (opened before Test 4)
 
 # ─── Verdict ───────────────────────────────────────────────────────────────
 echo ""
