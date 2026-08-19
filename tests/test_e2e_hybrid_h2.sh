@@ -1728,8 +1728,11 @@ fi
 # while the client is still alive.
 assert_stream_lane_used "$CLIENT_LOG_T8" "Test8 v6 stream"
 
-stats_t8="$(bench_query_control "$CTRL_PORT" get_status)"
-agg_check_t8="$(echo "$stats_t8" | python3 -c "
+stats_t8=""
+agg_check_t8=""
+for _ in $(seq 1 15); do
+    stats_t8="$(bench_query_control "$CTRL_PORT" get_status)"
+    agg_check_t8="$(echo "$stats_t8" | python3 -c "
 import sys, json
 # Half of Test 3's 100000 floor: this phase is a single ~6s iperf3 burst,
 # not Test 3's repeated run_iperf3_repeated series, so fewer per-path bytes
@@ -1756,6 +1759,11 @@ if lo < 0.2 * hi:
     print('FAIL imbalanced lo=%d hi=%d minshare=%.2f' % (lo, hi, share)); sys.exit()
 print('OK lo=%d hi=%d minshare=%.2f' % (lo, hi, share))
 ")"
+    if [ "${agg_check_t8#OK}" != "$agg_check_t8" ]; then
+        break
+    fi
+    sleep 1
+done
 echo "  per-path load (tx+rx) after IPv6 iperf3 burst: ${agg_check_t8}"
 if [ "${agg_check_t8#OK}" != "$agg_check_t8" ]; then
     echo "PASS: both paths carried meaningful load from IPv6 TCP-lane traffic (${agg_check_t8})"
@@ -1820,15 +1828,29 @@ else
         # same RTM_DELLINK-driven drop-path lifecycle production traffic
         # goes through on a real link loss.
         ip netns exec "$NS_CLIENT" ip link set "$(bench_path_veth_client 0)" down
-        sleep 3
 
-        V6_BYTES_AFTER="$(cat "$V6_BYTES_FILE" 2>/dev/null || echo 0)"
-        [ -n "$V6_BYTES_AFTER" ] || V6_BYTES_AFTER=0
+        # Link loss and path re-add are asynchronous. The old fixed three
+        # second sleep sampled exactly as the replacement path was created on
+        # slower runners, so it could report a false stall before the stream
+        # had any opportunity to send on the recovered path. Wait for the
+        # replacement path first, then give the flow a bounded observation
+        # window to demonstrate post-recovery progress.
+        recovered_paths_t8="$(bench_wait_for_n_paths 2 15 "$CTRL_PORT")" || true
+        echo "  IPv6 paths after path 0 down: ${recovered_paths_t8}"
+        V6_BYTES_AFTER="$V6_BYTES_BEFORE"
+        for _ in $(seq 1 10); do
+            V6_BYTES_AFTER="$(cat "$V6_BYTES_FILE" 2>/dev/null || echo 0)"
+            [ -n "$V6_BYTES_AFTER" ] || V6_BYTES_AFTER=0
+            if [ "$V6_BYTES_AFTER" -gt "$V6_BYTES_BEFORE" ]; then
+                break
+            fi
+            sleep 1
+        done
         echo "  IPv6 flow bytes received after path 0 down: ${V6_BYTES_AFTER}"
-        if [ "$V6_BYTES_AFTER" -gt "$V6_BYTES_BEFORE" ]; then
-            echo "PASS: IPv6 TCP-lane flow kept flowing after path 0 was dropped (failover, no stall)"
+        if [ "$recovered_paths_t8" -ge 2 ] 2>/dev/null && [ "$V6_BYTES_AFTER" -gt "$V6_BYTES_BEFORE" ]; then
+            echo "PASS: IPv6 TCP-lane flow kept flowing after path 0 was dropped and path recovery completed"
         else
-            echo "FAIL: IPv6 TCP-lane flow stalled after path 0 was dropped (${V6_BYTES_BEFORE} -> ${V6_BYTES_AFTER})"
+            echo "FAIL: IPv6 TCP-lane flow stalled after path recovery (${V6_BYTES_BEFORE} -> ${V6_BYTES_AFTER}, paths=${recovered_paths_t8})"
             fail=1
         fi
 

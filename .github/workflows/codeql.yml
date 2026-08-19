@@ -62,15 +62,6 @@ jobs:
                 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
           make -j$(nproc) ssl crypto
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4.37.3
-        with:
-          languages: c-cpp
-          queries: security-and-quality
-
-      # xquic is third-party; we don't analyze it. Skipping the traced
-      # build on cache hit is fine — only the mqvpn build below needs to
-      # be CodeQL-traced for analysis.
       - name: Cache xquic (Release)
         id: xquic-cache
         uses: actions/cache@v6
@@ -83,7 +74,7 @@ jobs:
           # v4: bumped with the BoringSSL cache — libxquic.so absorbs it.
           key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v4
 
-      - name: Build xquic (CodeQL traced)
+      - name: Build xquic dependency
         if: steps.xquic-cache.outputs.cache-hit != 'true'
         run: |
           cd third_party/xquic
@@ -94,6 +85,15 @@ jobs:
                 -DXQC_ENABLE_XOR=ON \
                 -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
           make -j$(nproc)
+
+      # Initialize after the third-party dependency has been built. CodeQL
+      # then traces only the mqvpn build below; xquic is vendored code and
+      # its findings belong upstream, not in this repository's alert set.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4.37.3
+        with:
+          languages: c-cpp
+          queries: security-and-quality
 
       - name: Build mqvpn (CodeQL traced)
         run: |
