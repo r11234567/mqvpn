@@ -405,6 +405,12 @@ jobs:
           sudo -E timeout --signal=TERM --kill-after=10s 5m \
             scripts/ci_e2e/run_reinjection_test.sh
 
+      - name: E2E UdpGso config test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_udp_gso_config_test.sh
+
   msan:
     runs-on: ubuntu-latest
     timeout-minutes: 30

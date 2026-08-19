@@ -566,6 +566,10 @@ main(int argc, char *argv[])
             .hybrid = file_cfg.hybrid,
             /* [Advanced]; 0 = off. Client-only (server path never reads it). */
             .recv_rate_limit = file_cfg.recv_rate_limit,
+            /* [Advanced] UdpGso; default 1. Applies to client and server. */
+            .udp_gso = file_cfg.udp_gso,
+            /* [Advanced] UdpGro; default 1. Applies to client and server. */
+            .udp_gro = file_cfg.udp_gro,
         };
         for (int i = 0; i < n_paths; i++) {
             cfg.path_ifaces[i] = path_ifaces[i];
@@ -630,6 +634,10 @@ main(int argc, char *argv[])
             .proxy_h2_backend_tls = file_cfg.proxy_h2_backend_tls,
             .proxy_max_connections = file_cfg.proxy_max_connections,
             .proxy_idle_timeout_sec = file_cfg.proxy_idle_timeout_sec,
+            /* [Advanced] UdpGso; default 1. Applies to client and server. */
+            .udp_gso = file_cfg.udp_gso,
+            /* [Advanced] UdpGro; default 1. Applies to client and server. */
+            .udp_gro = file_cfg.udp_gro,
         };
         for (int i = 0; i < eff_n_users; i++) {
             cfg.user_names[i] = eff_user_names[i];

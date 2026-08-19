@@ -19,11 +19,16 @@
 
 mqvpn is an open-source VPN that combines multiple internet connections—such as Wi-Fi, cellular, Starlink, and multiple ISPs—for bandwidth aggregation and seamless failover.
 
+Example: an 8 Mbps SRT live stream over two 6 Mbit uplinks — a single connection (left) vs the same two connections bonded by mqvpn (right):
+
+https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
+
 ## Table of Contents
 
 <!--toc:start-->
 - [Supported Platforms](#supported-platforms)
 - [Features](#features)
+- [Key Use Cases](#key-use-cases)
 - [Installation](#installation)
   - [Server](#server)
   - [Client (deb package)](#client-deb-package)
@@ -91,6 +96,14 @@ mqvpn is an open-source VPN that combines multiple internet connections—such a
 - **Shared-port fallback proxy** — A Linux server can route unmatched QUIC SNI to another QUIC service and proxy ordinary matched HTTP/3 requests to an h2c backend.
 - **DNS override** — Prevents DNS leaks. Uses `resolvectl` on systemd-resolved systems, falls back to resolv.conf.
 
+
+## Key Use Cases
+
+**Stream bonding** — live feeds (SRT, RTMP) where a single connection does not provide sufficient bandwidth. The video at the top of this page shows an 8 Mbps SRT stream carried over two 6 Mbit uplinks; details in [Benchmarks](#benchmarks).
+
+**Boosting general-purpose transfer** — not just video: bonding speeds up everyday traffic too. UDP and any other traffic is aggregated across paths over the datagram lane, and with [hybrid mode](#hybrid-mode-tcp-lane) TCP is aggregated as well — even a single TCP connection can use multiple paths at once. Details in [Benchmarks](#benchmarks).
+
+**Staying connected on unreliable links** — when one connection drops or degrades (moving vehicles, congested Wi-Fi, cellular dead spots), traffic continues over the remaining paths without interrupting sessions.
 
 ## Installation
 
@@ -577,6 +590,18 @@ Charts: [MinRTT](bench_results/hybrid_mode/hybrid_mode_minrtt_1783350878.png) ·
 | gain | **+26 %** | +29 % | +13 % | +12 % | +7 % |
 
 Charts: [MinRTT](bench_results/hybrid_mode/hybrid_mode_asym_minrtt_1785306660.png) · [WLB](bench_results/hybrid_mode/hybrid_mode_asym_wlb_1785306660.png) — data: [`bench_results/hybrid_mode/`](bench_results/hybrid_mode/)
+
+### SRT live streaming
+
+SRT contribution feeds over mqvpn, netns-emulated impaired links, mqvpn defaults (WLB, BBRv2) + SRT `lossmaxttl=32`. The starved-uplinks comparison video is shown at the top of this page; per-scenario results:
+
+| Scenario | Direct (single link) | mqvpn (2-path) |
+|---|---|---|
+| Starved uplinks (8 Mbps FHD over 2 × 6 Mbit) | VMAF 8.6, 1.2 s frozen | VMAF **87.7**, 0 s frozen |
+| Exceeds any single link (120 Mbps over 2 × 100 Mbit) | 31.5 % stream loss | **0.06 %** stream loss |
+| Dual cellular (42 Mbps over 40 + 30 Mbit lossy links) | 20–40 % stream loss | **0.9 %** stream loss |
+
+Full report: [`bench_results/srt/REPORT.md`](bench_results/srt/REPORT.md) — data & comparison videos: [`bench_results/srt/`](bench_results/srt/) — bench: [`scripts/benchmark_srt.sh`](scripts/benchmark_srt.sh)
 
 ## Architecture
 
