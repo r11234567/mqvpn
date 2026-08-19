@@ -516,6 +516,7 @@ svr_sni_router_init(mqvpn_server_t *s)
     }
     config.max_tracked_conns = s->config.proxy_max_connections;
     config.conn_timeout_sec = s->config.proxy_idle_timeout_sec;
+    config.fallback_proxy_protocol = 1;
     sni_router_callbacks_t callbacks = {
         .accept_packet = svr_sni_accept,
         .register_fd = svr_sni_register_fd,
@@ -848,6 +849,17 @@ cb_write_before_accept(const unsigned char *buf, size_t size, const struct socka
 {
     mqvpn_server_t *s = (mqvpn_server_t *)user_data;
     return svr_do_send(s, buf, size, peer, peerlen);
+}
+
+static int
+cb_retry_packet_required(xqc_engine_t *engine, xqc_connection_t *conn,
+                         const xqc_cid_t *cid, void *user_data)
+{
+    (void)engine;
+    (void)conn;
+    (void)cid;
+    (void)user_data;
+    return XQC_TRUE;
 }
 
 static int
@@ -2233,6 +2245,7 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
     xqc_transport_callbacks_t tcbs = {
         .server_accept = cb_accept,
         .server_refuse = cb_refuse,
+        .conn_retry_packet_condition_check = cb_retry_packet_required,
         .write_socket = cb_write_socket,
         .write_socket_ex = cb_write_socket_ex,
         .stateless_reset = cb_stateless_reset,
