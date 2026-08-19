@@ -811,7 +811,8 @@ fallback_send(sni_router_t *router, sni_connection_state_t *conn, const uint8_t 
         uint8_t header[PP2_HEADER_LEN + PP2_INET6_ADDR_LEN];
         size_t header_len = 0;
         const struct sockaddr *src = (const struct sockaddr *)&conn->peer_addr;
-        const struct sockaddr *dst = (const struct sockaddr *)&router->config.fallback_addr;
+        const struct sockaddr *dst =
+            (const struct sockaddr *)&router->config.fallback_addr;
         memcpy(header, PP2_SIGNATURE, sizeof(PP2_SIGNATURE));
         header[12] = 0x21;
         if (src->sa_family == AF_INET && dst->sa_family == AF_INET) {

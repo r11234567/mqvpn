@@ -265,8 +265,9 @@ accept_packet(const uint8_t *pkt, size_t len, const struct sockaddr *peer,
 }
 
 static sni_router_t *
-create_router_at_with_proxy(const char *const *allowed, size_t allowed_count, test_ctx_t *ctx,
-                            uint16_t fallback_port, int fallback_proxy_protocol)
+create_router_at_with_proxy(const char *const *allowed, size_t allowed_count,
+                            test_ctx_t *ctx, uint16_t fallback_port,
+                            int fallback_proxy_protocol)
 {
     struct sockaddr_in fallback = {0};
     fallback.sin_family = AF_INET;
@@ -456,15 +457,16 @@ test_fallback_proxy_protocol_v2(void)
     struct timeval timeout = {.tv_sec = 2};
     assert(setsockopt(backend, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
     socklen_t backend_addr_len = sizeof(backend_addr);
-    assert(getsockname(backend, (struct sockaddr *)&backend_addr, &backend_addr_len) == 0);
+    assert(getsockname(backend, (struct sockaddr *)&backend_addr, &backend_addr_len) ==
+           0);
 
     uint8_t packet[1200];
     size_t packet_len = decode_hex(RFC9001_CLIENT_INITIAL, packet, sizeof(packet));
     struct sockaddr_in peer = test_peer();
     const char *allowed[] = {"vpn.example.com"};
     test_ctx_t ctx = {0};
-    sni_router_t *router = create_router_at_with_proxy(allowed, 1, &ctx,
-                                                        backend_addr.sin_port, 1);
+    sni_router_t *router =
+        create_router_at_with_proxy(allowed, 1, &ctx, backend_addr.sin_port, 1);
     assert(router != NULL);
     assert(sni_router_process(router, packet, packet_len, (struct sockaddr *)&peer,
                               sizeof(peer)) == SNI_ROUTE_FALLBACK);
