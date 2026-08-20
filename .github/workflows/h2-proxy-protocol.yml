@@ -1,0 +1,114 @@
+name: H2 Proxy Protocol
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/h2_proxy.c'
+      - 'src/h2_proxy.h'
+      - 'src/sni_router.c'
+      - 'tests/test_h2_proxy_protocol.sh'
+      - '.github/workflows/h2-proxy-protocol.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/h2_proxy.c'
+      - 'src/h2_proxy.h'
+      - 'src/sni_router.c'
+      - 'tests/test_h2_proxy_protocol.sh'
+      - '.github/workflows/h2-proxy-protocol.yml'
+  workflow_dispatch:
+
+jobs:
+  h2-proxy-protocol-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libevent-dev golang iptables \
+            libnghttp2-dev pkg-config nginx curl
+
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve BoringSSL pin
+        id: bssl-pin
+        run: echo "sha=$(git -C third_party/xquic/third_party/boringssl rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL (gcc fPIC)
+        id: bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-${{ steps.bssl-pin.outputs.sha }}-linux-gcc-fpic-v2
+
+      - name: Build BoringSSL
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic/third_party/boringssl
+          mkdir -p build && cd build
+          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j$(nproc) ssl crypto
+
+      - name: Verify BoringSSL is optimized
+        run: bash scripts/ci_check_bssl_optimized.sh third_party/xquic/third_party/boringssl/build
+
+      - name: Cache xquic (Release)
+        id: xquic-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v5
+
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_BBR2=ON \
+                -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON \
+                -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
+          make -j$(nproc)
+
+      - name: Build mqvpn with H2 proxy
+        run: |
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
+                -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
+          make -j$(nproc)
+
+      - name: Unit tests
+        run: cd build && ctest --output-on-failure
+
+      - name: Run H2 Proxy Protocol test
+        run: |
+          cd build
+          sudo ../tests/test_h2_proxy_protocol.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: h2-proxy-protocol-logs
+          path: |
+            /tmp/mqvpn-h2-proxy-test.*/
+            /var/log/nginx/
+          retention-days: 3

@@ -643,6 +643,7 @@ static const cfg_key_desc_t cfg_keys[] = {
     CFG_STR(SEC_PROXY, "QuicFallback", "quic_fallback", proxy_quic_fallback),
     CFG_STR(SEC_PROXY, "Http2Backend", "http2_backend", proxy_h2_backend),
     CFG_BOOL(SEC_PROXY, "Http2BackendTLS", "http2_backend_tls", proxy_h2_backend_tls),
+    CFG_BOOL(SEC_PROXY, "Http2BackendProxyProtocol", "http2_backend_proxy_protocol", proxy_h2_backend_proxy_protocol),
     CFG_U32(SEC_PROXY, "MaxConnections", "max_connections", proxy_max_connections),
     CFG_U32(SEC_PROXY, "IdleTimeoutSec", "idle_timeout_sec", proxy_idle_timeout_sec),
     /* [Advanced] — JSON side lives inside the bounded "advanced" object.

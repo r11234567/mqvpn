@@ -144,6 +144,7 @@ struct mqvpn_config_s {
     char proxy_quic_fallback[280];
     char proxy_h2_backend[280];
     int proxy_h2_backend_tls;
+    int proxy_h2_backend_proxy_protocol;
     uint32_t proxy_max_connections;
     uint32_t proxy_idle_timeout_sec;
 

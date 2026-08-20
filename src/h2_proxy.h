@@ -24,6 +24,7 @@ typedef struct {
     uint32_t conn_timeout_sec;
     size_t max_buffered_body;
     int backend_tls;
+    int backend_proxy_protocol;
 } h2_proxy_config_t;
 
 typedef struct {
@@ -50,7 +51,9 @@ void h2_proxy_destroy(h2_proxy_t *proxy);
 h2_proxy_stream_t *h2_proxy_handle_request(h2_proxy_t *proxy,
                                            xqc_h3_request_t *h3_request,
                                            const xqc_http_headers_t *headers, int fin,
-                                           void *h3_stream_user_data);
+                                           void *h3_stream_user_data,
+                                           const struct sockaddr *client_addr,
+                                           socklen_t client_addrlen);
 int h2_proxy_on_h3_body(h2_proxy_stream_t *stream, const uint8_t *data, size_t len,
                         int fin);
 int h2_proxy_on_h3_writable(h2_proxy_stream_t *stream);

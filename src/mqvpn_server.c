@@ -581,6 +581,7 @@ svr_h2_proxy_init(mqvpn_server_t *s)
     memset(&config, 0, sizeof(config));
     config.backend_addr = backend_addr;
     config.backend_addrlen = backend_addrlen;
+    config.backend_proxy_protocol = s->config.proxy_h2_backend_proxy_protocol;
     config.max_connections = s->config.proxy_max_connections;
     config.max_streams_per_conn = 100;
     config.conn_timeout_sec = s->config.proxy_idle_timeout_sec;
@@ -1808,7 +1809,9 @@ cb_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t flag,
         if (s->h2_proxy) {
             stream->role = SVR_STREAM_ROLE_H2_PROXY;
             stream->h2_proxy_stream =
-                h2_proxy_handle_request(s->h2_proxy, h3_request, headers, fin, stream);
+                h2_proxy_handle_request(s->h2_proxy, h3_request, headers, fin, stream,
+                                        (const struct sockaddr *)&stream->conn->peer_addr,
+                                        stream->conn->peer_addrlen);
             return 0;
         }
 #endif

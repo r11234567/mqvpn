@@ -25,6 +25,14 @@
 #define H2_MAX_RESPONSE_HEADERS    256u
 #define H2_MAX_HEADER_BYTES        (32u * 1024u)
 
+/* Proxy Protocol v2 constants */
+#define PROXY_PROTOCOL_V2_SIG "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A"
+#define PROXY_PROTOCOL_V2_SIG_LEN 12
+#define PROXY_PROTOCOL_V2_VERSION 0x20
+#define PROXY_PROTOCOL_V2_CMD_PROXY 0x01
+#define PROXY_PROTOCOL_V2_AF_INET 0x11
+#define PROXY_PROTOCOL_V2_AF_INET6 0x21
+
 typedef struct h2_backend_conn_s h2_backend_conn_t;
 
 struct h2_proxy_stream_s {
@@ -33,6 +41,9 @@ struct h2_proxy_stream_s {
     void *h3_user_data;
     h2_backend_conn_t *backend_conn;
     int32_t backend_stream_id;
+
+    struct sockaddr_storage client_addr;
+    socklen_t client_addrlen;
 
     uint8_t *request_body;
     size_t request_body_len;
@@ -65,6 +76,7 @@ struct h2_backend_conn_s {
     uint64_t last_active;
     uint32_t stream_count;
     int connected;
+    int proxy_protocol_sent;
     struct h2_backend_conn_s *next;
 };
 
@@ -81,6 +93,90 @@ static void backend_destroy(h2_backend_conn_t *conn);
 static int stream_flush_response(h2_proxy_stream_t *stream);
 static int is_hop_by_hop(const uint8_t *name, size_t len, const uint8_t *value,
                          size_t value_len);
+static ssize_t build_proxy_protocol_v2(uint8_t *buf, size_t buf_len,
+                                       const struct sockaddr *client_addr,
+                                       socklen_t client_addrlen,
+                                       const struct sockaddr *server_addr,
+                                       socklen_t server_addrlen);
+
+static ssize_t
+build_proxy_protocol_v2(uint8_t *buf, size_t buf_len,
+                       const struct sockaddr *client_addr,
+                       socklen_t client_addrlen,
+                       const struct sockaddr *server_addr,
+                       socklen_t server_addrlen)
+{
+    /* Proxy Protocol v2 format:
+     *   12 bytes: signature
+     *   1 byte:   version (4 bits) + command (4 bits)
+     *   1 byte:   address family (4 bits) + protocol (4 bits)
+     *   2 bytes:  address length (big-endian)
+     *   N bytes:  address data
+     */
+    if (buf_len < 16) return -1;
+
+    const struct sockaddr_in *c4 = NULL, *s4 = NULL;
+    const struct sockaddr_in6 *c6 = NULL, *s6 = NULL;
+    uint8_t af_proto = 0;
+    uint16_t addr_len = 0;
+    size_t offset = 0;
+
+    /* Signature */
+    memcpy(buf, PROXY_PROTOCOL_V2_SIG, PROXY_PROTOCOL_V2_SIG_LEN);
+    offset = PROXY_PROTOCOL_V2_SIG_LEN;
+
+    /* Version + Command: v2 + PROXY */
+    buf[offset++] = PROXY_PROTOCOL_V2_VERSION | PROXY_PROTOCOL_V2_CMD_PROXY;
+
+    /* Determine address family */
+    if (client_addr->sa_family == AF_INET && server_addr->sa_family == AF_INET) {
+        c4 = (const struct sockaddr_in *)client_addr;
+        s4 = (const struct sockaddr_in *)server_addr;
+        af_proto = PROXY_PROTOCOL_V2_AF_INET;  /* AF_INET + STREAM */
+        addr_len = 12;  /* 4 + 4 + 2 + 2 */
+    } else if (client_addr->sa_family == AF_INET6 && server_addr->sa_family == AF_INET6) {
+        c6 = (const struct sockaddr_in6 *)client_addr;
+        s6 = (const struct sockaddr_in6 *)server_addr;
+        af_proto = PROXY_PROTOCOL_V2_AF_INET6;  /* AF_INET6 + STREAM */
+        addr_len = 36;  /* 16 + 16 + 2 + 2 */
+    } else {
+        /* Address family mismatch or unsupported */
+        return -1;
+    }
+
+    if (buf_len < (size_t)(offset + 2 + addr_len)) return -1;
+
+    buf[offset++] = af_proto;
+
+    /* Address length (big-endian) */
+    buf[offset++] = (addr_len >> 8) & 0xFF;
+    buf[offset++] = addr_len & 0xFF;
+
+    /* Address data */
+    if (c4 && s4) {
+        /* IPv4: src_addr (4) + dst_addr (4) + src_port (2) + dst_port (2) */
+        memcpy(buf + offset, &c4->sin_addr.s_addr, 4);
+        offset += 4;
+        memcpy(buf + offset, &s4->sin_addr.s_addr, 4);
+        offset += 4;
+        memcpy(buf + offset, &c4->sin_port, 2);
+        offset += 2;
+        memcpy(buf + offset, &s4->sin_port, 2);
+        offset += 2;
+    } else if (c6 && s6) {
+        /* IPv6: src_addr (16) + dst_addr (16) + src_port (2) + dst_port (2) */
+        memcpy(buf + offset, &c6->sin6_addr, 16);
+        offset += 16;
+        memcpy(buf + offset, &s6->sin6_addr, 16);
+        offset += 16;
+        memcpy(buf + offset, &c6->sin6_port, 2);
+        offset += 2;
+        memcpy(buf + offset, &s6->sin6_port, 2);
+        offset += 2;
+    }
+
+    return (ssize_t)offset;
+}
 
 static void
 proxy_log(h2_proxy_t *proxy, int level, const char *fmt, ...)
@@ -510,6 +606,40 @@ static int
 submit_request(h2_proxy_stream_t *stream, const xqc_http_headers_t *headers, int fin)
 {
     if (!headers || headers->count == 0 || headers->count > 256) return -1;
+
+    h2_backend_conn_t *conn = stream->backend_conn;
+    h2_proxy_t *proxy = stream->proxy;
+
+    /* Send Proxy Protocol v2 on first request of this connection.
+     * Must happen after connection is established but before any HTTP/2 frames. */
+    if (proxy->config.backend_proxy_protocol && conn->connected &&
+        !conn->proxy_protocol_sent && stream->client_addrlen > 0) {
+        uint8_t pp_buf[128];
+        struct sockaddr_storage local_addr;
+        socklen_t local_addrlen = sizeof(local_addr);
+
+        if (getsockname(conn->fd, (struct sockaddr *)&local_addr, &local_addrlen) == 0) {
+            ssize_t pp_len = build_proxy_protocol_v2(
+                pp_buf, sizeof(pp_buf),
+                (const struct sockaddr *)&stream->client_addr, stream->client_addrlen,
+                (const struct sockaddr *)&local_addr, local_addrlen);
+
+            if (pp_len > 0) {
+                ssize_t sent = send(conn->fd, pp_buf, (size_t)pp_len, 0);
+                if (sent == pp_len) {
+                    conn->proxy_protocol_sent = 1;
+                    proxy_log(proxy, 1, "[H2Proxy] Sent Proxy Protocol v2 (%zd bytes)", pp_len);
+                } else {
+                    proxy_log(proxy, 2, "[H2Proxy] Proxy Protocol send failed: %s",
+                              sent < 0 ? strerror(errno) : "partial send");
+                    return -1;
+                }
+            } else {
+                proxy_log(proxy, 2, "[H2Proxy] Failed to build Proxy Protocol v2 header");
+            }
+        }
+    }
+
     nghttp2_nv *nv = calloc(headers->count, sizeof(*nv));
     if (!nv) return -1;
     size_t count = 0;
@@ -642,11 +772,20 @@ h2_proxy_destroy(h2_proxy_t *proxy)
 h2_proxy_stream_t *
 h2_proxy_handle_request(h2_proxy_t *proxy, xqc_h3_request_t *h3_request,
                         const xqc_http_headers_t *headers, int fin,
-                        void *h3_stream_user_data)
+                        void *h3_stream_user_data,
+                        const struct sockaddr *client_addr,
+                        socklen_t client_addrlen)
 {
     if (!proxy || !h3_request || !headers) return NULL;
     h2_proxy_stream_t *stream = stream_create(proxy, h3_request, h3_stream_user_data);
     if (!stream) return NULL;
+
+    // Store client address for Proxy Protocol
+    if (client_addr && client_addrlen <= sizeof(stream->client_addr)) {
+        memcpy(&stream->client_addr, client_addr, client_addrlen);
+        stream->client_addrlen = client_addrlen;
+    }
+
     h2_backend_conn_t *conn = backend_available(proxy);
     if (!conn) {
         proxy->stats.backend_errors++;
