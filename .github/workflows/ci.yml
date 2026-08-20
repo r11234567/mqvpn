@@ -54,7 +54,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev golang iptables
+          sudo apt-get install -y cmake libevent-dev golang iptables libnghttp2-dev pkg-config
 
       - name: Compute xquic SHA
         id: xqsha
@@ -126,6 +126,15 @@ jobs:
           cmake -DCMAKE_BUILD_TYPE=Release \
                 -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
           make -j$(nproc)
+
+      - name: Verify H2 proxy enabled
+        run: |
+          if ! grep -q "MQVPN_ENABLE_H2_PROXY:BOOL=ON" build/CMakeCache.txt; then
+            echo "ERROR: H2 proxy not enabled in build!"
+            echo "This means nghttp2 was not found. Please check the dependencies."
+            exit 1
+          fi
+          echo "✅ H2 proxy is enabled"
 
       - name: Unit tests (ctest)
         run: cd build && ctest --output-on-failure
@@ -1174,7 +1183,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev golang iptables conntrack clang iperf3 jq netcat-openbsd curl python3
+          sudo apt-get install -y cmake libevent-dev golang iptables conntrack clang iperf3 jq netcat-openbsd curl python3 libnghttp2-dev pkg-config
 
       - name: Compute xquic SHA
         id: xqsha
