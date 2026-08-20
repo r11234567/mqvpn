@@ -829,6 +829,21 @@ target_link_libraries(mqvpn
     stdc++
 )
 
+# Enable H2 proxy support in CLI if nghttp2 was found
+if(MQVPN_ENABLE_H2_PROXY)
+    target_compile_definitions(mqvpn PRIVATE MQVPN_H2_PROXY_ENABLED)
+    if(NGHTTP2_LIBRARIES)
+        target_link_libraries(mqvpn ${NGHTTP2_LIBRARIES})
+    else()
+        target_link_libraries(mqvpn ${NGHTTP2_LIB})
+    endif()
+    if(NGHTTP2_INCLUDE_DIR)
+        target_include_directories(mqvpn PRIVATE ${NGHTTP2_INCLUDE_DIR})
+    elseif(NGHTTP2_INCLUDE_DIRS)
+        target_include_directories(mqvpn PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+    endif()
+endif()
+
 # ---------- Tests ----------
 option(BUILD_TESTING "Build unit tests" ON)
 if(BUILD_TESTING)
