@@ -5,6 +5,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build}"
+XQUIC_CLIENT="${XQUIC_CLIENT:-$PROJECT_ROOT/third_party/xquic/build/tests/test_client}"
 
 echo "=== H2 Proxy Protocol Test ==="
 echo "Build dir: $BUILD_DIR"
@@ -12,6 +13,10 @@ echo "Build dir: $BUILD_DIR"
 # Check if binaries exist
 if [ ! -f "$BUILD_DIR/mqvpn" ]; then
     echo "ERROR: mqvpn binary not found at $BUILD_DIR/mqvpn"
+    exit 1
+fi
+if [ ! -x "$XQUIC_CLIENT" ]; then
+    echo "ERROR: xquic HTTP/3 client not found at $XQUIC_CLIENT"
     exit 1
 fi
 
@@ -134,10 +139,19 @@ trap "kill $MQVPN_PID $NGINX_PID 2>/dev/null || true; rm -rf $TEST_DIR" EXIT
 echo ""
 echo "=== Testing H2 Proxy with Proxy Protocol ==="
 
-# Use curl to send HTTP/3 request through mqvpn
-PROXY_RESPONSE=$(curl -k --http3-only \
-    --resolve test.example.com:4433:127.0.0.1 \
-    https://test.example.com:4433/ 2>&1 || echo "CURL_FAILED")
+# Use xquic's native client because Ubuntu's curl is built without HTTP/3.
+CLIENT_LOG="$TEST_DIR/xquic-client.log"
+RESPONSE_FILE="$TEST_DIR/proxy-response.txt"
+if ! timeout 15s "$XQUIC_CLIENT" \
+    -a 127.0.0.1 -p 4433 -h test.example.com \
+    -u https://test.example.com/ -G -w "$RESPONSE_FILE" \
+    >"$CLIENT_LOG" 2>&1; then
+    cat "$CLIENT_LOG"
+    echo "ERROR: xquic HTTP/3 request failed"
+    exit 1
+fi
+cat "$CLIENT_LOG"
+PROXY_RESPONSE=$(cat "$RESPONSE_FILE")
 
 echo "Proxy response: $PROXY_RESPONSE"
 
