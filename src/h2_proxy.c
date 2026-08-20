@@ -106,6 +106,9 @@ build_proxy_protocol_v2(uint8_t *buf, size_t buf_len,
                        const struct sockaddr *server_addr,
                        socklen_t server_addrlen)
 {
+    (void)client_addrlen;
+    (void)server_addrlen;
+
     /* Proxy Protocol v2 format:
      *   12 bytes: signature
      *   1 byte:   version (4 bits) + command (4 bits)
@@ -780,7 +783,7 @@ h2_proxy_handle_request(h2_proxy_t *proxy, xqc_h3_request_t *h3_request,
     h2_proxy_stream_t *stream = stream_create(proxy, h3_request, h3_stream_user_data);
     if (!stream) return NULL;
 
-    // Store client address for Proxy Protocol
+    /* Store client address for Proxy Protocol */
     if (client_addr && client_addrlen <= sizeof(stream->client_addr)) {
         memcpy(&stream->client_addr, client_addr, client_addrlen);
         stream->client_addrlen = client_addrlen;
