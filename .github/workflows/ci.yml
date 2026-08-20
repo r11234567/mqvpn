@@ -129,20 +129,27 @@ jobs:
 
       - name: Verify H2 proxy enabled
         run: |
-          echo "Checking if H2 proxy was enabled..."
-          if grep -q "MQVPN_ENABLE_H2_PROXY" build/CMakeCache.txt; then
-            echo "✅ H2 proxy is enabled"
-            grep "MQVPN_ENABLE_H2_PROXY" build/CMakeCache.txt || true
+          echo "Checking CMake configuration..."
+          if [ -f build/CMakeCache.txt ]; then
+            echo "CMakeCache.txt exists, searching for H2_PROXY..."
+            grep -i "h2.*proxy\|nghttp" build/CMakeCache.txt || echo "No H2_PROXY entries found"
           else
-            echo "❌ ERROR: H2 proxy not found in CMakeCache.txt"
-            echo "This means nghttp2 was not found. Please check the dependencies."
+            echo "ERROR: CMakeCache.txt not found!"
             exit 1
           fi
-          # Also verify the binary includes h2_proxy symbols
-          if nm build/libmqvpn.a 2>/dev/null | grep -q h2_proxy; then
-            echo "✅ h2_proxy symbols found in libmqvpn.a"
+          echo ""
+          echo "Verifying h2_proxy symbols in binary..."
+          if [ -f build/libmqvpn.a ]; then
+            if nm build/libmqvpn.a 2>/dev/null | grep -q "h2_proxy"; then
+              echo "✅ h2_proxy symbols found in libmqvpn.a"
+              echo "✅ H2 proxy feature is included in the build"
+            else
+              echo "❌ ERROR: h2_proxy symbols NOT found in binary!"
+              echo "This means H2 proxy was not compiled in."
+              exit 1
+            fi
           else
-            echo "⚠️ Warning: h2_proxy symbols not found in binary"
+            echo "WARNING: libmqvpn.a not found, skipping symbol check"
           fi
 
       - name: Unit tests (ctest)
