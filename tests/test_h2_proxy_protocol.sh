@@ -104,8 +104,8 @@ cat > "$TEST_DIR/server.json" <<EOF
 {
     "role": "server",
     "listen": "[::]:4433",
-    "cert": "$TEST_DIR/server.crt",
-    "key": "$TEST_DIR/server.key",
+    "cert_file": "$TEST_DIR/server.crt",
+    "key_file": "$TEST_DIR/server.key",
     "auth_key": "h2-proxy-protocol-test-key",
     "proxy": {
         "enabled": true,
