@@ -3,20 +3,8 @@ name: H2 Proxy Protocol
 on:
   push:
     branches: [main]
-    paths:
-      - 'src/h2_proxy.c'
-      - 'src/h2_proxy.h'
-      - 'src/sni_router.c'
-      - 'tests/test_h2_proxy_protocol.sh'
-      - '.github/workflows/h2-proxy-protocol.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'src/h2_proxy.c'
-      - 'src/h2_proxy.h'
-      - 'src/sni_router.c'
-      - 'tests/test_h2_proxy_protocol.sh'
-      - '.github/workflows/h2-proxy-protocol.yml'
   workflow_dispatch:
 
 jobs:

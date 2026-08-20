@@ -586,7 +586,12 @@ run_iperf3_through_tunnel() {
 
     ip netns exec "$NS_SERVER" iperf3 -s -B "$target" -1 &>/dev/null &
     local ipid=$!
-    sleep 1
+    if ! wait_for_listening_port "$NS_SERVER" "$INNER_TCP_PORT" 10; then
+        kill "$ipid" 2>/dev/null || true
+        wait "$ipid" 2>/dev/null || true
+        echo "0.0"
+        return
+    fi
 
     ip netns exec "$NS_CLIENT" timeout $((duration + 15)) \
         iperf3 -c "$target" -t "$duration" -P 1 --json >"$json" 2>&1 || true
@@ -624,7 +629,12 @@ run_iperf3_v6_through_tunnel() {
 
     ip netns exec "$NS_SERVER" iperf3 -s -6 -B "$target" -1 &>/dev/null &
     local ipid=$!
-    sleep 1
+    if ! wait_for_listening_port "$NS_SERVER" "$INNER_TCP_PORT" 10; then
+        kill "$ipid" 2>/dev/null || true
+        wait "$ipid" 2>/dev/null || true
+        echo "0.0"
+        return
+    fi
 
     ip netns exec "$NS_CLIENT" timeout $((duration + 15)) \
         iperf3 -c "$target" -6 -t "$duration" -P 1 --json >"$json" 2>&1 || true
