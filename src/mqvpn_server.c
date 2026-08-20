@@ -467,7 +467,9 @@ svr_sni_send_client(const uint8_t *pkt, size_t len, const struct sockaddr *peer,
 static int
 svr_sni_router_init(mqvpn_server_t *s)
 {
-    LOG_I(s, "DEBUG: proxy_enabled=%d, h2_proxy_protocol=%d, max_conn=%u, timeout=%u, sni='%s'",
+    LOG_I(s,
+          "DEBUG: proxy_enabled=%d, h2_proxy_protocol=%d, max_conn=%u, timeout=%u, "
+          "sni='%s'",
           s->config.proxy_enabled, s->config.proxy_h2_backend_proxy_protocol,
           s->config.proxy_max_connections, s->config.proxy_idle_timeout_sec,
           s->config.proxy_sni);

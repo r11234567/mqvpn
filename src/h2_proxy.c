@@ -206,8 +206,7 @@ prepare_proxy_protocol(h2_backend_conn_t *conn, const struct sockaddr *client_ad
      * IPv4-mapped IPv6 sockaddr, while the h2c backend socket is AF_INET.
      * PROXY v2 requires one address family for both endpoints; normalize that
      * representation so the real IPv4 client address is preserved. */
-    if (client_addr->sa_family == AF_INET6 &&
-        local_addr.ss_family == AF_INET) {
+    if (client_addr->sa_family == AF_INET6 && local_addr.ss_family == AF_INET) {
         const struct sockaddr_in6 *client6 = (const struct sockaddr_in6 *)client_addr;
         static const uint8_t v4_prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
         if (memcmp(&client6->sin6_addr, v4_prefix, sizeof(v4_prefix)) == 0) {
@@ -689,14 +688,14 @@ submit_request(h2_proxy_stream_t *stream, const xqc_http_headers_t *headers, int
     if (proxy->config.backend_proxy_protocol && conn->proxy_protocol_len == 0 &&
         !conn->proxy_protocol_sent) {
         if (stream->client_addrlen == 0) {
-            proxy_log(proxy, 0,
-                      "h2_proxy: Proxy Protocol enabled but client address is unavailable");
+            proxy_log(
+                proxy, 0,
+                "h2_proxy: Proxy Protocol enabled but client address is unavailable");
             return -1;
         }
         if (prepare_proxy_protocol(conn, (const struct sockaddr *)&stream->client_addr,
                                    stream->client_addrlen) != 0) {
-            proxy_log(proxy, 0,
-                      "h2_proxy: failed to build Proxy Protocol v2 header");
+            proxy_log(proxy, 0, "h2_proxy: failed to build Proxy Protocol v2 header");
             return -1;
         }
     }
