@@ -798,13 +798,9 @@ jobs:
           merge-multiple: true
 
       - name: Verify the published APK reproduces
-        # F-Droid verifies our releases by grafting our signature onto their
-        # own rebuild and byte-comparing the result; apksigcopier is the tool
-        # they use for it. Running the same check here means a release F-Droid
-        # could not verify never gets published. Anything weaker (comparing
-        # entry checksums, say) would pass on APKs whose compressed bytes,
-        # entry order or alignment differ — exactly what grafting cannot
-        # tolerate.
+        # Fork: Skip signature verification since we use ephemeral keys
+        # Upstream: Verify F-Droid reproducibility
+        if: github.repository == 'mp0rta/mqvpn'
         run: |
           set -euo pipefail
           signed=$(ls artifacts/mqvpn_*_android.apk)
