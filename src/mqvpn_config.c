@@ -152,6 +152,7 @@ mqvpn_config_new(void)
     cfg->init_max_path_id = 0; /* 0 = use xquic default (8) */
     cfg->proxy_max_connections = 64;
     cfg->proxy_idle_timeout_sec = 60;
+    cfg->proxy_quic_fallback_proxy_protocol = 1;
     cfg->udp_gso = 1; /* TX GSO/batch enabled by default */
 
     /* §16: reorder shim defaults (mode OFF until explicitly enabled). */
@@ -618,6 +619,14 @@ mqvpn_config_set_proxy_protocol(mqvpn_config_t *cfg, int enabled)
 {
     if (!cfg) return MQVPN_ERR_INVALID_ARG;
     cfg->proxy_h2_backend_proxy_protocol = enabled != 0;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_quic_fallback_proxy_protocol(mqvpn_config_t *cfg, int enabled)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    cfg->proxy_quic_fallback_proxy_protocol = enabled != 0;
     return MQVPN_OK;
 }
 

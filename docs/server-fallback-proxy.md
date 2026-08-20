@@ -53,6 +53,7 @@ Add the following section to the server configuration:
 Enabled = true
 SNI = vpn.example.com,*.edge.example
 QuicFallback = 127.0.0.1:4443
+QuicFallbackProxyProtocol = false
 Http2Backend = 127.0.0.1:8080
 Http2BackendTLS = false
 MaxConnections = 64
@@ -64,6 +65,7 @@ IdleTimeoutSec = 60
 | `Enabled` | Enables the Linux server proxy path. | `false` |
 | `SNI` | Comma-separated exact names or single-label wildcard patterns. Maximum 16 entries. | none |
 | `QuicFallback` | UDP `host:port` for unmatched SNI. Use `[address]:port` for IPv6 literals. | none |
+| `QuicFallbackProxyProtocol` | Prefix the first fallback datagram with PROXY v2. Disable for QUIC listeners that do not support PROXY protocol (including nginx QUIC). | `true` |
 | `Http2Backend` | TCP `host:port` for prior-knowledge h2c requests. | none |
 | `Http2BackendTLS` | Reserved for a future TLS upstream. The server rejects `true`. | `false` |
 | `MaxConnections` | Limit applied independently to tracked/fallback connections and the H2 pool. | `64` |
@@ -87,6 +89,7 @@ JSON uses a bounded `proxy` object:
     "enabled": true,
     "sni": "vpn.example.com,*.edge.example",
     "quic_fallback": "127.0.0.1:4443",
+    "quic_fallback_proxy_protocol": false,
     "http2_backend": "127.0.0.1:8080",
     "http2_backend_tls": false,
     "max_connections": 64,

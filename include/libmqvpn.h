@@ -648,6 +648,11 @@ MQVPN_API int mqvpn_config_set_proxy(mqvpn_config_t *cfg, int enabled,
  * before the HTTP/2 preface. This is independent of the endpoint settings
  * above so older callers remain source and ABI compatible. */
 MQVPN_API int mqvpn_config_set_proxy_protocol(mqvpn_config_t *cfg, int enabled);
+/* Select whether unmatched-SNI QUIC fallback datagrams start with a PROXY v2
+ * header. Disable this for QUIC listeners (such as nginx QUIC) that do not
+ * support PROXY protocol on their UDP listener. */
+MQVPN_API int mqvpn_config_set_quic_fallback_proxy_protocol(mqvpn_config_t *cfg,
+                                                            int enabled);
 
 /* ─── Client API ─── */
 

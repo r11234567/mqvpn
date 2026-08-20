@@ -641,6 +641,8 @@ static const cfg_key_desc_t cfg_keys[] = {
     CFG_BOOL(SEC_PROXY, "Enabled", "enabled", proxy_enabled),
     CFG_STR(SEC_PROXY, "SNI", "sni", proxy_sni),
     CFG_STR(SEC_PROXY, "QuicFallback", "quic_fallback", proxy_quic_fallback),
+    CFG_BOOL(SEC_PROXY, "QuicFallbackProxyProtocol", "quic_fallback_proxy_protocol",
+             proxy_quic_fallback_proxy_protocol),
     CFG_STR(SEC_PROXY, "Http2Backend", "http2_backend", proxy_h2_backend),
     CFG_BOOL(SEC_PROXY, "Http2BackendTLS", "http2_backend_tls", proxy_h2_backend_tls),
     CFG_BOOL(SEC_PROXY, "Http2BackendProxyProtocol", "http2_backend_proxy_protocol",
@@ -1312,6 +1314,7 @@ mqvpn_config_defaults(mqvpn_file_config_t *cfg)
     mqvpn_hybrid_config_default(&cfg->hybrid);   /* H1: hybrid defaults (disabled) */
     cfg->proxy_max_connections = 64;
     cfg->proxy_idle_timeout_sec = 60;
+    cfg->proxy_quic_fallback_proxy_protocol = 1;
 }
 
 int

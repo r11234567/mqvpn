@@ -96,6 +96,7 @@ typedef struct mqvpn_file_config_s {
     int proxy_enabled;
     char proxy_sni[280];
     char proxy_quic_fallback[280];
+    int proxy_quic_fallback_proxy_protocol;
     char proxy_h2_backend[280];
     int proxy_h2_backend_tls;
     int proxy_h2_backend_proxy_protocol;

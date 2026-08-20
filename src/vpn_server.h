@@ -45,6 +45,7 @@ typedef struct mqvpn_server_cfg_s {
     int proxy_enabled;
     const char *proxy_sni;
     const char *proxy_quic_fallback;
+    int proxy_quic_fallback_proxy_protocol;
     const char *proxy_h2_backend;
     int proxy_h2_backend_tls;
     int proxy_h2_backend_proxy_protocol;

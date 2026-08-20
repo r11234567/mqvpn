@@ -29,6 +29,7 @@ Scheduler = wlb
 # Enabled = false
 # SNI = vpn.example.com,*.edge.example
 # QuicFallback = 127.0.0.1:4443
+# QuicFallbackProxyProtocol = true
 # Http2Backend = 127.0.0.1:8080
 # Http2BackendTLS = false
 # MaxConnections = 64

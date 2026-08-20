@@ -630,6 +630,8 @@ main(int argc, char *argv[])
             .proxy_enabled = file_cfg.proxy_enabled,
             .proxy_sni = file_cfg.proxy_sni,
             .proxy_quic_fallback = file_cfg.proxy_quic_fallback,
+            .proxy_quic_fallback_proxy_protocol =
+                file_cfg.proxy_quic_fallback_proxy_protocol,
             .proxy_h2_backend = file_cfg.proxy_h2_backend,
             .proxy_h2_backend_tls = file_cfg.proxy_h2_backend_tls,
             .proxy_h2_backend_proxy_protocol = file_cfg.proxy_h2_backend_proxy_protocol,

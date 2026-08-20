@@ -468,11 +468,12 @@ static int
 svr_sni_router_init(mqvpn_server_t *s)
 {
     LOG_I(s,
-          "DEBUG: proxy_enabled=%d, h2_proxy_protocol=%d, max_conn=%u, timeout=%u, "
+          "DEBUG: proxy_enabled=%d, quic_fallback_proxy_protocol=%d, "
+          "h2_proxy_protocol=%d, max_conn=%u, timeout=%u, "
           "sni='%s'",
-          s->config.proxy_enabled, s->config.proxy_h2_backend_proxy_protocol,
-          s->config.proxy_max_connections, s->config.proxy_idle_timeout_sec,
-          s->config.proxy_sni);
+          s->config.proxy_enabled, s->config.proxy_quic_fallback_proxy_protocol,
+          s->config.proxy_h2_backend_proxy_protocol, s->config.proxy_max_connections,
+          s->config.proxy_idle_timeout_sec, s->config.proxy_sni);
     if (!s->config.proxy_enabled) return 0;
     if (s->config.proxy_max_connections == 0 || s->config.proxy_max_connections > 65535 ||
         s->config.proxy_idle_timeout_sec == 0 ||
@@ -522,7 +523,7 @@ svr_sni_router_init(mqvpn_server_t *s)
     }
     config.max_tracked_conns = s->config.proxy_max_connections;
     config.conn_timeout_sec = s->config.proxy_idle_timeout_sec;
-    config.fallback_proxy_protocol = 1;
+    config.fallback_proxy_protocol = s->config.proxy_quic_fallback_proxy_protocol;
     sni_router_callbacks_t callbacks = {
         .accept_packet = svr_sni_accept,
         .register_fd = svr_sni_register_fd,
