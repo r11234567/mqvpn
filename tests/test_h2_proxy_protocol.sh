@@ -50,8 +50,8 @@ http {
 
     # Upstream with Proxy Protocol
     server {
-        listen 127.0.0.1:8444 proxy_protocol;
-        listen [::1]:8444 proxy_protocol;
+        listen 127.0.0.1:8444 http2 proxy_protocol;
+        listen [::1]:8444 http2 proxy_protocol;
         server_name _;
 
         location / {
@@ -134,8 +134,8 @@ echo "=== Testing H2 Proxy with Proxy Protocol ==="
 
 # Use curl to send HTTP/3 request through mqvpn
 PROXY_RESPONSE=$(curl -k --http3-only \
-    --resolve localhost:4433:127.0.0.1 \
-    https://localhost:4433/ 2>&1 || echo "CURL_FAILED")
+    --resolve test.example.com:4433:127.0.0.1 \
+    https://test.example.com:4433/ 2>&1 || echo "CURL_FAILED")
 
 echo "Proxy response: $PROXY_RESPONSE"
 
