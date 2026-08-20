@@ -60,7 +60,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-h3-client-v1
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-h3-client-v2
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -73,7 +73,7 @@ jobs:
                 -DXQC_ENABLE_FEC=ON \
                 -DXQC_ENABLE_XOR=ON \
                 -DXQC_ENABLE_TESTING=ON \
-                -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
+                -DCMAKE_C_FLAGS="-Wno-dangling-pointer -Wno-stringop-truncation" ..
           make -j$(nproc) xquic test_client
 
       - name: Build mqvpn with H2 proxy
