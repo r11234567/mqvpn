@@ -29,7 +29,8 @@ env:
   # NDK_VERSION in android-repro.yml.
   NDK_VERSION: "28.2.13676358"
   # SHA-256 fingerprint of the canonical mqvpn upload certificate (public).
-  UPLOAD_CERT_SHA256: "F1:C5:D8:18:AE:C5:EA:4F:28:7B:44:CE:CC:1E:41:A0:AD:F2:B9:04:C8:EB:12:B3:41:F2:69:4F:BA:AB:B0:42"
+  # Fork: Use fork-specific certificate
+  UPLOAD_CERT_SHA256: "50:DF:DC:CA:66:1A:D4:62:BE:1A:84:6A:BE:51:C5:AD:C6:5D:83:6F:4F:52:07:B1:43:60:69:18:DD:2B:AE:98"
 
 jobs:
   build-release:
