@@ -194,13 +194,34 @@ prepare_proxy_protocol(h2_backend_conn_t *conn, const struct sockaddr *client_ad
                        socklen_t client_addrlen)
 {
     struct sockaddr_storage local_addr;
+    struct sockaddr_in mapped_client;
+    const struct sockaddr *source_addr = client_addr;
+    socklen_t source_addrlen = client_addrlen;
     socklen_t local_addrlen = sizeof(local_addr);
     if (!conn || !client_addr ||
         getsockname(conn->fd, (struct sockaddr *)&local_addr, &local_addrlen) != 0)
         return -1;
+
+    /* A dual-stack QUIC listener commonly reports an IPv4 peer as an
+     * IPv4-mapped IPv6 sockaddr, while the h2c backend socket is AF_INET.
+     * PROXY v2 requires one address family for both endpoints; normalize that
+     * representation so the real IPv4 client address is preserved. */
+    if (client_addr->sa_family == AF_INET6 &&
+        local_addr.ss_family == AF_INET) {
+        const struct sockaddr_in6 *client6 = (const struct sockaddr_in6 *)client_addr;
+        static const uint8_t v4_prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+        if (memcmp(&client6->sin6_addr, v4_prefix, sizeof(v4_prefix)) == 0) {
+            memset(&mapped_client, 0, sizeof(mapped_client));
+            mapped_client.sin_family = AF_INET;
+            memcpy(&mapped_client.sin_addr, &client6->sin6_addr.s6_addr[12], 4);
+            mapped_client.sin_port = client6->sin6_port;
+            source_addr = (const struct sockaddr *)&mapped_client;
+            source_addrlen = sizeof(mapped_client);
+        }
+    }
     ssize_t length = build_proxy_protocol_v2(
-        conn->proxy_protocol_buf, sizeof(conn->proxy_protocol_buf), client_addr,
-        client_addrlen, (const struct sockaddr *)&local_addr, local_addrlen);
+        conn->proxy_protocol_buf, sizeof(conn->proxy_protocol_buf), source_addr,
+        source_addrlen, (const struct sockaddr *)&local_addr, local_addrlen);
     if (length <= 0) return -1;
     conn->proxy_protocol_len = (size_t)length;
     conn->proxy_protocol_off = 0;
@@ -665,11 +686,20 @@ submit_request(h2_proxy_stream_t *stream, const xqc_http_headers_t *headers, int
     h2_backend_conn_t *conn = stream->backend_conn;
     h2_proxy_t *proxy = stream->proxy;
 
-    if (proxy->config.backend_proxy_protocol && stream->client_addrlen > 0 &&
-        conn->proxy_protocol_len == 0 && !conn->proxy_protocol_sent &&
-        prepare_proxy_protocol(conn, (const struct sockaddr *)&stream->client_addr,
-                               stream->client_addrlen) != 0)
-        return -1;
+    if (proxy->config.backend_proxy_protocol && conn->proxy_protocol_len == 0 &&
+        !conn->proxy_protocol_sent) {
+        if (stream->client_addrlen == 0) {
+            proxy_log(proxy, 0,
+                      "h2_proxy: Proxy Protocol enabled but client address is unavailable");
+            return -1;
+        }
+        if (prepare_proxy_protocol(conn, (const struct sockaddr *)&stream->client_addr,
+                                   stream->client_addrlen) != 0) {
+            proxy_log(proxy, 0,
+                      "h2_proxy: failed to build Proxy Protocol v2 header");
+            return -1;
+        }
+    }
     if (conn->connected && flush_proxy_protocol(conn) != 0) return -1;
 
     nghttp2_nv *nv = calloc(headers->count, sizeof(*nv));

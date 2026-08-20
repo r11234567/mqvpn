@@ -644,6 +644,10 @@ MQVPN_API int mqvpn_config_set_proxy(mqvpn_config_t *cfg, int enabled,
                                      const char *sni_csv, const char *quic_fallback,
                                      const char *http2_backend, int http2_backend_tls,
                                      uint32_t max_connections, uint32_t idle_timeout_sec);
+/* Select whether H2 backend connections send a PROXY protocol v2 header
+ * before the HTTP/2 preface. This is independent of the endpoint settings
+ * above so older callers remain source and ABI compatible. */
+MQVPN_API int mqvpn_config_set_proxy_protocol(mqvpn_config_t *cfg, int enabled);
 
 /* ─── Client API ─── */
 

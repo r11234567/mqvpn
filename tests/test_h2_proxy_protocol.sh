@@ -116,7 +116,7 @@ cat > "$TEST_DIR/server.json" <<EOF
         "enabled": true,
         "sni": "test.example.com",
         "quic_fallback": "127.0.0.1:8446",
-        "http2_backend": "127.0.0.1:8444",
+        "http2_backend": "[::1]:8444",
         "http2_backend_proxy_protocol": true
     }
 }

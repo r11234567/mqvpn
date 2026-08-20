@@ -614,6 +614,14 @@ mqvpn_config_set_proxy(mqvpn_config_t *cfg, int enabled, const char *sni_csv,
 }
 
 int
+mqvpn_config_set_proxy_protocol(mqvpn_config_t *cfg, int enabled)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    cfg->proxy_h2_backend_proxy_protocol = enabled != 0;
+    return MQVPN_OK;
+}
+
+int
 mqvpn_config_set_tun_mtu(mqvpn_config_t *cfg, int mtu)
 {
     if (!cfg) return MQVPN_ERR_INVALID_ARG;

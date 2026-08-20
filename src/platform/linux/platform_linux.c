@@ -1253,7 +1253,12 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
         mqvpn_config_free(lib_cfg);
         return 1;
     }
-    lib_cfg->proxy_h2_backend_proxy_protocol = cfg->proxy_h2_backend_proxy_protocol;
+    if (mqvpn_config_set_proxy_protocol(lib_cfg, cfg->proxy_h2_backend_proxy_protocol) !=
+        MQVPN_OK) {
+        LOG_ERR("invalid [Proxy] Http2BackendProxyProtocol setting");
+        mqvpn_config_free(lib_cfg);
+        return 1;
+    }
     /* Unconditional: 0 is a meaningful explicit-disable, not "unset". */
     mqvpn_config_set_udp_gso(lib_cfg, cfg->udp_gso);
 
