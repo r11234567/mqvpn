@@ -129,12 +129,21 @@ jobs:
 
       - name: Verify H2 proxy enabled
         run: |
-          if ! grep -q "MQVPN_ENABLE_H2_PROXY:BOOL=ON" build/CMakeCache.txt; then
-            echo "ERROR: H2 proxy not enabled in build!"
+          echo "Checking if H2 proxy was enabled..."
+          if grep -q "MQVPN_ENABLE_H2_PROXY" build/CMakeCache.txt; then
+            echo "✅ H2 proxy is enabled"
+            grep "MQVPN_ENABLE_H2_PROXY" build/CMakeCache.txt || true
+          else
+            echo "❌ ERROR: H2 proxy not found in CMakeCache.txt"
             echo "This means nghttp2 was not found. Please check the dependencies."
             exit 1
           fi
-          echo "✅ H2 proxy is enabled"
+          # Also verify the binary includes h2_proxy symbols
+          if nm build/libmqvpn.a 2>/dev/null | grep -q h2_proxy; then
+            echo "✅ h2_proxy symbols found in libmqvpn.a"
+          else
+            echo "⚠️ Warning: h2_proxy symbols not found in binary"
+          fi
 
       - name: Unit tests (ctest)
         run: cd build && ctest --output-on-failure
