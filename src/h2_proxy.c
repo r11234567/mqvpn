@@ -124,6 +124,7 @@ build_proxy_protocol_v2(uint8_t *buf, size_t buf_len, const struct sockaddr *cli
 
     const struct sockaddr_in *c4 = NULL, *s4 = NULL;
     const struct sockaddr_in6 *c6 = NULL, *s6 = NULL;
+    struct sockaddr_in6 c4_as_v6, s4_as_v6;
     uint8_t af_proto = 0;
     uint16_t addr_len = 0;
     size_t offset = 0;
@@ -150,8 +151,27 @@ build_proxy_protocol_v2(uint8_t *buf, size_t buf_len, const struct sockaddr *cli
         s6 = (const struct sockaddr_in6 *)server_addr;
         af_proto = PROXY_PROTOCOL_V2_AF_INET6; /* AF_INET6 + STREAM */
         addr_len = 36;                         /* 16 + 16 + 2 + 2 */
+    } else if (server_addr->sa_family == AF_INET6 && client_addr->sa_family == AF_INET &&
+               client_addrlen >= sizeof(struct sockaddr_in) &&
+               server_addrlen >= sizeof(struct sockaddr_in6)) {
+        /* An IPv4 client can be represented as an IPv4-mapped IPv6 source
+         * when the H2 backend is IPv6-only. This keeps one backend endpoint
+         * usable for both public address families. */
+        const struct sockaddr_in *client4 = (const struct sockaddr_in *)client_addr;
+        const struct sockaddr_in6 *server6 = (const struct sockaddr_in6 *)server_addr;
+        memset(&c4_as_v6, 0, sizeof(c4_as_v6));
+        c4_as_v6.sin6_family = AF_INET6;
+        c4_as_v6.sin6_addr.s6_addr[10] = 0xff;
+        c4_as_v6.sin6_addr.s6_addr[11] = 0xff;
+        memcpy(&c4_as_v6.sin6_addr.s6_addr[12], &client4->sin_addr, 4);
+        c4_as_v6.sin6_port = client4->sin_port;
+        c6 = &c4_as_v6;
+        s4_as_v6 = *server6;
+        s6 = &s4_as_v6;
+        af_proto = PROXY_PROTOCOL_V2_AF_INET6;
+        addr_len = 36;
     } else {
-        /* Address family mismatch or unsupported */
+        /* An IPv6 client cannot be represented by an IPv4-only backend. */
         return -1;
     }
 
