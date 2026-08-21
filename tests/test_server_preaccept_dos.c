@@ -207,10 +207,10 @@ main(void)
     /* 3. Raw xquic client engine — the hostile probe. */
     xqc_engine_ssl_config_t engine_ssl;
     memset(&engine_ssl, 0, sizeof(engine_ssl));
-    /* Prioritize AES-256-GCM; enable X25519MLKEM768 post-quantum support */
+    /* Prioritize AES-256-GCM; add X25519MLKEM768 as optional PQC support */
     engine_ssl.ciphers =
         "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256";
-    engine_ssl.groups = "X25519:P-256:P-384:P-521";
+    engine_ssl.groups = "X25519:P-256:P-384:P-521:X25519MLKEM768";
 
     xqc_engine_callback_t engine_cbs = {
         .set_event_timer = atk_set_event_timer,
