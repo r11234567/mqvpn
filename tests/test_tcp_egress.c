@@ -531,7 +531,8 @@ probe_create_engine(void)
     /* Prioritize AES-256-GCM for stronger encryption */
     engine_ssl.ciphers =
         "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256";
-    engine_ssl.groups = "X25519:P-256:P-384:P-521";
+    /* Enable post-quantum key exchange with X25519MLKEM768 */
+    engine_ssl.groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
 
     xqc_engine_callback_t engine_cbs = {
         .set_event_timer = probe_set_event_timer,
