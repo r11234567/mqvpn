@@ -207,7 +207,9 @@ main(void)
     /* 3. Raw xquic client engine — the hostile probe. */
     xqc_engine_ssl_config_t engine_ssl;
     memset(&engine_ssl, 0, sizeof(engine_ssl));
-    engine_ssl.ciphers = XQC_TLS_CIPHERS;
+    /* Prioritize AES-256-GCM for stronger encryption */
+    engine_ssl.ciphers =
+        "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256";
     engine_ssl.groups = XQC_TLS_GROUPS;
 
     xqc_engine_callback_t engine_cbs = {
