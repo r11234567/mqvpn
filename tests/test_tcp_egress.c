@@ -23,6 +23,7 @@
 #include "hybrid/tcp_egress.h"
 #include "mqvpn_conn_settings.h"
 #include "mqvpn_internal.h"
+#include "log.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -2896,6 +2897,7 @@ TEST(parse_path_accepts_v6_literal_45_chars)
 int
 main(void)
 {
+    mqvpn_log_set_level(MQVPN_LOG_DEBUG);
     printf("test_tcp_egress: server mqvpn-tcp dispatch tests\n");
 
     run_unrecognized_protocol_gets_501();
