@@ -34,7 +34,6 @@
 #include "libmqvpn.h"
 #include "mqvpn_internal.h"
 #include "server_h3_settings.h"
-#include "log.h"
 
 /* Test infrastructure */
 
@@ -931,7 +930,6 @@ TEST(server_max_clients_config)
 int
 main(void)
 {
-    mqvpn_log_set_level(MQVPN_LOG_DEBUG);
     printf("test_server: libmqvpn server API tests\n");
 
     /* server_new validation */
