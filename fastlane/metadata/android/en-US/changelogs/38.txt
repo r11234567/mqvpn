@@ -1,3 +1,13 @@
+- Add a launcher icon.
+- Server certificate verification is now on by default: the "Insecure
+  (skip TLS verify)" toggle resets to off once on upgrade — turn it
+  back on manually if your server uses a self-signed certificate.
+- Ask for the notification permission when connecting, so the VPN
+  status notification appears on Android 13+.
+- Disconnect now fully stops the VPN service and removes its
+  notification.
 - Core library: new multipath reinjection support. The tunnel can send copies
   of selected packets over a second link for smoother behavior on flaky
   connections (config-level feature; no app UI yet).
+- Update BoringSSL to 0.20260813.0, picking up upstream TLS/crypto
+  fixes since the previous pin.
