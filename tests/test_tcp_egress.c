@@ -553,7 +553,7 @@ probe_create_engine(void)
 
     xqc_config_t xconfig;
     if (xqc_engine_get_default_config(&xconfig, XQC_ENGINE_CLIENT) < 0) return NULL;
-    xconfig.cfg_log_level = XQC_LOG_INFO;
+    xconfig.cfg_log_level = XQC_LOG_ERROR;
 
     xqc_engine_t *engine = xqc_engine_create(XQC_ENGINE_CLIENT, &xconfig, &engine_ssl,
                                              &engine_cbs, &tcbs, NULL);
@@ -719,7 +719,7 @@ harness_start(harness_t *h, const char *protocol, size_t protocol_len, int auto_
         mqvpn_config_set_listen(svr_cfg, "0.0.0.0", 443);
         mqvpn_config_set_subnet(svr_cfg, "10.0.0.0/24");
         mqvpn_config_set_tls_cert(svr_cfg, TEST_CERT_FILE, TEST_KEY_FILE);
-        mqvpn_config_set_log_level(svr_cfg, MQVPN_LOG_INFO);
+        mqvpn_config_set_log_level(svr_cfg, MQVPN_LOG_ERROR);
         /* [Hybrid] Enabled defaults to false (docs/control-api.md) — this
          * whole file's dispatch tests exercise the connect-tcp path, which
          * (I2 fix) now ALSO gates on this runtime flag, not just the compile
@@ -2737,7 +2737,7 @@ TEST(get_egress_policy_v6_tunnel_unset_without_subnet6)
     mqvpn_config_set_listen(cfg, "0.0.0.0", 443);
     mqvpn_config_set_subnet(cfg, "10.0.0.0/24");
     mqvpn_config_set_tls_cert(cfg, TEST_CERT_FILE, TEST_KEY_FILE);
-    mqvpn_config_set_log_level(cfg, MQVPN_LOG_INFO);
+    mqvpn_config_set_log_level(cfg, MQVPN_LOG_ERROR);
 
     mqvpn_server_callbacks_t cbs = MQVPN_SERVER_CALLBACKS_INIT;
     cbs.tun_output = counting_tun_output;
@@ -2764,7 +2764,7 @@ TEST(get_egress_policy_v6_tunnel_set_when_subnet6_configured)
     mqvpn_config_set_subnet(cfg, "10.0.0.0/24");
     ASSERT_EQ(mqvpn_config_set_subnet6(cfg, "2001:db8:abcd::/112"), MQVPN_OK);
     mqvpn_config_set_tls_cert(cfg, TEST_CERT_FILE, TEST_KEY_FILE);
-    mqvpn_config_set_log_level(cfg, MQVPN_LOG_INFO);
+    mqvpn_config_set_log_level(cfg, MQVPN_LOG_ERROR);
 
     mqvpn_server_callbacks_t cbs = MQVPN_SERVER_CALLBACKS_INIT;
     cbs.tun_output = counting_tun_output;
