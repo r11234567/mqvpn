@@ -553,7 +553,7 @@ probe_create_engine(void)
 
     xqc_config_t xconfig;
     if (xqc_engine_get_default_config(&xconfig, XQC_ENGINE_CLIENT) < 0) return NULL;
-    xconfig.cfg_log_level = XQC_LOG_ERROR;
+    xconfig.cfg_log_level = XQC_LOG_INFO;
 
     xqc_engine_t *engine = xqc_engine_create(XQC_ENGINE_CLIENT, &xconfig, &engine_ssl,
                                              &engine_cbs, &tcbs, NULL);
