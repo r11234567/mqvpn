@@ -53,6 +53,7 @@ https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
   - [Android SDK](#android-sdk)
 - [Testing](#testing)
 - [Usage](#usage)
+- [Known issues](#known-issues)
 - [Roadmap](#roadmap)
 - [Protocol Standards](#protocol-standards)
 - [Community](#community)
@@ -740,6 +741,30 @@ mqvpn [--config PATH] --mode client|server [options]
   --genkey               Generate PSK and exit
   --help                 Show all options
 ```
+
+## Known issues
+
+### Post-quantum handshake behind a Retry — mitigated in xquic, not fully fixed
+
+`X25519MLKEM768` is requested by default on both sides (`src/mqvpn_client.c`,
+`src/mqvpn_server.c`). Its 1184-byte key share fills the client's first Initial packet
+to `MQVPN_MAX_PKT_OUT_SIZE` (1400). The server then answers with a Retry for address
+validation, and xquic rebuilds that Initial with the Retry token added to the header
+while copying the payload in unchanged — pushing the packet past the AEAD output buffer
+by a single byte. Encryption failed with `XQC_TLS_ENCRYPT_DATA_ERROR` (-736) and the
+connection closed locally, so **no handshake could complete at all**. It surfaced as a
+10-second dispatch timeout in `tests/test_tcp_egress.c`, but production clients hit the
+same path.
+
+Mitigated in the xquic fork by reserving worst-case header-growth space
+([r11234567/xquic@a40cbd5](https://github.com/r11234567/xquic/commit/a40cbd5)), pinned
+through `third_party/xquic`. PMTUD cannot help here: it only takes effect after the
+handshake negotiates transport parameters, while the failure is in the handshake itself.
+
+**Still open:** the re-sent Initial can exceed the configured `max_pkt_out_size`, so it
+may be dropped on a path whose real MTU is that small. The proper fix is re-fragmenting
+the CRYPTO data under the new header; tracked under "Known issues" in the xquic fork's
+README.
 
 ## Roadmap
 
