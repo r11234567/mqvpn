@@ -114,8 +114,6 @@ jobs:
           cmake --build build -j2
 
       - name: RFC, proxy, config, and MASQUE regressions
-        env:
-          MQVPN_LOG_LEVEL: info
         run: |
           ctest --test-dir build --output-on-failure \
                 -R '^(test_sni_router|test_h2_proxy|test_config|test_server|test_linux_server_socket|test_tcp_egress)$'
