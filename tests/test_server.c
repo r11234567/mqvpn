@@ -138,7 +138,7 @@ make_server_config(void)
     mqvpn_config_set_listen(cfg, "0.0.0.0", 443);
     mqvpn_config_set_subnet(cfg, "10.0.0.0/24");
     mqvpn_config_set_tls_cert(cfg, TEST_CERT_FILE, TEST_KEY_FILE);
-    mqvpn_config_set_log_level(cfg, MQVPN_LOG_ERROR);
+    mqvpn_config_set_log_level(cfg, MQVPN_LOG_INFO);
     return cfg;
 }
 
@@ -758,7 +758,7 @@ TEST(server_session_quic_loopback)
     mqvpn_config_t *cli_cfg = mqvpn_config_new();
     mqvpn_config_set_server(cli_cfg, "127.0.0.1", ntohs(svr_addr.sin_port));
     mqvpn_config_set_insecure(cli_cfg, 1);
-    mqvpn_config_set_log_level(cli_cfg, MQVPN_LOG_ERROR);
+    mqvpn_config_set_log_level(cli_cfg, MQVPN_LOG_INFO);
 
     mqvpn_client_callbacks_t cli_cbs = MQVPN_CLIENT_CALLBACKS_INIT;
     cli_cbs.tun_output = mock_cli_tun_output;
