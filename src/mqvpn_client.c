@@ -2849,8 +2849,11 @@ init_xquic_engine(mqvpn_client_t *c)
     const mqvpn_config_t *cfg = &c->config;
     xqc_engine_ssl_config_t engine_ssl;
     memset(&engine_ssl, 0, sizeof(engine_ssl));
-    engine_ssl.ciphers = XQC_TLS_CIPHERS;
-    engine_ssl.groups = XQC_TLS_GROUPS;
+    /* Prioritize AES-256-GCM for stronger encryption */
+    engine_ssl.ciphers =
+        "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256";
+    /* Enable post-quantum key exchange with X25519MLKEM768 */
+    engine_ssl.groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
 
     xqc_engine_callback_t engine_cbs = {
         .set_event_timer = cb_set_event_timer,
@@ -3705,8 +3708,16 @@ tun_send_datagram(mqvpn_client_t *c, cli_conn_t *conn, const uint8_t *pkt, size_
                                     mqvpn_dgram_qos_level(c->config.scheduler));
 
     if (xret == -XQC_EAGAIN) {
+        /* Backpressure: xquic returns -XQC_EAGAIN before writing any datagram
+         * frame (xqc_datagram.c bails ahead of xqc_write_datagram_frame_to_packet),
+         * so nothing was sent — do NOT count it in dgram_sent. Note the
+         * platform's MQVPN_ERR_AGAIN contract is "stop reading the TUN until
+         * ready_for_tun"; this packet itself is dropped, not retried
+         * (IP-layer loss under backpressure — inner transports retransmit),
+         * which is exactly why counting it would inflate dgram_sent with
+         * packets that never went out. Matches the server TX tail
+         * (mqvpn_server.c), which counts on XQC_OK only. */
         c->backpressure = 1;
-        c->dgram_sent++;
         return MQVPN_ERR_AGAIN;
     }
     if (xret < 0) {
@@ -4193,6 +4204,15 @@ mqvpn_client_set_server_addr(mqvpn_client_t *c, const struct sockaddr *addr,
                              socklen_t addrlen)
 {
     if (!c || !addr) return MQVPN_ERR_INVALID_ARG;
+    /* Reject an oversized addrlen instead of copying: this is an exported
+     * FFI/JNI entry point, so a miscomputed socklen_t (or a corrupted
+     * addrinfo ai_addrlen) larger than sockaddr_storage would otherwise
+     * overrun c->server_addr into adjacent fields. Rejecting (rather than
+     * clamping) also avoids memcpy over-reading the caller's real sockaddr
+     * object, which is typically far smaller than the bogus length; every
+     * legitimate sockaddr fits in sockaddr_storage, so an oversized length
+     * is always a caller bug. Mirrors mqvpn_server_set_socket_fd. */
+    if (addrlen > sizeof(c->server_addr)) return MQVPN_ERR_INVALID_ARG;
     memcpy(&c->server_addr, addr, addrlen);
     c->server_addrlen = addrlen;
     return MQVPN_OK;

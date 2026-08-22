@@ -13,12 +13,14 @@ on:
       - 'src/platform/linux/platform_linux.c'
       - 'src/platform/linux/server_socket_policy.h'
       - 'src/server_h3_settings.h'
+      - 'src/hybrid/**'
       - 'include/libmqvpn.h'
       - 'tests/test_sni_router.c'
       - 'tests/test_h2_proxy.c'
       - 'tests/test_linux_server_socket.c'
       - 'tests/test_server.c'
       - 'tests/test_config.c'
+      - 'tests/test_tcp_egress.c'
       - 'patches/xquic/**'
       - 'scripts/apply_xquic_patches.sh'
       - '.github/workflows/sni-h2-proxy-tests.yml'
@@ -114,9 +116,33 @@ jobs:
           cmake --build build -j2
 
       - name: RFC, proxy, config, and MASQUE regressions
+        env:
+          # Full detail from both engines plus per-datagram tracing. The test
+          # harness is silent by default (see the diagnostics block in
+          # tests/test_tcp_egress.c); without these a timeout in here reports
+          # only "rc == -1", with nothing to say which layer failed.
+          MQVPN_TEST_VERBOSE: '1'
+          MQVPN_TEST_LOG: debug
+          MQVPN_TEST_XQUIC_LOG: debug
         run: |
+          # --output-on-failure only prints a failing test's tail once the
+          # captured output exceeds the default limit, so raise both caps:
+          # verbose xquic tracing runs well past 300K on a 10s timeout.
           ctest --test-dir build --output-on-failure \
+                --test-output-size-passed 4194304 \
+                --test-output-size-failed 33554432 \
                 -R '^(test_sni_router|test_h2_proxy|test_config|test_server|test_linux_server_socket|test_tcp_egress)$'
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: protocol-regression-logs
+          path: |
+            build/Testing/**/*.log
+            build/Testing/**/*.xml
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Initial-path runtime ceiling
         run: timeout 5s ./build/tests/test_sni_router
