@@ -2898,6 +2898,7 @@ int
 main(void)
 {
     mqvpn_log_set_level(MQVPN_LOG_DEBUG);
+    LOG_INF("Starting test_tcp_egress with DEBUG log level");
     printf("test_tcp_egress: server mqvpn-tcp dispatch tests\n");
 
     run_unrecognized_protocol_gets_501();
