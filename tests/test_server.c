@@ -932,7 +932,6 @@ int
 main(void)
 {
     mqvpn_log_set_level(MQVPN_LOG_DEBUG);
-    LOG_INF("Starting test_server with DEBUG log level");
     printf("test_server: libmqvpn server API tests\n");
 
     /* server_new validation */
