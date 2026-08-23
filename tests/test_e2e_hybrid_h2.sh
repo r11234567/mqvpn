@@ -565,6 +565,40 @@ run_byte_identical_transfer() {
 # once; a persistent sub-floor sample fails the owning test.
 IPERF_MIN_MBPS=1.0
 
+# iperf3's default control/data port, used to wait for the one-shot server to
+# actually be listening instead of guessing with a fixed sleep.
+IPERF_PORT=5201
+
+# Explain a sub-floor sample. A bare "0.0 Mbps" cannot distinguish a tunnel
+# that died mid-run from a JSON the parser could not read, and both have
+# shown up in CI — so print whatever the run did leave behind. stderr is
+# captured to its own file (NOT merged into the JSON: any warning iperf3
+# writes there would corrupt the document and silently yield 0.0).
+iperf3_report_bad_sample() {
+    local json="$1" err="$2" label="${3:-iperf3}"
+    echo "  [$label] sub-floor sample — diagnostics:" >&2
+    python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception as e:
+    print('    JSON unparseable: %s' % e)
+    raise SystemExit
+if 'error' in d:
+    print('    iperf3 reported: %s' % d['error'])
+if 'end' not in d:
+    print('    no \"end\" block — the run never completed its summary')
+elif 'sum_received' not in d['end']:
+    print('    \"end\" present without sum_received; keys=%s' % sorted(d['end']))
+print('    intervals recorded: %d' % len(d.get('intervals') or []))
+" "$json" >&2 2>/dev/null || true
+    if [ -s "$err" ]; then
+        echo "    stderr:" >&2
+        head -10 "$err" | sed 's/^/      /' >&2
+    fi
+}
+
 # Single iperf3 TCP measurement (one flow) against $1 for $2 seconds.
 # Mirrors the existing netns iperf3-through-tunnel pattern in
 # benchmarks/bench_aggregate.sh: a one-shot server (`-1`) in NS_SERVER bound
@@ -581,15 +615,33 @@ IPERF_MIN_MBPS=1.0
 run_iperf3_through_tunnel() {
     local target="$1"
     local duration="${2:-6}"
-    local json
+    local json err
     json="$(mktemp)"
+    err="$(mktemp)"
 
     ip netns exec "$NS_SERVER" iperf3 -s -B "$target" -1 &>/dev/null &
     local ipid=$!
-    sleep 1
 
+    # Wait for the listener instead of sleeping a fixed second: on a loaded
+    # runner `iperf3 -s` can still be binding when the client fires, and the
+    # ECONNREFUSED that follows is indistinguishable from a broken tunnel in
+    # the "0.0" emitted below. Normally this returns in one 0.5s poll, so the
+    # happy path is faster than the sleep it replaces. The 5s cap is
+    # deliberately tight: a bind either succeeds at once or never (a target
+    # address that does not exist in NS_SERVER), and the perf phase can issue
+    # 30 samples, so a generous timeout here would eat its 12-minute budget.
+    if ! wait_for_listening_port "$NS_SERVER" "$IPERF_PORT" 5; then
+        echo "  [iperf3] server never listened on ${IPERF_PORT} (target ${target})" >&2
+        kill "$ipid" 2>/dev/null || true
+        wait "$ipid" 2>/dev/null || true
+        rm -f "$json" "$err"
+        echo "0.0"
+        return
+    fi
+
+    # stderr to its own file, never into "$json" — see iperf3_report_bad_sample.
     ip netns exec "$NS_CLIENT" timeout $((duration + 15)) \
-        iperf3 -c "$target" -t "$duration" -P 1 --json >"$json" 2>&1 || true
+        iperf3 -c "$target" -t "$duration" -P 1 --json >"$json" 2>"$err" || true
 
     kill "$ipid" 2>/dev/null || true
     wait "$ipid" 2>/dev/null || true
@@ -608,7 +660,10 @@ try:
 except Exception:
     print('0.0')
 ")"
-    rm -f "$json"
+    if awk -v m="$mbps" -v f="$IPERF_MIN_MBPS" 'BEGIN{exit !(m<f)}'; then
+        iperf3_report_bad_sample "$json" "$err" "iperf3 v4"
+    fi
+    rm -f "$json" "$err"
     echo "$mbps"
 }
 
@@ -619,15 +674,27 @@ except Exception:
 run_iperf3_v6_through_tunnel() {
     local target="$1"
     local duration="${2:-6}"
-    local json
+    local json err
     json="$(mktemp)"
+    err="$(mktemp)"
 
     ip netns exec "$NS_SERVER" iperf3 -s -6 -B "$target" -1 &>/dev/null &
     local ipid=$!
-    sleep 1
+
+    # Same listener wait and stderr separation as the v4 twin above. `ss -ltn`
+    # renders a v6-bound listener as "[fd00:a6::100]:5201", which the port
+    # match handles unchanged.
+    if ! wait_for_listening_port "$NS_SERVER" "$IPERF_PORT" 5; then
+        echo "  [iperf3 v6] server never listened on ${IPERF_PORT} (target ${target})" >&2
+        kill "$ipid" 2>/dev/null || true
+        wait "$ipid" 2>/dev/null || true
+        rm -f "$json" "$err"
+        echo "0.0"
+        return
+    fi
 
     ip netns exec "$NS_CLIENT" timeout $((duration + 15)) \
-        iperf3 -c "$target" -6 -t "$duration" -P 1 --json >"$json" 2>&1 || true
+        iperf3 -c "$target" -6 -t "$duration" -P 1 --json >"$json" 2>"$err" || true
 
     kill "$ipid" 2>/dev/null || true
     wait "$ipid" 2>/dev/null || true
@@ -646,7 +713,10 @@ try:
 except Exception:
     print('0.0')
 ")"
-    rm -f "$json"
+    if awk -v m="$mbps" -v f="$IPERF_MIN_MBPS" 'BEGIN{exit !(m<f)}'; then
+        iperf3_report_bad_sample "$json" "$err" "iperf3 v6"
+    fi
+    rm -f "$json" "$err"
     echo "$mbps"
 }
 
@@ -1173,6 +1243,14 @@ if len(loads) < 2:
 lo, hi = loads[0], loads[-1]
 share = (lo / hi) if hi else 0.0
 if lo < FLOOR:
+    # See the same branch in Test 8 for why both-under-floor is reported
+    # separately: it is not a load-share verdict, it means no path carried
+    # the burst at all.
+    if hi < FLOOR:
+        print('FAIL no-path-carried-load lo=%d hi=%d (floor=%d) — neither path '
+              'moved the burst; these per-connection counters are not from the '
+              'connection that carried it (tunnel reconnected mid-measurement?)'
+              % (lo, hi, FLOOR)); sys.exit()
     print('FAIL underused lo=%d hi=%d (floor=%d)' % (lo, hi, FLOOR)); sys.exit()
 if lo < 0.2 * hi:
     print('FAIL imbalanced lo=%d hi=%d minshare=%.2f' % (lo, hi, share)); sys.exit()
@@ -1754,6 +1832,17 @@ if len(loads) < 2:
 lo, hi = loads[0], loads[-1]
 share = (lo / hi) if hi else 0.0
 if lo < FLOOR:
+    # Both paths under the floor is not a load-share verdict at all: no path
+    # carried the burst. These counters are per-QUIC-connection, so that is
+    # what a mid-measurement reconnect looks like from here — the traffic went
+    # to the old connection, the snapshot describes the new one. Seen in CI as
+    # lo=0 hi=602 alongside a 0.0 Mbps sample, against lo=33M hi=53M on a
+    # passing run. Name it instead of blaming path spread.
+    if hi < FLOOR:
+        print('FAIL no-path-carried-load lo=%d hi=%d (floor=%d) — neither path '
+              'moved the burst; these per-connection counters are not from the '
+              'connection that carried it (tunnel reconnected mid-measurement?)'
+              % (lo, hi, FLOOR)); sys.exit()
     print('FAIL underused lo=%d hi=%d (floor=%d)' % (lo, hi, FLOOR)); sys.exit()
 if lo < 0.2 * hi:
     print('FAIL imbalanced lo=%d hi=%d minshare=%.2f' % (lo, hi, share)); sys.exit()
@@ -1898,6 +1987,18 @@ if [ "$fail" -ne 0 ]; then
     echo "--- Server log T6 (last 20) ---"; tail -20 "$SERVER_LOG_T6"
     echo "--- Client log T8 (last 30) ---"; tail -30 "$CLIENT_LOG_T8"
     echo "--- Server log T8 (last 20) ---"; tail -20 "$SERVER_LOG_T8"
+    # Test 8's known flake is the QUIC connection dying during the iperf3
+    # burst: iperf3 then reports 0.0 and the per-path counters describe the
+    # replacement connection. The fixed tails above cannot show it — by the
+    # time the suite finishes, the death and the reconnect have scrolled past
+    # 30 lines. These two filters run over the WHOLE T8 logs, so the next
+    # occurrence carries its own cause instead of needing a re-run.
+    echo "--- T8 client: connection lifecycle (whole log, filtered) ---"
+    grep -aE 'connection closed|conn_destroy|close_msg|socket exception|state: |abandon the only|no route to' \
+        "$CLIENT_LOG_T8" | cut -c1-220 | tail -40 || true
+    echo "--- T8 server: session lifecycle (whole log, filtered) ---"
+    grep -aE 'Extended CONNECT|tunnel established|session removed|addr_pool|conn_destroy|path (created|removed)' \
+        "$SERVER_LOG_T8" | cut -c1-220 | tail -30 || true
     exit 1
 fi
 echo "RESULT: PASS"

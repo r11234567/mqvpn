@@ -124,6 +124,14 @@ for ((i = 1; i <= NUM_CYCLES; i++)); do
     ip netns exec "$NS_SERVER" ip addr add "$FAULT_IP_S" dev "$FAULT_VETH_S" 2>/dev/null || true
     ip netns exec "$NS_CLIENT" tc qdisc add dev "$FAULT_VETH_C" root netem ${FAULT_NETEM} 2>/dev/null || true
     ip netns exec "$NS_SERVER" tc qdisc add dev "$FAULT_VETH_S" root netem ${FAULT_NETEM} 2>/dev/null || true
+    # Downing a link also purges the routes through it, and re-adding the
+    # address only restores the connected /24. Without this, the first Path B
+    # fault permanently strips Path B's route to the server: the re-add gate
+    # then refuses to rebuild the path, the client runs single-pathed for the
+    # rest of the run, and every later Path A fault kills the whole connection
+    # ("abandon the only active path"). Called unconditionally — it is
+    # idempotent, so the Path A cycles simply no-op.
+    ci_stress_add_path_b_route
 
     # (e) Let traffic recover (10s: QUIC path revalidation takes ~10-15s)
     sleep 10
