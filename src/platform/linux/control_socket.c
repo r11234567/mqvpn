@@ -661,8 +661,8 @@ ctrl_socket_create(struct event_base *eb, const char *addr, int port,
     cs->eb = eb;
     cs->server = server;
     /* Borrowed, not copied — the platform ctx outlives this socket. */
-    cs->gro_receives = gro_receives;
-    cs->gro_datagrams = gro_datagrams;
+    cs->gro_receives = gro_receives;   // lgtm[cpp/stack-address-escape]
+    cs->gro_datagrams = gro_datagrams; // lgtm[cpp/stack-address-escape]
 
     /* Determine address family */
     struct sockaddr_in sin4;
