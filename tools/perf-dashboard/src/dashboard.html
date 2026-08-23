@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>mqvpn perf history</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfc;
+  --panel: #ffffff;
+  --border: #e3e5e9;
+  --ink: #1b1d22;
+  --muted: #6b7280;
+  --line: #3b6fd4;
+  --line-soft: rgba(59, 111, 212, 0.14);
+  --chip: #f1f3f7;
+  --warn: #9a5b00;
+  --warn-bg: #fff4e0;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --panel: #1b1e24;
+    --border: #2b2f37;
+    --ink: #e6e8ec;
+    --muted: #98a0ad;
+    --line: #7aa5f0;
+    --line-soft: rgba(122, 165, 240, 0.18);
+    --chip: #23272f;
+    --warn: #ffcf8a;
+    --warn-bg: #3a2c12;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+a { color: var(--line); }
+header {
+  position: sticky; top: 0; z-index: 5;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 18px;
+}
+h1 { font-size: 15px; margin: 0 0 10px; font-weight: 650; letter-spacing: .01em; }
+h1 small { font-weight: 400; color: var(--muted); margin-left: 8px; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+label.ctl { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+select, input[type=search] {
+  font: inherit; font-size: 13px;
+  background: var(--bg); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 7px;
+  padding: 5px 8px;
+}
+input[type=search] { min-width: 200px; }
+.meta { padding: 10px 18px; color: var(--muted); font-size: 12.5px; }
+.notice {
+  margin: 10px 18px; padding: 9px 12px;
+  background: var(--warn-bg); color: var(--warn);
+  border-radius: 8px; font-size: 12.5px;
+}
+main { padding: 0 18px 40px; }
+.grid {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+}
+.card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 11px 12px 8px;
+  cursor: pointer; text-align: left; width: 100%;
+  font: inherit; color: inherit;
+}
+.card:hover, .card:focus-visible { border-color: var(--line); outline: none; }
+.card .name {
+  font-size: 12px; color: var(--muted);
+  word-break: break-all; line-height: 1.35; margin-bottom: 5px;
+}
+.card .val { font-size: 19px; font-weight: 620; font-variant-numeric: tabular-nums; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 5px 0 2px; }
+.chip {
+  font-size: 11px; padding: 1.5px 6px; border-radius: 999px;
+  background: var(--chip); color: var(--muted);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+svg { display: block; width: 100%; }
+.spark { height: 46px; }
+#detail {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 16px; margin-bottom: 16px;
+}
+#detail.hidden { display: none; }
+.detail-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.detail-title { font-size: 13.5px; font-weight: 620; word-break: break-all; }
+.close {
+  border: 1px solid var(--border); background: var(--bg); color: var(--muted);
+  border-radius: 7px; padding: 3px 9px; cursor: pointer; font: inherit; font-size: 12px;
+}
+.plot-wrap { position: relative; margin-top: 10px; }
+.plot { height: 300px; }
+.axis { stroke: var(--border); stroke-width: 1; }
+.gridline { stroke: var(--border); stroke-width: 1; stroke-dasharray: 3 4; opacity: .7; }
+.tick { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+#tip {
+  position: absolute; pointer-events: none; opacity: 0;
+  transform: translate(-50%, -100%);
+  background: var(--ink); color: var(--bg);
+  padding: 5px 8px; border-radius: 6px; font-size: 11.5px;
+  white-space: nowrap; transition: opacity .08s;
+}
+.empty { color: var(--muted); padding: 30px 0; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>mqvpn perf history <small id="sub">loading…</small></h1>
+  <div class="controls">
+    <label class="ctl">source
+      <select id="channel">
+        <option value="push">per-commit</option>
+        <option value="weekly">weekly</option>
+      </select>
+    </label>
+    <label class="ctl">benchmark <select id="test"></select></label>
+    <label class="ctl">runs
+      <select id="limit">
+        <option>10</option><option>20</option><option selected>40</option>
+        <option>60</option><option>100</option>
+      </select>
+    </label>
+    <label class="ctl">sort
+      <select id="sort">
+        <option value="name">name</option>
+        <option value="move">biggest move</option>
+        <option value="noise">noisiest</option>
+      </select>
+    </label>
+    <label class="ctl"><input type="checkbox" id="hideflat" checked> hide unchanging</label>
+    <input type="search" id="filter" placeholder="filter metrics…">
+  </div>
+</header>
+
+<p class="meta" id="meta"></p>
+<div class="notice" id="notice" hidden></div>
+
+<main>
+  <section id="detail" class="hidden">
+    <div class="detail-head">
+      <div>
+        <div class="detail-title" id="dTitle"></div>
+        <div class="chips" id="dChips"></div>
+      </div>
+      <button class="close" id="dClose">close</button>
+    </div>
+    <div class="plot-wrap">
+      <svg class="plot" id="dPlot" preserveAspectRatio="none"></svg>
+      <div id="tip"></div>
+    </div>
+  </section>
+  <div class="grid" id="grid"></div>
+  <p class="empty" id="empty" hidden></p>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const state = { data: null, selected: null };
+
+/* ── formatting ─────────────────────────────────────────────────────── */
+
+function fmt(v) {
+  if (v === null || v === undefined || !Number.isFinite(v)) return '—';
+  const a = Math.abs(v);
+  if (a === 0) return '0';
+  if (a >= 1000) return v.toFixed(0);
+  if (a >= 100) return v.toFixed(1);
+  if (a >= 1) return v.toFixed(2);
+  if (a >= 0.01) return v.toFixed(3);
+  return v.toExponential(1);
+}
+
+function shortTime(iso) {
+  if (!iso) return '?';
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toISOString().slice(0, 16).replace('T', ' ');
+}
+
+/* ── statistics ─────────────────────────────────────────────────────── */
+
+function stats(values) {
+  const f = values.filter((v) => v !== null && Number.isFinite(v));
+  if (!f.length) return null;
+  const mean = f.reduce((a, b) => a + b, 0) / f.length;
+  const sorted = [...f].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  const variance = f.length > 1
+    ? f.reduce((a, b) => a + (b - mean) ** 2, 0) / (f.length - 1)
+    : 0;
+  const sd = Math.sqrt(variance);
+  const last = f[f.length - 1];
+  const prev = f.length > 1 ? f[f.length - 2] : null;
+  return {
+    n: f.length,
+    mean, median, sd,
+    // Coefficient of variation: the honest read on whether a movement in this
+    // metric means anything on a shared cloud runner.
+    cv: mean !== 0 ? (sd / Math.abs(mean)) * 100 : null,
+    last, prev,
+    delta: prev !== null && prev !== 0 ? ((last - prev) / Math.abs(prev)) * 100 : null,
+    flat: sorted[0] === sorted[sorted.length - 1],
+    min: sorted[0], max: sorted[sorted.length - 1],
+  };
+}
+
+/* ── svg helpers ────────────────────────────────────────────────────── */
+
+function scale(values, w, h, padX, padY) {
+  const f = values.filter((v) => v !== null && Number.isFinite(v));
+  let min = Math.min(...f);
+  let max = Math.max(...f);
+  if (!Number.isFinite(min)) { min = 0; max = 1; }
+  if (min === max) { const b = Math.abs(min) || 1; min -= b * 0.05; max += b * 0.05; }
+  const n = values.length;
+  return {
+    min, max,
+    x: (i) => (n <= 1 ? w / 2 : padX + (i * (w - 2 * padX)) / (n - 1)),
+    y: (v) => h - padY - ((v - min) / (max - min)) * (h - 2 * padY),
+  };
+}
+
+// Gaps (a run whose file was unreadable) break the line instead of being
+// drawn through, so a missing point never looks like a measured value.
+function linePath(values, s) {
+  let d = '';
+  let pen = false;
+  values.forEach((v, i) => {
+    if (v === null || !Number.isFinite(v)) { pen = false; return; }
+    d += `${pen ? 'L' : 'M'}${s.x(i).toFixed(2)} ${s.y(v).toFixed(2)} `;
+    pen = true;
+  });
+  return d.trim();
+}
+
+function svgEl(tag, attrs) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  return el;
+}
+
+function sparkline(values) {
+  const W = 240, H = 46;
+  const s = scale(values, W, H, 2, 5);
+  const svg = svgEl('svg', { class: 'spark', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none' });
+  const d = linePath(values, s);
+  if (d) {
+    svg.appendChild(svgEl('path', {
+      d, fill: 'none', stroke: 'var(--line)', 'stroke-width': 1.6,
+      'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+      'vector-effect': 'non-scaling-stroke',
+    }));
+    for (let i = values.length - 1; i >= 0; i--) {
+      if (values[i] !== null && Number.isFinite(values[i])) {
+        svg.appendChild(svgEl('circle', {
+          cx: s.x(i), cy: s.y(values[i]), r: 2.4, fill: 'var(--line)',
+          'vector-effect': 'non-scaling-stroke',
+        }));
+        break;
+      }
+    }
+  }
+  return svg;
+}
+
+/* ── rendering ──────────────────────────────────────────────────────── */
+
+function visibleMetrics() {
+  const d = state.data;
+  if (!d) return [];
+  const q = $('filter').value.trim().toLowerCase();
+  const hideFlat = $('hideflat').checked;
+  const mode = $('sort').value;
+
+  let items = Object.keys(d.metrics).map((name) => ({ name, values: d.metrics[name], st: stats(d.metrics[name]) }));
+  items = items.filter((it) => it.st);
+  if (hideFlat) items = items.filter((it) => !it.st.flat);
+  if (q) items = items.filter((it) => it.name.toLowerCase().includes(q));
+
+  const rank = { name: (a, b) => a.name.localeCompare(b.name) };
+  if (mode === 'move') {
+    items.sort((a, b) => Math.abs(b.st.delta ?? 0) - Math.abs(a.st.delta ?? 0) || rank.name(a, b));
+  } else if (mode === 'noise') {
+    items.sort((a, b) => (b.st.cv ?? 0) - (a.st.cv ?? 0) || rank.name(a, b));
+  } else {
+    items.sort(rank.name);
+  }
+  return items;
+}
+
+function renderGrid() {
+  const grid = $('grid');
+  grid.textContent = '';
+  const items = visibleMetrics();
+
+  $('empty').hidden = items.length > 0;
+  if (!items.length) {
+    $('empty').textContent = state.data && Object.keys(state.data.metrics).length
+      ? 'No metric matches the current filter. Unchecking “hide unchanging” shows constants such as netem settings and durations.'
+      : 'No data for this benchmark yet.';
+    return;
+  }
+
+  for (const it of items) {
+    const card = document.createElement('button');
+    card.className = 'card';
+    card.type = 'button';
+
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = it.name;
+
+    const val = document.createElement('div');
+    val.className = 'val';
+    val.textContent = fmt(it.st.last);
+
+    const chips = document.createElement('div');
+    chips.className = 'chips';
+    if (it.st.delta !== null) {
+      chips.appendChild(chip(`${it.st.delta >= 0 ? '▲' : '▼'} ${Math.abs(it.st.delta).toFixed(1)}% vs prev`));
+    }
+    if (it.st.cv !== null) chips.appendChild(chip(`CV ${it.st.cv.toFixed(1)}%`));
+    chips.appendChild(chip(`med ${fmt(it.st.median)}`));
+    chips.appendChild(chip(`n=${it.st.n}`));
+
+    card.append(name, val, chips, sparkline(it.values));
+    card.addEventListener('click', () => openDetail(it.name));
+    grid.appendChild(card);
+  }
+}
+
+function chip(text) {
+  const el = document.createElement('span');
+  el.className = 'chip';
+  el.textContent = text;
+  return el;
+}
+
+function openDetail(name) {
+  state.selected = name;
+  const d = state.data;
+  const values = d.metrics[name];
+  const st = stats(values);
+  if (!st) return;
+
+  $('detail').classList.remove('hidden');
+  $('dTitle').textContent = name;
+
+  const chips = $('dChips');
+  chips.textContent = '';
+  chips.appendChild(chip(`latest ${fmt(st.last)}`));
+  chips.appendChild(chip(`median ${fmt(st.median)}`));
+  chips.appendChild(chip(`min ${fmt(st.min)}`));
+  chips.appendChild(chip(`max ${fmt(st.max)}`));
+  if (st.cv !== null) chips.appendChild(chip(`CV ${st.cv.toFixed(1)}%`));
+
+  drawDetail(values, d.runs);
+  $('detail').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function drawDetail(values, runs) {
+  const W = 900, H = 300, padX = 54, padY = 18;
+  const svg = $('dPlot');
+  svg.textContent = '';
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const s = scale(values, W, H, padX, padY);
+
+  // y grid + ticks
+  for (let i = 0; i <= 4; i++) {
+    const v = s.min + ((s.max - s.min) * i) / 4;
+    const y = s.y(v);
+    svg.appendChild(svgEl('line', { x1: padX, y1: y, x2: W - padX / 3, y2: y, class: 'gridline' }));
+    const t = svgEl('text', { x: padX - 8, y: y + 3.5, class: 'tick', 'text-anchor': 'end' });
+    t.textContent = fmt(v);
+    svg.appendChild(t);
+  }
+
+  const d = linePath(values, s);
+  if (d) {
+    svg.appendChild(svgEl('path', {
+      d, fill: 'none', stroke: 'var(--line)', 'stroke-width': 2,
+      'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+      'vector-effect': 'non-scaling-stroke',
+    }));
+  }
+  values.forEach((v, i) => {
+    if (v === null || !Number.isFinite(v)) return;
+    svg.appendChild(svgEl('circle', { cx: s.x(i), cy: s.y(v), r: 3, fill: 'var(--line)' }));
+  });
+
+  // x labels: first and last run only — commit SHAs do not fit otherwise.
+  if (runs.length) {
+    const first = svgEl('text', { x: padX, y: H - 3, class: 'tick', 'text-anchor': 'start' });
+    first.textContent = `${runs[0].commit || '?'} · ${shortTime(runs[0].timestamp)}`;
+    const lastRun = runs[runs.length - 1];
+    const last = svgEl('text', { x: W - padX / 3, y: H - 3, class: 'tick', 'text-anchor': 'end' });
+    last.textContent = `${lastRun.commit || '?'} · ${shortTime(lastRun.timestamp)}`;
+    svg.append(first, last);
+  }
+
+  const cursor = svgEl('line', {
+    x1: 0, y1: padY, x2: 0, y2: H - padY,
+    stroke: 'var(--line)', 'stroke-width': 1, opacity: 0,
+  });
+  svg.appendChild(cursor);
+
+  const tip = $('tip');
+  const onMove = (ev) => {
+    const box = svg.getBoundingClientRect();
+    if (!box.width) return;
+    const vx = ((ev.clientX - box.left) / box.width) * W;
+    let best = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < values.length; i++) {
+      if (values[i] === null || !Number.isFinite(values[i])) continue;
+      const dist = Math.abs(s.x(i) - vx);
+      if (dist < bestDist) { bestDist = dist; best = i; }
+    }
+    if (best < 0) return;
+    cursor.setAttribute('x1', s.x(best));
+    cursor.setAttribute('x2', s.x(best));
+    cursor.setAttribute('opacity', 0.45);
+    const run = runs[best] || {};
+    tip.textContent = `${fmt(values[best])} · ${run.commit || '?'} · ${shortTime(run.timestamp)}`;
+    tip.style.left = `${(s.x(best) / W) * box.width}px`;
+    tip.style.top = `${((s.y(values[best]) - 10) / H) * box.height}px`;
+    tip.style.opacity = 1;
+  };
+  svg.onmousemove = onMove;
+  svg.onmouseleave = () => { tip.style.opacity = 0; cursor.setAttribute('opacity', 0); };
+}
+
+/* ── data loading ───────────────────────────────────────────────────── */
+
+async function getJSON(path, params) {
+  const url = new URL(path, location.origin);
+  for (const [k, v] of Object.entries(params || {})) url.searchParams.set(k, v);
+  const res = await fetch(url, { credentials: 'same-origin' });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText} — ${await res.text()}`);
+  return res.json();
+}
+
+async function loadTests() {
+  const channel = $('channel').value;
+  const info = await getJSON('/api/tests', { channel });
+  const sel = $('test');
+  const previous = sel.value;
+  sel.textContent = '';
+  for (const t of info.tests) {
+    const opt = document.createElement('option');
+    opt.value = t.id;
+    opt.textContent = `${t.id} (${t.runs})`;
+    sel.appendChild(opt);
+  }
+  if (previous && info.tests.some((t) => t.id === previous)) sel.value = previous;
+
+  $('sub').textContent = info.tests.length
+    ? `${info.runs} runs indexed · newest ${info.newest ? info.newest.commit : '?'}`
+    : 'no data published yet';
+  return info;
+}
+
+async function loadSeries() {
+  const test = $('test').value;
+  if (!test) {
+    state.data = null;
+    $('meta').textContent = '';
+    renderGrid();
+    return;
+  }
+  $('meta').textContent = 'loading…';
+  const data = await getJSON('/api/series', {
+    channel: $('channel').value,
+    test,
+    limit: $('limit').value,
+  });
+  state.data = data;
+
+  const first = data.runs[0];
+  const last = data.runs[data.runs.length - 1];
+  $('meta').textContent = data.runs.length
+    ? `${data.runs.length} runs · ${shortTime(first.timestamp)} → ${shortTime(last.timestamp)} · ${data.totalMetrics} metrics`
+    : 'no runs for this benchmark';
+
+  const problems = [];
+  if (data.truncated) problems.push(`Only the first ${Object.keys(data.metrics).length} of ${data.totalMetrics} metrics are shown.`);
+  if (data.errors && data.errors.length) problems.push(`${data.errors.length} result file(s) could not be read; those points are gaps.`);
+  $('notice').hidden = problems.length === 0;
+  $('notice').textContent = problems.join(' ');
+
+  $('detail').classList.add('hidden');
+  state.selected = null;
+  renderGrid();
+}
+
+async function refreshAll() {
+  try {
+    await loadTests();
+    await loadSeries();
+  } catch (err) {
+    $('meta').textContent = '';
+    $('notice').hidden = false;
+    $('notice').textContent = `Failed to load: ${err.message}`;
+  }
+}
+
+$('channel').addEventListener('change', refreshAll);
+$('test').addEventListener('change', () => loadSeries().catch((e) => { $('notice').hidden = false; $('notice').textContent = e.message; }));
+$('limit').addEventListener('change', () => loadSeries().catch((e) => { $('notice').hidden = false; $('notice').textContent = e.message; }));
+$('filter').addEventListener('input', renderGrid);
+$('sort').addEventListener('change', renderGrid);
+$('hideflat').addEventListener('change', renderGrid);
+$('dClose').addEventListener('click', () => { $('detail').classList.add('hidden'); state.selected = null; });
+window.addEventListener('resize', () => { if (state.selected) drawDetail(state.data.metrics[state.selected], state.data.runs); });
+
+refreshAll();
+</script>
+</body>
+</html>

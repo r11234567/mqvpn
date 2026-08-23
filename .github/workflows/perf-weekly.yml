@@ -1,40 +1,44 @@
 name: Performance Tests (Weekly)
 
-# Full benchmark suite. Manual trigger only for now, for the same reason
-# perf.yml is (see the long note there): `runs-on: perf-test` is a
-# self-hosted label with no runner registered in this fork, so a scheduled
-# run only ever queued and was then dropped by the shared `perf-test`
-# concurrency group. Four cron firings, four cancellations, no results.
+# Full benchmark suite — every Sunday at 3:00 UTC. stress.yml's schedule
+# comment ("after perf-weekly at 3:00") is written relative to this slot, so
+# keep the two in step if either moves.
 #
-# To restore the schedule: register a runner carrying the `perf-test` label,
-# then uncomment the two lines below. 03:00 UTC Sunday is kept as the
-# intended slot — stress.yml's own schedule comment is written relative to
-# it — so re-enabling needs no other edit.
+# Runs on a GitHub-hosted runner for the same reason perf.yml does, and its
+# results carry the same caveat: shared cloud vCPUs, so read the series as a
+# trend against this repo's own history, never as an absolute figure or as
+# something comparable to upstream's dedicated box.
 #
-# Security: same restriction as perf.yml — no PR trigger, ever. A
-# self-hosted machine must not execute untrusted code.
+# Security: same restriction as perf.yml — no PR trigger, ever.
 
 on:
-  # schedule:
-  #   - cron: '0 3 * * 0'
+  schedule:
+    - cron: '0 3 * * 0'
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Shared with perf.yml on purpose — one physical benchmark box, serialized.
+# Separate from perf.yml's group: they shared one only to serialize access to a
+# single physical box, and hosted runs each get their own VM. The two write
+# different R2 prefixes (perf-data/weekly vs perf-data), so their index.json
+# read-modify-write cycles cannot collide either. cancel-in-progress stays off
+# so a manual re-run queues behind a suite in flight instead of killing it.
 concurrency:
-  group: perf-test
+  group: perf-weekly
   cancel-in-progress: false
 
 jobs:
   perf-weekly:
-    runs-on: perf-test
-    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      # Job-level so the publish steps can gate on presence; see perf.yml.
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
     steps:
-      - name: Pre-checkout cleanup (root-owned files)
-        run: sudo rm -rf ci_bench_results bench_results
-
       - uses: actions/checkout@v7
         with:
           submodules: recursive
@@ -43,20 +47,30 @@ jobs:
         shell: bash
         run: bash scripts/apply_xquic_patches.sh
 
-      - name: Cleanup stale state
+      - name: Install dependencies
         run: |
-          sudo pkill -f 'mqvpn.*ci-bench' || true
-          sudo ip netns del ci-bench-server 2>/dev/null || true
-          sudo ip netns del ci-bench-client 2>/dev/null || true
-          sudo pkill -f 'iperf3' || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3
 
-      - name: Clean previous build
-        run: |
-          rm -rf third_party/xquic/third_party/boringssl/build
-          rm -rf third_party/xquic/build
-          rm -rf build
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve BoringSSL pin
+        id: bssl-pin
+        run: echo "sha=$(git -C third_party/xquic/third_party/boringssl rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Same keys as perf.yml on purpose: identical flags, so the two workflows
+      # share one cache entry instead of each paying for its own build.
+      - name: Cache BoringSSL (gcc Release, perf)
+        id: bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-${{ steps.bssl-pin.outputs.sha }}-linux-gcc-release-fpic-perf-v1
 
       - name: Build BoringSSL
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
         run: |
           cd third_party/xquic/third_party/boringssl
           mkdir -p build && cd build
@@ -66,7 +80,20 @@ jobs:
                 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
           make -j$(nproc) ssl crypto
 
+      - name: Verify BoringSSL is an optimized build
+        run: bash scripts/ci_check_bssl_optimized.sh third_party/xquic/third_party/boringssl/build
+
+      - name: Cache xquic (gcc Release, perf)
+        id: xquic-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-perf-v1
+
       - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
         run: |
           cd third_party/xquic
           mkdir -p build && cd build
@@ -117,19 +144,12 @@ jobs:
           path: ci_bench_results/*.json
           retention-days: 90
 
-      - name: Verify aws-cli is installed on runner
-        if: success()
-        run: aws --version
-
       - name: Publish results to R2
-        if: success()
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        if: ${{ success() && env.R2_ACCOUNT_ID != '' }}
         run: bash scripts/ci_publish/publish_to_r2.sh perf-data/weekly weekly
 
-      - name: Post-job cleanup (root-owned files)
-        if: always()
-        run: sudo rm -rf ci_bench_results
+      - name: Note that R2 publishing was skipped
+        if: ${{ success() && env.R2_ACCOUNT_ID == '' }}
+        run: |
+          echo "::notice::R2_* secrets are not set — results are in this run's" \
+               "artifact only, and the dashboard will not show this run."

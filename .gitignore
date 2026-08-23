@@ -51,6 +51,10 @@ website/.vitepress/cache/
 # Bench data is published to R2 (perf-data.mqvpn.org), not committed.
 website/public/perf-data/
 
+# Cloudflare Worker that charts the published bench data
+tools/perf-dashboard/node_modules/
+tools/perf-dashboard/.wrangler/
+
 # Git worktrees
 .worktrees/
 

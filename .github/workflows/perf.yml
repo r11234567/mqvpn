@@ -1,49 +1,50 @@
 name: Performance Tests
 
-# Manual trigger only. Two independent reasons, and both must stop applying
-# before a push or PR trigger goes back in:
+# Core benchmark suite, on a GitHub-hosted runner.
 #
-#   1. `runs-on: perf-test` is a self-hosted label, and this fork has no
-#      runner registered under it. A triggered run therefore never starts —
-#      it queues, and the next request entering the shared `perf-test`
-#      concurrency group drops it ("Canceling since a higher priority
-#      waiting request for perf-test exists"). Every push to main spent a
-#      run that way: 53 runs, 53 cancellations, zero benchmark results.
-#   2. A self-hosted box must never execute untrusted code, which rules out
-#      a PR trigger no matter what the runner situation is.
+# Why hosted: `runs-on: perf-test` was a self-hosted label with no runner
+# registered in this fork, so this workflow never executed once — 53 runs, 53
+# cancellations, zero results. A noisy number beats no number.
 #
-# e6766b3 already made this manual-only for reason 1; 892c7bb ("refresh
-# workflows from upstream 0.16.0") took upstream's triggers back wholesale.
-# Upstream runs its own perf machine, this fork does not — so keep the fork's
-# version of this block when re-syncing workflows.
+# How to read the results: shared cloud vCPUs have neighbours, so absolute
+# throughput here is NOT comparable to upstream's dedicated box, and a single
+# run means little on its own. Treat every series as a trend against this
+# repo's own history, and check a metric's coefficient of variation (the
+# dashboard shows it) before reading anything into a movement.
 #
-# Runner requires: cmake gcc make git libevent-dev golang iptables
-#                  iproute2 iperf3 python3 jq openssl aws-cli
-# Publishing also needs the R2_* repository secrets (see the last steps).
+# Never runs on PRs: fork code must not execute with this workflow's token.
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Group shared with perf-weekly.yml deliberately: both target the single
-# `perf-test` machine, and two benchmark suites on one box would be
-# measuring each other. cancel-in-progress is false so a manual run queues
-# behind the weekly suite rather than killing a 2-hour job mid-flight — the
-# old `true` here meant any push to main could do exactly that.
+# Its own group now. The old shared `perf-test` group existed to serialize two
+# workflows onto one physical box; hosted runs each get a fresh VM, so the only
+# shared resource left is the index.json that publish_to_r2.sh rewrites
+# read-modify-write. perf-weekly writes a different prefix, so this workflow can
+# only race itself — cancel-in-progress holds it to a single writer and drops
+# superseded commits instead of queueing one long job per push.
 concurrency:
-  group: perf-test
-  cancel-in-progress: false
+  group: perf-push
+  cancel-in-progress: true
 
 jobs:
   perf-test:
-    runs-on: perf-test
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Job-level rather than on the publish step, so the steps below can skip
+      # themselves when R2 is unconfigured: the `secrets` context is not
+      # available in a step `if:`, but `env` is.
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
     steps:
-      - name: Pre-checkout cleanup (root-owned files)
-        run: sudo rm -rf ci_bench_results bench_results
-
       - uses: actions/checkout@v7
         with:
           submodules: recursive
@@ -52,20 +53,36 @@ jobs:
         shell: bash
         run: bash scripts/apply_xquic_patches.sh
 
-      - name: Cleanup stale state
+      # The self-hosted box had these preinstalled. gcc, make, git, python3, jq
+      # and the AWS CLI already ship on the hosted image; these do not.
+      - name: Install dependencies
         run: |
-          sudo pkill -f 'mqvpn.*ci-bench' || true
-          sudo ip netns del ci-bench-server 2>/dev/null || true
-          sudo ip netns del ci-bench-client 2>/dev/null || true
-          sudo pkill -f 'iperf3' || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3
 
-      - name: Clean previous build
-        run: |
-          rm -rf third_party/xquic/third_party/boringssl/build
-          rm -rf third_party/xquic/build
-          rm -rf build
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve BoringSSL pin
+        id: bssl-pin
+        run: echo "sha=$(git -C third_party/xquic/third_party/boringssl rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Caching replaces the old "Clean previous build" step, which wiped a
+      # persistent workspace and would now delete what we just restored. An
+      # ephemeral VM starts clean, so the wipe has nothing left to do — and the
+      # dependency builds are the bulk of the wall time. Keys carry the build
+      # flags, so a tree built for a different configuration can never be
+      # served to this job.
+      - name: Cache BoringSSL (gcc Release, perf)
+        id: bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-${{ steps.bssl-pin.outputs.sha }}-linux-gcc-release-fpic-perf-v1
 
       - name: Build BoringSSL
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
         run: |
           cd third_party/xquic/third_party/boringssl
           mkdir -p build && cd build
@@ -77,10 +94,25 @@ jobs:
                 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
           make -j$(nproc) ssl crypto
 
+      # Deliberately outside the cache-miss guard: this is the guard for the
+      # -O0 trap above, and a poisoned cache entry is exactly the case worth
+      # catching.
       - name: Verify BoringSSL is an optimized build
         run: bash scripts/ci_check_bssl_optimized.sh third_party/xquic/third_party/boringssl/build
 
+      - name: Cache xquic (gcc Release, perf)
+        id: xquic-cache
+        uses: actions/cache@v6
+        with:
+          # See ci.yml's "Cache xquic (Release)" comment re: xqc_configure.h —
+          # it is generated, so it must travel with build/.
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-perf-v1
+
       - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
         run: |
           cd third_party/xquic
           mkdir -p build && cd build
@@ -115,19 +147,15 @@ jobs:
           path: ci_bench_results/*.json
           retention-days: 90
 
-      - name: Verify aws-cli is installed on runner
-        if: success()
-        run: aws --version
-
+      # Skipped rather than failed when R2 is unconfigured: the artifact above
+      # still carries this run's results, so a missing bucket must not turn a
+      # green benchmark run red.
       - name: Publish results to R2
-        if: success()
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        if: ${{ success() && env.R2_ACCOUNT_ID != '' }}
         run: bash scripts/ci_publish/publish_to_r2.sh perf-data push
 
-      - name: Post-job cleanup (root-owned files)
-        if: always()
-        run: sudo rm -rf ci_bench_results
+      - name: Note that R2 publishing was skipped
+        if: ${{ success() && env.R2_ACCOUNT_ID == '' }}
+        run: |
+          echo "::notice::R2_* secrets are not set — results are in this run's" \
+               "artifact only, and the dashboard will not show this commit."
