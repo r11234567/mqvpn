@@ -21,12 +21,14 @@
 
 #include "libmqvpn.h"
 #include "hybrid/tcp_egress.h"
+#include "log.h"
 #include "mqvpn_conn_settings.h"
 #include "mqvpn_internal.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdint.h>
@@ -82,6 +84,111 @@ test_now_us(void)
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000000ull + (uint64_t)tv.tv_usec;
 }
+
+/* ── Diagnostics ──
+ *
+ * This harness is silent by default: the dispatch tests assert on :status
+ * codes, and both engines are chatty enough to bury them. That silence is
+ * also why a timeout here used to be undiagnosable in CI — the only artifact
+ * was `rc == -1` on the ASSERT_EQ line, with no way to tell a failed QUIC
+ * handshake apart from a server that accepted the connection and never
+ * answered. These knobs turn the harness inside out; none of them change the
+ * default (quiet) behavior:
+ *
+ *   MQVPN_TEST_VERBOSE=1        master switch — everything below, max detail
+ *   MQVPN_TEST_LOG=<lvl>        mqvpn server-side level:
+ *                               debug|info|warn|error   (default error)
+ *   MQVPN_TEST_XQUIC_LOG=<lvl>  xquic engine level:
+ *                               debug|info|stats|warn|error|fatal|report|off
+ *                               (default off — the sink stays silent)
+ *   MQVPN_TEST_TRACE_IO=1       one line per datagram the harness relays
+ *
+ * The timeout report itself is deliberately NOT gated: a test that fails
+ * should always say how far it got. */
+typedef struct {
+    int verbose;
+    int trace_io;
+    int xquic_log_on;
+    xqc_log_level_t xquic_level;
+    mqvpn_log_level_t mqvpn_level;
+} tdiag_t;
+
+static tdiag_t g_diag;
+
+/* Treat unset, empty, "0", "false" and "off" as disabled so a workflow can
+ * pass MQVPN_TEST_VERBOSE=0 to mean "off" rather than accidentally enabling
+ * it by defining the variable at all. */
+static int
+tdiag_flag(const char *name)
+{
+    const char *v = getenv(name);
+    if (!v || !*v) return 0;
+    return strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+}
+
+static void
+tdiag_init(void)
+{
+    const char *mq = getenv("MQVPN_TEST_LOG");
+    const char *xq = getenv("MQVPN_TEST_XQUIC_LOG");
+
+    g_diag.verbose = tdiag_flag("MQVPN_TEST_VERBOSE");
+    g_diag.trace_io = g_diag.verbose || tdiag_flag("MQVPN_TEST_TRACE_IO");
+
+    g_diag.mqvpn_level = g_diag.verbose ? MQVPN_LOG_DEBUG : MQVPN_LOG_ERROR;
+    if (mq && *mq) {
+        if (!strcmp(mq, "debug"))
+            g_diag.mqvpn_level = MQVPN_LOG_DEBUG;
+        else if (!strcmp(mq, "info"))
+            g_diag.mqvpn_level = MQVPN_LOG_INFO;
+        else if (!strcmp(mq, "warn"))
+            g_diag.mqvpn_level = MQVPN_LOG_WARN;
+        else
+            g_diag.mqvpn_level = MQVPN_LOG_ERROR;
+    }
+
+    /* xquic's own trace log is off unless explicitly asked for: wiring the
+     * sink up unconditionally would add engine noise to every currently-quiet
+     * local run. XQC_LOG_DEBUG is the most verbose end of the scale
+     * (xqc_log.h gates on `log_level >= level`, and DEBUG is the largest
+     * enumerator), the opposite direction from mqvpn_log_level_t above. */
+    g_diag.xquic_log_on = g_diag.verbose;
+    g_diag.xquic_level = g_diag.verbose ? XQC_LOG_DEBUG : XQC_LOG_ERROR;
+    if (xq && *xq) {
+        g_diag.xquic_log_on = 1;
+        if (!strcmp(xq, "debug"))
+            g_diag.xquic_level = XQC_LOG_DEBUG;
+        else if (!strcmp(xq, "info"))
+            g_diag.xquic_level = XQC_LOG_INFO;
+        else if (!strcmp(xq, "stats") || !strcmp(xq, "stat"))
+            g_diag.xquic_level = XQC_LOG_STATS;
+        else if (!strcmp(xq, "warn"))
+            g_diag.xquic_level = XQC_LOG_WARN;
+        else if (!strcmp(xq, "error"))
+            g_diag.xquic_level = XQC_LOG_ERROR;
+        else if (!strcmp(xq, "fatal"))
+            g_diag.xquic_level = XQC_LOG_FATAL;
+        else if (!strcmp(xq, "report"))
+            g_diag.xquic_level = XQC_LOG_REPORT;
+        else {
+            g_diag.xquic_log_on = 0;
+            g_diag.xquic_level = XQC_LOG_ERROR;
+        }
+    }
+}
+
+/* Harness diagnostic line. stderr, unbuffered, to match mqvpn_log's own sink
+ * so one captured CI log reads as a single ordered timeline (see the setvbuf
+ * call in main). */
+#define TDIAG(fmt, ...)                                        \
+    do {                                                       \
+        fprintf(stderr, "[harness] " fmt "\n", ##__VA_ARGS__); \
+    } while (0)
+
+#define TDIAG_IF(cond, fmt, ...)             \
+    do {                                     \
+        if (cond) TDIAG(fmt, ##__VA_ARGS__); \
+    } while (0)
 
 /* Counts inner-IP packets the server forwarded out of the tunnel — the
  * observable the tunnel-survival regression test asserts on. */
@@ -162,17 +269,31 @@ typedef struct {
      * parks a server-side connect-tcp flow in uplink_withheld. Independent
      * of raw_capture (checked first) so the two knobs don't fight. */
     int suppress_body_drain;
+
+    /* ── Diagnostics (see the tdiag block above) ──
+     * Milestone flags and byte counters, so a timeout can report how far the
+     * connection actually got instead of just "no response". conn_created and
+     * conn_closed mirror the h3_conn create/close notifies; closing_err is
+     * the last error xquic reported on the request. */
+    int conn_created;
+    int conn_closed;
+    long closing_err;
+    uint64_t tx_datagrams, tx_bytes;
 } probe_conn_t;
 
 static void
 probe_log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *user_data)
 {
     (void)lvl;
-    (void)buf;
-    (void)size;
     (void)user_data;
-    /* Silent — this test cares about dispatch behavior, not xquic's own log
-     * noise. */
+    /* Silent unless diagnostics were asked for: these tests care about
+     * dispatch behavior, not xquic's own log noise. When enabled this is the
+     * only window into handshake-level failures (TLS group/cipher
+     * negotiation, CRYPTO frame sizing, packet encryption errors), which is
+     * exactly what a dispatch probe that never completes its handshake needs.
+     * xquic hands us a non-NUL-terminated buffer, hence the bounded %.*s. */
+    if (!g_diag.xquic_log_on || !buf || size == 0) return;
+    fprintf(stderr, "[xquic:%d] %.*s\n", (int)lvl, (int)size, (const char *)buf);
 }
 
 static void
@@ -195,9 +316,19 @@ probe_write_socket(const unsigned char *buf, size_t size, const struct sockaddr 
         res = sendto(p->fd, buf, size, MSG_DONTWAIT, peer, peerlen);
     } while (res < 0 && errno == EINTR);
     if (res < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return XQC_SOCKET_EAGAIN;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            TDIAG_IF(g_diag.trace_io, "cli->svr EAGAIN (%zu bytes deferred)", size);
+            return XQC_SOCKET_EAGAIN;
+        }
+        /* Always reported: a send error here strands the handshake, and it is
+         * invisible in the pass/fail line the test framework prints. */
+        TDIAG("cli->svr send FAILED: %s (%zu bytes)", strerror(errno), size);
         return XQC_SOCKET_ERROR;
     }
+    p->tx_datagrams++;
+    p->tx_bytes += (uint64_t)res;
+    TDIAG_IF(g_diag.trace_io, "cli->svr datagram #%llu: %zd bytes",
+             (unsigned long long)p->tx_datagrams, res);
     return res;
 }
 
@@ -379,6 +510,8 @@ probe_cb_h3_conn_create(xqc_h3_conn_t *h3_conn, const xqc_cid_t *cid, void *user
     (void)cid;
     probe_conn_t *p = (probe_conn_t *)user_data;
     p->h3_conn = h3_conn;
+    p->conn_created = 1;
+    TDIAG_IF(g_diag.verbose, "probe: h3 conn created");
     return 0;
 }
 
@@ -388,15 +521,54 @@ probe_cb_h3_conn_handshake_finished(xqc_h3_conn_t *h3_conn, void *user_data)
     (void)h3_conn;
     probe_conn_t *p = (probe_conn_t *)user_data;
     p->handshake_done = 1;
+    TDIAG_IF(g_diag.verbose,
+             "probe: handshake finished (%llu datagrams / %llu bytes sent)",
+             (unsigned long long)p->tx_datagrams, (unsigned long long)p->tx_bytes);
     if (p->auto_open) probe_open_request(p);
+}
+
+/* Dumps xquic's own view of the connection: conn_err carries the transport /
+ * TLS error code (e.g. XQC_TLS_ENCRYPT_DATA_ERROR) that a failed handshake
+ * would otherwise take to the grave, and max_acked_mtu shows what packet size
+ * the path actually validated — the pair needed to tell an oversized-Initial
+ * problem apart from a plain unreachable peer.
+ *
+ * xquic dynamically allocates stats.paths_info and documents that the caller
+ * must free() it; this is the only place in the file that reads stats, so the
+ * free lives here rather than in every caller. */
+static void
+probe_report_conn_stats(xqc_engine_t *engine, const xqc_cid_t *cid, const char *tag)
+{
+    if (!engine) return;
+    xqc_conn_stats_t st = xqc_conn_get_stats(engine, cid);
+    TDIAG("%s: conn_err=%d send=%u recv=%u lost=%u tlp=%u srtt=%" PRIu64
+          "us max_acked_mtu=%u early_data=%d alpn=\"%.*s\"",
+          tag, st.conn_err, st.send_count, st.recv_count, st.lost_count, st.tlp_count,
+          (uint64_t)st.srtt, st.max_acked_mtu, (int)st.early_data_flag,
+          (int)sizeof(st.alpn), st.alpn);
+    TDIAG("%s: conn_info=\"%.*s\"", tag, (int)sizeof(st.conn_info), st.conn_info);
+    free(st.paths_info);
 }
 
 static int
 probe_cb_h3_conn_close(xqc_h3_conn_t *h3_conn, const xqc_cid_t *cid, void *user_data)
 {
     (void)h3_conn;
-    (void)cid;
-    (void)user_data;
+    probe_conn_t *p = (probe_conn_t *)user_data;
+    if (!p) return 0;
+    p->conn_closed = 1;
+    /* Always reported when it lands before the handshake: a close at that
+     * point is the signature of a failed handshake (TLS alert, version
+     * negotiation, an Initial the peer could not process), and it is the one
+     * event that explains an otherwise silent dispatch timeout. */
+    if (!p->handshake_done) {
+        TDIAG("probe: connection CLOSED before handshake completed "
+              "(%llu datagrams / %llu bytes sent)",
+              (unsigned long long)p->tx_datagrams, (unsigned long long)p->tx_bytes);
+        probe_report_conn_stats(p->engine, cid, "probe/closed");
+    } else {
+        TDIAG_IF(g_diag.verbose, "probe: h3 conn closed");
+    }
     return 0;
 }
 
@@ -419,8 +591,12 @@ probe_cb_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t fl
                     memcpy(p->status, h->value.iov_base, n);
                     p->status[n] = '\0';
                 }
+                TDIAG_IF(g_diag.verbose, "probe: rsp header %.*s: %.*s",
+                         (int)h->name.iov_len, (const char *)h->name.iov_base,
+                         (int)h->value.iov_len, (const char *)h->value.iov_base);
             }
             p->response_done = 1;
+            TDIAG_IF(g_diag.verbose, "probe: response complete, :status=%s", p->status);
         }
     }
 
@@ -511,6 +687,7 @@ probe_cb_request_close(xqc_h3_request_t *h3_request, void *user_data)
     (void)h3_request;
     probe_conn_t *p = (probe_conn_t *)user_data;
     if (p) p->request_closed = 1;
+    TDIAG_IF(g_diag.verbose, "probe: request closed");
     return 0;
 }
 
@@ -519,8 +696,12 @@ probe_cb_request_closing_notify(xqc_h3_request_t *h3_request, xqc_int_t err,
                                 void *user_data)
 {
     (void)h3_request;
-    (void)err;
-    (void)user_data;
+    probe_conn_t *p = (probe_conn_t *)user_data;
+    /* Retained rather than discarded: a nonzero err here is the difference
+     * between "the server never answered" and "the stream was reset out from
+     * under the request", which the timeout report below distinguishes. */
+    if (p) p->closing_err = (long)err;
+    TDIAG_IF(g_diag.verbose || err != 0, "probe: request closing, err=%ld", (long)err);
 }
 
 static xqc_engine_t *
@@ -528,8 +709,11 @@ probe_create_engine(void)
 {
     xqc_engine_ssl_config_t engine_ssl;
     memset(&engine_ssl, 0, sizeof(engine_ssl));
-    engine_ssl.ciphers = XQC_TLS_CIPHERS;
-    engine_ssl.groups = XQC_TLS_GROUPS;
+    /* Prioritize AES-256-GCM for stronger encryption */
+    engine_ssl.ciphers =
+        "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256";
+    /* Enable post-quantum key exchange with X25519MLKEM768 */
+    engine_ssl.groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
 
     xqc_engine_callback_t engine_cbs = {
         .set_event_timer = probe_set_event_timer,
@@ -550,7 +734,10 @@ probe_create_engine(void)
 
     xqc_config_t xconfig;
     if (xqc_engine_get_default_config(&xconfig, XQC_ENGINE_CLIENT) < 0) return NULL;
-    xconfig.cfg_log_level = XQC_LOG_ERROR;
+    /* Env-driven (MQVPN_TEST_XQUIC_LOG / MQVPN_TEST_VERBOSE); defaults to the
+     * historical XQC_LOG_ERROR, and probe_log_write drops everything unless
+     * diagnostics were explicitly enabled. */
+    xconfig.cfg_log_level = g_diag.xquic_level;
 
     xqc_engine_t *engine = xqc_engine_create(XQC_ENGINE_CLIENT, &xconfig, &engine_ssl,
                                              &engine_cbs, &tcbs, NULL);
@@ -614,6 +801,14 @@ typedef struct {
     mqvpn_server_t *svr;
     probe_conn_t probe;
     harness_egress_fd_t egress_fds[HARNESS_MAX_EGRESS_FDS];
+
+    /* Diagnostics: datagrams the pump handed to each side. svr_rx counts
+     * client->server (what the server was actually offered), cli_rx counts
+     * server->client — the server writes straight to svr_fd internally, so
+     * cli_rx is the harness's only view of the server's transmissions. */
+    uint64_t svr_rx_datagrams, svr_rx_bytes;
+    uint64_t cli_rx_datagrams, cli_rx_bytes;
+    int pump_rounds;
 } harness_t;
 
 /* mqvpn_server_callbacks_t.egress_fd_register implementation: records/
@@ -716,7 +911,13 @@ harness_start(harness_t *h, const char *protocol, size_t protocol_len, int auto_
         mqvpn_config_set_listen(svr_cfg, "0.0.0.0", 443);
         mqvpn_config_set_subnet(svr_cfg, "10.0.0.0/24");
         mqvpn_config_set_tls_cert(svr_cfg, TEST_CERT_FILE, TEST_KEY_FILE);
-        mqvpn_config_set_log_level(svr_cfg, MQVPN_LOG_ERROR);
+        /* Env-driven (MQVPN_TEST_LOG / MQVPN_TEST_VERBOSE); defaults to the
+         * historical MQVPN_LOG_ERROR. mqvpn_log_set_level is called too
+         * because the library's global level is what gates log lines emitted
+         * before mqvpn_server_new applies this config (the addr_pool banner,
+         * for one). */
+        mqvpn_config_set_log_level(svr_cfg, g_diag.mqvpn_level);
+        mqvpn_log_set_level(g_diag.mqvpn_level);
         /* [Hybrid] Enabled defaults to false (docs/control-api.md) — this
          * whole file's dispatch tests exercise the connect-tcp path, which
          * (I2 fix) now ALSO gates on this runtime flag, not just the compile
@@ -776,11 +977,16 @@ harness_start(harness_t *h, const char *protocol, size_t protocol_len, int auto_
                                          &ssl_cfg, (struct sockaddr *)&h->svr_addr,
                                          sizeof(h->svr_addr), &h->probe);
         if (!cid) {
+            TDIAG("harness_start: xqc_h3_connect FAILED (protocol=\"%.*s\")",
+                  (int)protocol_len, protocol ? protocol : "");
             xqc_engine_destroy(h->probe.engine);
             goto fail_server;
         }
         memcpy(&h->probe.cid, cid, sizeof(h->probe.cid));
     }
+    TDIAG_IF(g_diag.verbose,
+             "harness_start: server on 127.0.0.1:%d, probe protocol=\"%.*s\"",
+             ntohs(h->svr_addr.sin_port), (int)protocol_len, protocol ? protocol : "");
     return 0;
 
 fail_server:
@@ -800,12 +1006,17 @@ harness_pump(harness_t *h, const int *done, int budget_ms)
     for (int elapsed = 0; elapsed < budget_ms && !*done;) {
         struct sockaddr_storage from;
         socklen_t from_len;
+        h->pump_rounds++;
 
         for (;;) {
             from_len = sizeof(from);
             ssize_t n = recvfrom(h->svr_fd, buf, sizeof(buf), MSG_DONTWAIT,
                                  (struct sockaddr *)&from, &from_len);
             if (n <= 0) break;
+            h->svr_rx_datagrams++;
+            h->svr_rx_bytes += (uint64_t)n;
+            TDIAG_IF(g_diag.trace_io, "svr<-cli datagram #%llu: %zd bytes",
+                     (unsigned long long)h->svr_rx_datagrams, n);
             mqvpn_server_on_socket_recv(h->svr, buf, (size_t)n, (struct sockaddr *)&from,
                                         from_len);
         }
@@ -814,6 +1025,10 @@ harness_pump(harness_t *h, const int *done, int budget_ms)
             ssize_t n = recvfrom(h->cli_fd, buf, sizeof(buf), MSG_DONTWAIT,
                                  (struct sockaddr *)&from, &from_len);
             if (n <= 0) break;
+            h->cli_rx_datagrams++;
+            h->cli_rx_bytes += (uint64_t)n;
+            TDIAG_IF(g_diag.trace_io, "cli<-svr datagram #%llu: %zd bytes",
+                     (unsigned long long)h->cli_rx_datagrams, n);
             xqc_engine_packet_process(h->probe.engine, buf, (size_t)n,
                                       (struct sockaddr *)&h->cli_addr,
                                       sizeof(h->cli_addr), (struct sockaddr *)&from,
@@ -1047,6 +1262,60 @@ harness_pump_with_sink(harness_t *h, tcp_sink_t *sink, const int *done, int budg
     }
 }
 
+/* Explains a probe that never reached its awaited milestone. Deliberately
+ * ungated: `rc == -1` on an ASSERT_EQ line is all a CI log used to carry, and
+ * it cannot distinguish a QUIC handshake that never completed from a server
+ * that accepted the connection and never answered the request. Everything
+ * here is already in hand — it just needs printing. */
+static void
+probe_report_timeout(const harness_t *h, const char *awaiting, int budget_ms)
+{
+    const probe_conn_t *p = &h->probe;
+
+    TDIAG("---- dispatch probe TIMEOUT ----");
+    TDIAG("  waiting for : %s (budget %dms, %d pump rounds)", awaiting, budget_ms,
+          h->pump_rounds);
+    TDIAG("  protocol    : \"%.*s\"", (int)p->protocol_len,
+          p->protocol ? p->protocol : "");
+    TDIAG("  path        : %s", p->path ? p->path : "(default \"/probe\")");
+    TDIAG("  authority   : %s", p->authority);
+    TDIAG("  milestones  : conn_created=%d handshake_done=%d response_done=%d "
+          "request_closed=%d conn_closed=%d",
+          p->conn_created, p->handshake_done, p->response_done, p->request_closed,
+          p->conn_closed);
+    TDIAG("  status seen : \"%s\"  closing_err=%ld", p->status, p->closing_err);
+    TDIAG("  cli -> svr  : %llu datagrams / %llu bytes sent, %llu / %llu arrived",
+          (unsigned long long)p->tx_datagrams, (unsigned long long)p->tx_bytes,
+          (unsigned long long)h->svr_rx_datagrams, (unsigned long long)h->svr_rx_bytes);
+    TDIAG("  svr -> cli  : %llu datagrams / %llu bytes arrived",
+          (unsigned long long)h->cli_rx_datagrams, (unsigned long long)h->cli_rx_bytes);
+    probe_report_conn_stats(p->engine, &p->cid, "  xquic       ");
+
+    /* Narrow the search before anyone opens a debugger: which milestone was
+     * missed localizes the fault to one layer. */
+    if (!p->conn_created)
+        TDIAG("  => the H3 connection object was never created; the failure is in "
+              "engine/connection setup, not in dispatch.");
+    else if (!p->handshake_done && h->cli_rx_datagrams == 0)
+        TDIAG("  => the server never sent a single packet back. Suspect the "
+              "server-side listener/TLS setup, or a client Initial the server "
+              "dropped outright (e.g. an Initial larger than the server's "
+              "XQC_QUIC_MAX_MSS / unsupported TLS group). Re-run with "
+              "MQVPN_TEST_VERBOSE=1 for both engines' logs.");
+    else if (!p->handshake_done)
+        TDIAG("  => the QUIC/TLS handshake never completed even though packets "
+              "flowed both ways. Suspect key-exchange group or cipher "
+              "negotiation, or a CRYPTO frame that does not fit the path MSS "
+              "(the X25519MLKEM768 key share alone is 1184 bytes). Re-run with "
+              "MQVPN_TEST_XQUIC_LOG=debug.");
+    else if (!p->response_done)
+        TDIAG("  => the handshake succeeded but no response headers arrived: the "
+              "server accepted the connection and never answered the Extended "
+              "CONNECT. Look at the server-side dispatch logs above "
+              "(MQVPN_TEST_LOG=debug).");
+    TDIAG("--------------------------------");
+}
+
 /* ── Shared dispatch probe ──
  *
  * Opens one Extended CONNECT with `protocol`, drives to a response, returns
@@ -1056,12 +1325,19 @@ run_dispatch_probe(const char *protocol, size_t protocol_len, char *out_status,
                    size_t out_status_cap)
 {
     harness_t h;
-    if (harness_start(&h, protocol, protocol_len, /*auto_open=*/1, NULL) != 0) return -1;
+    if (harness_start(&h, protocol, protocol_len, /*auto_open=*/1, NULL) != 0) {
+        TDIAG("run_dispatch_probe: harness_start FAILED (protocol=\"%.*s\")",
+              (int)protocol_len, protocol ? protocol : "");
+        return -1;
+    }
 
     harness_pump(&h, &h.probe.response_done, 10000);
 
     int ok = h.probe.response_done;
-    if (ok) snprintf(out_status, out_status_cap, "%s", h.probe.status);
+    if (ok)
+        snprintf(out_status, out_status_cap, "%s", h.probe.status);
+    else
+        probe_report_timeout(&h, "response headers", 10000);
 
     harness_stop(&h);
     return ok ? 0 : -1;
@@ -1081,19 +1357,34 @@ run_dispatch_probe_with_path(const char *protocol, size_t protocol_len, const ch
                              size_t out_status_cap)
 {
     harness_t h;
-    if (harness_start(&h, protocol, protocol_len, /*auto_open=*/0, cfg_hook) != 0)
+    if (harness_start(&h, protocol, protocol_len, /*auto_open=*/0, cfg_hook) != 0) {
+        TDIAG("run_dispatch_probe_with_path: harness_start FAILED "
+              "(protocol=\"%.*s\" path=%s)",
+              (int)protocol_len, protocol ? protocol : "", path ? path : "(null)");
         return -1;
+    }
     h.probe.path = path;
 
     harness_pump(&h, &h.probe.handshake_done, 10000);
-    if (!h.probe.handshake_done || probe_open_request(&h.probe) != 0) {
+    if (!h.probe.handshake_done) {
+        probe_report_timeout(&h, "handshake", 10000);
+        harness_stop(&h);
+        return -1;
+    }
+    if (probe_open_request(&h.probe) != 0) {
+        TDIAG("run_dispatch_probe_with_path: probe_open_request FAILED after a "
+              "completed handshake (path=%s)",
+              path ? path : "(null)");
         harness_stop(&h);
         return -1;
     }
 
     harness_pump(&h, &h.probe.response_done, 10000);
     int ok = h.probe.response_done;
-    if (ok) snprintf(out_status, out_status_cap, "%s", h.probe.status);
+    if (ok)
+        snprintf(out_status, out_status_cap, "%s", h.probe.status);
+    else
+        probe_report_timeout(&h, "response headers", 10000);
 
     harness_stop(&h);
     return ok ? 0 : -1;
@@ -2734,7 +3025,7 @@ TEST(get_egress_policy_v6_tunnel_unset_without_subnet6)
     mqvpn_config_set_listen(cfg, "0.0.0.0", 443);
     mqvpn_config_set_subnet(cfg, "10.0.0.0/24");
     mqvpn_config_set_tls_cert(cfg, TEST_CERT_FILE, TEST_KEY_FILE);
-    mqvpn_config_set_log_level(cfg, MQVPN_LOG_ERROR);
+    mqvpn_config_set_log_level(cfg, g_diag.mqvpn_level);
 
     mqvpn_server_callbacks_t cbs = MQVPN_SERVER_CALLBACKS_INIT;
     cbs.tun_output = counting_tun_output;
@@ -2761,7 +3052,7 @@ TEST(get_egress_policy_v6_tunnel_set_when_subnet6_configured)
     mqvpn_config_set_subnet(cfg, "10.0.0.0/24");
     ASSERT_EQ(mqvpn_config_set_subnet6(cfg, "2001:db8:abcd::/112"), MQVPN_OK);
     mqvpn_config_set_tls_cert(cfg, TEST_CERT_FILE, TEST_KEY_FILE);
-    mqvpn_config_set_log_level(cfg, MQVPN_LOG_ERROR);
+    mqvpn_config_set_log_level(cfg, g_diag.mqvpn_level);
 
     mqvpn_server_callbacks_t cbs = MQVPN_SERVER_CALLBACKS_INIT;
     cbs.tun_output = counting_tun_output;
@@ -2893,7 +3184,21 @@ TEST(parse_path_accepts_v6_literal_45_chars)
 int
 main(void)
 {
+    tdiag_init();
+
+    /* The test framework prints progress to stdout while every log sink
+     * (mqvpn_log, the xquic sink, TDIAG) writes stderr. Under ctest stdout is
+     * a pipe and therefore block-buffered, which would flush all the PASS/FAIL
+     * lines *after* the logs they belong to and make the captured output
+     * unreadable. Unbuffer both so the two streams interleave in real order. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     printf("test_tcp_egress: server mqvpn-tcp dispatch tests\n");
+    TDIAG_IF(g_diag.verbose || g_diag.trace_io || g_diag.xquic_log_on,
+             "diagnostics: mqvpn_level=%d xquic_level=%d xquic_log=%s trace_io=%s",
+             (int)g_diag.mqvpn_level, (int)g_diag.xquic_level,
+             g_diag.xquic_log_on ? "on" : "off", g_diag.trace_io ? "on" : "off");
 
     run_unrecognized_protocol_gets_501();
     run_mqvpn_tcp_bad_path_gets_400();
