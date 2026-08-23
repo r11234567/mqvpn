@@ -232,7 +232,24 @@ typedef struct {
 
     int handshake_done;
     int response_done;
+    /* request_closed mirrors h3_request_close_notify: the request OBJECT was
+     * destroyed. That is not the same event as "the peer closed the stream",
+     * and it is not a prompt one — xquic parks a terminal stream on
+     * XQC_TIMER_STREAM_CLOSE for 3x max_pto (xqc_stream.c) before destroying
+     * it, which is >=2.3s from the initial-RTT floor alone (srtt 250ms,
+     * rttvar 125ms => pto 775ms) and grows with rttvar. Wait on it only where
+     * the budget is generous, or where the close is graceful (a FIN, which
+     * raises no closing notify at all).
+     *
+     * request_closing/closing_err mirror h3_request_closing_notify, which
+     * xquic raises straight out of the RESET_STREAM frame handler
+     * (xqc_frame.c -> xqc_stream_closing). For anything that observes a PEER
+     * reset — every idle-eviction test here — this is both the prompt signal
+     * and the more precise one: it carries the peer's error code, so it can
+     * distinguish an eviction's H3_REQUEST_CANCELLED from an unrelated
+     * teardown, which request_closed cannot. */
     int request_closed;
+    int request_closing;
     char status[16];
 
     /* Cached request object (relay tests below): probe_open_request_
@@ -699,8 +716,12 @@ probe_cb_request_closing_notify(xqc_h3_request_t *h3_request, xqc_int_t err,
     probe_conn_t *p = (probe_conn_t *)user_data;
     /* Retained rather than discarded: a nonzero err here is the difference
      * between "the server never answered" and "the stream was reset out from
-     * under the request", which the timeout report below distinguishes. */
-    if (p) p->closing_err = (long)err;
+     * under the request", which the timeout report below distinguishes — and
+     * it is what the idle-eviction tests wait on (see request_closing). */
+    if (p) {
+        p->closing_err = (long)err;
+        p->request_closing = 1;
+    }
     TDIAG_IF(g_diag.verbose || err != 0, "probe: request closing, err=%ld", (long)err);
 }
 
@@ -1280,9 +1301,12 @@ probe_report_timeout(const harness_t *h, const char *awaiting, int budget_ms)
     TDIAG("  path        : %s", p->path ? p->path : "(default \"/probe\")");
     TDIAG("  authority   : %s", p->authority);
     TDIAG("  milestones  : conn_created=%d handshake_done=%d response_done=%d "
-          "request_closed=%d conn_closed=%d",
-          p->conn_created, p->handshake_done, p->response_done, p->request_closed,
-          p->conn_closed);
+          "request_closing=%d request_closed=%d conn_closed=%d",
+          p->conn_created, p->handshake_done, p->response_done, p->request_closing,
+          p->request_closed, p->conn_closed);
+    /* request_closing=1 with request_closed=0 is the normal reading of a
+     * stream the peer reset while xquic still holds it on its 3x-max_pto
+     * close linger — not a stall. */
     TDIAG("  status seen : \"%s\"  closing_err=%ld", p->status, p->closing_err);
     TDIAG("  cli -> svr  : %llu datagrams / %llu bytes sent, %llu / %llu arrived",
           (unsigned long long)p->tx_datagrams, (unsigned long long)p->tx_bytes,
@@ -1842,7 +1866,9 @@ TEST(mqvpn_tcp_global_cap_gets_503)
     h.probe.path = path1;
     h.probe.response_done = 0;
     h.probe.status[0] = '\0';
+    h.probe.request_closing = 0;
     h.probe.request_closed = 0;
+    h.probe.closing_err = 0;
     ASSERT_EQ(probe_open_request_with_body(&h.probe), 0);
     harness_pump(&h, &h.probe.response_done, 10000);
     ASSERT_EQ(h.probe.response_done, 1);
@@ -2379,16 +2405,32 @@ TEST(mqvpn_tcp_active_idle_timeout_evicts)
      * real gettimeofday time (svr_now_us), so this wait must be too, or the
      * iteration budget can expire in <1s of real time and the sweep never
      * fires. 4s real ceiling: a working sweep fires ~1s in; a broken one is
-     * still bounded so the suite can't hang. */
+     * still bounded so the suite can't hang.
+     *
+     * The stream-side observable is request_closing, NOT request_closed. The
+     * eviction resets the stream (svr_tcp_egress_on_idle_evict ->
+     * xqc_h3_request_close -> xqc_stream_close_with_error(
+     * H3_REQUEST_CANCELLED)), so the RESET_STREAM raises the closing notify as
+     * soon as it is processed — whereas request_closed additionally waits out
+     * xquic's 3x-max_pto stream-close linger (XQC_TIMER_STREAM_CLOSE). That
+     * linger is >=2.3s at the initial-RTT floor (srtt 250ms, rttvar 125ms =>
+     * pto 775ms) and grows with rttvar, so on an MSan runner it could consume
+     * this whole budget on its own. Waiting on it bought no coverage — the
+     * linger is xquic's transport bookkeeping, not this test's subject — and
+     * request-object destruction is still covered, on generous budgets, by the
+     * global-cap and non-tunnel-close tests. */
     int evicted = 0;
     uint64_t wait_start_us = test_now_us();
     while (!evicted && test_now_us() - wait_start_us < 4000000ull) {
         tcp_sink_pump(&sink);
         int never = 0;
         harness_pump(&h, &never, 20);
-        evicted = h.probe.request_closed && sink.eof_seen;
+        evicted = h.probe.request_closing && sink.eof_seen;
     }
-    ASSERT_EQ(h.probe.request_closed, 1);
+    ASSERT_EQ(h.probe.request_closing, 1);
+    /* Pins that the sweep CANCELLED the stream rather than failing it some
+     * other way — the "never a 5xx" half of this test's contract. */
+    ASSERT_EQ(h.probe.closing_err, (long)H3_REQUEST_CANCELLED);
     ASSERT_EQ(sink.eof_seen, 1);
 
     /* Regression, same shape as the connect-timeout/global-cap tests: the
@@ -2497,7 +2539,9 @@ TEST(mqvpn_tcp_two_flow_same_conn_idle_eviction)
      * in the same pass. Wait for all four observables; keep pumping both
      * sinks so their EOFs land. Real-wall-clock bound, not iteration count
      * — see the idle-timeout-evicts test for why (harness_pump's budget
-     * accounting decouples from real time under CI poll churn). */
+     * accounting decouples from real time under CI poll churn), and for why
+     * the stream-side observable is request_closing rather than
+     * request_closed (xquic's 3x-max_pto stream-close linger). */
     int all_gone = 0;
     uint64_t wait_start_us = test_now_us();
     while (!all_gone && test_now_us() - wait_start_us < 4000000ull) {
@@ -2505,11 +2549,13 @@ TEST(mqvpn_tcp_two_flow_same_conn_idle_eviction)
         tcp_sink_pump(&sink2);
         int never = 0;
         harness_pump(&h, &never, 20);
-        all_gone = h.probe.request_closed && second.request_closed && sink1.eof_seen &&
+        all_gone = h.probe.request_closing && second.request_closing && sink1.eof_seen &&
                    sink2.eof_seen;
     }
-    ASSERT_EQ(h.probe.request_closed, 1);
-    ASSERT_EQ(second.request_closed, 1);
+    ASSERT_EQ(h.probe.request_closing, 1);
+    ASSERT_EQ(second.request_closing, 1);
+    ASSERT_EQ(h.probe.closing_err, (long)H3_REQUEST_CANCELLED);
+    ASSERT_EQ(second.closing_err, (long)H3_REQUEST_CANCELLED);
     ASSERT_EQ(sink1.eof_seen, 1);
     ASSERT_EQ(sink2.eof_seen, 1);
 
@@ -2522,7 +2568,9 @@ TEST(mqvpn_tcp_two_flow_same_conn_idle_eviction)
     h.probe.path = path3;
     h.probe.response_done = 0;
     h.probe.status[0] = '\0';
+    h.probe.request_closing = 0;
     h.probe.request_closed = 0;
+    h.probe.closing_err = 0;
     ASSERT_EQ(probe_open_request_with_body(&h.probe), 0);
     harness_pump_with_sink(&h, &sink3, &h.probe.response_done, 10000);
     ASSERT_EQ(h.probe.response_done, 1);
@@ -2600,10 +2648,12 @@ TEST(mqvpn_tcp_parked_flow_idle_eviction)
      * so it isn't blocked by the probe's own non-draining). */
     /* Real-wall-clock bound, not iteration count — the idle sweep fires on
      * real gettimeofday time, while harness_pump's budget accounting can run
-     * ahead of real time under CI poll churn (see idle-timeout-evicts). */
+     * ahead of real time under CI poll churn (see idle-timeout-evicts, which
+     * also explains why the stream-side observable is request_closing and not
+     * request_closed). */
     int sink_eof = 0;
     uint64_t wait_start_us = test_now_us();
-    while (!(sink_eof && h.probe.request_closed) &&
+    while (!(sink_eof && h.probe.request_closing) &&
            test_now_us() - wait_start_us < 4000000ull) {
         int never = 0;
         harness_pump(&h, &never, 20);
@@ -2614,7 +2664,8 @@ TEST(mqvpn_tcp_parked_flow_idle_eviction)
         }
     }
     ASSERT_EQ(sink_eof, 1);
-    ASSERT_EQ(h.probe.request_closed, 1);
+    ASSERT_EQ(h.probe.request_closing, 1);
+    ASSERT_EQ(h.probe.closing_err, (long)H3_REQUEST_CANCELLED);
 
     harness_stop(&h);
     tcp_sink_close(&sink);
@@ -2668,7 +2719,9 @@ TEST(non_tunnel_close_keeps_tunnel_established)
      * so the server-side stream close definitely lands too. */
     p->response_done = 0;
     p->status[0] = '\0';
+    p->request_closing = 0;
     p->request_closed = 0;
+    p->closing_err = 0;
     ASSERT_EQ(probe_open_request(p), 0);
     harness_pump(&h, &p->request_closed, 10000);
     ASSERT_EQ(p->request_closed, 1);
