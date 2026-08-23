@@ -1334,8 +1334,10 @@ run_dispatch_probe(const char *protocol, size_t protocol_len, char *out_status,
     harness_pump(&h, &h.probe.response_done, 10000);
 
     int ok = h.probe.response_done;
-    if (ok) snprintf(out_status, out_status_cap, "%s", h.probe.status);
-    else probe_report_timeout(&h, "response headers", 10000);
+    if (ok)
+        snprintf(out_status, out_status_cap, "%s", h.probe.status);
+    else
+        probe_report_timeout(&h, "response headers", 10000);
 
     harness_stop(&h);
     return ok ? 0 : -1;
@@ -1379,8 +1381,10 @@ run_dispatch_probe_with_path(const char *protocol, size_t protocol_len, const ch
 
     harness_pump(&h, &h.probe.response_done, 10000);
     int ok = h.probe.response_done;
-    if (ok) snprintf(out_status, out_status_cap, "%s", h.probe.status);
-    else probe_report_timeout(&h, "response headers", 10000);
+    if (ok)
+        snprintf(out_status, out_status_cap, "%s", h.probe.status);
+    else
+        probe_report_timeout(&h, "response headers", 10000);
 
     harness_stop(&h);
     return ok ? 0 : -1;
