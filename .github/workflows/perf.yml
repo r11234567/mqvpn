@@ -1,21 +1,40 @@
 name: Performance Tests
 
-# Security: only push to main and manual trigger.
-# Never runs on PRs — prevents fork code execution on self-hosted runner.
+# Manual trigger only. Two independent reasons, and both must stop applying
+# before a push or PR trigger goes back in:
+#
+#   1. `runs-on: perf-test` is a self-hosted label, and this fork has no
+#      runner registered under it. A triggered run therefore never starts —
+#      it queues, and the next request entering the shared `perf-test`
+#      concurrency group drops it ("Canceling since a higher priority
+#      waiting request for perf-test exists"). Every push to main spent a
+#      run that way: 53 runs, 53 cancellations, zero benchmark results.
+#   2. A self-hosted box must never execute untrusted code, which rules out
+#      a PR trigger no matter what the runner situation is.
+#
+# e6766b3 already made this manual-only for reason 1; 892c7bb ("refresh
+# workflows from upstream 0.16.0") took upstream's triggers back wholesale.
+# Upstream runs its own perf machine, this fork does not — so keep the fork's
+# version of this block when re-syncing workflows.
+#
 # Runner requires: cmake gcc make git libevent-dev golang iptables
-#                  iproute2 iperf3 python3 jq openssl
+#                  iproute2 iperf3 python3 jq openssl aws-cli
+# Publishing also needs the R2_* repository secrets (see the last steps).
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Group shared with perf-weekly.yml deliberately: both target the single
+# `perf-test` machine, and two benchmark suites on one box would be
+# measuring each other. cancel-in-progress is false so a manual run queues
+# behind the weekly suite rather than killing a 2-hour job mid-flight — the
+# old `true` here meant any push to main could do exactly that.
 concurrency:
   group: perf-test
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   perf-test:

@@ -1,16 +1,28 @@
 name: Performance Tests (Weekly)
 
-# Full benchmark suite — runs every Sunday at 3:00 UTC.
-# Security: same restrictions as perf.yml (no PR trigger).
+# Full benchmark suite. Manual trigger only for now, for the same reason
+# perf.yml is (see the long note there): `runs-on: perf-test` is a
+# self-hosted label with no runner registered in this fork, so a scheduled
+# run only ever queued and was then dropped by the shared `perf-test`
+# concurrency group. Four cron firings, four cancellations, no results.
+#
+# To restore the schedule: register a runner carrying the `perf-test` label,
+# then uncomment the two lines below. 03:00 UTC Sunday is kept as the
+# intended slot — stress.yml's own schedule comment is written relative to
+# it — so re-enabling needs no other edit.
+#
+# Security: same restriction as perf.yml — no PR trigger, ever. A
+# self-hosted machine must not execute untrusted code.
 
 on:
-  schedule:
-    - cron: '0 3 * * 0'
+  # schedule:
+  #   - cron: '0 3 * * 0'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Shared with perf.yml on purpose — one physical benchmark box, serialized.
 concurrency:
   group: perf-test
   cancel-in-progress: false
