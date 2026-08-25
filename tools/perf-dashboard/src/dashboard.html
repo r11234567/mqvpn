@@ -211,6 +211,8 @@ const METRIC_LABELS = {
   throughput_mbps: ['Throughput', '吞吐'],
   aggregation_efficiency: ['Aggregation efficiency', '聚合效率'],
   vs_best_single: ['vs best single path', '相对最优单路'],
+  gain_pct: ['Multipath gain', '多路径增益'],
+  gain: ['Multipath gain', '多路径增益'],
   utilization: ['Link utilization', '链路利用率'],
   // latency
   srtt_ms: ['Smoothed RTT', '平滑 RTT'],
@@ -300,14 +302,50 @@ function humanise(leaf) {
              .replace(/^./, (c) => c.toUpperCase());
 }
 
-/** path -> {label, group, unit}. Group is the bracket chain (scenario=…, streams=8). */
+/* Split a dotted path on dots that are OUTSIDE brackets. A naive split breaks
+ * `intervals[time_sec=0.5].mbps`, where the bracket key itself contains a dot. */
+function splitPath(path) {
+  const out = [];
+  let cur = '', depth = 0;
+  for (const ch of path) {
+    if (ch === '[') depth++;
+    else if (ch === ']') depth--;
+    if (ch === '.' && depth === 0) { out.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/* Generic container names that carry no information once the leaf is named.
+ * Everything else in the path does: `results.wlb[streams=1].multipath_mbps`
+ * and `netem.path_a.rate_mbit` are only distinguishable by their object keys
+ * (wlb/minrtt, path_a/path_b), so dropping those would collapse two
+ * schedulers -- or two links -- into identical rows. */
+const PATH_NOISE = new Set(['results', 'result', 'data', 'end']);
+
+/** path -> {label, group, unit}. Group is every non-leaf segment, object keys
+ *  and bracket keys alike, which is what makes near-duplicate rows tellable
+ *  apart. */
 function describe(path) {
-  const groups = [...path.matchAll(/\[([^\]]*)\]/g)].map((m) => m[1]);
-  const leaf = path.split('.').pop().replace(/\[[^\]]*\]/g, '');
+  const segs = splitPath(path);
+  const leafSeg = segs.pop() || '';
+  const leaf = leafSeg.replace(/\[[^\]]*\]/g, '');
+
+  const parts = [];
+  const pushSeg = (seg) => {
+    const base = seg.replace(/\[[^\]]*\]/g, '');
+    if (base && !PATH_NOISE.has(base)) parts.push(base);
+    for (const m of seg.matchAll(/\[([^\]]*)\]/g)) parts.push(m[1]);
+  };
+  segs.forEach(pushSeg);
+  // A trailing bracket on the leaf segment is a group key too, not a name.
+  for (const m of leafSeg.matchAll(/\[([^\]]*)\]/g)) parts.push(m[1]);
+
   const known = METRIC_LABELS[leaf];
   return {
     label: known ? known[LANG === 'zh' ? 1 : 0] : humanise(leaf),
-    group: groups.join(' · '),
+    group: parts.join(' · '),
     unit: unitOf(leaf),
     leaf,
   };
