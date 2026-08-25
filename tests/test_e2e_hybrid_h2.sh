@@ -2004,12 +2004,51 @@ if [ "$fail" -ne 0 ]; then
     grep -aE 'Extended CONNECT|tunnel established|session removed|addr_pool|conn_destroy|path (created|removed)' \
         "$SERVER_LOG_T8" | cut -c1-460 | tail -30 || true
     # The close reason on its own line, so it survives any later re-narrowing
-    # of the filters above and is greppable in the raw CI log.
+    # of the filters above and is greppable in the raw CI log. Labelled by
+    # role: these are mktemp paths, and "tmp.TErCbFOpnl" tells the reader
+    # nothing about which side raised the error -- which is the whole question.
     echo "--- T8 close reasons (err + local/remote) ---"
-    for f in "$CLIENT_LOG_T8" "$SERVER_LOG_T8"; do
-        grep -ao 'err:0x[0-9a-fA-F]*|close_msg:[^|]*' "$f" 2>/dev/null | sort | uniq -c |
-            sed "s|^|  $(basename "$f") |" || true
+    for pair in "client:$CLIENT_LOG_T8" "server:$SERVER_LOG_T8"; do
+        grep -ao 'err:0x[0-9a-fA-F]*|close_msg:[^|]*' "${pair#*:}" 2>/dev/null |
+            sort | uniq -c | sed "s|^|  ${pair%%:*} |" || true
     done
+
+    # Whatever xquic complained about before it tore the connection down. The
+    # close reason says WHICH side rejected a frame; this says WHAT it
+    # rejected, and it is never in the tails above because it happens
+    # mid-run, thousands of lines earlier.
+    echo "--- T8 xquic errors (deduped, both sides) ---"
+    for pair in "client:$CLIENT_LOG_T8" "server:$SERVER_LOG_T8"; do
+        grep -a '\[error\]' "${pair#*:}" 2>/dev/null |
+            sed -E 's/.*\[error\] *//; s/\|scid:[0-9a-f]+//; s/\|conn:[0-9A-Fx]+//' |
+            cut -c1-200 | sort | uniq -c | sort -rn | head -12 |
+            sed "s|^|  ${pair%%:*} |" || true
+    done
+
+    # Full logs as an artifact: the dumps above are a triage summary, and
+    # every round of "add one more filter, wait for the next failure" costs a
+    # CI cycle. Collect once, answer any later question offline.
+    if [ -n "${GITHUB_WORKSPACE:-}" ]; then
+        _logdir="${GITHUB_WORKSPACE}/hybrid-e2e-logs"
+        mkdir -p "$_logdir"
+        for pair in "t1-client:$CLIENT_LOG_T1"   "t1-server:$SERVER_LOG_T1" \
+                    "t1b-client:$CLIENT_LOG_T1B" "t1b-server:$SERVER_LOG_T1B" \
+                    "t1c-client:$CLIENT_LOG_T1C" "t1c-server:$SERVER_LOG_T1C" \
+                    "t7a-client:$CLIENT_LOG_T7A" "t7b-client:$CLIENT_LOG_T7B" \
+                    "t7b-server:$SERVER_LOG_T7B" "t2a-client:$CLIENT_LOG_T2A" \
+                    "t2b-client:$CLIENT_LOG_T2B" "t3a-client:$CLIENT_LOG_T3A" \
+                    "t3b-client:$CLIENT_LOG_T3B" "t3b-server:$SERVER_LOG_T3B" \
+                    "t4-client:$CLIENT_LOG_T4"   "t4-server:$SERVER_LOG_T4" \
+                    "t5-client:$CLIENT_LOG_T5"   "t5-server:$SERVER_LOG_T5" \
+                    "t6-client:$CLIENT_LOG_T6"   "t6-server:$SERVER_LOG_T6" \
+                    "t8-client:$CLIENT_LOG_T8"   "t8-server:$SERVER_LOG_T8"; do
+            [ -f "${pair#*:}" ] && cp "${pair#*:}" "${_logdir}/${pair%%:*}.log" 2>/dev/null || true
+        done
+        # The suite runs under sudo, so these land root-owned; upload-artifact
+        # reads them as the runner user.
+        chmod -R a+rX "$_logdir" 2>/dev/null || true
+        echo "--- full logs collected in hybrid-e2e-logs/ (uploaded as an artifact) ---"
+    fi
     exit 1
 fi
 echo "RESULT: PASS"

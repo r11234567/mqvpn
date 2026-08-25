@@ -1178,6 +1178,20 @@ jobs:
       - name: E2E hybrid H2 throughput gate (netns, Release build)
         run: HYBRID_H2_PHASES=perf sudo -E timeout --foreground --kill-after=15s 12m tests/test_e2e_hybrid_h2.sh build-release/mqvpn
 
+      # Test 8 fails intermittently with the server rejecting a client frame
+      # (FRAME_ENCODING_ERROR) tens of MB into a multipath IPv6 transfer. The
+      # in-log dumps are a triage summary; the full per-test logs make the
+      # next occurrence answerable without spending another CI cycle adding
+      # one more grep. Written by the suite only on failure.
+      - name: Upload hybrid-e2e logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hybrid-e2e-logs-${{ github.run_attempt }}
+          path: hybrid-e2e-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
   hybrid-egress-off:
     # Pins the LANE=ON / EGRESS=OFF build shape (client TCP lane compiled
     # in, server-side TCP egress compiled out) — the shape the darwin job
