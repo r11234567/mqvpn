@@ -1993,12 +1993,23 @@ if [ "$fail" -ne 0 ]; then
     # time the suite finishes, the death and the reconnect have scrolled past
     # 30 lines. These two filters run over the WHOLE T8 logs, so the next
     # occurrence carries its own cause instead of needing a re-run.
+    # 220 was too narrow: on an xqc_conn_destroy report line the fields that
+    # say WHY (err:0x.., close_msg:local/remote) sit around column 250-300, so
+    # the cut removed exactly the answer. 460 covers them without dragging in
+    # the per-path blob that follows.
     echo "--- T8 client: connection lifecycle (whole log, filtered) ---"
     grep -aE 'connection closed|conn_destroy|close_msg|socket exception|state: |abandon the only|no route to' \
-        "$CLIENT_LOG_T8" | cut -c1-220 | tail -40 || true
+        "$CLIENT_LOG_T8" | cut -c1-460 | tail -40 || true
     echo "--- T8 server: session lifecycle (whole log, filtered) ---"
     grep -aE 'Extended CONNECT|tunnel established|session removed|addr_pool|conn_destroy|path (created|removed)' \
-        "$SERVER_LOG_T8" | cut -c1-220 | tail -30 || true
+        "$SERVER_LOG_T8" | cut -c1-460 | tail -30 || true
+    # The close reason on its own line, so it survives any later re-narrowing
+    # of the filters above and is greppable in the raw CI log.
+    echo "--- T8 close reasons (err + local/remote) ---"
+    for f in "$CLIENT_LOG_T8" "$SERVER_LOG_T8"; do
+        grep -ao 'err:0x[0-9a-fA-F]*|close_msg:[^|]*' "$f" 2>/dev/null | sort | uniq -c |
+            sed "s|^|  $(basename "$f") |" || true
+    done
     exit 1
 fi
 echo "RESULT: PASS"
