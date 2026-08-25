@@ -170,6 +170,10 @@ ci_bench_apply_netem() {
 
 ci_bench_start_server() {
     local scheduler="${1:-$CI_BENCH_SCHEDULER}"
+    # Optional extra CLI flags (e.g. "--control-port 9091"), mirroring
+    # bench_start_vpn_server in benchmarks/bench_env_setup.sh. Existing callers
+    # pass nothing and are unaffected.
+    local extra="${2:-}"
     _CB_WORK_DIR="$(mktemp -d)"
 
     _CB_PSK=$("$MQVPN" --genkey 2>/dev/null)
@@ -186,6 +190,7 @@ ci_bench_start_server() {
         --key "${_CB_WORK_DIR}/server.key" \
         --auth-key "$_CB_PSK" \
         --scheduler "$scheduler" \
+        ${extra} \
         --log-level "$CI_BENCH_LOG_LEVEL" &
     _CB_SERVER_PID=$!
     sleep 2

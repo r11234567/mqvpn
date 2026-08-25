@@ -44,6 +44,9 @@ jobs:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      # Stamped into each result document. publish_to_r2.sh derives the index
+      # entry's commit from git independently, so this is the in-file copy.
+      CI_BENCH_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -58,7 +61,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3
+          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3 netcat-openbsd
 
       - name: Compute xquic SHA
         id: xqsha
@@ -138,6 +141,14 @@ jobs:
 
       - name: Aggregation benchmark (WLB + MinRTT)
         run: sudo bash scripts/ci_benchmarks/ci_bench_aggregate.sh build/mqvpn
+
+      # One realistic bad network, on the per-commit path. hetero_extreme
+      # (optimized BGP + junk BGP behind a weak-signal 5G leg) is the
+      # highest-signal single scenario: a scheduler regression shows up in
+      # "does the junk path drag the good one down" before it shows anywhere
+      # else. The full matrix is weekly — see docs/network_emulation_matrix.md.
+      - name: Realistic-network scenario (hetero_extreme)
+        run: sudo -E bash scripts/ci_benchmarks/ci_bench_scenarios.sh percommit build/mqvpn
 
       - name: Upload results
         if: always()

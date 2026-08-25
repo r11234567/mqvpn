@@ -38,6 +38,7 @@ jobs:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      CI_BENCH_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -50,7 +51,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3
+          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3 netcat-openbsd
 
       - name: Compute xquic SHA
         id: xqsha
@@ -153,3 +154,145 @@ jobs:
         run: |
           echo "::notice::R2_* secrets are not set — results are in this run's" \
                "artifact only, and the dashboard will not show this run."
+
+  # ── Realistic-network scenario matrix ──────────────────────────────────
+  #
+  # Each path is built as access-leg + transit-leg over a chain of namespaces;
+  # see docs/network_emulation_matrix.md for why the factor space is sampled
+  # this way instead of enumerated (the full cross product is ~69k configs).
+  #
+  # These jobs deliberately do NOT publish to R2. publish_to_r2.sh is a
+  # read-modify-write on one index.json, so six matrix jobs racing it would
+  # clobber each other's entries. They upload artifacts and a single
+  # downstream writer publishes them.
+  netsim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false   # one bad scenario must not hide the other five
+      matrix:
+        include:
+          # Heterogeneity classes: the only multipath dimension that matters,
+          # since a scheduler behaves identically across two similar links.
+          - { id: classes,     args: classes }
+          # The five special conditions, run under saturating load — they all
+          # have functional coverage already; load is what was missing.
+          - { id: special,     args: special }
+          # One transit profile against all ten access legs.
+          - { id: cat_iplc,    args: catalog iplc }
+          - { id: cat_opt,     args: catalog bgp_opt }
+          - { id: cat_plain,   args: catalog bgp_plain }
+          - { id: cat_junk,    args: catalog bgp_junk }
+          - { id: cat_carrier, args: catalog carrier_qos }
+    env:
+      CI_BENCH_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3 netcat-openbsd
+
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve BoringSSL pin
+        id: bssl-pin
+        run: echo "sha=$(git -C third_party/xquic/third_party/boringssl rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Same cache keys as the other perf jobs, so the matrix shares one
+      # dependency build instead of each paying for its own.
+      - name: Cache BoringSSL (gcc Release, perf)
+        id: bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-${{ steps.bssl-pin.outputs.sha }}-linux-gcc-release-fpic-perf-v1
+
+      - name: Build BoringSSL
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic/third_party/boringssl
+          mkdir -p build && cd build
+          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j$(nproc) ssl crypto
+
+      - name: Cache xquic (gcc Release, perf)
+        id: xquic-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-perf-v1
+
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
+          make -j$(nproc)
+
+      - name: Build mqvpn (Release)
+        run: |
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
+          make -j$(nproc)
+
+      - name: Scenario ${{ matrix.id }}
+        run: sudo -E bash scripts/ci_benchmarks/ci_bench_scenarios.sh ${{ matrix.args }} build/mqvpn
+
+      - name: Upload scenario results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: netsim-${{ matrix.id }}
+          path: ci_bench_results/*.json
+          retention-days: 90
+
+  # Single writer for the scenario results. Depends on perf-weekly as well as
+  # the matrix so the two never rewrite perf-data/weekly/index.json at the same
+  # time; `always()` keeps the scenario data publishable even if the long
+  # benchmark job failed.
+  netsim-publish:
+    needs: [netsim, perf-weekly]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Collect scenario artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: netsim-*
+          merge-multiple: true
+          path: ci_bench_results
+
+      - name: Publish scenario results to R2
+        if: ${{ env.R2_ACCOUNT_ID != '' }}
+        run: bash scripts/ci_publish/publish_to_r2.sh perf-data/weekly weekly
+
+      - name: Note that R2 publishing was skipped
+        if: ${{ env.R2_ACCOUNT_ID == '' }}
+        run: |
+          echo "::notice::R2_* secrets are not set — scenario results are in the" \
+               "netsim-* artifacts only."
