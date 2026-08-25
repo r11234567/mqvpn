@@ -304,7 +304,44 @@ cleanup_bg_procs() {
     done
 }
 
-trap 'cleanup_bg_procs; cleanup_http_server; bench_cleanup; rm -rf "$HTTP_DOCROOT"; rm -f \
+# Copy every per-test log somewhere the CI step can upload it.
+#
+# This has to run from the EXIT trap, not from the verdict block: the suite is
+# `set -eu`, so any check that fails by RETURNING non-zero (assert_series_floor
+# is the one that bites — it sets fail=1 *and* returns 1) aborts the script
+# before the verdict is ever reached. A collector that only ran there would be
+# missing for exactly the failures that are hardest to reproduce.
+#
+# Collect unconditionally; the workflow step is `if: failure()`, so a passing
+# run just leaves an unread directory behind.
+collect_logs() {
+    [ -n "${GITHUB_WORKSPACE:-}" ] || return 0
+    local dir="${GITHUB_WORKSPACE}/hybrid-e2e-logs" pair
+    mkdir -p "$dir" 2>/dev/null || return 0
+    for pair in "t1-client:$CLIENT_LOG_T1"   "t1-server:$SERVER_LOG_T1" \
+                "t1b-client:$CLIENT_LOG_T1B" "t1b-server:$SERVER_LOG_T1B" \
+                "t1c-client:$CLIENT_LOG_T1C" "t1c-server:$SERVER_LOG_T1C" \
+                "t7a-client:$CLIENT_LOG_T7A" "t7a-server:$SERVER_LOG_T7A" \
+                "t7b-client:$CLIENT_LOG_T7B" "t7b-server:$SERVER_LOG_T7B" \
+                "t2a-client:$CLIENT_LOG_T2A" "t2a-server:$SERVER_LOG_T2A" \
+                "t2b-client:$CLIENT_LOG_T2B" "t2b-server:$SERVER_LOG_T2B" \
+                "t3a-client:$CLIENT_LOG_T3A" "t3a-server:$SERVER_LOG_T3A" \
+                "t3b-client:$CLIENT_LOG_T3B" "t3b-server:$SERVER_LOG_T3B" \
+                "t4-client:$CLIENT_LOG_T4"   "t4-server:$SERVER_LOG_T4" \
+                "t5-client:$CLIENT_LOG_T5"   "t5-server:$SERVER_LOG_T5" \
+                "t6-client:$CLIENT_LOG_T6"   "t6-server:$SERVER_LOG_T6" \
+                "t8-client:$CLIENT_LOG_T8"   "t8-server:$SERVER_LOG_T8"; do
+        # `|| true` on both: this runs from a trap under `set -e`, where a
+        # missing log or a failed chmod would abort the handler and skip the
+        # rest of the cleanup.
+        [ -s "${pair#*:}" ] && cp "${pair#*:}" "${dir}/${pair%%:*}.log" 2>/dev/null || true
+    done
+    # The suite runs under sudo; upload-artifact reads as the runner user.
+    chmod -R a+rX "$dir" 2>/dev/null || true
+    return 0
+}
+
+trap 'collect_logs; cleanup_bg_procs; cleanup_http_server; bench_cleanup; rm -rf "$HTTP_DOCROOT"; rm -f \
     "$CLIENT_LOG_T1" "$SERVER_LOG_T1" "$CLIENT_LOG_T1B" "$SERVER_LOG_T1B" \
     "$CLIENT_LOG_T1C" "$SERVER_LOG_T1C" \
     "$CLIENT_LOG_T7A" "$SERVER_LOG_T7A" \
@@ -752,10 +789,17 @@ print(f'{sum(vals) / len(vals):.2f}' if vals else '0.0')
 " "$@"
 }
 
-# Fail the owning test (sets fail=1) if ANY sample in the series ($2..) is
-# below IPERF_MIN_MBPS — a persistent sub-floor sample survived the
-# in-repeat retry, so the measurement is broken and its average must not be
-# trusted as a gate input. $1 is a label for the diagnostic.
+# Fail the owning test if ANY sample in the series ($2..) is below
+# IPERF_MIN_MBPS — a persistent sub-floor sample survived the in-repeat retry,
+# so the measurement is broken and its average must not be trusted as a gate
+# input. $1 is a label for the diagnostic.
+#
+# Note this ABORTS the run, it does not just record: every call site invokes it
+# bare, and the suite is `set -e`, so the `return 1` ends the script there and
+# `fail=1` never gets read. That is the intended outcome (a sub-floor baseline
+# usually means the tunnel is gone, and every later measurement would be a
+# confusing 0.0 too) — but it is why the log collection lives in the EXIT trap
+# rather than in the verdict block, which this path never reaches.
 assert_series_floor() {
     local label="$1"; shift
     local bad
@@ -2025,30 +2069,10 @@ if [ "$fail" -ne 0 ]; then
             sed "s|^|  ${pair%%:*} |" || true
     done
 
-    # Full logs as an artifact: the dumps above are a triage summary, and
-    # every round of "add one more filter, wait for the next failure" costs a
-    # CI cycle. Collect once, answer any later question offline.
-    if [ -n "${GITHUB_WORKSPACE:-}" ]; then
-        _logdir="${GITHUB_WORKSPACE}/hybrid-e2e-logs"
-        mkdir -p "$_logdir"
-        for pair in "t1-client:$CLIENT_LOG_T1"   "t1-server:$SERVER_LOG_T1" \
-                    "t1b-client:$CLIENT_LOG_T1B" "t1b-server:$SERVER_LOG_T1B" \
-                    "t1c-client:$CLIENT_LOG_T1C" "t1c-server:$SERVER_LOG_T1C" \
-                    "t7a-client:$CLIENT_LOG_T7A" "t7b-client:$CLIENT_LOG_T7B" \
-                    "t7b-server:$SERVER_LOG_T7B" "t2a-client:$CLIENT_LOG_T2A" \
-                    "t2b-client:$CLIENT_LOG_T2B" "t3a-client:$CLIENT_LOG_T3A" \
-                    "t3b-client:$CLIENT_LOG_T3B" "t3b-server:$SERVER_LOG_T3B" \
-                    "t4-client:$CLIENT_LOG_T4"   "t4-server:$SERVER_LOG_T4" \
-                    "t5-client:$CLIENT_LOG_T5"   "t5-server:$SERVER_LOG_T5" \
-                    "t6-client:$CLIENT_LOG_T6"   "t6-server:$SERVER_LOG_T6" \
-                    "t8-client:$CLIENT_LOG_T8"   "t8-server:$SERVER_LOG_T8"; do
-            [ -f "${pair#*:}" ] && cp "${pair#*:}" "${_logdir}/${pair%%:*}.log" 2>/dev/null || true
-        done
-        # The suite runs under sudo, so these land root-owned; upload-artifact
-        # reads them as the runner user.
-        chmod -R a+rX "$_logdir" 2>/dev/null || true
-        echo "--- full logs collected in hybrid-e2e-logs/ (uploaded as an artifact) ---"
-    fi
+    # Full logs come from collect_logs in the EXIT trap, which also covers the
+    # abort paths this block never reaches.
+    [ -n "${GITHUB_WORKSPACE:-}" ] &&
+        echo "--- full logs uploaded as the hybrid-e2e-logs artifact ---" || true
     exit 1
 fi
 echo "RESULT: PASS"
