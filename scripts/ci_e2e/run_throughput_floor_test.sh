@@ -83,15 +83,33 @@ NETEM_A="delay 10ms rate 300mbit"
 NETEM_B="delay 30ms rate 80mbit"
 
 IPERF_DURATION=10
-IPERF_STREAMS=4
+# 16, not 4. On this A=300/10ms + B=80/30ms topology the multipath number is
+# only a stable quantity once there are enough concurrent flows to keep the
+# slow, high-RTT path busy; below that it is dominated by head-of-line timing
+# that varies run to run. Measured across seven CI runs of the aggregate
+# benchmark, the coefficient of variation on multipath gain falls monotonically
+# with stream count:
+#
+#   streams=1   gain  +2.3%   CV 316%
+#   streams=4   gain  +9.2%   CV 225%
+#   streams=16  gain +22.6%   CV  21%
+#   streams=64  gain +26.6%   CV 9.2%
+#
+# At 4 streams the gain is statistically indistinguishable from zero, so a
+# ratio gate there fires on noise: this test read 0.75 on a build whose
+# aggregate benchmark read 1.09 for the same configuration minutes earlier.
+# 16 keeps the healthy/regressed gap just as wide (healthy ~1.22, the guarded
+# regression ~0.32) while cutting the noise on the numerator roughly fourfold
+# (multipath CV 3.4% vs 14%). The denominator was never the problem —
+# single-path throughput is stable to CV 0.1% at every stream count.
+IPERF_STREAMS=16
 
-# Floor thresholds. Healthy on this machine sees single ~260 Mbps and
-# multi ~280 Mbps. The regression we are guarding against produced
-# multi ~84 Mbps (single unchanged). The ratio assertion is what
-# actually catches the regression class (healthy ~1.08 vs regressed
-# ~0.32 — wide margin against either floor). The absolute floors are
-# only a sanity check; relax them to ~30 if a noisy CI runner trips
-# them on a healthy build.
+# Floor thresholds. Healthy at 16 streams sees single ~270 Mbps and multi
+# ~330 Mbps. The regression we are guarding against produced multi ~84 Mbps
+# (single unchanged). The ratio assertion is what actually catches the
+# regression class (healthy ~1.22 vs regressed ~0.32 — wide margin against
+# either floor). The absolute floors are only a sanity check; relax them to
+# ~30 if a noisy CI runner trips them on a healthy build.
 FLOOR_SINGLE_MBPS=60
 FLOOR_MULTI_MBPS=60
 FLOOR_MULTI_OVER_SINGLE_RATIO=0.8
