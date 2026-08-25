@@ -1,148 +1,123 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>mqvpn perf history</title>
+<title>mqvpn 性能历史 · perf history</title>
 <style>
 :root {
   color-scheme: light dark;
-  --bg: #fbfbfc;
-  --panel: #ffffff;
-  --border: #e3e5e9;
-  --ink: #1b1d22;
-  --muted: #6b7280;
-  --line: #3b6fd4;
-  --line-soft: rgba(59, 111, 212, 0.14);
-  --chip: #f1f3f7;
-  --warn: #9a5b00;
-  --warn-bg: #fff4e0;
+  --bg: #fbfbfc; --panel: #fff; --border: #e3e5e9; --ink: #1b1d22;
+  --muted: #6b7280; --line: #3b6fd4; --chip: #f1f3f7;
+  --warn: #9a5b00; --warn-bg: #fff4e0; --up: #17803d; --dn: #b42318;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #14161a;
-    --panel: #1b1e24;
-    --border: #2b2f37;
-    --ink: #e6e8ec;
-    --muted: #98a0ad;
-    --line: #7aa5f0;
-    --line-soft: rgba(122, 165, 240, 0.18);
-    --chip: #23272f;
-    --warn: #ffcf8a;
-    --warn-bg: #3a2c12;
+    --bg: #14161a; --panel: #1b1e24; --border: #2b2f37; --ink: #e6e8ec;
+    --muted: #98a0ad; --line: #7aa5f0; --chip: #23272f;
+    --warn: #ffcf8a; --warn-bg: #3a2c12; --up: #5ed69a; --dn: #ff9a8f;
   }
 }
 * { box-sizing: border-box; }
-body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--ink);
-  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-}
-a { color: var(--line); }
-header {
-  position: sticky; top: 0; z-index: 5;
-  background: var(--panel);
-  border-bottom: 1px solid var(--border);
-  padding: 12px 18px;
-}
-h1 { font-size: 15px; margin: 0 0 10px; font-weight: 650; letter-spacing: .01em; }
-h1 small { font-weight: 400; color: var(--muted); margin-left: 8px; }
-.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-label.ctl { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
-select, input[type=search] {
-  font: inherit; font-size: 13px;
-  background: var(--bg); color: var(--ink);
-  border: 1px solid var(--border); border-radius: 7px;
-  padding: 5px 8px;
-}
-input[type=search] { min-width: 200px; }
-.meta { padding: 10px 18px; color: var(--muted); font-size: 12.5px; }
-.notice {
-  margin: 10px 18px; padding: 9px 12px;
-  background: var(--warn-bg); color: var(--warn);
-  border-radius: 8px; font-size: 12.5px;
-}
-main { padding: 0 18px 40px; }
-.grid {
-  display: grid; gap: 12px;
-  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
-}
-.card {
-  background: var(--panel); border: 1px solid var(--border);
-  border-radius: 10px; padding: 11px 12px 8px;
-  cursor: pointer; text-align: left; width: 100%;
-  font: inherit; color: inherit;
-}
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+        "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif; }
+header { position: sticky; top: 0; z-index: 5; background: var(--panel);
+  border-bottom: 1px solid var(--border); padding: 11px 18px; }
+.titlerow { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+h1 { font-size: 15px; margin: 0; font-weight: 650; }
+h1 small { font-weight: 400; color: var(--muted); margin-left: 6px; font-size: 12px; }
+.controls { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; margin-top: 9px; }
+label.ctl { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+select, input[type=search] { font: inherit; font-size: 13px; background: var(--bg);
+  color: var(--ink); border: 1px solid var(--border); border-radius: 7px; padding: 5px 8px; }
+input[type=search] { min-width: 180px; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+.seg button { font: inherit; font-size: 12.5px; padding: 5px 11px; border: 0;
+  background: var(--bg); color: var(--muted); cursor: pointer; }
+.seg button[aria-pressed=true] { background: var(--line); color: #fff; }
+.meta { padding: 9px 18px; color: var(--muted); font-size: 12.5px; }
+.notice { margin: 9px 18px; padding: 9px 12px; background: var(--warn-bg);
+  color: var(--warn); border-radius: 8px; font-size: 12.5px; }
+main { padding: 0 18px 44px; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(272px, 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 11px 12px 8px; cursor: pointer; text-align: left; width: 100%;
+  font: inherit; color: inherit; }
 .card:hover, .card:focus-visible { border-color: var(--line); outline: none; }
-.card .name {
-  font-size: 12px; color: var(--muted);
-  word-break: break-all; line-height: 1.35; margin-bottom: 5px;
-}
-.card .val { font-size: 19px; font-weight: 620; font-variant-numeric: tabular-nums; }
+.card .nm { font-size: 13px; font-weight: 600; line-height: 1.3; }
+.card .grp { font-size: 11px; color: var(--muted); margin-top: 2px; word-break: break-all; }
+.card .val { font-size: 19px; font-weight: 620; font-variant-numeric: tabular-nums; margin-top: 5px; }
+.card .val .u { font-size: 12px; font-weight: 500; color: var(--muted); margin-left: 3px; }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 5px 0 2px; }
-.chip {
-  font-size: 11px; padding: 1.5px 6px; border-radius: 999px;
-  background: var(--chip); color: var(--muted);
-  font-variant-numeric: tabular-nums; white-space: nowrap;
-}
+.chip { font-size: 11px; padding: 1.5px 6px; border-radius: 999px; background: var(--chip);
+  color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.chip.up { color: var(--up); } .chip.dn { color: var(--dn); }
 svg { display: block; width: 100%; }
-.spark { height: 46px; }
-#detail {
-  background: var(--panel); border: 1px solid var(--border);
-  border-radius: 10px; padding: 14px 16px; margin-bottom: 16px;
-}
+.spark { height: 44px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 9px; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 600; font-size: 12px; position: sticky; top: 0;
+  background: var(--panel); cursor: pointer; }
+td.n { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:hover { background: var(--chip); }
+.tblwrap { background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; overflow-x: auto; }
+#detail { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px 16px; margin-bottom: 16px; }
 #detail.hidden { display: none; }
-.detail-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
-.detail-title { font-size: 13.5px; font-weight: 620; word-break: break-all; }
-.close {
-  border: 1px solid var(--border); background: var(--bg); color: var(--muted);
-  border-radius: 7px; padding: 3px 9px; cursor: pointer; font: inherit; font-size: 12px;
-}
-.plot-wrap { position: relative; margin-top: 10px; }
+.dhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.close { border: 1px solid var(--border); background: var(--bg); color: var(--muted);
+  border-radius: 7px; padding: 3px 9px; cursor: pointer; font: inherit; font-size: 12px; }
+.plotwrap { position: relative; margin-top: 10px; }
 .plot { height: 300px; }
-.axis { stroke: var(--border); stroke-width: 1; }
 .gridline { stroke: var(--border); stroke-width: 1; stroke-dasharray: 3 4; opacity: .7; }
 .tick { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
-#tip {
-  position: absolute; pointer-events: none; opacity: 0;
-  transform: translate(-50%, -100%);
-  background: var(--ink); color: var(--bg);
-  padding: 5px 8px; border-radius: 6px; font-size: 11.5px;
-  white-space: nowrap; transition: opacity .08s;
-}
+#tip { position: absolute; pointer-events: none; opacity: 0; transform: translate(-50%, -100%);
+  background: var(--ink); color: var(--bg); padding: 5px 8px; border-radius: 6px;
+  font-size: 11.5px; white-space: nowrap; transition: opacity .08s; }
 .empty { color: var(--muted); padding: 30px 0; }
-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>mqvpn perf history <small id="sub">loading…</small></h1>
+  <div class="titlerow">
+    <h1 id="h1">mqvpn 性能历史<small id="sub">加载中…</small></h1>
+    <span style="flex:1"></span>
+    <div class="seg" id="langSeg">
+      <button type="button" data-lang="zh">中文</button>
+      <button type="button" data-lang="en">EN</button>
+    </div>
+  </div>
   <div class="controls">
-    <label class="ctl">source
+    <label class="ctl"><span data-i="src"></span>
       <select id="channel">
-        <option value="push">per-commit</option>
-        <option value="weekly">weekly</option>
+        <option value="push"></option>
+        <option value="weekly"></option>
       </select>
     </label>
-    <label class="ctl">benchmark <select id="test"></select></label>
-    <label class="ctl">runs
-      <select id="limit">
-        <option>10</option><option>20</option><option selected>40</option>
-        <option>60</option><option>100</option>
-      </select>
+    <label class="ctl"><span data-i="bench"></span> <select id="test"></select></label>
+    <label class="ctl"><span data-i="runs"></span>
+      <select id="limit"><option>10</option><option>20</option><option selected>40</option>
+        <option>60</option><option>100</option></select>
     </label>
-    <label class="ctl">sort
+    <div class="seg" id="viewSeg">
+      <button type="button" data-view="trend"></button>
+      <button type="button" data-view="latest"></button>
+      <button type="button" data-view="run"></button>
+    </div>
+    <label class="ctl" id="commitWrap" style="display:none"><span data-i="commit"></span>
+      <select id="commit"></select>
+    </label>
+    <label class="ctl"><span data-i="sort"></span>
       <select id="sort">
-        <option value="name">name</option>
-        <option value="move">biggest move</option>
-        <option value="noise">noisiest</option>
+        <option value="name"></option><option value="move"></option><option value="noise"></option>
       </select>
     </label>
-    <label class="ctl"><input type="checkbox" id="hideflat" checked> hide unchanging</label>
-    <input type="search" id="filter" placeholder="filter metrics…">
+    <label class="ctl"><input type="checkbox" id="hideflat" checked> <span data-i="hideflat"></span></label>
+    <input type="search" id="filter">
   </div>
 </header>
 
@@ -151,28 +126,194 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
 
 <main>
   <section id="detail" class="hidden">
-    <div class="detail-head">
+    <div class="dhead">
       <div>
-        <div class="detail-title" id="dTitle"></div>
+        <div id="dTitle" style="font-size:13.5px;font-weight:620"></div>
         <div class="chips" id="dChips"></div>
       </div>
-      <button class="close" id="dClose">close</button>
+      <button class="close" id="dClose"></button>
     </div>
-    <div class="plot-wrap">
-      <svg class="plot" id="dPlot" preserveAspectRatio="none"></svg>
-      <div id="tip"></div>
-    </div>
+    <div class="plotwrap"><svg class="plot" id="dPlot" preserveAspectRatio="none"></svg><div id="tip"></div></div>
   </section>
   <div class="grid" id="grid"></div>
+  <div class="tblwrap" id="tblwrap" hidden><table id="tbl"><thead></thead><tbody></tbody></table></div>
   <p class="empty" id="empty" hidden></p>
 </main>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const state = { data: null, selected: null };
 
-/* ── formatting ─────────────────────────────────────────────────────── */
+/* ── i18n ────────────────────────────────────────────────────────────────
+ * Two languages, one dictionary. Default follows the browser, then whatever
+ * the viewer last chose (localStorage is per-artifact-origin and may throw in
+ * a private window, hence the try/catch).                                  */
+const I18N = {
+  zh: {
+    title: 'mqvpn 性能历史', src: '数据源', bench: '基准项', runs: '运行数',
+    sort: '排序', hideflat: '隐藏无变化', filterPh: '筛选指标…',
+    trend: '趋势', latest: '仅最新', run: '单次提交', commit: '提交',
+    push: '每次提交', weekly: '每周全量',
+    byname: '按名称', bymove: '按变动幅度', bynoise: '按噪声',
+    close: '关闭', noData: '该基准项暂无数据。',
+    noMatch: '没有指标匹配当前筛选。取消“隐藏无变化”可显示常量(如 netem 配置、时长)。',
+    loading: '加载中…', noPub: '尚未发布数据',
+    runsIndexed: (n, c) => `已索引 ${n} 次运行 · 最新 ${c}`,
+    range: (n, a, b, m) => `${n} 次运行 · ${a} → ${b} · ${m} 个指标`,
+    truncated: (k, t) => `仅显示 ${t} 个指标中的前 ${k} 个。`,
+    readErr: (n) => `${n} 个结果文件无法读取,对应点显示为断口。`,
+    loadFail: (m) => `加载失败:${m}`,
+    colMetric: '指标', colValue: '数值', colDelta: '相对上次', colCv: '波动(CV)',
+    colTrend: '走势', colUnit: '单位',
+    latestVal: '最新值', vsPrev: '相对上次', median: '中位数', min: '最小', max: '最大',
+    noRun: '该次运行没有可用指标。',
+    cvHint: 'CV 为变异系数 —— 共享 runner 上,先看它再看涨跌:CV 25% 的指标动 10% 说明不了什么。',
+  },
+  en: {
+    title: 'mqvpn perf history', src: 'source', bench: 'benchmark', runs: 'runs',
+    sort: 'sort', hideflat: 'hide unchanging', filterPh: 'filter metrics…',
+    trend: 'Trend', latest: 'Latest only', run: 'Single run', commit: 'commit',
+    push: 'per-commit', weekly: 'weekly',
+    byname: 'by name', bymove: 'by biggest move', bynoise: 'by noisiest',
+    close: 'close', noData: 'No data for this benchmark yet.',
+    noMatch: 'No metric matches the filter. Unchecking “hide unchanging” shows constants such as netem settings and durations.',
+    loading: 'loading…', noPub: 'no data published yet',
+    runsIndexed: (n, c) => `${n} runs indexed · newest ${c}`,
+    range: (n, a, b, m) => `${n} runs · ${a} → ${b} · ${m} metrics`,
+    truncated: (k, t) => `Only the first ${k} of ${t} metrics are shown.`,
+    readErr: (n) => `${n} result file(s) could not be read; those points are gaps.`,
+    loadFail: (m) => `Failed to load: ${m}`,
+    colMetric: 'Metric', colValue: 'Value', colDelta: 'vs prev', colCv: 'CV',
+    colTrend: 'Trend', colUnit: 'Unit',
+    latestVal: 'latest', vsPrev: 'vs prev', median: 'median', min: 'min', max: 'max',
+    noRun: 'This run recorded no metrics.',
+    cvHint: 'CV is the coefficient of variation — on a shared runner, read it before reading a movement: a metric with CV 25% has not told you much by moving 10%.',
+  },
+};
+let LANG = 'zh';
+const t = (k) => I18N[LANG][k];
 
+/* ── metric naming ───────────────────────────────────────────────────────
+ * The API returns dotted paths (`results[scenario=hetero_extreme].vs_best_single`)
+ * because the Worker charts whatever numbers it finds and has no schema. That
+ * is the right call server-side, but it is not a name a human reads, so the
+ * naming lives here: split the path into group + leaf, look the leaf up, and
+ * fall back to a humanised form so an unknown metric is still legible.     */
+const METRIC_LABELS = {
+  // throughput / aggregation
+  solo_a_mbps: ['Path A alone', '仅路径 A'],
+  solo_b_mbps: ['Path B alone', '仅路径 B'],
+  multipath_mbps: ['Multipath total', '多路径合计'],
+  single_path_mbps: ['Single path', '单路径'],
+  direct_mbps: ['Direct (no VPN)', '直连(无 VPN)'],
+  multipath_wlb_mbps: ['Multipath · WLB', '多路径 · WLB'],
+  multipath_minrtt_mbps: ['Multipath · MinRTT', '多路径 · MinRTT'],
+  theoretical_max_mbps: ['Theoretical max', '理论上限'],
+  throughput_mbps: ['Throughput', '吞吐'],
+  aggregation_efficiency: ['Aggregation efficiency', '聚合效率'],
+  vs_best_single: ['vs best single path', '相对最优单路'],
+  utilization: ['Link utilization', '链路利用率'],
+  // latency
+  srtt_ms: ['Smoothed RTT', '平滑 RTT'],
+  srtt: ['Smoothed RTT', '平滑 RTT'],
+  min_rtt_ms: ['Minimum RTT', '最小 RTT'],
+  min_rtt: ['Minimum RTT', '最小 RTT'],
+  rtt_ms: ['RTT', 'RTT'],
+  one_way_delay_ms: ['One-way delay', '单向延迟'],
+  delay_ms: ['Emulated delay', '模拟延迟'],
+  rtt_inflation: ['RTT inflation (bufferbloat)', 'RTT 膨胀(缓冲膨胀)'],
+  jitter_ms: ['Jitter', '抖动'],
+  // loss / integrity
+  pkt_lost: ['Packets lost', '丢包数'],
+  dgram_lost: ['Datagrams lost', '数据报丢失'],
+  dgram_sent: ['Datagrams sent', '数据报发送'],
+  dgram_acked: ['Datagrams acked', '数据报确认'],
+  lost_percent: ['Loss rate', '丢包率'],
+  lost_dgram_count: ['Datagrams lost', '数据报丢失'],
+  fec_recover_cnt: ['FEC recovered', 'FEC 恢复'],
+  fec_send_cnt: ['FEC sent', 'FEC 发送'],
+  // path fairness
+  path_minshare: ['Path balance (min/max)', '路径均衡度(小/大)'],
+  minshare: ['Path balance (min/max)', '路径均衡度(小/大)'],
+  bytes_tx: ['Bytes sent', '发送字节'],
+  bytes_rx: ['Bytes received', '接收字节'],
+  // failover
+  ttf_sec: ['Time to detect failure', '故障检测耗时'],
+  ttr_sec: ['Time to recover', '恢复耗时'],
+  pre_fault_avg_mbps: ['Before fault', '故障前'],
+  degraded_avg_mbps: ['While degraded', '降级期间'],
+  recovery_avg_mbps: ['After recovery', '恢复后'],
+  post_recover_avg_mbps: ['After both recovered', '双路恢复后'],
+  // batching (the readout that makes a PPS-capped carrier profile actionable)
+  gso_factor: ['GSO batching factor', 'GSO 批量倍率'],
+  gro_factor: ['GRO batching factor', 'GRO 批量倍率'],
+  // resource
+  server_rss_peak_kb: ['Server peak memory', '服务端峰值内存'],
+  client_rss_peak_kb: ['Client peak memory', '客户端峰值内存'],
+  server_rss: ['Server memory', '服务端内存'],
+  client_rss: ['Client memory', '客户端内存'],
+  // stability
+  cv_pct: ['Variability (CV)', '波动(CV)'],
+  multipath_cv_pct: ['Multipath variability', '多路径波动'],
+  // special conditions
+  before_idle_mbps: ['Before idle', '空闲前'],
+  after_idle_mbps: ['After 35 s idle', '空闲 35 秒后'],
+  survived_ratio: ['Survival ratio', '存活比'],
+  recovered: ['Recovered', '已恢复'],
+  survived: ['Survived', '存活'],
+  dl_idle_mbps: ['Downlink, idle uplink', '下行(上行空闲)'],
+  dl_under_ul_load_mbps: ['Downlink, uplink saturated', '下行(上行满载)'],
+  dl_retention: ['Downlink retention', '下行保持率'],
+  // overhead ratios
+  single_path: ['Single-path overhead', '单路开销'],
+  multipath_minrtt: ['MinRTT overhead', 'MinRTT 开销'],
+  multipath_wlb: ['WLB overhead', 'WLB 开销'],
+  // context
+  rate_mbit: ['Emulated bandwidth', '模拟带宽'],
+  streams: ['Parallel streams', '并发流数'],
+  target_mbps: ['Target rate', '目标速率'],
+  packet_size: ['Packet size', '包长'],
+  duration_sec: ['Duration', '时长'],
+  iperf_sec: ['iperf duration', 'iperf 时长'],
+  repeats: ['Repeats', '重复次数'],
+  netem_seed: ['netem seed available', 'netem seed 可用'],
+  pps_police: ['PPS cap available', 'PPS 限速可用'],
+  cycles_ok: ['Cycles passed', '通过轮次'],
+  cycles_failed: ['Cycles failed', '失败轮次'],
+  num_cycles: ['Cycles', '总轮次'],
+};
+
+// Unit from the leaf's suffix, so an unknown metric still gets one right.
+function unitOf(leaf) {
+  if (/_mbps$|_mbit$/.test(leaf)) return 'Mbps';
+  if (/_ms$/.test(leaf)) return 'ms';
+  if (/_sec$/.test(leaf)) return 's';
+  if (/_kb$/.test(leaf)) return 'KB';
+  if (/_pct$|percent$/.test(leaf)) return '%';
+  if (/_bytes$|^bytes_/.test(leaf)) return 'B';
+  if (/efficiency$|_ratio$|_factor$|inflation$|minshare$|retention$|utilization$/.test(leaf)) return '×';
+  return '';
+}
+
+function humanise(leaf) {
+  return leaf.replace(/_(mbps|ms|sec|kb|pct|bytes)$/, '')
+             .replace(/_/g, ' ')
+             .replace(/^./, (c) => c.toUpperCase());
+}
+
+/** path -> {label, group, unit}. Group is the bracket chain (scenario=…, streams=8). */
+function describe(path) {
+  const groups = [...path.matchAll(/\[([^\]]*)\]/g)].map((m) => m[1]);
+  const leaf = path.split('.').pop().replace(/\[[^\]]*\]/g, '');
+  const known = METRIC_LABELS[leaf];
+  return {
+    label: known ? known[LANG === 'zh' ? 1 : 0] : humanise(leaf),
+    group: groups.join(' · '),
+    unit: unitOf(leaf),
+    leaf,
+  };
+}
+
+/* ── formatting / stats ─────────────────────────────────────────────────── */
 function fmt(v) {
   if (v === null || v === undefined || !Number.isFinite(v)) return '—';
   const a = Math.abs(v);
@@ -183,62 +324,44 @@ function fmt(v) {
   if (a >= 0.01) return v.toFixed(3);
   return v.toExponential(1);
 }
-
 function shortTime(iso) {
   if (!iso) return '?';
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : d.toISOString().slice(0, 16).replace('T', ' ');
 }
-
-/* ── statistics ─────────────────────────────────────────────────────── */
-
 function stats(values) {
   const f = values.filter((v) => v !== null && Number.isFinite(v));
   if (!f.length) return null;
   const mean = f.reduce((a, b) => a + b, 0) / f.length;
-  const sorted = [...f].sort((a, b) => a - b);
-  const mid = sorted.length >> 1;
-  const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-  const variance = f.length > 1
-    ? f.reduce((a, b) => a + (b - mean) ** 2, 0) / (f.length - 1)
-    : 0;
-  const sd = Math.sqrt(variance);
+  const s = [...f].sort((a, b) => a - b);
+  const mid = s.length >> 1;
+  const median = s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+  const sd = f.length > 1
+    ? Math.sqrt(f.reduce((a, b) => a + (b - mean) ** 2, 0) / (f.length - 1)) : 0;
   const last = f[f.length - 1];
   const prev = f.length > 1 ? f[f.length - 2] : null;
-  return {
-    n: f.length,
-    mean, median, sd,
-    // Coefficient of variation: the honest read on whether a movement in this
-    // metric means anything on a shared cloud runner.
+  return { n: f.length, mean, median, sd,
     cv: mean !== 0 ? (sd / Math.abs(mean)) * 100 : null,
     last, prev,
     delta: prev !== null && prev !== 0 ? ((last - prev) / Math.abs(prev)) * 100 : null,
-    flat: sorted[0] === sorted[sorted.length - 1],
-    min: sorted[0], max: sorted[sorted.length - 1],
-  };
+    flat: s[0] === s[s.length - 1], min: s[0], max: s[s.length - 1] };
 }
 
-/* ── svg helpers ────────────────────────────────────────────────────── */
-
+/* ── svg ────────────────────────────────────────────────────────────────── */
 function scale(values, w, h, padX, padY) {
   const f = values.filter((v) => v !== null && Number.isFinite(v));
-  let min = Math.min(...f);
-  let max = Math.max(...f);
+  let min = Math.min(...f), max = Math.max(...f);
   if (!Number.isFinite(min)) { min = 0; max = 1; }
   if (min === max) { const b = Math.abs(min) || 1; min -= b * 0.05; max += b * 0.05; }
   const n = values.length;
-  return {
-    min, max,
+  return { min, max,
     x: (i) => (n <= 1 ? w / 2 : padX + (i * (w - 2 * padX)) / (n - 1)),
-    y: (v) => h - padY - ((v - min) / (max - min)) * (h - 2 * padY),
-  };
+    y: (v) => h - padY - ((v - min) / (max - min)) * (h - 2 * padY) };
 }
-
-// Gaps (a run whose file was unreadable) break the line instead of being
-// drawn through, so a missing point never looks like a measured value.
+// Gaps break the line rather than being drawn through, so a run whose file was
+// unreadable never looks like a measured value.
 function linePath(values, s) {
-  let d = '';
-  let pen = false;
+  let d = '', pen = false;
   values.forEach((v, i) => {
     if (v === null || !Number.isFinite(v)) { pen = false; return; }
     d += `${pen ? 'L' : 'M'}${s.x(i).toFixed(2)} ${s.y(v).toFixed(2)} `;
@@ -246,30 +369,23 @@ function linePath(values, s) {
   });
   return d.trim();
 }
-
 function svgEl(tag, attrs) {
   const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
   for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
   return el;
 }
-
-function sparkline(values) {
-  const W = 240, H = 46;
-  const s = scale(values, W, H, 2, 5);
-  const svg = svgEl('svg', { class: 'spark', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none' });
+function sparkline(values, w = 240, h = 44) {
+  const s = scale(values, w, h, 2, 5);
+  const svg = svgEl('svg', { class: 'spark', viewBox: `0 0 ${w} ${h}`, preserveAspectRatio: 'none' });
   const d = linePath(values, s);
   if (d) {
-    svg.appendChild(svgEl('path', {
-      d, fill: 'none', stroke: 'var(--line)', 'stroke-width': 1.6,
-      'stroke-linejoin': 'round', 'stroke-linecap': 'round',
-      'vector-effect': 'non-scaling-stroke',
-    }));
+    svg.appendChild(svgEl('path', { d, fill: 'none', stroke: 'var(--line)',
+      'stroke-width': 1.6, 'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+      'vector-effect': 'non-scaling-stroke' }));
     for (let i = values.length - 1; i >= 0; i--) {
       if (values[i] !== null && Number.isFinite(values[i])) {
-        svg.appendChild(svgEl('circle', {
-          cx: s.x(i), cy: s.y(values[i]), r: 2.4, fill: 'var(--line)',
-          'vector-effect': 'non-scaling-stroke',
-        }));
+        svg.appendChild(svgEl('circle', { cx: s.x(i), cy: s.y(values[i]), r: 2.4,
+          fill: 'var(--line)', 'vector-effect': 'non-scaling-stroke' }));
         break;
       }
     }
@@ -277,162 +393,229 @@ function sparkline(values) {
   return svg;
 }
 
-/* ── rendering ──────────────────────────────────────────────────────── */
+/* ── state ──────────────────────────────────────────────────────────────── */
+const state = { data: null, selected: null, view: 'trend', runIdx: null };
 
-function visibleMetrics() {
+function store(k, v) { try { v === undefined ? 0 : localStorage.setItem(k, v); } catch {} }
+function recall(k) { try { return localStorage.getItem(k); } catch { return null; } }
+
+function metricItems() {
   const d = state.data;
   if (!d) return [];
   const q = $('filter').value.trim().toLowerCase();
   const hideFlat = $('hideflat').checked;
   const mode = $('sort').value;
 
-  let items = Object.keys(d.metrics).map((name) => ({ name, values: d.metrics[name], st: stats(d.metrics[name]) }));
-  items = items.filter((it) => it.st);
-  if (hideFlat) items = items.filter((it) => !it.st.flat);
-  if (q) items = items.filter((it) => it.name.toLowerCase().includes(q));
+  let items = Object.keys(d.metrics).map((name) => {
+    const desc = describe(name);
+    return { name, desc, values: d.metrics[name], st: stats(d.metrics[name]) };
+  }).filter((it) => it.st);
 
-  const rank = { name: (a, b) => a.name.localeCompare(b.name) };
-  if (mode === 'move') {
-    items.sort((a, b) => Math.abs(b.st.delta ?? 0) - Math.abs(a.st.delta ?? 0) || rank.name(a, b));
-  } else if (mode === 'noise') {
-    items.sort((a, b) => (b.st.cv ?? 0) - (a.st.cv ?? 0) || rank.name(a, b));
-  } else {
-    items.sort(rank.name);
-  }
+  if (hideFlat) items = items.filter((it) => !it.st.flat);
+  if (q) items = items.filter((it) =>
+    it.name.toLowerCase().includes(q) ||
+    it.desc.label.toLowerCase().includes(q) ||
+    it.desc.group.toLowerCase().includes(q));
+
+  const byName = (a, b) => a.desc.group.localeCompare(b.desc.group) || a.desc.label.localeCompare(b.desc.label);
+  if (mode === 'move') items.sort((a, b) => Math.abs(b.st.delta ?? 0) - Math.abs(a.st.delta ?? 0) || byName(a, b));
+  else if (mode === 'noise') items.sort((a, b) => (b.st.cv ?? 0) - (a.st.cv ?? 0) || byName(a, b));
+  else items.sort(byName);
   return items;
 }
 
-function renderGrid() {
+function chip(text, cls) {
+  const el = document.createElement('span');
+  el.className = 'chip' + (cls ? ' ' + cls : '');
+  el.textContent = text;
+  return el;
+}
+// Deltas carry no good/bad colour by default: direction is not interpretable
+// across metrics (higher _mbps is better, lower ttr_sec is better), so colouring
+// a throughput drop green would be worse than no colour at all. The arrow shows
+// direction and the reader supplies the meaning.
+function deltaChip(delta) {
+  if (delta === null || delta === undefined) return null;
+  return chip(`${delta >= 0 ? '▲' : '▼'} ${Math.abs(delta).toFixed(1)}% ${t('vsPrev')}`);
+}
+
+/* ── view: trend (cards + sparkline) ───────────────────────────────────── */
+function renderTrend(items) {
   const grid = $('grid');
+  grid.hidden = false; $('tblwrap').hidden = true;
   grid.textContent = '';
-  const items = visibleMetrics();
-
-  $('empty').hidden = items.length > 0;
-  if (!items.length) {
-    $('empty').textContent = state.data && Object.keys(state.data.metrics).length
-      ? 'No metric matches the current filter. Unchecking “hide unchanging” shows constants such as netem settings and durations.'
-      : 'No data for this benchmark yet.';
-    return;
-  }
-
   for (const it of items) {
     const card = document.createElement('button');
-    card.className = 'card';
-    card.type = 'button';
+    card.className = 'card'; card.type = 'button';
 
-    const name = document.createElement('div');
-    name.className = 'name';
-    name.textContent = it.name;
+    const nm = document.createElement('div');
+    nm.className = 'nm'; nm.textContent = it.desc.label;
+    const grp = document.createElement('div');
+    grp.className = 'grp'; grp.textContent = it.desc.group || it.desc.leaf;
 
     const val = document.createElement('div');
-    val.className = 'val';
-    val.textContent = fmt(it.st.last);
+    val.className = 'val'; val.textContent = fmt(it.st.last);
+    if (it.desc.unit) {
+      const u = document.createElement('span');
+      u.className = 'u'; u.textContent = it.desc.unit; val.appendChild(u);
+    }
 
     const chips = document.createElement('div');
     chips.className = 'chips';
-    if (it.st.delta !== null) {
-      chips.appendChild(chip(`${it.st.delta >= 0 ? '▲' : '▼'} ${Math.abs(it.st.delta).toFixed(1)}% vs prev`));
-    }
+    const dc = deltaChip(it.st.delta); if (dc) chips.appendChild(dc);
     if (it.st.cv !== null) chips.appendChild(chip(`CV ${it.st.cv.toFixed(1)}%`));
-    chips.appendChild(chip(`med ${fmt(it.st.median)}`));
+    chips.appendChild(chip(`${t('median')} ${fmt(it.st.median)}`));
     chips.appendChild(chip(`n=${it.st.n}`));
 
-    card.append(name, val, chips, sparkline(it.values));
+    card.append(nm, grp, val, chips, sparkline(it.values));
     card.addEventListener('click', () => openDetail(it.name));
     grid.appendChild(card);
   }
 }
 
-function chip(text) {
-  const el = document.createElement('span');
-  el.className = 'chip';
-  el.textContent = text;
-  return el;
+/* ── view: latest only (compact table of the newest value) ─────────────── */
+function renderLatest(items) {
+  $('grid').hidden = true;
+  const wrap = $('tblwrap'); wrap.hidden = false;
+  const tbl = $('tbl');
+  tbl.tHead.innerHTML = `<tr><th>${t('colMetric')}</th><th></th>`
+    + `<th class="n">${t('colValue')}</th><th>${t('colUnit')}</th>`
+    + `<th class="n">${t('colDelta')}</th><th class="n">${t('colCv')}</th>`
+    + `<th>${t('colTrend')}</th></tr>`;
+  const tb = tbl.tBodies[0]; tb.textContent = '';
+  for (const it of items) {
+    const tr = document.createElement('tr');
+    const mk = (txt, cls) => { const td = document.createElement('td');
+      if (cls) td.className = cls; td.textContent = txt; return td; };
+    tr.append(mk(it.desc.label), mk(it.desc.group || ''), mk(fmt(it.st.last), 'n'),
+      mk(it.desc.unit, ''),
+      mk(it.st.delta === null ? '—' : `${it.st.delta >= 0 ? '+' : ''}${it.st.delta.toFixed(1)}%`, 'n'),
+      mk(it.st.cv === null ? '—' : it.st.cv.toFixed(1) + '%', 'n'));
+    const tdSpark = document.createElement('td');
+    tdSpark.style.width = '150px';
+    tdSpark.appendChild(sparkline(it.values, 150, 26));
+    tr.appendChild(tdSpark);
+    tr.addEventListener('click', () => openDetail(it.name));
+    tb.appendChild(tr);
+  }
 }
 
+/* ── view: single run (one commit, every metric it recorded) ───────────── */
+function renderRun(items) {
+  $('grid').hidden = true;
+  const wrap = $('tblwrap'); wrap.hidden = false;
+  const idx = state.runIdx;
+  const tbl = $('tbl');
+  tbl.tHead.innerHTML = `<tr><th>${t('colMetric')}</th><th></th>`
+    + `<th class="n">${t('colValue')}</th><th>${t('colUnit')}</th>`
+    + `<th class="n">${t('colDelta')}</th></tr>`;
+  const tb = tbl.tBodies[0]; tb.textContent = '';
+
+  let shown = 0;
+  for (const it of items) {
+    const v = it.values[idx];
+    if (v === null || v === undefined || !Number.isFinite(v)) continue;
+    // Compare against the nearest earlier run that recorded this metric, not
+    // blindly idx-1: a gap there would otherwise read as "no change".
+    let prev = null;
+    for (let j = idx - 1; j >= 0; j--) {
+      if (it.values[j] !== null && Number.isFinite(it.values[j])) { prev = it.values[j]; break; }
+    }
+    const d = prev !== null && prev !== 0 ? ((v - prev) / Math.abs(prev)) * 100 : null;
+    const tr = document.createElement('tr');
+    const mk = (txt, cls) => { const td = document.createElement('td');
+      if (cls) td.className = cls; td.textContent = txt; return td; };
+    tr.append(mk(it.desc.label), mk(it.desc.group || ''), mk(fmt(v), 'n'), mk(it.desc.unit, ''),
+      mk(d === null ? '—' : `${d >= 0 ? '+' : ''}${d.toFixed(1)}%`, 'n'));
+    tr.addEventListener('click', () => openDetail(it.name));
+    tb.appendChild(tr);
+    shown++;
+  }
+  if (!shown) {
+    $('empty').hidden = false; $('empty').textContent = t('noRun');
+    wrap.hidden = true;
+  }
+}
+
+function render() {
+  const items = metricItems();
+  const has = items.length > 0;
+  $('empty').hidden = has;
+  if (!has) {
+    $('grid').hidden = true; $('tblwrap').hidden = true;
+    $('empty').textContent = state.data && Object.keys(state.data.metrics).length
+      ? t('noMatch') : t('noData');
+    return;
+  }
+  if (state.view === 'trend') renderTrend(items);
+  else if (state.view === 'latest') renderLatest(items);
+  else renderRun(items);
+}
+
+/* ── detail plot ───────────────────────────────────────────────────────── */
 function openDetail(name) {
   state.selected = name;
-  const d = state.data;
-  const values = d.metrics[name];
-  const st = stats(values);
+  const d = state.data, values = d.metrics[name], st = stats(values);
   if (!st) return;
-
+  const desc = describe(name);
   $('detail').classList.remove('hidden');
-  $('dTitle').textContent = name;
-
-  const chips = $('dChips');
-  chips.textContent = '';
-  chips.appendChild(chip(`latest ${fmt(st.last)}`));
-  chips.appendChild(chip(`median ${fmt(st.median)}`));
-  chips.appendChild(chip(`min ${fmt(st.min)}`));
-  chips.appendChild(chip(`max ${fmt(st.max)}`));
+  $('dTitle').textContent = desc.label + (desc.group ? `  ·  ${desc.group}` : '')
+    + (desc.unit ? `  (${desc.unit})` : '');
+  const chips = $('dChips'); chips.textContent = '';
+  chips.appendChild(chip(`${t('latestVal')} ${fmt(st.last)}`));
+  chips.appendChild(chip(`${t('median')} ${fmt(st.median)}`));
+  chips.appendChild(chip(`${t('min')} ${fmt(st.min)}`));
+  chips.appendChild(chip(`${t('max')} ${fmt(st.max)}`));
   if (st.cv !== null) chips.appendChild(chip(`CV ${st.cv.toFixed(1)}%`));
-
+  chips.appendChild(chip(name));
   drawDetail(values, d.runs);
   $('detail').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 function drawDetail(values, runs) {
-  const W = 900, H = 300, padX = 54, padY = 18;
-  const svg = $('dPlot');
-  svg.textContent = '';
+  const W = 900, H = 300, padX = 56, padY = 18;
+  const svg = $('dPlot'); svg.textContent = '';
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
   const s = scale(values, W, H, padX, padY);
 
-  // y grid + ticks
   for (let i = 0; i <= 4; i++) {
-    const v = s.min + ((s.max - s.min) * i) / 4;
-    const y = s.y(v);
+    const v = s.min + ((s.max - s.min) * i) / 4, y = s.y(v);
     svg.appendChild(svgEl('line', { x1: padX, y1: y, x2: W - padX / 3, y2: y, class: 'gridline' }));
-    const t = svgEl('text', { x: padX - 8, y: y + 3.5, class: 'tick', 'text-anchor': 'end' });
-    t.textContent = fmt(v);
-    svg.appendChild(t);
+    const tx = svgEl('text', { x: padX - 8, y: y + 3.5, class: 'tick', 'text-anchor': 'end' });
+    tx.textContent = fmt(v); svg.appendChild(tx);
   }
-
   const d = linePath(values, s);
-  if (d) {
-    svg.appendChild(svgEl('path', {
-      d, fill: 'none', stroke: 'var(--line)', 'stroke-width': 2,
-      'stroke-linejoin': 'round', 'stroke-linecap': 'round',
-      'vector-effect': 'non-scaling-stroke',
-    }));
-  }
+  if (d) svg.appendChild(svgEl('path', { d, fill: 'none', stroke: 'var(--line)',
+    'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+    'vector-effect': 'non-scaling-stroke' }));
   values.forEach((v, i) => {
     if (v === null || !Number.isFinite(v)) return;
     svg.appendChild(svgEl('circle', { cx: s.x(i), cy: s.y(v), r: 3, fill: 'var(--line)' }));
   });
-
-  // x labels: first and last run only — commit SHAs do not fit otherwise.
   if (runs.length) {
-    const first = svgEl('text', { x: padX, y: H - 3, class: 'tick', 'text-anchor': 'start' });
-    first.textContent = `${runs[0].commit || '?'} · ${shortTime(runs[0].timestamp)}`;
-    const lastRun = runs[runs.length - 1];
-    const last = svgEl('text', { x: W - padX / 3, y: H - 3, class: 'tick', 'text-anchor': 'end' });
-    last.textContent = `${lastRun.commit || '?'} · ${shortTime(lastRun.timestamp)}`;
-    svg.append(first, last);
+    const a = svgEl('text', { x: padX, y: H - 3, class: 'tick', 'text-anchor': 'start' });
+    a.textContent = `${runs[0].commit || '?'} · ${shortTime(runs[0].timestamp)}`;
+    const lr = runs[runs.length - 1];
+    const b = svgEl('text', { x: W - padX / 3, y: H - 3, class: 'tick', 'text-anchor': 'end' });
+    b.textContent = `${lr.commit || '?'} · ${shortTime(lr.timestamp)}`;
+    svg.append(a, b);
   }
-
-  const cursor = svgEl('line', {
-    x1: 0, y1: padY, x2: 0, y2: H - padY,
-    stroke: 'var(--line)', 'stroke-width': 1, opacity: 0,
-  });
+  const cursor = svgEl('line', { x1: 0, y1: padY, x2: 0, y2: H - padY,
+    stroke: 'var(--line)', 'stroke-width': 1, opacity: 0 });
   svg.appendChild(cursor);
-
   const tip = $('tip');
-  const onMove = (ev) => {
+  svg.onmousemove = (ev) => {
     const box = svg.getBoundingClientRect();
     if (!box.width) return;
     const vx = ((ev.clientX - box.left) / box.width) * W;
-    let best = -1;
-    let bestDist = Infinity;
+    let best = -1, bestDist = Infinity;
     for (let i = 0; i < values.length; i++) {
       if (values[i] === null || !Number.isFinite(values[i])) continue;
       const dist = Math.abs(s.x(i) - vx);
       if (dist < bestDist) { bestDist = dist; best = i; }
     }
     if (best < 0) return;
-    cursor.setAttribute('x1', s.x(best));
-    cursor.setAttribute('x2', s.x(best));
+    cursor.setAttribute('x1', s.x(best)); cursor.setAttribute('x2', s.x(best));
     cursor.setAttribute('opacity', 0.45);
     const run = runs[best] || {};
     tip.textContent = `${fmt(values[best])} · ${run.commit || '?'} · ${shortTime(run.timestamp)}`;
@@ -440,12 +623,45 @@ function drawDetail(values, runs) {
     tip.style.top = `${((s.y(values[best]) - 10) / H) * box.height}px`;
     tip.style.opacity = 1;
   };
-  svg.onmousemove = onMove;
   svg.onmouseleave = () => { tip.style.opacity = 0; cursor.setAttribute('opacity', 0); };
 }
 
-/* ── data loading ───────────────────────────────────────────────────── */
+/* ── chrome / i18n application ─────────────────────────────────────────── */
+function applyLang() {
+  document.documentElement.lang = LANG === 'zh' ? 'zh' : 'en';
+  $('h1').firstChild.textContent = t('title');
+  document.title = LANG === 'zh' ? 'mqvpn 性能历史' : 'mqvpn perf history';
+  for (const el of document.querySelectorAll('[data-i]')) el.textContent = t(el.dataset.i);
+  $('filter').placeholder = t('filterPh');
+  $('dClose').textContent = t('close');
+  const ch = $('channel');
+  ch.options[0].textContent = t('push'); ch.options[1].textContent = t('weekly');
+  const so = $('sort');
+  so.options[0].textContent = t('byname'); so.options[1].textContent = t('bymove');
+  so.options[2].textContent = t('bynoise');
+  for (const b of $('viewSeg').children) {
+    b.textContent = t(b.dataset.view);
+    b.setAttribute('aria-pressed', String(b.dataset.view === state.view));
+  }
+  for (const b of $('langSeg').children) b.setAttribute('aria-pressed', String(b.dataset.lang === LANG));
+  $('commitWrap').style.display = state.view === 'run' ? '' : 'none';
+}
 
+function fillCommits() {
+  const sel = $('commit'); sel.textContent = '';
+  const runs = (state.data && state.data.runs) || [];
+  // Newest first in the picker even though the series is oldest-first.
+  for (let i = runs.length - 1; i >= 0; i--) {
+    const o = document.createElement('option');
+    o.value = String(i);
+    o.textContent = `${runs[i].commit || '?'} · ${shortTime(runs[i].timestamp)}`;
+    sel.appendChild(o);
+  }
+  if (state.runIdx === null || state.runIdx >= runs.length) state.runIdx = runs.length - 1;
+  sel.value = String(state.runIdx);
+}
+
+/* ── data ──────────────────────────────────────────────────────────────── */
 async function getJSON(path, params) {
   const url = new URL(path, location.origin);
   for (const [k, v] of Object.entries(params || {})) url.searchParams.set(k, v);
@@ -455,78 +671,80 @@ async function getJSON(path, params) {
 }
 
 async function loadTests() {
-  const channel = $('channel').value;
-  const info = await getJSON('/api/tests', { channel });
-  const sel = $('test');
-  const previous = sel.value;
+  const info = await getJSON('/api/tests', { channel: $('channel').value });
+  const sel = $('test'), prev = sel.value;
   sel.textContent = '';
-  for (const t of info.tests) {
-    const opt = document.createElement('option');
-    opt.value = t.id;
-    opt.textContent = `${t.id} (${t.runs})`;
-    sel.appendChild(opt);
+  for (const x of info.tests) {
+    const o = document.createElement('option');
+    o.value = x.id; o.textContent = `${x.id} (${x.runs})`;
+    sel.appendChild(o);
   }
-  if (previous && info.tests.some((t) => t.id === previous)) sel.value = previous;
-
+  if (prev && info.tests.some((x) => x.id === prev)) sel.value = prev;
   $('sub').textContent = info.tests.length
-    ? `${info.runs} runs indexed · newest ${info.newest ? info.newest.commit : '?'}`
-    : 'no data published yet';
-  return info;
+    ? ' · ' + t('runsIndexed')(info.runs, info.newest ? info.newest.commit : '?')
+    : ' · ' + t('noPub');
 }
 
 async function loadSeries() {
   const test = $('test').value;
-  if (!test) {
-    state.data = null;
-    $('meta').textContent = '';
-    renderGrid();
-    return;
-  }
-  $('meta').textContent = 'loading…';
-  const data = await getJSON('/api/series', {
-    channel: $('channel').value,
-    test,
-    limit: $('limit').value,
-  });
+  if (!test) { state.data = null; $('meta').textContent = ''; render(); return; }
+  $('meta').textContent = t('loading');
+  const data = await getJSON('/api/series',
+    { channel: $('channel').value, test, limit: $('limit').value });
   state.data = data;
+  state.runIdx = null;
+  fillCommits();
 
-  const first = data.runs[0];
-  const last = data.runs[data.runs.length - 1];
+  const first = data.runs[0], last = data.runs[data.runs.length - 1];
   $('meta').textContent = data.runs.length
-    ? `${data.runs.length} runs · ${shortTime(first.timestamp)} → ${shortTime(last.timestamp)} · ${data.totalMetrics} metrics`
-    : 'no runs for this benchmark';
+    ? t('range')(data.runs.length, shortTime(first.timestamp), shortTime(last.timestamp), data.totalMetrics)
+      + '  ·  ' + t('cvHint')
+    : t('noData');
 
   const problems = [];
-  if (data.truncated) problems.push(`Only the first ${Object.keys(data.metrics).length} of ${data.totalMetrics} metrics are shown.`);
-  if (data.errors && data.errors.length) problems.push(`${data.errors.length} result file(s) could not be read; those points are gaps.`);
+  if (data.truncated) problems.push(t('truncated')(Object.keys(data.metrics).length, data.totalMetrics));
+  if (data.errors && data.errors.length) problems.push(t('readErr')(data.errors.length));
   $('notice').hidden = problems.length === 0;
   $('notice').textContent = problems.join(' ');
 
-  $('detail').classList.add('hidden');
-  state.selected = null;
-  renderGrid();
+  $('detail').classList.add('hidden'); state.selected = null;
+  render();
 }
 
-async function refreshAll() {
-  try {
-    await loadTests();
-    await loadSeries();
-  } catch (err) {
-    $('meta').textContent = '';
-    $('notice').hidden = false;
-    $('notice').textContent = `Failed to load: ${err.message}`;
-  }
-}
+const guard = (fn) => () => fn().catch((e) => {
+  $('notice').hidden = false; $('notice').textContent = t('loadFail')(e.message);
+});
+const refreshAll = guard(async () => { await loadTests(); await loadSeries(); });
 
+/* ── wiring ────────────────────────────────────────────────────────────── */
+$('langSeg').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  LANG = b.dataset.lang; store('perf_lang', LANG);
+  applyLang(); if (state.data) { fillCommits(); render(); }
+  if (state.selected) openDetail(state.selected);
+});
+$('viewSeg').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  state.view = b.dataset.view; store('perf_view', state.view);
+  applyLang(); render();
+});
+$('commit').addEventListener('change', () => { state.runIdx = Number($('commit').value); render(); });
 $('channel').addEventListener('change', refreshAll);
-$('test').addEventListener('change', () => loadSeries().catch((e) => { $('notice').hidden = false; $('notice').textContent = e.message; }));
-$('limit').addEventListener('change', () => loadSeries().catch((e) => { $('notice').hidden = false; $('notice').textContent = e.message; }));
-$('filter').addEventListener('input', renderGrid);
-$('sort').addEventListener('change', renderGrid);
-$('hideflat').addEventListener('change', renderGrid);
-$('dClose').addEventListener('click', () => { $('detail').classList.add('hidden'); state.selected = null; });
-window.addEventListener('resize', () => { if (state.selected) drawDetail(state.data.metrics[state.selected], state.data.runs); });
+$('test').addEventListener('change', guard(loadSeries));
+$('limit').addEventListener('change', guard(loadSeries));
+$('filter').addEventListener('input', render);
+$('sort').addEventListener('change', render);
+$('hideflat').addEventListener('change', render);
+$('dClose').addEventListener('click', () => {
+  $('detail').classList.add('hidden'); state.selected = null;
+});
+window.addEventListener('resize', () => {
+  if (state.selected && state.data) drawDetail(state.data.metrics[state.selected], state.data.runs);
+});
 
+LANG = recall('perf_lang') || ((navigator.language || 'en').startsWith('zh') ? 'zh' : 'en');
+state.view = recall('perf_view') || 'trend';
+applyLang();
 refreshAll();
 </script>
 </body>
