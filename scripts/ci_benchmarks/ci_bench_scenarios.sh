@@ -6,6 +6,7 @@
 #
 #   sudo ./ci_bench_scenarios.sh percommit          [mqvpn]
 #   sudo ./ci_bench_scenarios.sh classes            [mqvpn]
+#   sudo ./ci_bench_scenarios.sh combo              [mqvpn]
 #   sudo ./ci_bench_scenarios.sh catalog <transit>  [mqvpn]
 #   sudo ./ci_bench_scenarios.sh special            [mqvpn]
 #
@@ -132,26 +133,46 @@ start_server_with_ctrl() {
     ci_bench_start_server "${1:-$CI_BENCH_SCHEDULER}" "--control-port ${CTRL_PORT}"
 }
 
-# ── scenario: one heterogeneity class (solo A, solo B, both) ───────────────
+# ── scenario: one heterogeneity class from the curated table ──────────────
 run_class() {
     local class="$1" sched="${2:-$CI_BENCH_SCHEDULER}"
     local spec="${NETSIM_CLASS[$class]:-}"
     [ -n "$spec" ] || { echo "unknown class $class" >&2; return 1; }
+    run_pair "$class" "${spec%%|*}" "${spec##*|}" "$sched"
+}
+
+# ── scenario: any two path specs (solo A, solo B, both) ───────────────────
+#
+# run_pair <label> <specA> <specB> [scheduler]
+#
+# A spec is "<access>:<transit>[:<nat>[:<mtu>]]", so the two legs are freely
+# composed and need no entry in any table — which is what lets run_combo
+# generate a covering set instead of hand-authoring one.
+#
+# Measuring each leg alone and then together, back to back in the same job, is
+# what makes the ratios meaningful: they divide out whatever share of the
+# shared runner we happened to get. Comparing a multipath number here against a
+# solo number from a different job would not.
+run_pair() {
+    local class="$1" a_spec="$2" b_spec="$3" sched="${4:-$CI_BENCH_SCHEDULER}"
+    local spec="${a_spec}|${b_spec}"
 
     echo ""
-    echo "── class ${class} (scheduler=${sched}) ──"
+    echo "── ${class} (scheduler=${sched}) ──"
     # Defensive: an earlier scenario that returned early may have left a
     # server running. Deleting a namespace does not kill what runs inside it,
     # so without this the orphans accumulate across the loop.
     ci_bench_stop_vpn 2>/dev/null || true
     netsim_setup 2 >/dev/null || return 1
-    netsim_apply_class "$class" 4242 || return 1
+    netsim_apply_path 0 "$a_spec" 4242 || return 1
+    netsim_apply_path 1 "$b_spec" 4252 || return 1
 
     # A flapping path needs its storm running for the whole measurement,
-    # otherwise the class degenerates into its stable base profile.
+    # otherwise the scenario degenerates into its stable base profile.
     SPIKE_PID=""
     local t0 t1
-    t0="$(netsim_class_transit "$class" 0)"; t1="$(netsim_class_transit "$class" 1)"
+    t0="$(netsim_path_field "$a_spec" transit)"
+    t1="$(netsim_path_field "$b_spec" transit)"
     if [ -n "${NETSIM_SPIKE[$t1]:-}" ]; then
         SPIKE_PID="$(netsim_spike_start 1 "$t1" 8 20 35)"
     elif [ -n "${NETSIM_SPIKE[$t0]:-}" ]; then
@@ -195,6 +216,38 @@ print(json.dumps(row))" \
     netsim_teardown
 }
 
+# ── scenario: a generated covering set of multipath combinations ──────────
+#
+# The four axes are independent (any access leg composes with any transit, NAT
+# and MTU), so the full product is 6 x 10 x 5 x 3 = 900 single paths and
+# ~810,000 pairs. Enumerating it is not an option, and sampling it randomly
+# would give an unrepeatable answer.
+#
+# Instead: a covering set. Rotate through each axis so that EVERY level of
+# every axis appears at least once on the good side and at least once on the
+# bad side, in ~10 pairs rather than 810,000. That catches "this transit is
+# broken", "this NAT is broken", "this MTU is broken" — the single-factor
+# faults, which is what a matrix this shape is actually good for. Specific
+# multi-factor interactions worth naming live in NETSIM_CLASS instead, where
+# they are curated rather than generated.
+run_combo() {
+    # Ordered worst-to-best-ish so a pair is always a real disagreement.
+    local -a good_transit=(bgp_opt bgp_plain iplc bgp_opt bgp_plain iplc bgp_opt bgp_plain iplc bgp_opt)
+    local -a good_access=(eth wifi_good 5g_full eth wifi_good 5g_full eth wifi_good 5g_full eth)
+    local -a good_nat=(public public port_restricted public full_cone public port_restricted public public full_cone)
+    local -a bad_transit=(bgp_junk carrier_qos bgp_flappy bgp_plain_peak bgp_junk carrier_qos bgp_flappy bgp_plain_peak bgp_junk carrier_qos)
+    local -a bad_access=(5g_edge 5g_throttled wifi_busy tether_otg geo_sat starlink 5g_half 5g_edge 5g_throttled wifi_busy)
+    local -a bad_nat=(symmetric cgnat port_restricted cgnat symmetric full_cone cgnat symmetric cgnat port_restricted)
+    local -a bad_mtu=(1400 1400 1500 1400 1500 1500 1280 1400 1400 1500)
+
+    local i n=${#good_transit[@]}
+    for (( i=0; i<n; i++ )); do
+        local a="${good_access[$i]}:${good_transit[$i]}:${good_nat[$i]}"
+        local b="${bad_access[$i]}:${bad_transit[$i]}:${bad_nat[$i]}:${bad_mtu[$i]}"
+        run_pair "combo${i}" "$a" "$b" || echo "  (combo$i failed, continuing)"
+    done
+}
+
 # ── scenario: one transit profile across every access leg, single path ────
 run_catalog() {
     local transit="$1" leg
@@ -203,7 +256,7 @@ run_catalog() {
         echo "── catalog ${transit} + ${leg} ──"
         ci_bench_stop_vpn 2>/dev/null || true   # see run_class
         netsim_setup 1 >/dev/null || continue
-        netsim_apply_path 0 "$leg" "$transit" 4242 || { netsim_teardown; continue; }
+        netsim_apply_path 0 "${leg}:${transit}" 4242 || { netsim_teardown; continue; }
         start_server_with_ctrl >/dev/null || { netsim_teardown; continue; }
 
         local mbps cv stats rss
@@ -237,14 +290,9 @@ run_special() {
     #    "silent killer" is the default -- this just has to idle past it.
     echo ""
     echo "── special: nat_aging (idle 35s behind NAT, mid-session) ──"
-    if netsim_setup 1 >/dev/null && netsim_apply_path 0 5g_half bgp_plain 4242; then
-        hop="$(netsim_hop_ns 0)"
-        # Rule first, sysctl second: the nf_conntrack_* knobs only exist once
-        # the module has been pulled in, which adding the NAT rule does.
-        ip netns exec "$hop" iptables -t nat -A POSTROUTING \
-            -o "$(netsim_veth_hop_srv 0)" -j MASQUERADE 2>/dev/null || true
-        ip netns exec "$hop" sysctl -qw net.netfilter.nf_conntrack_udp_timeout=30 2>/dev/null || true
-
+    # The `:port_restricted` axis in the spec installs the masquerade and pins
+    # nf_conntrack_udp_timeout to 30 s, so this test only has to idle past it.
+    if netsim_setup 1 >/dev/null && netsim_apply_path 0 "5g_half:bgp_plain:port_restricted" 4242; then
         if start_server_with_ctrl >/dev/null \
            && ci_bench_start_client "--path $(netsim_veth_cli 0)" >/dev/null 2>&1 \
            && ci_bench_wait_tunnel 25 >/dev/null 2>&1; then
@@ -268,7 +316,7 @@ print(json.dumps({'scenario':'nat_aging','before_idle_mbps':b,'after_idle_mbps':
     echo ""
     echo "── special: corrupt_reorder (under load) ──"
     NETSIM_ACCESS[_damaged]="delay 30ms 10ms distribution normal corrupt 0.1% reorder 25% 50% duplicate 0.5% rate 100mbit"
-    if netsim_setup 1 >/dev/null && netsim_apply_path 0 _damaged bgp_plain 4242 \
+    if netsim_setup 1 >/dev/null && netsim_apply_path 0 "_damaged:bgp_plain" 4242 \
        && start_server_with_ctrl >/dev/null; then
         local mbps cv stats
         read -r mbps cv < <(measure_pathset "--path $(netsim_veth_cli 0)")
@@ -291,7 +339,7 @@ print(json.dumps(row))" "$mbps" "$cv" "$stats" >> "$ROWS"
     #    test is that the ACKs for the downlink have to share that queue.
     echo ""
     echo "── special: ack_starvation (asymmetric + bloated uplink) ──"
-    if netsim_setup 1 >/dev/null && netsim_apply_path 0 eth bgp_plain 4242; then
+    if netsim_setup 1 >/dev/null && netsim_apply_path 0 "eth:bgp_plain" 4242; then
         hop="$(netsim_hop_ns 0)"; dev_up="$(netsim_veth_hop_srv 0)"
         ip netns exec "$hop" tc qdisc replace dev "$dev_up" root \
             netem delay 30ms rate 5mbit limit 12000 || true
@@ -336,9 +384,16 @@ case "$MODE" in
   classes)
     TEST_NAME="netsim_classes"
     REPEATS="${CI_BENCH_REPEATS:-3}"
-    for c in homo_good homo_bad hetero_extreme asym_capacity asym_latency one_flapping carrier_pair; do
+    for c in homo_good homo_bad hetero_extreme asym_capacity premium_plus_mobile \
+             asym_latency one_flapping carrier_pair nat_split mtu_split \
+             home_plus_tether dual_mobile sat_plus_cell; do
         run_class "$c" || echo "  (class $c failed, continuing)"
     done
+    ;;
+  combo)
+    TEST_NAME="netsim_combo"
+    REPEATS="${CI_BENCH_REPEATS:-3}"
+    run_combo
     ;;
   catalog)
     TEST_NAME="netsim_catalog_${CATALOG_TRANSIT}"
@@ -363,13 +418,15 @@ doc = {
   'mode': sys.argv[4],
   'iperf_sec': int(sys.argv[5]),
   'repeats': int(sys.argv[6]),
-  'caps': {'netem_seed': int(sys.argv[7]), 'pps_police': int(sys.argv[8])},
+  'caps': {'netem_seed': int(sys.argv[7]), 'pps_police': int(sys.argv[8]),
+           'nat': int(sys.argv[9])},
   'results': rows,
 }
-json.dump(doc, open(sys.argv[9], 'w'), indent=2)
+json.dump(doc, open(sys.argv[10], 'w'), indent=2)
 print('scenarios recorded: %d' % len(rows))" \
     "$ROWS" "$TEST_NAME" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$MODE" \
-    "$IPERF_SEC" "$REPEATS" "$NETSIM_HAVE_SEED" "$NETSIM_HAVE_PPS" "$OUT"
+    "$IPERF_SEC" "$REPEATS" "$NETSIM_HAVE_SEED" "$NETSIM_HAVE_PPS" \
+    "$NETSIM_HAVE_NAT" "$OUT"
 
 echo ""
 echo "Result: $OUT"

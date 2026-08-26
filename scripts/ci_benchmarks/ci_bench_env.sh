@@ -303,8 +303,24 @@ ci_bench_run_iperf() {
     [ -n "$target_bw" ] && args="$args -b $target_bw"
     [ "$dir" = "DL" ] && args="$args -R"
 
-    ip netns exec "$NS_CLIENT" iperf3 $args > "$json_file" 2>&1 || true
+    # Two hang guards, both mandatory once the emulated path is allowed to be
+    # genuinely broken (see tests/test_e2e_hybrid_h2.sh, which documents the
+    # same pair):
+    #
+    #  - `timeout` on the client: over a lossy, high-RTT tunnel iperf3 can sit
+    #    on its control connection well past the test duration, and with no
+    #    bound the caller waits forever.
+    #  - kill the server BEFORE waiting on it: `iperf3 -s -1` blocks until its
+    #    first connection, so if the client never got through, a bare
+    #    `wait` never returns.
+    #
+    # Without these, one unreachable path hangs the whole run until the job
+    # timeout — which is exactly how the weekly netsim `classes` job burned 60
+    # minutes while its siblings finished in six.
+    ip netns exec "$NS_CLIENT" timeout $((duration + 20)) \
+        iperf3 $args > "$json_file" 2>&1 || true
 
+    kill "$iperf_srv_pid" 2>/dev/null || true
     wait "$iperf_srv_pid" 2>/dev/null || true
 
     echo "$json_file"

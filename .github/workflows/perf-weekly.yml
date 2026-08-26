@@ -172,9 +172,15 @@ jobs:
       fail-fast: false   # one bad scenario must not hide the other five
       matrix:
         include:
-          # Heterogeneity classes: the only multipath dimension that matters,
-          # since a scheduler behaves identically across two similar links.
+          # Curated multipath pairs, organised by the KIND of disagreement
+          # between the two legs (capacity, latency, stability, NAT, MTU) plus
+          # real-world composites like fibre+tether and dual-mobile.
           - { id: classes,     args: classes }
+          # Generated covering set over access x transit x NAT x MTU: every
+          # level of every axis appears at least once on each side of a pair,
+          # which catches single-factor faults without enumerating the ~810k
+          # possible pairs.
+          - { id: combo,       args: combo }
           # The five special conditions, run under saturating load — they all
           # have functional coverage already; load is what was missing.
           - { id: special,     args: special }

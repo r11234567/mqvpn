@@ -50,22 +50,41 @@ netsim_hop_srv_ip()      { echo "10.${NETSIM_OCTETS[$1]}.2.1"; }
 netsim_srv_ip()          { echo "10.${NETSIM_OCTETS[$1]}.2.2"; }
 
 # ── Transit profiles (the six backbone classes) ────────────────────────────
-# `limit` is in PACKETS and is deliberately sized against each profile's
-# bandwidth-delay product: queue depth is what separates a well-managed line
-# from a bloated one, so leaving it at netem's default 1000 would erase the
-# difference between `iplc` and `bgp_junk`.
+#
+# Two independent axes, and keeping them separate is the point of the table:
+#
+#   QUALITY  — loss, jitter shape, queue depth
+#   CAPACITY — the rate cap, i.e. how small the pipe is
+#
+# The premium tiers are quality-rich and capacity-poor: a private line is
+# flawless and tiny, an optimized-BGP port is near-flawless and moderate. The
+# commodity tiers invert it: plain BGP gives you the widest pipe and pays for
+# it in loss and peak-hour degradation; junk transit and a throttled carrier
+# advertise capacity they cannot deliver. Rates below are calibrated so that
+# against a ~380mbit plain-BGP reference, a private line yields ~50 and an
+# optimized port ~150 — the "great network, small pipe" feel, which no single
+# quality-only or capacity-only model reproduces.
+#
+# `limit` is in PACKETS and is sized against each profile's bandwidth-delay
+# product: queue depth is what separates a well-managed line from a bloated
+# one, so leaving it at netem's default 1000 would erase the difference
+# between `iplc` and `bgp_junk`.
 declare -gA NETSIM_TRANSIT=(
-  # Private line: stable, negligible jitter, no loss, SMALL pipe. Aggregation
-  # has the most to offer here, which is why it is not just "a fast link".
-  [iplc]="delay 65ms 1ms distribution normal rate 150mbit limit 1000"
+  # Private line (IPLC/IEPL): flawless and TINY. Aggregation has the most to
+  # offer here precisely because one line cannot carry the load alone — the
+  # scenario a customer buys multipath for.
+  [iplc]="delay 65ms 1ms distribution normal rate 50mbit limit 500"
 
-  # Optimized BGP: the upper bound we compare everything else against. Held at
-  # 400mbit so the emulated link stays the bottleneck on a shared runner
-  # (docs §8); the 1gbit variant is a separate, explicitly runner-bound probe.
-  [bgp_opt]="delay 40ms 2ms distribution normal loss 0.01% rate 400mbit limit 2200"
+  # Optimized BGP: excellent quality, moderate pipe. Bigger than a private line
+  # but still a fraction of what a plain transit port gives you — that gap is
+  # the whole point of the tier and the reason it is priced the way it is.
+  [bgp_opt]="delay 40ms 2ms distribution normal loss 0.01% rate 150mbit limit 900"
 
-  # Plain BGP, off-peak. The diurnal driver swaps this for _peak.
-  [bgp_plain]="delay 80ms 8ms distribution normal loss 0.1% rate 300mbit limit 2500"
+  # Plain BGP, off-peak. The WIDE pipe: it can nearly saturate, and its
+  # weakness is quality (loss, peak-hour degradation), not capacity. This is
+  # the reference the two tiers above are read against — a 380mbit-class port
+  # where IPLC gets 50 and optimized BGP gets 150.
+  [bgp_plain]="delay 80ms 8ms distribution normal loss 0.1% rate 380mbit limit 3200"
   [bgp_plain_peak]="delay 110ms 25ms distribution normal loss 0.8% rate 180mbit limit 4000"
 
   # Cogent-class junk. The load-bearing detail is `loss gemodel` rather than
@@ -118,26 +137,134 @@ declare -gA NETSIM_ACCESS=(
   [tether_otg]="delay 45ms 25ms distribution paretonormal loss 0.4% rate 90mbit duplicate 0.3% corrupt 0.05%"
 )
 
-# MTU per access leg where it differs from 1500.
+# MTU per access leg where it differs from 1500. An explicit `:mtu` in a path
+# spec overrides this.
 declare -gA NETSIM_LEG_MTU=(
   [tether_otg]=1400
 )
 
-# ── Heterogeneity classes (what multipath testing is actually about) ───────
-# A scheduler does not behave differently across "two 300mbit links" and "two
-# 310mbit links", so enumerating path PAIRS is waste. It behaves differently
-# across these classes. Format: "<accessA>:<transitA>|<accessB>:<transitB>".
+# ── Client NAT behaviours ──────────────────────────────────────────────────
+# Applied at the access hop, which is where a CPE or carrier NAT actually sits.
+# `cgnat` additionally NATs at the transit hop, so the client is behind two
+# translations — the shape a mobile subscriber usually has.
+#
+# These are the four RFC 3489 behaviours plus no-NAT. What separates them for a
+# QUIC tunnel is whether the source port stays put: `symmetric` allocates a new
+# port per destination, so a path that re-resolves or migrates looks like a
+# different peer to the server and has to be re-validated.
+declare -gA NETSIM_NAT=(
+  [public]=""                                  # routed, no translation
+  [full_cone]="--random-fully --persistent"    # one stable mapping for all peers
+  [port_restricted]=""                         # plain masquerade (conntrack default)
+  [symmetric]="--random"                       # fresh port per destination
+  [cgnat]=""                                   # masquerade twice; see below
+)
+
+# netsim_apply_nat <slot> <nat_type>
+#
+# Idempotent per slot: the rule is added once at path-build time. `|| true`
+# throughout because a kernel without a given masquerade flag must degrade to a
+# plainer NAT rather than abort the whole scenario — netsim_detect_caps reports
+# what was actually available.
+netsim_apply_nat() {
+    local slot="$1" nat="${2:-public}"
+    local hop; hop="$(netsim_hop_ns "$slot")"
+    local out; out="$(netsim_veth_hop_srv "$slot")"
+
+    [ "$nat" = "public" ] && return 0
+    if [ -z "${NETSIM_NAT[$nat]+x}" ]; then
+        echo "netsim: unknown NAT type '$nat'" >&2
+        return 1
+    fi
+    # Degrade to 'public' rather than failing the scenario; detect_caps said so.
+    [ "$NETSIM_HAVE_NAT" = 1 ] || return 0
+
+    # shellcheck disable=SC2086  # flags are intentionally word-split
+    ip netns exec "$hop" iptables -t nat -A POSTROUTING -o "$out" \
+        -j MASQUERADE ${NETSIM_NAT[$nat]} 2>/dev/null ||
+        ip netns exec "$hop" iptables -t nat -A POSTROUTING -o "$out" \
+            -j MASQUERADE 2>/dev/null || true
+
+    # A second translation at the transit hop: the client's packets are
+    # rewritten twice before they reach the server.
+    if [ "$nat" = "cgnat" ]; then
+        ip netns exec "$NETSIM_NS_SERVER" sysctl -qw net.ipv4.ip_forward=1 2>/dev/null || true
+        ip netns exec "$hop" iptables -t nat -A POSTROUTING -o "$out" \
+            -j MASQUERADE 2>/dev/null || true
+    fi
+
+    # UDP conntrack ages out in 30 s by default, which IS the "silent killer"
+    # every mobile user meets. Pin it explicitly so the value is part of the
+    # scenario rather than a distro default that might differ on the runner.
+    ip netns exec "$hop" sysctl -qw net.netfilter.nf_conntrack_udp_timeout=30 \
+        2>/dev/null || true
+}
+
+# ── Path specs and scenario pairs ──────────────────────────────────────────
+#
+# A path is a free combination of the four axes:
+#
+#     <access>:<transit>[:<nat>[:<mtu>]]
+#
+# so "eth:bgp_plain:public" is a wired client on a public IP behind ordinary
+# transit, and "5g_throttled:carrier_qos:symmetric:1400" is a phone on a
+# throttled carrier behind symmetric NAT with a clamped MTU. Any access leg
+# composes with any transit, any NAT and any MTU — the axes are independent by
+# construction, which is what makes the interesting combinations cheap to write
+# instead of needing a hand-authored profile each.
+#
+# A scenario pairs two such specs with '|'. Pairing is where the value is: a
+# scheduler behaves the same across "two similar links" no matter what they
+# are, and differently the moment the two legs disagree. The list below is
+# therefore organised by the KIND of disagreement, not by enumerating pairs.
 declare -gA NETSIM_CLASS=(
-  [homo_good]="eth:bgp_opt|eth:bgp_opt"
-  [homo_bad]="5g_half:bgp_junk|5g_half:bgp_junk"
-  # The critical one: does the junk path drag the good path down? This is
-  # where WLB / MinRTT / backup-FEC actually separate, and it is the
-  # per-commit gate scenario.
-  [hetero_extreme]="eth:bgp_opt|5g_edge:bgp_junk"
-  [asym_capacity]="eth:iplc|eth:bgp_plain"
-  [asym_latency]="eth:bgp_opt|geo_sat:bgp_plain"
-  [one_flapping]="eth:bgp_opt|eth:bgp_flappy"
-  [carrier_pair]="5g_throttled:carrier_qos|5g_half:carrier_qos"
+  # ── Baselines: what aggregation looks like with nothing wrong ──
+  [homo_good]="eth:bgp_opt:public|eth:bgp_opt:public"
+  [homo_bad]="5g_half:bgp_junk:port_restricted|5g_half:bgp_junk:port_restricted"
+
+  # ── The headline case, and the per-commit gate ──
+  # Wired public-IP client on a premium port, plus a barely-connected phone
+  # behind carrier NAT on junk transit. Everything differs at once: capacity,
+  # latency, loss burstiness, NAT, MTU. The question is whether the bad leg
+  # drags the good one down, and it is where WLB / MinRTT / backup-FEC
+  # actually separate.
+  [hetero_extreme]="eth:bgp_opt:public|5g_edge:bgp_junk:symmetric:1400"
+
+  # ── Capacity disagreement: tiny premium line + wide commodity port ──
+  # The "great network, small pipe" pairing. A 50mbit private line next to a
+  # 380mbit plain-BGP port: aggregation has to use both without letting the
+  # small one become the head-of-line.
+  [asym_capacity]="eth:iplc:public|eth:bgp_plain:public"
+  # Same disagreement, but the small pipe is also the good one and the big
+  # pipe is behind CGNAT — the realistic office-plus-mobile-backup shape.
+  [premium_plus_mobile]="eth:iplc:public|5g_full:bgp_plain:cgnat"
+
+  # ── Latency disagreement ──
+  [asym_latency]="eth:bgp_opt:public|geo_sat:bgp_plain:port_restricted"
+
+  # ── Stability disagreement ──
+  [one_flapping]="eth:bgp_opt:public|eth:bgp_flappy:public"
+
+  # ── Both legs throttled by the carrier: is the PPS cap symmetric? ──
+  [carrier_pair]="5g_throttled:carrier_qos:symmetric:1400|5g_half:carrier_qos:cgnat:1400"
+
+  # ── NAT disagreement with everything else held equal ──
+  # Isolates NAT as the variable: identical links, one public, one symmetric.
+  # A difference here is a NAT-handling bug, not a scheduling one.
+  [nat_split]="eth:bgp_plain:public|eth:bgp_plain:symmetric"
+
+  # ── MTU disagreement with everything else held equal ──
+  # Isolates MTU. Pairs with carrier_qos elsewhere, where a PPS cap makes
+  # bytes-per-packet the dominant term.
+  [mtu_split]="eth:bgp_plain:public:1500|eth:bgp_plain:public:1280"
+
+  # ── Real-world composites ──
+  # Home fibre plus a tethered phone, the commonest consumer multipath setup.
+  [home_plus_tether]="wifi_good:bgp_plain:port_restricted|tether_otg:carrier_qos:cgnat:1400"
+  # Two mobile paths, one prioritised and one not, both behind carrier NAT.
+  [dual_mobile]="5g_full:bgp_plain:cgnat|5g_throttled:carrier_qos:cgnat:1400"
+  # Satellite primary with a congested-cell backup: both legs bad, differently.
+  [sat_plus_cell]="starlink:bgp_plain:port_restricted|5g_edge:bgp_junk:symmetric:1400"
 )
 
 # ── Runtime capability detection ───────────────────────────────────────────
@@ -146,6 +273,7 @@ declare -gA NETSIM_CLASS=(
 # of assuming, and degrade to something honest.
 NETSIM_HAVE_SEED=0
 NETSIM_HAVE_PPS=0
+NETSIM_HAVE_NAT=0
 
 netsim_detect_caps() {
     local probe_ns="netsim-capprobe"
@@ -166,10 +294,18 @@ netsim_detect_caps() {
         NETSIM_HAVE_PPS=1
     fi
 
+    # NAT needs the nat table plus conntrack. Without it every path silently
+    # becomes `public`, which would quietly delete a whole axis of the matrix —
+    # so it is reported, not assumed.
+    if ip netns exec "$probe_ns" iptables -t nat -L >/dev/null 2>&1; then
+        NETSIM_HAVE_NAT=1
+    fi
+
     ip netns del "$probe_ns" 2>/dev/null || true
 
-    echo "netsim caps: netem-seed=$([ "$NETSIM_HAVE_SEED" = 1 ] && echo yes || echo NO) " \
-         "pps-police=$([ "$NETSIM_HAVE_PPS" = 1 ] && echo yes || echo NO)"
+    echo "netsim caps: netem-seed=$([ "$NETSIM_HAVE_SEED" = 1 ] && echo yes || echo NO)" \
+         "pps-police=$([ "$NETSIM_HAVE_PPS" = 1 ] && echo yes || echo NO)" \
+         "nat=$([ "$NETSIM_HAVE_NAT" = 1 ] && echo yes || echo NO)"
     if [ "$NETSIM_HAVE_SEED" != 1 ]; then
         echo "  note: no netem seed on this iproute2 — loss/jitter patterns vary" \
              "run-to-run; compensate with longer runs, not more repeats."
@@ -177,6 +313,10 @@ netsim_detect_caps() {
     if [ "$NETSIM_HAVE_PPS" != 1 ]; then
         echo "  note: no 'police pkts_rate' — carrier_qos/5g_throttled lose their" \
              "packet-rate cap and become ordinary high-bandwidth profiles."
+    fi
+    if [ "$NETSIM_HAVE_NAT" != 1 ]; then
+        echo "  note: no iptables nat table — every path degrades to 'public'," \
+             "so NAT-dependent scenarios measure something easier than intended."
     fi
 }
 
@@ -291,15 +431,24 @@ netsim_setup() {
     echo "OK: netsim topology up — $n path(s), 2 hops each, server ${NETSIM_SERVER_ADDR}"
 }
 
-# netsim_apply_path <slot> <access_leg> <transit_profile> [seed]
+# netsim_apply_path <slot> <spec> [seed]
 #
-# Shapes both legs of one path. Each leg is shaped on BOTH ends so the path is
-# symmetric; RTT therefore ends up 2 x (access_delay + transit_delay).
+# spec = "<access>:<transit>[:<nat>[:<mtu>]]"
+#
+# Shapes both legs of one path, installs the NAT and clamps the MTU. Each leg
+# is shaped on BOTH ends, so RTT is 2 x (access_delay + transit_delay).
 netsim_apply_path() {
-    local slot="$1" access="$2" transit="$3" seed="${4:-0}"
+    local slot="$1" spec="$2" seed="${3:-0}"
+
+    # Split on ':' — the axes are positional, and only the first two are
+    # required, so an older two-field spec keeps working unchanged.
+    local IFS=:
+    read -r access transit nat mtu <<<"$spec"
+    unset IFS
+    nat="${nat:-public}"
+
     local aspec="${NETSIM_ACCESS[$access]:-}"
     local tspec="${NETSIM_TRANSIT[$transit]:-}"
-
     if [ -z "$aspec" ]; then echo "netsim: unknown access leg '$access'" >&2; return 1; fi
     if [ -z "$tspec" ]; then echo "netsim: unknown transit profile '$transit'" >&2; return 1; fi
 
@@ -321,16 +470,19 @@ netsim_apply_path() {
     ip netns exec "$hop"              tc qdisc replace dev "$vhs" root netem ${t_up} || return 1
     ip netns exec "$NETSIM_NS_SERVER" tc qdisc replace dev "$vs"  root netem ${t_dn} || return 1
 
-    # MTU belongs to the access leg (it is the CPE/radio that clamps it).
-    local mtu="${NETSIM_LEG_MTU[$access]:-}"
+    # An explicit MTU in the spec wins; otherwise the access leg's own clamp
+    # applies (it is the CPE or radio that sets it).
+    mtu="${mtu:-${NETSIM_LEG_MTU[$access]:-}}"
     [ -n "$mtu" ] && netsim_set_mtu "$slot" "$mtu"
+
+    netsim_apply_nat "$slot" "$nat" || return 1
 
     # Packet-rate cap, if either leg calls for one. Applied on the hop's
     # server-facing side so it throttles the uplink the way a carrier does.
     local pps="${NETSIM_PPS_CAP[$transit]:-${NETSIM_PPS_CAP[$access]:-}}"
     if [ -n "$pps" ]; then netsim_apply_pps_cap "$slot" "$pps"; fi
 
-    echo "  path $slot: ${access} + ${transit}$([ -n "$pps" ] && echo " (pps<=${pps})")"
+    echo "  path $slot: ${access} + ${transit} + nat=${nat}${mtu:+ mtu=$mtu}$([ -n "$pps" ] && echo " pps<=${pps}")"
 }
 
 # netsim_set_mtu <slot> <mtu> — clamp every device on the path.
@@ -406,17 +558,33 @@ netsim_apply_class() {
 
     local a="${spec%%|*}" b="${spec##*|}"
     echo "class ${class}:"
-    netsim_apply_path 0 "${a%%:*}" "${a##*:}" "$seed"          || return 1
-    netsim_apply_path 1 "${b%%:*}" "${b##*:}" "$((seed + 10))" || return 1
+    netsim_apply_path 0 "$a" "$seed"          || return 1
+    netsim_apply_path 1 "$b" "$((seed + 10))" || return 1
+}
+
+# netsim_path_field <spec> <access|transit|nat|mtu> — one axis out of a spec.
+# Positional parsing lives here so no caller has to repeat it.
+netsim_path_field() {
+    local spec="$1" want="$2"
+    local IFS=:
+    read -r access transit nat mtu <<<"$spec"
+    unset IFS
+    case "$want" in
+      access)  echo "$access" ;;
+      transit) echo "$transit" ;;
+      nat)     echo "${nat:-public}" ;;
+      mtu)     echo "${mtu:-}" ;;
+      *)       return 1 ;;
+    esac
 }
 
 # Which transit profile a class puts on a given slot — the spike driver needs
-# it, and parsing the class spec in every caller would duplicate this.
+# it to know whether that leg has a storm state.
 netsim_class_transit() {
     local class="$1" slot="$2"
     local spec="${NETSIM_CLASS[$class]:-}"
     [ -n "$spec" ] || return 1
     local leg
     if [ "$slot" = 0 ]; then leg="${spec%%|*}"; else leg="${spec##*|}"; fi
-    echo "${leg##*:}"
+    netsim_path_field "$leg" transit
 }
