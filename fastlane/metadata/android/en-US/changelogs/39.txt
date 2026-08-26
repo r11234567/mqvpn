@@ -1,0 +1,5 @@
+- No app-facing changes in this release. It exists so the published
+  version matches the source tree again after 0.16.1.
+- Development only: the benchmark suite gained an emulated-network
+  matrix (access leg + transit leg per path), and benchmark results
+  are now published to a dashboard from CI.
