@@ -33,6 +33,82 @@ The matrix now answers "how does a real deployment behave" for everything
 except *where the server is*: every path is still one hop wide, so a detour
 through another continent is modelled as latency rather than as a route.
 
+### 0.1 The matrix is built, but it has never produced a measurement
+
+Everything marked **done** above means *the scenario exists and runs*, not that
+it has yielded a usable number. In the 2026-08-26 weekly run
+([32942370465](https://github.com/r11234567/mqvpn/actions/runs/32942370465))
+**every netsim scenario reported `0.0 Mbps`** — 64 result rows across eight
+jobs, not one of them non-zero — and three of the eleven jobs never finished at
+all. The per-commit `netsim_percommit` row is 0.0 as well, so this has been true
+since the harness was first wired in, not a recent regression.
+
+Two independent defects, both in the harness rather than in mqvpn:
+
+**A. The tunnel never establishes, so every scenario reads zero.**
+`NETSIM_SERVER_ADDR` (`10.99.0.1`) exists only as a `/32` on `lo` in the server
+namespace, and the server answers on one wildcard-bound UDP socket with a plain
+`sendto()` (`src/mqvpn_server.c:765`; there is no `IP_PKTINFO` anywhere in
+`src/`). The kernel therefore picks the reply's source address by route lookup
+toward the client, which yields the server's veth address `10.<octet>.2.2` — not
+the `10.99.0.1` the client dialled. The client drops the reply, the handshake
+never completes, and the server closes 15 s later:
+
+```
+xqc_conn_destroy ... hsk_recv:0 | handshake_time:0 | close_msg:idle timeout
+                     l-0.0.0.0-4433-...  p-10.10.1.2-47462-...
+```
+
+`ci_bench_env.sh` never hit this because there the service address `10.100.0.1`
+*is* the directly-connected server veth, so the route-selected source and the
+dialled destination coincide. netsim is the first topology to put the service
+address behind a router hop.
+
+Fix: give every server-side route back to a client subnet an explicit preferred
+source, in `netsim_setup`:
+
+```bash
+ip netns exec "$NETSIM_NS_SERVER" ip route add "10.${NETSIM_OCTETS[$i]}.1.0/24" \
+    via "$(netsim_hop_srv_ip "$i")" dev "$vs" src "$NETSIM_SERVER_ADDR"
+```
+
+The `ping -I <dev>` reachability check that closes `netsim_setup` sources from
+the veth address, so it passes on a topology whose service address is
+unusable. It has to assert the *reply's* source address too, or it will keep
+certifying a broken path as healthy.
+
+**B. Any class with a flapping transit hangs its job until the 60-minute cap.**
+`netsim_spike_start` backgrounds an infinite loop and reports its PID on stdout,
+and the caller reads that PID through command substitution:
+
+```bash
+SPIKE_PID="$(netsim_spike_start 1 "$t1" 8 20 35)"
+```
+
+The backgrounded subshell inherits the write end of the substitution's pipe and
+never exits, so the pipe never reaches EOF and `$( )` blocks forever — before
+the server is even started. `bgp_flappy` is the only spike profile any class
+actually selects, which is exactly why `classes`, `combo` and `sched` (the three
+modes containing `one_flapping` or a `bgp_flappy` leg) time out, while `mtu`,
+`tiers`, `catalog` and `special` finish in 3-10 minutes. In the `sched` job the
+last lines are the two `path` announcements of `one_flapping`, then fifty
+minutes of silence.
+
+Fix: do not return the PID through stdout — have `netsim_spike_start` assign a
+global (`NETSIM_SPIKE_PID`) in the caller's own shell, or redirect the loop's
+stdout away from the pipe so the substitution can close. `netsim_spike_stop`'s
+`wait` must also tolerate a PID that is not its child.
+
+**C. A job that times out loses even the scenarios that succeeded.** The results
+JSON is written once, after the mode's loop finishes, so all three hung jobs
+uploaded nothing (`No files were found with the provided path:
+ci_bench_results/*.json`). Append each row as it is produced, or emit the
+document from the `EXIT` trap.
+
+Until A and B are fixed, nothing in §2-§4 can be concluded from this harness's
+output, and the §0 table should be read as "scenario implemented", never as
+"scenario measured".
+
 ---
 
 ## 1. Three blockers, before more coverage is worth adding
@@ -91,31 +167,31 @@ The cap must stay bounded — the point of it is that a hostile peer cannot pin
 unbounded memory with sparse frames. The fix is to make the bound consistent
 and non-fatal, not to remove it.
 
-### 1.2 `ci_bench_run_iperf` can hang forever
+### 1.2 `ci_bench_run_iperf` can hang forever — fixed
 
-The weekly `netsim (classes)` job was cancelled at its 60-minute timeout while
-its six siblings finished in 3-6 minutes. `ci_bench_run_iperf`
-(`scripts/ci_benchmarks/ci_bench_env.sh`) lacks both guards its sibling in
-`tests/test_e2e_hybrid_h2.sh` documents as mandatory:
+`ci_bench_run_iperf` (`scripts/ci_benchmarks/ci_bench_env.sh`) lacked both
+guards that its sibling in `tests/test_e2e_hybrid_h2.sh` documents as mandatory:
+no `timeout` wrapper on the iperf3 client, and `wait "$iperf_srv_pid"` on a
+one-shot `iperf3 -s -1` **without killing it first**, which never returns if no
+client ever connected. Both are now in place, along with a follow-up fix for the
+port collision between back-to-back samples.
 
-- no `timeout` wrapper on the iperf3 client;
-- `wait "$iperf_srv_pid"` on a one-shot `iperf3 -s -1` **without killing it
-  first** — if no client ever connects, that server never exits and the wait
-  blocks forever.
-
-The existing benchmarks never hit this because they only ever shape gentle
-paths (300 Mbit/10 ms). netsim is the first thing to drive paths bad enough
-that a tunnel fails to carry iperf3 — so this is a latent bug the new coverage
-exposed, not a new one.
-
-Fix: mirror the hybrid helper (client under `timeout $((duration + 15))`, kill
-the server before waiting). Every long matrix depends on this.
+This is called out because the symptom outlived the cause: `netsim (classes)`
+still burns its full 60 minutes, and it is now tempting to re-diagnose it here.
+It is not this. The remaining hang is the spike-driver deadlock in §0.1 B, which
+blocks before iperf3 is ever invoked.
 
 ### 1.3 Budget structure
 
-`classes` at 60 minutes was the hang, not real work: ~100 s per class x 7 is
-about 14 minutes. But the additions below multiply the scenario count, so the
-weekly must shard by scenario group rather than growing one job.
+`classes` at 60 minutes is the §0.1 B deadlock, not real work: ~95 s per class
+x 13 is about 20 minutes. But the additions below multiply the scenario count,
+so the weekly must shard by scenario group rather than growing one job.
+
+Note that the current timings are *failure* timings and will grow once §0.1 A is
+fixed. A scenario that cannot establish its tunnel spends 25 s per `measure_pathset`
+call timing out in `ci_bench_wait_tunnel` and never runs iperf3 at all; a working
+`run_pair` runs three real measurements instead. Re-estimate the budget against a
+run that actually carries traffic before sharding to the table in §4.
 
 ---
 
@@ -334,6 +410,13 @@ standard-runner minutes are free.
 
 ## 6. Build order
 
+0. **Make the harness measure anything at all** — the service-address source
+   bug (§0.1 A) and the spike-driver deadlock (§0.1 B). Everything numbered
+   below is already written and already running; none of it has produced a
+   non-zero result, so this is the only item that currently blocks value. Add
+   the reply-source assertion to `netsim_setup` at the same time, so a
+   regression here fails the job instead of publishing zeros.
+
 1. ~~Fix the `XQC_ELIMIT` connection kill.~~ **Done** — the buffered-frame cap
    was raised to match the receive window and `-XQC_ELIMIT` was made a tolerant
    error, so a full buffer drops a packet and retransmits instead of killing the
@@ -342,9 +425,12 @@ standard-runner minutes are free.
    killing the server before waiting on it. A follow-up fixed the related port
    collision: consecutive samples share one port, and the listener check could
    match the *previous* sample's server still shutting down.
-3. **N-hop chain**, then the geographic route table. The only remaining item,
-   and the one that needs `netsim_setup`'s veth chain and routing rewritten
-   rather than extended. Per-direction netem is already in place.
+3. **N-hop chain**, then the geographic route table. The largest remaining
+   *coverage* item, and the one that needs `netsim_setup`'s veth chain and
+   routing rewritten rather than extended. Per-direction netem is already in
+   place. Do this after item 0: the rewrite touches exactly the routing that
+   §0.1 A gets wrong, and doing both at once makes it impossible to tell which
+   change fixed or broke the handshake.
 4. ~~Server tiers + host contention.~~ **Done** — `ci_bench_host.sh`, `tiers`
    mode.
 5. ~~NAT matrix and MTU axis (including the PMTUD black hole).~~ **Done** —
@@ -355,3 +441,10 @@ standard-runner minutes are free.
 7. ~~Scheduler sweep~~ (**done**, `sched` mode) and ~~roaming under load~~
    (**done**). The dual-stack split is blocked on the client; see §2.5.
    Endurance jobs remain unscheduled.
+
+Still open, in short: item 0 (both defects), the N-hop chain and geographic
+routes (§2.1), the 2.5 G/1 G line rates (not feasible on a shared runner — §5),
+the dual-stack routing split (blocked on the client — §2.5), the fifth special
+condition, per-scenario incremental result writing (§0.1 C), and the endurance
+jobs. Everything else in §0 is implemented; none of it is yet verified against a
+run that carried traffic.
