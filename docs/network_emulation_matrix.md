@@ -1,337 +1,328 @@
-# Realistic network emulation matrix — design
+# Realistic network emulation matrix — status and completion plan
 
-Status: **proposal**. Nothing here is implemented yet.
-
-Today's benchmarks emulate one shape: two clean, symmetric, low-jitter links
-with uniform random loss (`bench_env_setup.sh`'s `BENCH_ENV_NETEM`). That is a
-reasonable model of a private backbone and a poor model of everything else, so
-the aggregation and failover numbers we publish describe the easiest case we
-ship into. This document plans the way out.
-
-Two tiers only, matching the existing workflows: **per-commit** (`perf.yml`,
-push to `main`) stays a fast smoke test on one bad network; **weekly**
-(`perf-weekly.yml`) carries the entire matrix. There is no nightly tier.
+Two tiers only, matching the existing workflows: **per-commit** (`perf.yml`, push
+to `main`) is a fast smoke test on one bad network; **weekly**
+(`perf-weekly.yml`) carries the matrix. There is no nightly tier.
 
 ---
 
-## 1. Why the cross product is not the plan
+## 0. Honest status
 
-Enumerating the factors as stated:
+Roughly **40%** of the requested scope is implemented. The path-shape half
+exists; the endpoint half does not, and the geographic routing that was called
+out explicitly is absent.
 
-| Factor | Levels |
+| Requested | Status | Where |
+|---|---|---|
+| 6 backbone classes (IPLC, optimized/plain/junk/flapping BGP, carrier QoS) | **done** — 7 profiles | `NETSIM_TRANSIT` |
+| Client access: eth / WiFi / 5G / satellite / tethering | **approximated** — 10 legs stand in for ~32 combinations | `NETSIM_ACCESS` |
+| Heterogeneity-class aggregation | **done** — 7 classes | `NETSIM_CLASS` |
+| **Many hops to the server** | **NOT done** — exactly one intermediate namespace (2 hops) | — |
+| **Geographic detours (Asia→EU via US, Asia→US via EU)** | **NOT done** | — |
+| **Asymmetric routing (forward ≠ return)** | **NOT done** — every leg is shaped identically both ways | — |
+| MTU large/small | **barely** — one leg at 1400; no 1280, no sweep | `NETSIM_LEG_MTU` |
+| Client NAT: public + 4 types | **NOT done** — only one MASQUERADE inside the NAT-aging test | — |
+| **Server tier (1c1g / 2c2g, GB5 400–2000)** | **NOT done** — designed, zero code | — |
+| **Host (母鸡) state: healthy / loaded / softirq storm** | **NOT done** | — |
+| Server 2.5G / client 1G line rates | **NOT done, and partly infeasible** — see §5 | — |
+| 5 special conditions | **3 of 5** — NAT aging, corrupt/reorder, ACK starvation | `run_special` |
+| Scheduler comparison across classes | **NOT done** — one scheduler per run | — |
+
+Nothing here is wasted: the leg-composition engine is what makes the rest cheap
+to add. But the matrix as it stands answers "how does a bad *link* behave",
+not "how does a real deployment behave".
+
+---
+
+## 1. Three blockers, before more coverage is worth adding
+
+### 1.1 A product bug that invalidates lossy measurements — `XQC_ELIMIT`
+
+Found by the hybrid-e2e failures. The server closes the connection with
+`FRAME_ENCODING_ERROR` (0x7) tens of MB into a transfer over a lossy,
+high-jitter, multipath route. The chain, from the collected logs:
+
+```
+xqc_insert_stream_frame  error  -613  (stream_id:16)   <- XQC_ELIMIT
+xqc_process_frames       process frame error  -613
+xqc_engine_packet_process  fail to process packets  ret:-613
+                         -> conn closed, err:0x7, close_msg:local error  (server)
+                                        err:0x7, close_msg:remote error (client)
+```
+
+`src/transport/xqc_frame.c:101` rejects a STREAM frame once
+`buffered_frame_count >= XQC_MAX_STREAM_FRAME_BUFFERED_COUNT` (8192), a CWE-770
+mitigation from upstream commit `e4d89de`. The cap itself is reasonable. Two
+things around it are not:
+
+- **It contradicts the advertised flow-control window.**
+  `XQC_MAX_RECV_WINDOW` is 16 MiB per stream, so a peer is told it may send
+  16 MiB of unread stream data. mqvpn sends 1400-byte packets
+  (`MQVPN_MAX_PKT_OUT_SIZE`), so 8192 frames is only **~11.5 MB** — less than
+  the window. A peer obeying flow control can be killed for exceeding a limit
+  it was never told about.
+- **Hitting a resource cap is treated as a protocol violation.** The caller
+  (`xqc_frame.c:722`) special-cases only `-XQC_EDUP_FRAME`; every other
+  non-zero return falls into `goto error`, which kills the connection. "I have
+  no room to buffer this" and "you sent me a malformed frame" get the same
+  fatal response.
+
+Why loss + jitter + multipath triggers it: a missing frame creates a hole, and
+every frame after the hole stays buffered because nothing can be delivered in
+order. Two paths with different one-way delays (35 ms vs 50 ms +/- 25 ms) keep a
+hole open continuously, so the backlog grows to thousands of nodes. This is
+mqvpn's core use case, not an edge case.
+
+**Until this is fixed, every lossy/multipath scenario in the matrix randomly
+loses its connection mid-measurement, and the numbers are noise.** Fixing it is
+prerequisite work, not a side quest. Directions, cheapest first:
+
+1. Derive the cap from the window rather than hardcoding it
+   (`window / min_expected_frame_payload`), so the two limits cannot disagree.
+2. Handle `-XQC_ELIMIT` distinctly from a protocol violation: reset the one
+   stream (`RESET_STREAM`/`STOP_SENDING`) instead of the whole connection, or
+   at minimum close with a resource error rather than `FRAME_ENCODING_ERROR`.
+3. Correct-but-invasive: do not ACK the packet whose frame could not be
+   buffered, so the peer retransmits when there is room. This is real
+   backpressure; the other two are damage control.
+
+The cap must stay bounded — the point of it is that a hostile peer cannot pin
+unbounded memory with sparse frames. The fix is to make the bound consistent
+and non-fatal, not to remove it.
+
+### 1.2 `ci_bench_run_iperf` can hang forever
+
+The weekly `netsim (classes)` job was cancelled at its 60-minute timeout while
+its six siblings finished in 3-6 minutes. `ci_bench_run_iperf`
+(`scripts/ci_benchmarks/ci_bench_env.sh`) lacks both guards its sibling in
+`tests/test_e2e_hybrid_h2.sh` documents as mandatory:
+
+- no `timeout` wrapper on the iperf3 client;
+- `wait "$iperf_srv_pid"` on a one-shot `iperf3 -s -1` **without killing it
+  first** — if no client ever connects, that server never exits and the wait
+  blocks forever.
+
+The existing benchmarks never hit this because they only ever shape gentle
+paths (300 Mbit/10 ms). netsim is the first thing to drive paths bad enough
+that a tunnel fails to carry iperf3 — so this is a latent bug the new coverage
+exposed, not a new one.
+
+Fix: mirror the hybrid helper (client under `timeout $((duration + 15))`, kill
+the server before waiting). Every long matrix depends on this.
+
+### 1.3 Budget structure
+
+`classes` at 60 minutes was the hang, not real work: ~100 s per class x 7 is
+about 14 minutes. But the additions below multiply the scenario count, so the
+weekly must shard by scenario group rather than growing one job.
+
+---
+
+## 2. Missing coverage, in priority order
+
+### 2.1 Geographic multi-hop and asymmetric routing — highest value
+
+This was the explicit ask and the biggest gap. What exists is
+`client -> hop -> server`, one intermediate namespace, with both directions of
+each leg shaped identically. What a real cross-border path looks like is a
+chain of five to eight hops, each with its own queue, and a return path that
+often does not retrace the forward one.
+
+**Topology.** Generalise the chain to N hops:
+
+```
+NS_CLIENT - access - hop1 - national - hop2 - transoceanic - hop3 - peering - NS_SERVER
+```
+
+Each hop is a namespace with `ip_forward=1` and its own netem, so delay and
+queueing accumulate the way they do on a real AS path, TTL decrements, and
+`traceroute` shows the hop count. The existing 2-hop code is this with N=1;
+the change is to loop over a hop list instead of creating one.
+
+**Route table** (one-way delays; RTT is the sum of both directions, which is
+the point):
+
+| Route | Forward | Return | RTT | Models |
+|---|---|---|---|---|
+| `cn_jp_direct` | CN-JP 30 | JP-CN 30 | 60 ms | symmetric regional |
+| `cn_eu_direct` | CN-RU-EU 45+55 | same reversed | 200 ms | symmetric long-haul |
+| `cn_eu_via_us` | CN-JP-USW-USE-EU 30+90+35+80 | EU-CN direct 180 | **415 ms** | **asymmetric detour** |
+| `cn_us_via_eu` | CN-RU-EU-US 45+55+80 | US-JP-CN 100+30 | **490 ms** | **asymmetric detour** |
+| `cn_us_direct` | CN-JP-US 30+90 | US-JP-CN 90+30 | 240 ms | symmetric transpacific |
+| `cn_us_congested_return` | CN-US 120 | US-CN 120, +2% loss, 40 Mbit | 480 ms | one-way congestion |
+
+The last one matters on its own: a path that is clean outbound and congested
+inbound is extremely common on China routes, and it is invisible to any
+symmetric model.
+
+**Implementation of asymmetry.** netem shapes egress only, which is exactly
+what makes this expressible. Forward = egress of each hop's server-facing
+device; return = egress of each hop's client-facing device. Two changes:
+
+1. Allow a *different* netem spec per direction on the same hop (today both
+   directions get the same string).
+2. For a true detour, route the return through a *different* hop chain: the
+   server's route to the client subnet points at return-chain hop 1, while the
+   client's route to the server points at forward-chain hop 1. Two chains per
+   path, joined at the endpoints.
+
+Verification must assert the asymmetry actually exists, not just that the
+config was applied: `ping` reports RTT (the sum), so the practical check is that
+`traceroute` from each end reports different hop counts, plus measured RTT
+matching `forward + return` rather than `2 x forward`.
+
+### 2.2 Server tier and host contention — entire second half of the ask
+
+Nothing exists. cgroup v2 with `cpu`/`cpuset`/`memory` and `systemd-run` are
+confirmed present.
+
+**Tiers.** Wrap the server process:
+`systemd-run --scope -p AllowedCPUs=... -p CPUQuota=... -p MemoryMax=...`
+
+| Tier | Nominal GB5 (single) | Shape | Emulation |
+|---|---|---|---|
+| `vps_1c1g` | 400-600 | 1 core, 1 GB | `AllowedCPUs=0 CPUQuota=40% MemoryMax=1G` |
+| `vps_1c1g_std` | 1000-1100 | 1 core, 1 GB | `AllowedCPUs=0 CPUQuota=100% MemoryMax=1G` |
+| `vps_2c2g` | 1400-1500 | 2 cores, 2 GB | `AllowedCPUs=0-1 CPUQuota=140% MemoryMax=2G` |
+| `vps_2c2g_fast` | 1500-2000 | 2 cores, 2 GB | `AllowedCPUs=0-1 CPUQuota=200% MemoryMax=2G` |
+
+**These labels are nominal and must be printed as such.** A GB5 score is
+IPC x frequency; `CPUQuota` throttles time slices. This reproduces the
+*throughput ceiling* of a smaller box, not its per-operation latency, and it
+cannot make a fast core behave like a slow one. Disk size (20 GB / 40 GB) has
+no effect on these tests and is not modelled.
+
+**Host (母鸡) state:**
+
+| State | Emulation |
 |---|---|
-| Backbone type | 6 (IPLC/IEPL, optimized BGP, plain BGP, junk BGP, flapping BGP, throttled/carrier) |
-| Client access | ~32 (wired, 2×WiFi, 3 signal × 3 congestion × 2 priority 5G, 2×2×2 satellite, 3 tethering) |
-| MTU | 3 |
-| Client NAT | 5 (public + 4 NAT behaviours) |
-| Server CPU tier | 4 |
-| Server sizing | 2 |
-| Host (母鸡) state | 3 |
+| `healthy` | nothing |
+| `noisy_neighbour` | `stress-ng --cpu N` pinned to the CPUs *outside* the server's `AllowedCPUs` |
+| `softirq_storm` | small-packet flood on an unrelated veth pair, to contend for `ksoftirqd` |
+| `cpu_capped` | tighten `CPUQuota` mid-run, emulating a provider throttle |
 
-`6 × 32 × 3 × 5 × 4 × 2 × 3` = **69,120** single-path configurations. At 75 s per
-measurement that is ~60 days of runner time for one pass. Multipath squares the
-path dimension: `(6 × 32)²` = **36,864** path pairs before any endpoint factor.
+Hypervisor steal time cannot be emulated in a container; competing load is the
+closest available proxy and should be labelled that way.
 
-So the plan is explicitly **not** to enumerate. Three reductions, in descending
-order of leverage.
+### 2.3 NAT matrix
 
-### 1.1 Legs compose — build them, don't enumerate them
+Documented, not implemented. All five at the access hop, with nftables/iptables:
 
-A "5G-half-signal client behind a junk BGP transit" is not a profile to be
-authored. It is an access leg *followed by* a transit leg; delay, loss and rate
-compose along the wire. Model a path as a **chain of namespaces**, one qdisc per
-hop:
+| Type | Rule |
+|---|---|
+| `public` | none |
+| `full_cone` | `masquerade persistent` (mapping stable across destinations) |
+| `port_restricted` | plain `masquerade` (conntrack default) |
+| `symmetric` | `masquerade random` (fresh port per destination) |
+| `cgnat` | masquerade at the access hop **and** at a transit hop (double NAT) |
 
-```
-NS_CLIENT ── access hop ── transit hop 1 ── transit hop 2 ── NS_SERVER
-             (CPE/radio)   (peering)        (backbone)
-```
+`nf_conntrack_udp_timeout` already defaults to 30 s, so the "silent killer" is
+the default; the aging test only has to idle past it. Worth adding on top:
+aging *while multipath*, where one path idles and the other stays busy — the
+busy path keeps the connection alive, so the idle path's NAT binding dies
+silently and only path recovery reveals it.
 
-`6 × 32 = 192` path types collapse to `6 + 10 = 16` reusable blocks, and the
-chain buys three things one veth cannot:
+### 2.4 MTU
 
-- **Real hop count.** A separate queue per hop, TTL decrements, a traceroute
-  that looks like the internet. Bufferbloat lives *in a hop's queue*; with one
-  veth there is only one queue to put it in.
-- **A place to put the NAT.** CPE NAT at the access hop, CGNAT at a transit hop
-  — double NAT becomes topology, not a special case.
-- **Independent failure injection.** Flap transit without touching access state.
+Today: one leg at 1400. Needed: 1500 / 1400 / 1280 as an explicit axis, plus a
+**PMTUD black hole** case (an intermediate hop that drops oversized packets
+*and* suppresses ICMP Frag Needed) — the failure mode that hangs a tunnel
+rather than slowing it. Cross MTU with `carrier_qos`, because under a PPS cap
+goodput scales with bytes-per-packet: that pairing is what turns MTU choice and
+GSO batching into a measurable number instead of a guess.
 
-### 1.2 Multipath cares about heterogeneity class, not about pairs
+### 2.5 The two remaining special conditions
 
-Schedulers do not differ between "two 300 Mbit links" and "two 310 Mbit links".
-They differ across these classes — this is the whole interesting space:
+- **Dual-stack routing split.** v4 and v6 paths with divergent delay/loss;
+  assert no stall when the preferred family degrades mid-transfer. Needs v6
+  addressing threaded through the hop chain — the reason it was deferred.
+- **Live roaming under load.** The existing rebind e2e, but with traffic
+  saturating the link across the address change.
 
-| Class | Composition | Question it answers |
-|---|---|---|
-| `homo_good` | 2× optimized | Does aggregation add at all? |
-| `homo_bad` | 2× junk | Does it degrade gracefully or collapse? |
-| `hetero_extreme` | optimized + junk | **Does the bad path drag down the good one?** |
-| `asym_capacity` | IPLC 150M + plain 300M | Is the split proportional to capacity? |
-| `asym_latency` | 40 ms + 320 ms GEO | Does it avoid head-of-line blocking? |
-| `one_flapping` | stable + flapping | Does it evacuate, and re-admit after? |
-| `carrier_pair` | 2× carrier_qos | Does PPS capping break both paths the same way? |
+### 2.6 Scheduler sweep
 
-Seven classes, not 36,864 pairs. `hetero_extreme` and `one_flapping` are where
-WLB / MinRTT / backup-FEC actually separate — they get the deepest runs.
-
-### 1.3 Endpoint factors are orthogonal — sample them pairwise
-
-NAT type, MTU, CPU tier and host state do not interact with *each other* in
-interesting ways; each interacts with the path. Use a **2-way covering array**
-(every pair of levels appears at least once) over
-`{backbone × access × MTU × NAT}`: ~35 runs instead of ~2,900, and any
-two-factor interaction bug still gets caught.
-
-Full-factorial only where interaction is known to exist:
-- MTU × path (PMTUD, fragmentation, black-hole detection)
-- loss burstiness × FEC scheduler (the entire point of backup-FEC)
-- PPS cap × packet size (see `carrier_qos` — this is where GSO pays)
+`classes` runs one scheduler. The interesting comparison is WLB vs MinRTT vs
+backup-FEC across `hetero_extreme`, `asym_latency` and `one_flapping` — the
+three classes where they should diverge. Current data already hints at it: WLB
+beats MinRTT at every stream count on the plain asymmetric profile, and MinRTT
+goes *negative* at 1 stream (multipath slower than single path), which deserves
+its own regression guard.
 
 ---
 
-## 2. Transit profiles (the six backbones)
+## 3. Dashboard: say what each test and metric is
 
-Verified against `iproute2-6.15` / kernel 6.12. `limit` is in packets, sized
-against the bandwidth-delay product, because queue depth *is* the difference
-between a good line and a bloated one.
+The picker shows `aggregate (7)`, `netsim_classes (1)`, `raw_throughput (9)`
+with no indication of what any of them measures, so a reader cannot tell a
+throughput benchmark from a smoke test. Three additions, all in the page:
 
-| Name | netem | Notes |
-|---|---|---|
-| `iplc` | `delay 65ms 1ms distribution normal rate 150mbit limit 1000` | Stable, low jitter, no loss, **small pipe**. Aggregation has the most to offer here. `limit` ≈ 1×BDP. |
-| `bgp_opt` | `delay 40ms 2ms distribution normal loss 0.01% rate 400mbit limit 2200` | The upper bound. See §7 on why not 1 Gbit by default. |
-| `bgp_plain` | off-peak: `delay 80ms 8ms distribution normal loss 0.1% rate 300mbit limit 2500`<br>peak: `delay 110ms 25ms distribution normal loss 0.8% rate 180mbit limit 4000` | Time-varying; the diurnal driver swaps between the two. |
-| `bgp_junk` | `delay 180ms 45ms distribution paretonormal loss gemodel 3% 20% 88% 0.5% rate 80mbit limit 6000` | Cogent-class. **Gilbert-Elliott, not uniform loss** — real bad lines lose in bursts, and burst loss is what breaks congestion control. `limit` ≈ 5×BDP = bloated. |
-| `bgp_flappy` | base = `bgp_plain` off-peak; every 45–90 s inject 5–15 s of<br>`delay 600ms 250ms distribution paretonormal loss 6% rate 6mbit limit 8000` | Applied with `tc qdisc change` (verified: mutates in place, does not reset the path). The most demanding scheduler test. |
-| `carrier_qos` | `delay 240ms 90ms distribution paretonormal loss gemodel 2% 15% 80% 0.3% rate 900mbit limit 10000`<br>**plus** `tc action police pkts_rate 8000 pkts_burst 200 drop` on UDP | The China-carrier shape: pipe looks huge, **packet rate is capped**, so bitrate collapses at small MTU. Verified available. |
+1. **A bilingual description per test id**, shown under the picker: what it
+   measures, what topology, and whether it is a gate or a trend. Keyed off the
+   `test` field already present in every document.
+2. **A metric glossary** — one line per metric explaining what it is and which
+   direction is good. `aggregation_efficiency` and `vs_best_single` are not
+   self-evident, and `rtt_inflation` needs "this is bufferbloat" spelled out.
+3. **Scenario context on each card.** Documents already carry `netem`,
+   `mode`, `caps`, `repeats`; surface the emulated profile next to the number
+   so a value is never read without knowing which network produced it.
 
-`carrier_qos` is the only profile whose optimization signal is *packet size*
-rather than congestion control: under a PPS cap, throughput scales with
-bytes-per-packet, so it measures directly whether GSO/batching and MTU choice
-pay off. No current profile can show that.
-
-## 3. Access legs (client side)
-
-Ten legs cover the ~32 requested combinations, because signal × congestion ×
-priority collapse onto the same three observables (delay, jitter tail, loss
-burstiness):
-
-| Name | netem | Models |
-|---|---|---|
-| `eth` | `delay 0.2ms rate 1000mbit` | Wired |
-| `wifi_good` | `delay 3ms 2ms distribution normal loss 0.05% rate 400mbit` | Clean 5 GHz |
-| `wifi_busy` | `delay 18ms 30ms distribution paretonormal loss 1.2% rate 60mbit limit 3000` | Contended channel |
-| `5g_full` | `delay 18ms 6ms distribution normal loss 0.05% rate 350mbit` | Full bars, uncongested, prioritized |
-| `5g_half` | `delay 45ms 25ms distribution paretonormal loss 0.4% rate 90mbit` | Half bars |
-| `5g_edge` | `delay 95ms 60ms distribution paretonormal loss gemodel 4% 25% 80% 1% rate 12mbit limit 4000` | Almost no signal |
-| `5g_throttled` | `delay 130ms 85ms distribution paretonormal loss gemodel 5% 20% 85% 1.5% rate 8mbit limit 5000` + PPS cap | Congested cell, no priority |
-| `starlink` | `delay 45ms 30ms distribution paretonormal loss 1% rate 200mbit` + 300 ms spike every 15 s | LEO reconfiguration |
-| `geo_sat` | `delay 320ms 25ms distribution normal loss 0.5% rate 20mbit limit 2000` | GEO |
-| `tether_otg` | `5g_half` + `duplicate 0.3% corrupt 0.05%`, MTU 1400 | Phone tethering; duplicate/corrupt is the "driver jank" |
-
-Radio-layer behaviour (HARQ, scheduler grants, handover) is *approximated* by
-the jitter tail and burst-loss model, not simulated — see §9.
-
-## 4. Endpoint factors
-
-**MTU** — 1500 / 1400 (tether, PPPoE) / 1280 (v6 minimum), set per access hop.
-
-**NAT** — at the access hop: `public` (none) · `full_cone` (persistent mapping)
-· `port_restricted` (conntrack default) · `symmetric` (`--random`) · `cgnat`
-(masquerade at access *and* transit hop).
-
-`nf_conntrack_udp_timeout` already defaults to **30 s** — the "silent killer" is
-the default, not something to force. It only needs a test that idles past it.
-
-**Server tier** — `systemd-run --scope -p AllowedCPUs= -p CPUQuota= -p MemoryMax=`
-(cgroup v2 `cpu`/`cpuset`/`memory`/`io` confirmed present):
-
-| Tier | Target GB5 (single) | Emulation |
-|---|---|---|
-| `weak` | 400–600 | `AllowedCPUs=0 CPUQuota=40% MemoryMax=1G` |
-| `std` | 1000–1100 | `AllowedCPUs=0 CPUQuota=100% MemoryMax=1G` |
-| `good` | 1400–1500 | `AllowedCPUs=0-1 CPUQuota=140% MemoryMax=2G` |
-| `high` | 1500–2000 | `AllowedCPUs=0-1 CPUQuota=200% MemoryMax=2G` |
-
-**Label these as approximations.** A GB5 score is IPC × frequency; `CPUQuota`
-throttles time slices. It reproduces the *throughput ceiling* of a slower box,
-not its per-operation latency.
-
-**Host (母鸡) state** — `healthy` · `noisy` (`stress-ng --cpu` on sibling CPUs)
-· `softirq_storm` (packet flood on an unrelated veth pair). Hypervisor steal
-cannot be emulated in a container; competing load is the closest proxy.
-
-## 5. The five special conditions
-
-All five already have **functional** coverage under `scripts/ci_e2e/`
-(`run_ipv6_dataplane`, `run_ipv6_transport`, `run_addr_del_failover`,
-`run_reconnect`, `run_nat_test`). None runs under saturating traffic — that is
-the real gap, because these are all *timing and buffering* bugs.
-
-| Condition | New variant | Tier |
-|---|---|---|
-| Dual-stack routing split | v4/v6 paths with divergent delay/loss; assert no stall when the preferred family degrades **mid-transfer** | weekly |
-| NAT 30 s aging | Idle 35 s mid-session behind NAT, resume; assert keepalive/rebind recovers with no user-visible break | weekly |
-| ACK starvation / bufferbloat | Asymmetric 100/5 Mbit, deep uplink queue, saturate uplink, measure downlink collapse — does pacing protect ACKs? | weekly |
-| Corrupt / reorder / duplicate | `corrupt 0.1% reorder 25% 50% duplicate 0.5%` under load; integrity + no crash | weekly |
-| Live roaming under load | Existing rebind test with iperf3 saturating across the address change | weekly |
+None of this needs Worker changes — the API returns whole documents and the
+naming layer already lives in the page.
 
 ---
 
-## 6. Metrics
+## 4. Revised tiering and budget
 
-The point of the matrix is the metrics, so these are collected for **every**
-scenario, not just the throughput ones.
+Sharded by scenario group so no single job approaches its timeout.
 
-**Throughput / aggregation**
-`solo_a_mbps` · `solo_b_mbps` · `multipath_mbps` · `aggregation_efficiency`
-(= mp / (a+b)) · `vs_best_single` (= mp / max(a,b), the headline "is multipath
-worth it") · `theoretical_max_mbps` · `utilization`
+### Per-commit — `perf.yml`, about +4 min
 
-**Latency**
-`srtt_p50_ms` · `srtt_p95_ms` · `srtt_p99_ms` · `min_rtt_ms` ·
-`rtt_inflation` (= p95/min, a direct bufferbloat readout)
+One bad network, ratio gates only, nothing that can flake:
+`hetero_extreme` multipath, gated on `vs_best_single` and `degraded_ratio`.
+Absolute Mbps recorded, never gated.
 
-**Loss / integrity**
-`dgram_lost` · `dgram_lost_pct` · `retrans_pct` · `fec_send_cnt` ·
-`fec_recover_cnt` · `fec_efficiency` · `reorder_events` · `dup_recv`
-
-**Path fairness**
-`path_bytes` per path · `minshare` (= min/max) · `path_switch_count`
-
-**Failover**
-`ttf_sec` · `ttr_sec` · `degraded_ratio` · `recovery_ratio` · `outage_ms`
-
-**Application-level** — what a user actually feels, and missing today
-`ttfb_p50_ms` · `ttfb_p95_ms` · `fct_64k_ms` · `fct_1m_ms` · `stall_count` ·
-`max_stall_ms`. Bulk iperf3 hides these: a scheduler can win on bulk goodput
-while making short flows worse.
-
-**Resource / batching**
-`server_rss_peak_kb` · `client_rss_peak_kb` · `server_cpu_pct` ·
-`gso_factor` (= udp_tx_datagrams / udp_tx_sends) ·
-`gro_factor` (= udp_rx_datagrams / udp_rx_receives). The two factors are the
-readout that makes `carrier_qos` actionable.
-
-**Stability**
-`samples` · `median` · `iqr` · `cv_pct` per repeated metric.
-
-## 7. Result JSON layout — and why the dashboard needs no change
-
-The Worker has **no metric-specific logic**: `flattenNumbers` walks any
-document and charts every finite number it finds, so new metrics appear with no
-code change. Two things in it are fixed rather than dynamic, and the JSON layout
-is designed around them so the Worker stays untouched:
-
-1. **`MAX_METRICS = 400` per document.** Today's worst file is `failover` at 251
-   (its per-interval time series dominates). So: **one file per scenario class**,
-   and put per-interval timelines in a separate `*_timeline_*.json`. Each file
-   then becomes its own entry in the dashboard's benchmark picker, which also
-   makes navigation better than one giant document would.
-
-2. **`ARRAY_KEY_FIELDS` labels array elements** by the first of
-   `name, scenario, condition, label, direction, scheduler, streams,
-   target_mbps, packet_size, loss_percent, time_sec` it finds. So key arrays
-   with **`scenario`** (e.g. `{"scenario": "iplc+5g_half", …}`) rather than
-   inventing `backbone`/`class`/`tier` as the key field — those would fall back
-   to a bare index and produce labels like `results[3].vs_best_single`.
-
-Everything else already works unchanged: `update_perf_index.py` globs `*.json`
-and registers whatever filenames it finds; `publish_to_r2.sh` uploads them;
-`testIdFromFile` strips the `_YYYYMMDD_HHMMSS` suffix, so
-`weekly_hetero_extreme_20260823_120000.json` becomes the series
-`weekly_hetero_extreme`.
-
-Top-level shape stays as it is today (`test`, `commit`, `timestamp`, `netem`,
-`results`), so nothing downstream needs teaching.
-
-## 8. Making the numbers mean something on a shared runner
-
-`perf.yml` now runs on `ubuntu-latest`, so absolute throughput is partly a
-measurement of whoever else is on the host. Five rules:
-
-1. **Shape below the runner's ceiling.** The emulated link must be the
-   bottleneck, not the runner CPU. The current ~380 Mbit aggregate profile
-   completes and produces stable numbers, so cap regular tiers at **≤400 Mbit
-   aggregate**. A 1 Gbit `bgp_opt` variant is a *capacity probe*, weekly only,
-   labelled runner-bound — a link that never saturates measures nothing.
-
-2. **Ratio metrics, not absolute.** `aggregation_efficiency`, `vs_best_single`
-   and `degraded_ratio` divide the host's speed out. Gate on those; publish
-   absolute Mbps as context.
-
-3. **Pair the measurements.** solo-A, solo-B and multipath run back-to-back in
-   the same job, seconds apart. Never compare across jobs.
-
-4. **Median of ≥3, with IQR and CV.** The dashboard already surfaces CV per
-   metric. Gate only when CV is under threshold; otherwise emit *inconclusive*
-   rather than failing — a noisy red is worse than an honest gap.
-
-5. **Seed netem.** `iproute2-6.15` accepts `netem … seed <N>` (verified:
-   re-applying the same seed reproduces it), removing netem's own PRNG as a
-   variance source — the dominant one for loss-sensitive metrics.
-   **Caveat:** `ubuntu-24.04` ships iproute2 6.1, which predates the knob.
-   Detect at runtime; fall back to longer runs (more samples), not more repeats.
-
-## 9. Tiering and budget
-
-Measured on the current `perf.yml` job (warm cache): fixed overhead ≈ 90 s;
-raw-throughput 67 s, failover 219 s, aggregation 301 s. A *scenario unit* is
-≈ 60 s single-path, ≈ 100 s multipath (solo A + solo B + MP).
-
-The repo is public, so standard-runner minutes are free and unlimited. The real
-constraints are the 6 h job cap, 20 concurrent jobs (Free plan), queue
-contention, and how long a push should wait for feedback.
-
-### Per-commit — `perf.yml`, push to `main`
-
-One bad network, nothing that can flake:
-
-- `hetero_extreme` (optimized + junk) multipath unit — the single
-  highest-signal scenario, since it is where a scheduler regression shows first
-- Gate on `vs_best_single` and `degraded_ratio` only; absolute Mbps recorded,
-  never gated
-- Keep the three existing benchmarks
-
-**Budget: +3–4 min** on a job that runs ~12 min today.
-
-### Weekly — `perf-weekly.yml`
-
-Everything else, as a matrix:
+### Weekly — `perf-weekly.yml`, sharded
 
 | Job | Content | Est. |
 |---|---|---|
-| `catalog-a` … `catalog-c` | 6 backbones × 10 access legs, single path (60 units), split 3 ways | 3 × ~22 min |
-| `classes` | 7 heterogeneity classes × 3 schedulers (21 MP units) | ~40 min |
-| `pairwise` | 2-way covering array over `{backbone × access × MTU × NAT}` (~35 units) | ~35 min |
-| `special` | the 5 special conditions, under load | ~20 min |
-| `tiers` | 4 CPU tiers × 3 host states at fixed network (12 units) | ~20 min |
-| `endurance` | 30 min diurnal (`bgp_plain` peak/off-peak) + 60 min soak on `bgp_flappy` | ~95 min |
-| `capacity` | 1 Gbit probe, labelled runner-bound | ~10 min |
+| `classes` | 7 heterogeneity classes | ~15 min |
+| `schedulers` | 3 classes x 3 schedulers | ~25 min |
+| `geo` | 6 geographic routes, incl. 3 asymmetric | ~25 min |
+| `catalog-a/b/c` | 6 transits x 10 access legs, split 3 ways | 3 x ~20 min |
+| `tiers` | 4 server tiers x 4 host states | ~30 min |
+| `nat-mtu` | 5 NAT types x 3 MTU + PMTUD black hole | ~25 min |
+| `special` | all 5 special conditions, under load | ~25 min |
+| `endurance` | 30 min diurnal + 60 min soak on `bgp_flappy` | ~95 min |
+| `capacity` | 1 Gbit+ probe, labelled runner-bound | ~10 min |
 
-**Total ≈ 4 job-hours/week across 8 parallel jobs**, longest job ~95 min —
-inside every limit, and the weekly wall-clock stays under two hours.
+About 11 parallel jobs, longest ~95 min, roughly 5 job-hours/week. Inside the
+6 h job cap and the 20-concurrent-job limit; the repo is public so
+standard-runner minutes are free.
 
-## 10. What this does not model
+## 5. What this cannot model — state it with the results
 
-- **GB5 scores.** `CPUQuota` emulates a throughput ceiling, not IPC. Tier labels
-  are nominal.
-- **1 Gbit line rate.** On a 4-vCPU shared runner this measures the runner.
-- **Radio layer.** HARQ, scheduler grants, handovers → approximated by jitter
-  tails and burst loss.
+- **GB5 scores.** `CPUQuota` caps throughput, not IPC. Tier labels are nominal.
+- **2.5 Gbit server / 1 Gbit client.** A shared 4-vCPU runner cannot saturate
+  those, so at those rates the runner is the bottleneck and the number measures
+  the runner. Regular tiers stay at or below 400 Mbit aggregate so the emulated
+  link is the constraint; anything above is a labelled capacity probe.
+- **Radio layer.** HARQ, scheduler grants and handovers are approximated by
+  jitter tails and burst loss, not simulated.
 - **BGP semantics.** A re-route is an abrupt delay/loss change; AS paths, flap
-  damping and convergence are out of scope.
+  damping and convergence are out of scope. The geographic routes model the
+  *result* of a detour, not the protocol that chose it.
 - **Hypervisor steal.** Competing load is a proxy.
-- **Cross-tenant noise.** Seeding netem removes *our* randomness, not the host's.
+- **Cross-tenant noise.** Seeding netem removes *our* randomness, not the
+  host's — which is why gates are on ratios and CV is published per metric.
 
-## 11. Build order
+## 6. Build order
 
-1. **Leg composition + chained-namespace topology** in `bench_env_setup.sh`.
-   Nothing else is measurable until a path can be built from an access leg and a
-   transit leg.
-2. **Profile catalog as data** (transit + access tables), seeded, with runtime
-   capability detection for `netem seed` and `police pkts_rate`.
-3. **Metric collection + ratio/CV harness**, emitting the §7 JSON layout.
-4. **Per-commit scenario** — smallest change that improves today's signal.
-5. **Weekly matrix** — classes, catalog, pairwise, special-under-load.
-6. **Endpoint factors** (NAT / MTU / server tier) and the endurance jobs.
+1. **Fix the `XQC_ELIMIT` connection kill.** Everything lossy is unmeasurable
+   until this is done.
+2. **Fix the `ci_bench_run_iperf` hang.** Every long matrix depends on it.
+3. **N-hop chain + per-direction netem**, then the geographic route table.
+4. **Server tiers + host contention** — the whole missing half, and cheap once
+   the wrapper exists.
+5. NAT matrix and MTU axis (including the PMTUD black hole).
+6. Dashboard descriptions and glossary.
+7. Scheduler sweep, remaining two special conditions, endurance jobs.
