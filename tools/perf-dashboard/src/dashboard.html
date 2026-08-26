@@ -37,6 +37,11 @@ input[type=search] { min-width: 180px; }
 .seg button { font: inherit; font-size: 12.5px; padding: 5px 11px; border: 0;
   background: var(--bg); color: var(--muted); cursor: pointer; }
 .seg button[aria-pressed=true] { background: var(--line); color: #fff; }
+.about { margin: 10px 18px 0; padding: 9px 12px; background: var(--panel);
+  border: 1px solid var(--border); border-left: 3px solid var(--line);
+  border-radius: 8px; font-size: 12.5px; line-height: 1.6; color: var(--ink); }
+.kind { display: inline-block; font-size: 11px; padding: 1px 7px; margin-right: 7px;
+  border-radius: 999px; background: var(--line); color: #fff; vertical-align: 1px; }
 .meta { padding: 9px 18px; color: var(--muted); font-size: 12.5px; }
 .notice { margin: 9px 18px; padding: 9px 12px; background: var(--warn-bg);
   color: var(--warn); border-radius: 8px; font-size: 12.5px; }
@@ -121,6 +126,10 @@ tbody tr:hover { background: var(--chip); }
   </div>
 </header>
 
+<div class="about" id="about" hidden>
+  <span class="kind" id="aboutKind"></span>
+  <span id="aboutText"></span>
+</div>
 <p class="meta" id="meta"></p>
 <div class="notice" id="notice" hidden></div>
 
@@ -191,6 +200,115 @@ const I18N = {
 };
 let LANG = 'zh';
 const t = (k) => I18N[LANG][k];
+
+/* ── what each benchmark actually is ────────────────────────────────────
+ * The picker only ever showed an id and a run count, so a reader could not
+ * tell a gated throughput benchmark from a smoke test over a deliberately
+ * broken network — and reading a number without knowing which of those
+ * produced it is worse than not seeing it.
+ *
+ * Keyed by the `test` field every result document already carries. Entries are
+ * [English, Chinese] and matched longest-prefix-first, so a family like
+ * netsim_catalog_* needs one entry rather than one per transit profile. */
+const TEST_INFO = [
+  ['netsim_percommit', {
+    kind: ['gate', '门禁'],
+    en: 'Per-commit gate. One deliberately hostile network (premium wired path + '
+      + 'a barely-connected 5G path on junk transit behind symmetric NAT). Gated '
+      + 'on ratios only, never on absolute Mbps.',
+    zh: '每次提交的门禁。一个刻意恶劣的网络组合(优质有线路径 + 几乎没信号的 5G 走垃圾骨干、'
+      + '对称 NAT 之后)。只对比值设门槛,绝不对绝对速率设门槛。',
+  }],
+  ['netsim_classes', {
+    kind: ['trend', '趋势'],
+    en: 'Curated multipath pairs, grouped by the KIND of disagreement between '
+      + 'the two legs: capacity, latency, stability, NAT, MTU, plus real-world '
+      + 'composites (home fibre + tethered phone, dual mobile, satellite + cell).',
+    zh: '精选的多路组合,按两条腿"哪里不一致"来分类:容量、延迟、稳定性、NAT、MTU,'
+      + '外加真实场景组合(家庭光纤+手机热点、双移动、卫星+蜂窝)。',
+  }],
+  ['netsim_combo', {
+    kind: ['trend', '趋势'],
+    en: 'Generated covering set over access x transit x NAT x MTU. Every level of '
+      + 'every axis appears at least once on each side of a pair, which catches '
+      + 'single-factor faults without enumerating the ~810k possible pairs.',
+    zh: '接入 x 骨干 x NAT x MTU 的生成式覆盖阵。每个轴的每个取值都至少在组合的两侧各出现一次,'
+      + '能抓出单因子故障,而不必穷举约 81 万种组合。',
+  }],
+  ['netsim_catalog', {
+    kind: ['trend', '趋势'],
+    en: 'One backbone profile swept across all ten client access types, single '
+      + 'path. Shows how much of a given transit a given last mile can actually use.',
+    zh: '一种骨干配置扫过全部十种客户端接入方式,单路径。用来看某种接入方式实际能吃下'
+      + '这条骨干多少带宽。',
+  }],
+  ['netsim_special', {
+    kind: ['regression', '回归'],
+    en: 'The pathological conditions, run UNDER LOAD rather than idle: NAT state '
+      + 'aging past the 30 s conntrack timeout, corrupt/reorder/duplicate packets, '
+      + 'and ACK starvation behind a bloated uplink queue.',
+    zh: '病态场景,而且是在满载流量下跑而非空载(这才是缺口所在):NAT 状态超过 conntrack '
+      + '30 秒老化、畸变/乱序/重复包、以及上行队列膨胀导致的 ACK 饥饿。',
+  }],
+  ['aggregate', {
+    kind: ['trend', '趋势'],
+    en: 'Multipath aggregation on the clean reference topology (300 Mbit/10 ms + '
+      + '80 Mbit/30 ms), swept over stream counts for both schedulers. Gain is '
+      + 'only meaningful at 16+ streams — below that its variance exceeds it.',
+    zh: '在干净的参考拓扑上测多路聚合(300M/10ms + 80M/30ms),对两种调度器扫不同并发流数。'
+      + '增益只在 16 流以上才有意义 —— 低于此其波动大于数值本身。',
+  }],
+  ['raw_throughput', {
+    kind: ['trend', '趋势'],
+    en: 'Tunnel overhead: direct throughput versus single-path and multipath '
+      + 'through the VPN, per direction. The overhead percentages are the point.',
+    zh: '隧道开销:直连吞吐 对比 经 VPN 的单路和多路,分上下行。重点看开销百分比。',
+  }],
+  ['failover', {
+    kind: ['trend', '趋势'],
+    en: 'Path fault and recovery: time to detect, time to recover, and the '
+      + 'throughput held while degraded, for each scheduler and each faulted path.',
+    zh: '路径故障与恢复:检测耗时、恢复耗时,以及降级期间还能保住多少吞吐,'
+      + '按调度器和故障路径分别统计。',
+  }],
+  ['udp_sweep', {
+    kind: ['trend', '趋势'],
+    en: 'UDP rate sweep: offered rate versus achieved throughput, loss and jitter, '
+      + 'at several packet sizes. Where a policer or a PPS cap shows up.',
+    zh: 'UDP 速率扫描:目标速率 对比 实际吞吐、丢包和抖动,涵盖多种包长。'
+      + '限速器或 PPS 上限会在这里现形。',
+  }],
+  ['multipath_scheduler', {
+    kind: ['trend', '趋势'],
+    en: 'Scheduler comparison across eight scenarios — the direct WLB versus '
+      + 'MinRTT versus backup-FEC read.',
+    zh: '八个场景下的调度器对比 —— 直接比较 WLB / MinRTT / backup-FEC。',
+  }],
+  ['backup_fec', {
+    kind: ['trend', '趋势'],
+    en: 'Backup-FEC scheduler against a sweep of loss on the primary path: how '
+      + 'much loss redundancy actually buys back.',
+    zh: 'backup-FEC 调度器在主路径丢包率扫描下的表现:冗余到底换回了多少。',
+  }],
+  ['ntn', {
+    kind: ['trend', '趋势'],
+    en: 'Non-terrestrial (satellite) profiles, where propagation delay dominates '
+      + 'every other term.',
+    zh: '非地面(卫星)场景,传播延迟主导一切其他因素。',
+  }],
+];
+
+function testInfo(id) {
+  if (!id) return null;
+  // Longest prefix wins so netsim_catalog_bgp_junk resolves to the family entry.
+  let best = null;
+  for (const [prefix, info] of TEST_INFO) {
+    if (id.startsWith(prefix) && (!best || prefix.length > best[0].length)) {
+      best = [prefix, info];
+    }
+  }
+  return best ? best[1] : null;
+}
 
 /* ── metric naming ───────────────────────────────────────────────────────
  * The API returns dotted paths (`results[scenario=hetero_extreme].vs_best_single`)
@@ -279,6 +397,7 @@ const METRIC_LABELS = {
   repeats: ['Repeats', '重复次数'],
   netem_seed: ['netem seed available', 'netem seed 可用'],
   pps_police: ['PPS cap available', 'PPS 限速可用'],
+  nat: ['NAT emulation available', 'NAT 模拟可用'],
   cycles_ok: ['Cycles passed', '通过轮次'],
   cycles_failed: ['Cycles failed', '失败轮次'],
   num_cycles: ['Cycles', '总轮次'],
@@ -723,8 +842,19 @@ async function loadTests() {
     : ' · ' + t('noPub');
 }
 
+// Say what the selected benchmark is, above its numbers.
+function renderAbout() {
+  const info = testInfo($('test').value);
+  const box = $('about');
+  if (!info) { box.hidden = true; return; }
+  box.hidden = false;
+  $('aboutKind').textContent = info.kind[LANG === 'zh' ? 1 : 0];
+  $('aboutText').textContent = LANG === 'zh' ? info.zh : info.en;
+}
+
 async function loadSeries() {
   const test = $('test').value;
+  renderAbout();
   if (!test) { state.data = null; $('meta').textContent = ''; render(); return; }
   $('meta').textContent = t('loading');
   const data = await getJSON('/api/series',
@@ -758,7 +888,8 @@ const refreshAll = guard(async () => { await loadTests(); await loadSeries(); })
 $('langSeg').addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
   LANG = b.dataset.lang; store('perf_lang', LANG);
-  applyLang(); if (state.data) { fillCommits(); render(); }
+  applyLang(); renderAbout();
+  if (state.data) { fillCommits(); render(); }
   if (state.selected) openDetail(state.selected);
 });
 $('viewSeg').addEventListener('click', (e) => {
@@ -780,7 +911,10 @@ window.addEventListener('resize', () => {
   if (state.selected && state.data) drawDetail(state.data.metrics[state.selected], state.data.runs);
 });
 
-LANG = recall('perf_lang') || ((navigator.language || 'en').startsWith('zh') ? 'zh' : 'en');
+// Chinese by default. The viewer's own choice still wins once made; only the
+// initial guess changed, because the browser locale was sending this dashboard
+// to English for its primary reader.
+LANG = recall('perf_lang') || 'zh';
 state.view = recall('perf_view') || 'trend';
 applyLang();
 refreshAll();
