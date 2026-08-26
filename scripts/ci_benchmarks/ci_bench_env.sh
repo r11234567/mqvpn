@@ -36,6 +36,7 @@ IP_B_SERVER="10.200.0.1/24"
 IP_A_SERVER_ADDR="10.100.0.1"
 TUNNEL_SERVER_IP="10.0.0.1"
 VPN_LISTEN_PORT="4433"
+IPERF3_PORT="5201"
 CI_BENCH_SCHEDULER="${CI_BENCH_SCHEDULER:-wlb}"
 CI_BENCH_LOG_LEVEL="${CI_BENCH_LOG_LEVEL:-error}"
 
@@ -294,9 +295,27 @@ ci_bench_run_iperf() {
     # Direction controlled by -R flag:
     #   DL (server→client): -R (reverse)
     #   UL (client→server): no flag (default iperf3 direction)
+    # Wait for the port to come free, then for the new server to own it. A
+    # scenario issues many samples back to back on this one port, and the
+    # previous sample's one-shot server can still be releasing its listener:
+    # bind then loses the race and dies into &>/dev/null, the client reaches
+    # the closing socket instead, and the sample comes back as a mid-transfer
+    # "Broken pipe" that looks like the emulated path failed.
+    local i
+    for (( i=0; i<20; i++ )); do
+        ip netns exec "$NS_SERVER" ss -ltn 2>/dev/null \
+            | grep -q ":${IPERF3_PORT} " || break
+        sleep 0.5
+    done
+
     ip netns exec "$NS_SERVER" iperf3 -s -B "$TUNNEL_SERVER_IP" -1 &>/dev/null &
     local iperf_srv_pid=$!
-    sleep 1
+
+    for (( i=0; i<20; i++ )); do
+        ip netns exec "$NS_SERVER" ss -ltn 2>/dev/null \
+            | grep -q ":${IPERF3_PORT} " && break
+        sleep 0.5
+    done
 
     local args="-c $TUNNEL_SERVER_IP -t $duration -P $parallel --json"
     [ "$proto" = "UDP" ] && args="$args -u"

@@ -656,6 +656,19 @@ run_iperf3_through_tunnel() {
     json="$(mktemp)"
     err="$(mktemp)"
 
+    # Let the previous sample's server finish releasing the port before
+    # binding. Without this the bind below loses the race, dies silently into
+    # &>/dev/null, and the listener check that follows matches the *old*
+    # server instead — so the client connects to a socket that is already
+    # closing and the transfer dies partway with "Broken pipe", which reads
+    # as a broken tunnel rather than the port collision it is.
+    if ! wait_for_port_free "$NS_SERVER" "$IPERF_PORT" 5; then
+        echo "  [iperf3] port ${IPERF_PORT} still busy from the previous sample" >&2
+        rm -f "$json" "$err"
+        echo "0.0"
+        return
+    fi
+
     ip netns exec "$NS_SERVER" iperf3 -s -B "$target" -1 &>/dev/null &
     local ipid=$!
 
@@ -667,7 +680,10 @@ run_iperf3_through_tunnel() {
     # deliberately tight: a bind either succeeds at once or never (a target
     # address that does not exist in NS_SERVER), and the perf phase can issue
     # 30 samples, so a generous timeout here would eat its 12-minute budget.
-    if ! wait_for_listening_port "$NS_SERVER" "$IPERF_PORT" 5; then
+    # The liveness check pairs with it: a server that lost a bind is gone,
+    # and reporting that beats letting the client draw its own conclusion.
+    if ! wait_for_listening_port "$NS_SERVER" "$IPERF_PORT" 5 \
+        || ! kill -0 "$ipid" 2>/dev/null; then
         echo "  [iperf3] server never listened on ${IPERF_PORT} (target ${target})" >&2
         kill "$ipid" 2>/dev/null || true
         wait "$ipid" 2>/dev/null || true
@@ -715,13 +731,21 @@ run_iperf3_v6_through_tunnel() {
     json="$(mktemp)"
     err="$(mktemp)"
 
+    if ! wait_for_port_free "$NS_SERVER" "$IPERF_PORT" 5; then
+        echo "  [iperf3 v6] port ${IPERF_PORT} still busy from the previous sample" >&2
+        rm -f "$json" "$err"
+        echo "0.0"
+        return
+    fi
+
     ip netns exec "$NS_SERVER" iperf3 -s -6 -B "$target" -1 &>/dev/null &
     local ipid=$!
 
-    # Same listener wait and stderr separation as the v4 twin above. `ss -ltn`
-    # renders a v6-bound listener as "[fd00:a6::100]:5201", which the port
-    # match handles unchanged.
-    if ! wait_for_listening_port "$NS_SERVER" "$IPERF_PORT" 5; then
+    # Same free-port wait, listener wait and stderr separation as the v4 twin
+    # above. `ss -ltn` renders a v6-bound listener as "[fd00:a6::100]:5201",
+    # which the port match handles unchanged.
+    if ! wait_for_listening_port "$NS_SERVER" "$IPERF_PORT" 5 \
+        || ! kill -0 "$ipid" 2>/dev/null; then
         echo "  [iperf3 v6] server never listened on ${IPERF_PORT} (target ${target})" >&2
         kill "$ipid" 2>/dev/null || true
         wait "$ipid" 2>/dev/null || true
@@ -863,6 +887,24 @@ wait_for_listening_port() {
     local i
     for (( i=0; i<timeout*2; i++ )); do
         if ip netns exec "$ns" ss -ltn 2>/dev/null | grep -q ":${port} "; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+# Inverse of wait_for_listening_port: poll until nothing is listening on $2.
+# The perf phase runs samples back to back on one fixed port, and a listener
+# check alone cannot tell a freshly bound server from the previous sample's
+# one-shot server still tearing its listener down. Whoever is about to bind
+# waits for the port to be genuinely free first, so a later "is it
+# listening?" can only be answering about the server it just started.
+wait_for_port_free() {
+    local ns="$1" port="$2" timeout="${3:-20}"
+    local i
+    for (( i=0; i<timeout*2; i++ )); do
+        if ! ip netns exec "$ns" ss -ltn 2>/dev/null | grep -q ":${port} "; then
             return 0
         fi
         sleep 0.5
