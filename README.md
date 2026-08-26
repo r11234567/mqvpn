@@ -26,6 +26,7 @@ https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
 ## Table of Contents
 
 <!--toc:start-->
+- [Differences from upstream](#differences-from-upstream)
 - [Supported Platforms](#supported-platforms)
 - [Features](#features)
 - [Key Use Cases](#key-use-cases)
@@ -62,6 +63,125 @@ https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
 - [License](#license)
 - [Acknowledgments](#acknowledgments)
 <!--toc:end-->
+
+## Differences from upstream
+
+This repository is a fork of [mp0rta/mqvpn](https://github.com/mp0rta/mqvpn).
+Relative to upstream it adds a real client-side certificate check, SNI-based
+shared-port routing on the server, and post-quantum key exchange — plus the
+transport fixes those changes turned out to need before the end-to-end suite
+would pass. The transport fixes live in the pinned
+[xquic fork](https://github.com/r11234567/xquic), not in this tree.
+
+### Client certificate verification against the OS trust store
+
+Upstream hands the decision to xquic/BoringSSL and collapses it into one flag:
+`cb_cert_verify` returns success when `--insecure` is set and failure otherwise,
+building no chain and checking no hostname of its own. This fork verifies the
+chain itself in `src/cert_verify.c`, against the platform's own trust store:
+
+- **Windows** — `CertGetCertificateChain` and
+  `CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL)` against the native
+  certificate store (linked via `crypt32`).
+- **POSIX** — the default CA paths of the bundled OpenSSL-compatible X.509
+  implementation. Packagers must make those paths resolvable on the target.
+
+Both paths check expiry, chaining to a trusted root, and that the certificate
+identity matches the hostname, and both report *why* a handshake was refused
+rather than failing opaquely. Verification is on by default, and `--insecure`
+is an explicit opt-out that logs a warning for as long as it is active.
+
+```ini
+# /etc/mqvpn/client.conf
+[Server]
+Address    = 203.0.113.10:443
+ServerName = vpn.example.com   # TLS SNI, and the name the certificate is checked
+                               # against (default: the host part of Address)
+# Insecure = true              # skip verification entirely — testing only
+```
+
+`ServerName` (CLI: `--tls-server-name`) is the setting to reach for when
+connecting to a bare IP that presents a DNS certificate: without it the IP
+literal is what gets matched and the handshake is refused. Full details, and the
+procedure for preserving this while merging upstream releases, are in
+[docs/client-certificate-verification.md](docs/client-certificate-verification.md).
+
+### Server fallback proxy — share one UDP port with another QUIC service
+
+On Linux the mqvpn listener can front a second QUIC service on the same port.
+The router reads the SNI out of QUIC v1/v2 Initial packets **without terminating
+the fallback connection's TLS**: configured names stay in mqvpn, ordinary HTTP/3
+goes to an h2c backend, and anything unmatched is forwarded as raw UDP.
+
+```ini
+# /etc/mqvpn/server.conf — Linux only, disabled by default
+[Proxy]
+Enabled         = true
+SNI             = vpn.example.com,*.edge.example  # names that stay in mqvpn
+QuicFallback    = 127.0.0.1:4443                  # unmatched SNI, raw UDP
+Http2Backend    = 127.0.0.1:8080                  # prior-knowledge h2c
+Http2BackendTLS = false                           # true is rejected on purpose
+MaxConnections  = 64
+IdleTimeoutSec  = 60
+```
+
+Both backends are required for the feature to start. `Http2BackendTLS = true` is
+rejected deliberately rather than ignored. See
+[docs/server-fallback-proxy.md](docs/server-fallback-proxy.md) for the routing
+rules, an nginx example, the security properties, and the current limitations.
+
+### Post-quantum key exchange (X25519MLKEM768)
+
+Both ends request hybrid ML-KEM-768 by default. It is compiled in rather than
+exposed as a config key; these two lines are identical in `src/mqvpn_client.c`
+and `src/mqvpn_server.c`:
+
+```c
+/* Prioritize AES-256-GCM for stronger encryption */
+engine_ssl.ciphers =
+    "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256";
+/* Enable post-quantum key exchange with X25519MLKEM768 */
+engine_ssl.groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
+```
+
+ML-KEM-768 is listed first with the classical curves behind it, so a peer that
+does not offer it still negotiates X25519 — turning this on does not cut off
+older clients or servers.
+
+ML-KEM-768's 1184-byte key share breaks assumptions the transport was built on,
+so it needs these supporting settings to work at all:
+
+| Setting | Value | Where |
+|---|---|---|
+| `enable_pmtud` | `1` | `src/mqvpn_conn_settings.c:131` |
+| `MQVPN_MAX_PKT_OUT_SIZE` | `1400` | `src/mqvpn_internal.h:40` |
+| `XQC_QUIC_MIN_MSS` / `XQC_QUIC_MAX_MSS` | `1200` / `1420` | xquic `src/transport/xqc_packet.h` |
+| `XQC_PACKET_OUT_HDR_GROWTH` | 277-byte reserve | xquic `src/transport/xqc_packet_out.h` |
+
+The MSS pair is back at upstream's numbers on purpose. Raising
+`XQC_QUIC_MIN_MSS` to 1500 was the first attempt at making the PQC handshake fit
+([6322682](https://github.com/r11234567/xquic/commit/6322682)); it was reverted
+in favour of PMTUD plus the header reserve
+([987c57c](https://github.com/r11234567/xquic/commit/987c57c)), which is the
+combination that actually works and does not assume a 1500-byte path. One
+residual limitation remains — see [Known issues](#known-issues).
+
+### End-to-end fixes carried in the pinned xquic
+
+`third_party/xquic` is pinned at
+[`2ae918c`](https://github.com/r11234567/xquic/commit/2ae918c). Enabling the
+features above exposed transport bugs that the e2e suite caught and that had to
+be fixed in xquic rather than here:
+
+| xquic commit | What it fixes |
+|---|---|
+| [a40cbd5](https://github.com/r11234567/xquic/commit/a40cbd5) | **A Retry could not follow a full Initial.** `xqc_conn_reassemble_packet()` rebuilt the Initial with the Retry token in the header but copied the payload in verbatim, sized against the shorter header. With a PQC key share filling the packet, AEAD needed 1453 bytes of a 1452-byte buffer and encryption failed with `XQC_TLS_ENCRYPT_DATA_ERROR` (-736), so no handshake completed at all. Surfaced as a 10 s dispatch timeout in `tests/test_tcp_egress.c`. Fixed by reserving worst-case header growth; the payload copy is now bounds-checked too. |
+| [513a991](https://github.com/r11234567/xquic/commit/513a991) | **A full receive buffer killed the connection.** Multipath bulk transfers died tens of MB in with `FRAME_ENCODING_ERROR`, traced to a buffered-frame cap of 8192 sitting *below* the 16 MiB receive window being advertised — a peer obeying flow control was rejected for exceeding a limit it was never told. Raised to `window/1KiB` and tied to the window by a `_Static_assert` so the two cannot drift apart again. |
+| [2ae918c](https://github.com/r11234567/xquic/commit/2ae918c) | Hardens `xqc_var_buf_reduce` against a wrapping subtraction and casts both operands in `xqc_submatrix`, replacing the equivalent hunks this repo carried in `patches/xquic/`. |
+
+On this side the matching work is in the netns e2e harness: the failover route
+fix and diagnostics in `42eac6c`, and waiting on `closing_notify` rather than
+`close_notify` in the TCP idle-eviction tests (`19f2e89`).
 
 ## Supported Platforms
 
