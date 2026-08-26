@@ -55,6 +55,14 @@ main { padding: 0 18px 44px; }
 .card .grp { font-size: 11px; color: var(--muted); margin-top: 2px; word-break: break-all; }
 .card .val { font-size: 19px; font-weight: 620; font-variant-numeric: tabular-nums; margin-top: 5px; }
 .card .val .u { font-size: 12px; font-weight: 500; color: var(--muted); margin-left: 3px; }
+/* Clamped rather than truncated: two lines is enough to tell which direction is
+   good, and the full text is on the card's title attribute. */
+.card .help { font-size: 11px; color: var(--muted); margin-top: 6px; line-height: 1.45;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+/* Context chips read as conditions, not measurements, so they sit back a shade
+   from the delta/CV chips above them. */
+.card .ctx { margin-top: 4px; opacity: 0.85; }
+.card .ctx .chip { font-size: 10px; }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 5px 0 2px; }
 .chip { font-size: 11px; padding: 1.5px 6px; border-radius: 999px; background: var(--chip);
   color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -227,6 +235,37 @@ const TEST_INFO = [
     zh: '精选的多路组合,按两条腿"哪里不一致"来分类:容量、延迟、稳定性、NAT、MTU,'
       + '外加真实场景组合(家庭光纤+手机热点、双移动、卫星+蜂窝)。',
   }],
+  ['netsim_mtu', {
+    kind: ['trend', '趋势'],
+    en: 'The MTU axis on its own: 1500/1400/1280 against a fixed 1500 reference leg, '
+      + 'the same sizes under a packet-rate cap (where goodput tracks bytes-per-packet '
+      + 'rather than bandwidth, so GSO batching becomes measurable), and a PMTUD black '
+      + 'hole — a hop that drops oversized packets AND the ICMP that would explain why, '
+      + 'which stalls a tunnel instead of slowing it.',
+    zh: '单独的 MTU 轴:1500/1400/1280 各自对照固定 1500 的参考腿;同样的尺寸再放到包速率'
+      + '受限的路径下(此时有效吞吐取决于每包字节数而非带宽,GSO 批量因此变得可测);以及 '
+      + 'PMTUD 黑洞 —— 中间跳既丢弃超长包、又丢弃本该解释原因的 ICMP,结果是隧道卡死而不是变慢。',
+  }],
+  ['netsim_sched', {
+    kind: ['trend', '趋势'],
+    en: 'WLB vs MinRTT vs backup-FEC over the three classes where they should diverge: '
+      + 'hetero_extreme, asym_latency and one_flapping. Watch vs_best_single — a value '
+      + 'below 1.0 means multipath came out slower than just using the better path.',
+    zh: 'WLB / MinRTT / backup-FEC 在三个本该拉开差距的场景上的对比:hetero_extreme、'
+      + 'asym_latency、one_flapping。重点看"相对最优单路":低于 1.0 就说明多路径反而比'
+      + '只用好的那条路还慢。',
+  }],
+  ['netsim_tiers', {
+    kind: ['trend', '趋势'],
+    en: 'Server box as the variable, network held wide open so it is not the bottleneck. '
+      + 'Four instance tiers as cgroup CPU/memory caps, then three host states on one tier '
+      + '(noisy neighbour, softirq storm, mid-run CPU throttle). Tier labels are nominal: '
+      + 'a quota caps throughput, it does not reproduce a slower core, and steal time '
+      + 'cannot be emulated from inside the guest at all.',
+    zh: '把服务器规格当变量,网络放到足够宽以免成为瓶颈。四档实例用 cgroup 的 CPU/内存限制'
+      + '模拟,再在其中一档上跑三种母鸡状态(邻居抢占、softirq 风暴、运行中被限流)。档位名称'
+      + '只是标签:配额只能压住吞吐上限,复现不了慢核心,steal time 更是无法在客户机内部模拟。',
+  }],
   ['netsim_combo', {
     kind: ['trend', '趋势'],
     en: 'Generated covering set over access x transit x NAT x MTU. Every level of '
@@ -380,6 +419,10 @@ const METRIC_LABELS = {
   survived_ratio: ['Survival ratio', '存活比'],
   recovered: ['Recovered', '已恢复'],
   survived: ['Survived', '存活'],
+  pre_roam_mbps: ['Before roam', '漫游前'],
+  post_roam_mbps: ['After roam', '漫游后'],
+  roam_retention: ['Roam retention', '漫游保持率'],
+  roam_applied: ['Roam actually applied', '漫游确实发生'],
   dl_idle_mbps: ['Downlink, idle uplink', '下行(上行空闲)'],
   dl_under_ul_load_mbps: ['Downlink, uplink saturated', '下行(上行满载)'],
   dl_retention: ['Downlink retention', '下行保持率'],
@@ -401,7 +444,129 @@ const METRIC_LABELS = {
   cycles_ok: ['Cycles passed', '通过轮次'],
   cycles_failed: ['Cycles failed', '失败轮次'],
   num_cycles: ['Cycles', '总轮次'],
+  // tier / host state
+  tier: ['Server tier', '服务器档位'],
+  host_state: ['Host state', '母鸡状态'],
+  path_a: ['Path A', '路径 A'],
+  path_b: ['Path B', '路径 B'],
+  scheduler: ['Scheduler', '调度器'],
+  net_class: ['Network class', '网络类型'],
+  tier_props: ['cgroup limits', 'cgroup 限制'],
+  icmp_drop: ['ICMP drop available', 'ICMP 丢弃可用'],
 };
+
+/* ── metric glossary ─────────────────────────────────────────────────────
+ * A translated name still does not say which way is better. `vs_best_single`
+ * of 1.4 is good, `rtt_inflation` of 1.4 is not, and `path_minshare` of 0 is a
+ * failure rather than a small number. Each entry is [en, zh, direction], where
+ * direction drives the arrow next to the name: 'up' = higher is better,
+ * 'down' = lower is better, 'flat' = context, not a score.
+ * Only metrics whose reading is not self-evident are listed; anything absent
+ * falls back to its label alone.                                           */
+const METRIC_HELP = {
+  aggregation_efficiency: [
+    'Multipath throughput divided by the sum of both paths measured alone. 1.0 means the two paths added up perfectly; below 1.0 is the cost of splitting traffic.',
+    '多路径吞吐 ÷ 两条路各自单跑之和。1.0 表示两条路完美相加,低于 1.0 就是分流的损耗。',
+    'up'],
+  vs_best_single: [
+    'Multipath throughput divided by the better single path. Below 1.0 means multipath is SLOWER than just using the good path — the failure this number exists to catch.',
+    '多路径吞吐 ÷ 较好的那条单路。低于 1.0 说明多路径比只用好路还慢 —— 这个指标就是为抓这种情况而存在的。',
+    'up'],
+  rtt_inflation: [
+    'Working RTT divided by the path\'s floor RTT. This is bufferbloat: 1.0 is an empty queue, 3.0 means packets wait three times the propagation delay.',
+    '工作 RTT ÷ 该路径的最小 RTT。这就是缓冲膨胀:1.0 表示队列为空,3.0 表示报文排队时间达到传播延迟的三倍。',
+    'down'],
+  path_minshare: [
+    'Traffic on the quieter path divided by the busier one. 0 means one path carried nothing at all, which is the aggregation failure worth alerting on; 1.0 is a perfectly even split.',
+    '较闲路径的流量 ÷ 较忙路径。0 表示有一条路完全没跑流量,这是最该报警的聚合失败;1.0 表示完全均分。',
+    'up'],
+  gso_factor: [
+    'Datagrams per sendmsg call. Under a packet-rate cap goodput scales with this, so a drop here explains a throughput drop that bandwidth alone cannot.',
+    '每次 sendmsg 发出的数据报数。在包速率受限时有效吞吐与它成正比,所以它下降能解释带宽无法解释的吞吐下降。',
+    'up'],
+  gro_factor: [
+    'Datagrams per recvmmsg call — the receive-side counterpart of the GSO factor.',
+    '每次 recvmmsg 收到的数据报数 —— GSO 倍率的接收侧对应项。',
+    'up'],
+  multipath_cv_pct: [
+    'Spread across repeats of the same measurement. High CV means the number is noise and a trend line through it is not evidence.',
+    '同一测量多次重复之间的离散度。CV 高说明这个数字是噪声,基于它的趋势线不能作为证据。',
+    'down'],
+  cv_pct: [
+    'Spread across repeats of the same measurement. High CV means the number is noise.',
+    '同一测量多次重复之间的离散度。CV 高说明这个数字是噪声。',
+    'down'],
+  ttf_sec: [
+    'How long the tunnel took to notice a path had died.',
+    '隧道发现某条路已死所用的时间。',
+    'down'],
+  ttr_sec: [
+    'How long throughput took to come back after the path returned.',
+    '路径恢复后吞吐重新回升所用的时间。',
+    'down'],
+  dl_retention: [
+    'Downlink throughput with the uplink saturated, divided by downlink with the uplink idle. Below 1.0 means ACK traffic is being starved by bulk upload.',
+    '上行满载时的下行吞吐 ÷ 上行空闲时的下行吞吐。低于 1.0 说明 ACK 被上行大流量挤掉了。',
+    'up'],
+  after_idle_mbps: [
+    'Throughput after idling past the NAT UDP timeout (30 s by default). A collapse here is a dead NAT binding, not congestion.',
+    '空闲超过 NAT UDP 超时(默认 30 秒)后的吞吐。这里崩掉是 NAT 映射失效,不是拥塞。',
+    'up'],
+  roam_retention: [
+    'Throughput after the client\'s source address moved mid-transfer, divided by throughput before. Read it together with "roam actually applied" — a perfect 1.0 with that flag at 0 means the address never moved and nothing was tested.',
+    '客户端源地址在传输中途变更之后的吞吐 ÷ 变更之前的吞吐。要和"漫游确实发生"一起看:若该标志为 0 而这里是完美的 1.0,说明地址根本没变,什么也没测到。',
+    'up'],
+  roam_applied: [
+    '1 when the source address really was rotated (needs iptables and conntrack on the runner), 0 when the tooling was missing and the run is not evidence of anything.',
+    '为 1 表示源地址确实被轮换了(需要 runner 上有 iptables 和 conntrack),为 0 表示工具缺失,这次运行不能作为任何结论的依据。',
+    'flat'],
+  server_rss_peak_kb: [
+    'Peak resident memory of the server process (VmHWM), the number a small instance runs out of first.',
+    '服务端进程的峰值常驻内存(VmHWM),小规格实例最先耗尽的就是它。',
+    'down'],
+  tier: [
+    'Emulated server size, applied as cgroup CPU and memory limits. A quota caps throughput; it does not reproduce a slower core\'s per-operation latency.',
+    '模拟的服务器规格,通过 cgroup 的 CPU/内存限制实现。配额只能压住吞吐上限,并不能复现慢核心的单次操作延迟。',
+    'flat'],
+  host_state: [
+    'What else was competing for the machine. Contention from a neighbour process is a proxy for a busy hypervisor — steal time cannot be emulated from inside the guest.',
+    '当时还有什么在抢这台机器。邻居进程的争抢只是"母鸡繁忙"的近似 —— steal time 无法在客户机内部模拟。',
+    'flat'],
+  multipath_mbps: [
+    'Throughput with both paths active. Absolute Mbps depends on the runner, so compare it against the ratios rather than across machines.',
+    '两条路同时启用时的吞吐。绝对 Mbps 取决于 runner,应与比值类指标对照看,不要跨机器比较。',
+    'up'],
+};
+
+function metricHelp(leaf) {
+  const h = METRIC_HELP[leaf];
+  if (!h) return null;
+  return { text: h[LANG === 'zh' ? 1 : 0], dir: h[2] };
+}
+const DIR_MARK = { up: '↑', down: '↓', flat: '·' };
+
+/* ── scenario context ────────────────────────────────────────────────────
+ * The string fields sharing a metric's object — for a netsim row that is the
+ * pair of path specs the number was measured over, and for a tier row the
+ * cgroup limits that were in force. A throughput figure means nothing without
+ * them, so they ride along on the card rather than living in the raw JSON.
+ *
+ * Matching is by object path: `results[scenario=x].multipath_mbps` and
+ * `results[scenario=x].path_a` share the prefix `results[scenario=x].`.     */
+const CONTEXT_LEAVES = ['path_a', 'path_b', 'tier_props', 'net_class', 'host_state', 'scheduler'];
+
+function scenarioContext(metricName) {
+  const ctx = (state.data && state.data.context) || {};
+  const cut = metricName.lastIndexOf('.');
+  if (cut < 0) return [];
+  const prefix = metricName.slice(0, cut + 1);
+  const out = [];
+  for (const leaf of CONTEXT_LEAVES) {
+    const v = ctx[prefix + leaf];
+    if (v) out.push([leaf, v]);
+  }
+  return out;
+}
 
 // Unit from the leaf's suffix, so an unknown metric still gets one right.
 function unitOf(leaf) {
@@ -605,10 +770,19 @@ function renderTrend(items) {
     const card = document.createElement('button');
     card.className = 'card'; card.type = 'button';
 
+    const help = metricHelp(it.desc.leaf);
+
     const nm = document.createElement('div');
-    nm.className = 'nm'; nm.textContent = it.desc.label;
+    nm.className = 'nm';
+    nm.textContent = help
+      ? `${it.desc.label} ${DIR_MARK[help.dir] || ''}`.trim()
+      : it.desc.label;
     const grp = document.createElement('div');
     grp.className = 'grp'; grp.textContent = it.desc.group || it.desc.leaf;
+
+    // The whole card gets the explanation, so hovering anywhere on it answers
+    // "which direction is good?" without a trip to the glossary below.
+    if (help) card.title = help.text;
 
     const val = document.createElement('div');
     val.className = 'val'; val.textContent = fmt(it.st.last);
@@ -624,7 +798,25 @@ function renderTrend(items) {
     chips.appendChild(chip(`${t('median')} ${fmt(it.st.median)}`));
     chips.appendChild(chip(`n=${it.st.n}`));
 
-    card.append(nm, grp, val, chips, sparkline(it.values));
+    card.append(nm, grp, val, chips);
+
+    const ctx = scenarioContext(it.name);
+    if (ctx.length) {
+      const cc = document.createElement('div');
+      cc.className = 'chips ctx';
+      for (const [leaf, v] of ctx) {
+        const label = (METRIC_LABELS[leaf] || [leaf, leaf])[LANG === 'zh' ? 1 : 0];
+        cc.appendChild(chip(`${label}: ${v}`));
+      }
+      card.appendChild(cc);
+    }
+
+    card.appendChild(sparkline(it.values));
+    if (help) {
+      const hl = document.createElement('div');
+      hl.className = 'help'; hl.textContent = help.text;
+      card.appendChild(hl);
+    }
     card.addEventListener('click', () => openDetail(it.name));
     grid.appendChild(card);
   }

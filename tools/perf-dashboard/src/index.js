@@ -153,7 +153,7 @@ async function apiSeries(url, env) {
     }
   });
 
-  const { metrics, truncated, totalMetrics } = buildSeries(docs);
+  const { metrics, context, truncated, totalMetrics } = buildSeries(docs);
 
   return {
     channel: channel.name,
@@ -161,6 +161,7 @@ async function apiSeries(url, env) {
     limit,
     runs: picked,
     metrics,
+    context,
     totalMetrics,
     truncated,
     errors,

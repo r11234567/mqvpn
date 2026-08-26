@@ -39,6 +39,10 @@ NETSIM_MAX_PATHS=${#NETSIM_OCTETS[@]}
 # dials one endpoint) and what a real deployment looks like.
 NETSIM_SERVER_ADDR="10.99.0.1"
 
+# Ethernet MTU, kept on the client side of a PMTUD black hole so the sender has
+# a reason to emit packets the far side cannot forward.
+NETSIM_FULL_MTU=1500
+
 netsim_hop_ns()          { echo "${NETSIM_NS_HOP_PREFIX}$1"; }
 netsim_veth_cli()        { echo "ns${1}-c"; }   # in NS_CLIENT, faces the hop
 netsim_veth_hop_cli()    { echo "ns${1}-hc"; }  # in the hop, faces the client
@@ -48,6 +52,9 @@ netsim_cli_ip()          { echo "10.${NETSIM_OCTETS[$1]}.1.2"; }
 netsim_hop_cli_ip()      { echo "10.${NETSIM_OCTETS[$1]}.1.1"; }
 netsim_hop_srv_ip()      { echo "10.${NETSIM_OCTETS[$1]}.2.1"; }
 netsim_srv_ip()          { echo "10.${NETSIM_OCTETS[$1]}.2.2"; }
+# The address a roaming client appears to move TO. Same subnet as the hop's
+# real server-facing address, so it needs no extra route to be reachable.
+netsim_hop_srv_ip_alt()  { echo "10.${NETSIM_OCTETS[$1]}.2.9"; }
 
 # ── Transit profiles (the six backbone classes) ────────────────────────────
 #
@@ -101,6 +108,12 @@ declare -gA NETSIM_TRANSIT=(
   # adds the policer. This is the only profile whose optimization signal is
   # packet size rather than congestion control.
   [carrier_qos]="delay 150ms 90ms distribution paretonormal loss gemodel 2% 15% 80% 0.3% rate 900mbit limit 10000"
+
+  # Not a product tier: a deliberately unconstrained path, so a benchmark whose
+  # subject is the *server* has no network ceiling in the way. Used by the tier
+  # sweep — against bgp_opt's 150mbit the faster tiers would all flatten out at
+  # the link rate and the tier axis would read as "no difference".
+  [lan]="delay 0.2ms rate 2000mbit limit 2000"
 )
 
 # Storm state for bgp_flappy / starlink, applied with `tc qdisc change` so the
@@ -200,6 +213,38 @@ netsim_apply_nat() {
         2>/dev/null || true
 }
 
+# netsim_roam <slot>
+#
+# Move the client's apparent source address, the way a handover does: replace
+# the hop's SNAT with one to a different source and drop the conntrack entries
+# holding the old mapping. Without the flush the live UDP flow keeps its
+# original translation, the server never sees a new peer address, and the test
+# passes while having exercised nothing — the same trap the D1 rebind e2e
+# documents.
+#
+# Returns non-zero if the tools are missing, so a caller can label the run
+# honestly instead of reporting a roam that never happened.
+netsim_roam() {
+    local slot="$1"
+    local hop; hop="$(netsim_hop_ns "$slot")"
+    local out; out="$(netsim_veth_hop_srv "$slot")"
+    local alt; alt="$(netsim_hop_srv_ip_alt "$slot")"
+
+    [ "$NETSIM_HAVE_NAT" = 1 ] || return 1
+    command -v conntrack >/dev/null 2>&1 || return 1
+
+    ip netns exec "$hop" ip addr add "${alt}/24" dev "$out" 2>/dev/null || true
+
+    # Flush whatever translation is in place, then pin the new source. SNAT
+    # rather than MASQUERADE: masquerade follows the interface's primary
+    # address, which is precisely what must not change here.
+    ip netns exec "$hop" iptables -t nat -F POSTROUTING 2>/dev/null || return 1
+    ip netns exec "$hop" iptables -t nat -A POSTROUTING -o "$out" \
+        -j SNAT --to-source "$alt" 2>/dev/null || return 1
+    ip netns exec "$hop" conntrack -F >/dev/null 2>&1 || true
+    return 0
+}
+
 # ── Path specs and scenario pairs ──────────────────────────────────────────
 #
 # A path is a free combination of the four axes:
@@ -254,9 +299,30 @@ declare -gA NETSIM_CLASS=(
   [nat_split]="eth:bgp_plain:public|eth:bgp_plain:symmetric"
 
   # ── MTU disagreement with everything else held equal ──
-  # Isolates MTU. Pairs with carrier_qos elsewhere, where a PPS cap makes
+  # Isolates MTU. Pairs with carrier_qos below, where a PPS cap makes
   # bytes-per-packet the dominant term.
   [mtu_split]="eth:bgp_plain:public:1500|eth:bgp_plain:public:1280"
+  # The axis, each entry against a fixed 1500 reference leg so a difference is
+  # attributable to the one leg that changed. mtu_split above is the 1280 end
+  # of the same axis; mtu_1500 is the control where nothing disagrees, which is
+  # what makes the other two readable.
+  [mtu_1500]="eth:bgp_plain:public:1500|eth:bgp_plain:public:1500"
+  [mtu_1400]="eth:bgp_plain:public:1500|eth:bgp_plain:public:1400"
+  # MTU under a packet-rate cap, where goodput scales with bytes-per-packet
+  # rather than with bandwidth. The pair of these two is what turns MTU choice
+  # and GSO batching into a number instead of a guess.
+  [mtu_pps_1500]="5g_throttled:carrier_qos:public:1500|5g_throttled:carrier_qos:public:1500"
+  [mtu_pps_1280]="5g_throttled:carrier_qos:public:1280|5g_throttled:carrier_qos:public:1280"
+  # One clean leg, one PMTUD black hole. The black-holed leg cannot carry
+  # full-size packets and never learns why, so this asks whether the tunnel
+  # rides the good path or stalls behind the broken one — a hang, not a
+  # slowdown, which is why it gets its own class.
+  [mtu_blackhole]="eth:bgp_plain:public:1500|eth:bgp_plain:public:bh1280"
+
+  # ── Server-bound reference, for the tier sweep ──
+  # Two unconstrained paths, so whatever limits throughput is the server's own
+  # CPU budget rather than the emulated network.
+  [tier_ref]="eth:lan:public|eth:lan:public"
 
   # ── Real-world composites ──
   # Home fibre plus a tethered phone, the commonest consumer multipath setup.
@@ -274,6 +340,7 @@ declare -gA NETSIM_CLASS=(
 NETSIM_HAVE_SEED=0
 NETSIM_HAVE_PPS=0
 NETSIM_HAVE_NAT=0
+NETSIM_HAVE_ICMP_DROP=0
 
 netsim_detect_caps() {
     local probe_ns="netsim-capprobe"
@@ -301,11 +368,23 @@ netsim_detect_caps() {
         NETSIM_HAVE_NAT=1
     fi
 
+    # A PMTUD black hole is built by dropping the ICMP that would report the
+    # smaller MTU. Without the filter table there is no black hole, only a
+    # small MTU — a slow path instead of a stalled one, which is a different
+    # test wearing the same name.
+    if ip netns exec "$probe_ns" iptables -A OUTPUT -p icmp \
+           --icmp-type fragmentation-needed -j DROP >/dev/null 2>&1; then
+        NETSIM_HAVE_ICMP_DROP=1
+        ip netns exec "$probe_ns" iptables -D OUTPUT -p icmp \
+            --icmp-type fragmentation-needed -j DROP >/dev/null 2>&1 || true
+    fi
+
     ip netns del "$probe_ns" 2>/dev/null || true
 
     echo "netsim caps: netem-seed=$([ "$NETSIM_HAVE_SEED" = 1 ] && echo yes || echo NO)" \
          "pps-police=$([ "$NETSIM_HAVE_PPS" = 1 ] && echo yes || echo NO)" \
-         "nat=$([ "$NETSIM_HAVE_NAT" = 1 ] && echo yes || echo NO)"
+         "nat=$([ "$NETSIM_HAVE_NAT" = 1 ] && echo yes || echo NO)" \
+         "icmp-drop=$([ "$NETSIM_HAVE_ICMP_DROP" = 1 ] && echo yes || echo NO)"
     if [ "$NETSIM_HAVE_SEED" != 1 ]; then
         echo "  note: no netem seed on this iproute2 — loss/jitter patterns vary" \
              "run-to-run; compensate with longer runs, not more repeats."
@@ -317,6 +396,10 @@ netsim_detect_caps() {
     if [ "$NETSIM_HAVE_NAT" != 1 ]; then
         echo "  note: no iptables nat table — every path degrades to 'public'," \
              "so NAT-dependent scenarios measure something easier than intended."
+    fi
+    if [ "$NETSIM_HAVE_ICMP_DROP" != 1 ]; then
+        echo "  note: cannot drop ICMP frag-needed — a 'bh' MTU degrades to an" \
+             "ordinary small MTU, measuring a slow path rather than a stalled one."
     fi
 }
 
@@ -471,9 +554,16 @@ netsim_apply_path() {
     ip netns exec "$NETSIM_NS_SERVER" tc qdisc replace dev "$vs"  root netem ${t_dn} || return 1
 
     # An explicit MTU in the spec wins; otherwise the access leg's own clamp
-    # applies (it is the CPE or radio that sets it).
+    # applies (it is the CPE or radio that sets it). A `bh` prefix asks for the
+    # black-hole variant at that size rather than a clean clamp.
     mtu="${mtu:-${NETSIM_LEG_MTU[$access]:-}}"
-    [ -n "$mtu" ] && netsim_set_mtu "$slot" "$mtu"
+    if [ -n "$mtu" ]; then
+        if [ "${mtu#bh}" != "$mtu" ]; then
+            netsim_set_pmtud_blackhole "$slot" "${mtu#bh}"
+        else
+            netsim_set_mtu "$slot" "$mtu"
+        fi
+    fi
 
     netsim_apply_nat "$slot" "$nat" || return 1
 
@@ -493,6 +583,43 @@ netsim_set_mtu() {
     ip netns exec "$hop" ip link set "$(netsim_veth_hop_cli "$slot")" mtu "$mtu"
     ip netns exec "$hop" ip link set "$(netsim_veth_hop_srv "$slot")" mtu "$mtu"
     ip netns exec "$NETSIM_NS_SERVER" ip link set "$(netsim_veth_srv "$slot")" mtu "$mtu"
+}
+
+# netsim_set_pmtud_blackhole <slot> <hop_mtu>
+#
+# The MTU failure that hangs a tunnel instead of slowing it. Three things have
+# to be true at once, and leaving out any one of them produces a merely slow
+# path:
+#
+#   1. the client side keeps a full-size MTU, so the sender goes on emitting
+#      packets too big for the far side;
+#   2. the hop's server-facing link is smaller, so forwarding them is
+#      impossible and the kernel drops them (QUIC sets DF, so there is no
+#      fragmentation to fall back on);
+#   3. the ICMP Frag Needed that would report the smaller MTU is dropped, so
+#      path MTU discovery never converges and the sender retransmits the same
+#      oversized packet indefinitely.
+#
+# Only the client->server direction is black-holed. The reverse stays clean,
+# which is both the realistic shape and what lets a stalled upload be told
+# apart from a dead path.
+netsim_set_pmtud_blackhole() {
+    local slot="$1" mtu="$2" hop
+    hop="$(netsim_hop_ns "$slot")"
+
+    ip netns exec "$NETSIM_NS_CLIENT" \
+        ip link set "$(netsim_veth_cli "$slot")" mtu "$NETSIM_FULL_MTU"
+    ip netns exec "$hop" \
+        ip link set "$(netsim_veth_hop_cli "$slot")" mtu "$NETSIM_FULL_MTU"
+    ip netns exec "$hop" \
+        ip link set "$(netsim_veth_hop_srv "$slot")" mtu "$mtu"
+    ip netns exec "$NETSIM_NS_SERVER" \
+        ip link set "$(netsim_veth_srv "$slot")" mtu "$mtu"
+
+    if [ "$NETSIM_HAVE_ICMP_DROP" = 1 ]; then
+        ip netns exec "$hop" iptables -A OUTPUT -p icmp \
+            --icmp-type fragmentation-needed -j DROP 2>/dev/null || true
+    fi
 }
 
 # netsim_apply_pps_cap <slot> <pps>

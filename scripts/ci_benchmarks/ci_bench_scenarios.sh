@@ -28,6 +28,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci_bench_env.sh"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/ci_bench_netsim.sh"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/ci_bench_host.sh"
 
 MODE="${1:-percommit}"
 case "$MODE" in
@@ -49,7 +51,7 @@ REPEATS="${CI_BENCH_REPEATS:-2}"
 CI_BENCH_RESULTS="${CI_BENCH_RESULTS:-${SCRIPT_DIR}/../../ci_bench_results}"
 mkdir -p "$CI_BENCH_RESULTS"
 ROWS="$(mktemp)"
-trap 'rm -f "$ROWS"; netsim_spike_stop "${SPIKE_PID:-}"; ci_bench_stop_vpn 2>/dev/null || true; netsim_teardown' EXIT
+trap 'rm -f "$ROWS"; netsim_spike_stop "${SPIKE_PID:-}"; ci_bench_host_stop 2>/dev/null || true; ci_bench_stop_vpn 2>/dev/null || true; ci_bench_tier_cleanup 2>/dev/null || true; netsim_teardown' EXIT
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -216,6 +218,83 @@ print(json.dumps(row))" \
     netsim_teardown
 }
 
+# ── scenario: server tier and host state ──────────────────────────────────
+#
+# run_tier <tier> <host_state> [class]
+#
+# The network is held at a class fast enough that it is not the bottleneck, so
+# what the number moves with is the server's own box. Read these as ceilings of
+# a smaller instance, not as that instance's latency: CPUQuota throttles time
+# slices, and no cgroup makes a fast core into a slow one. `noisy_neighbour`
+# and `softirq_storm` are competing-load proxies for a busy hypervisor, which
+# cannot be emulated from inside the guest at all.
+run_tier() {
+    local tier="$1" state="$2" class="${3:-tier_ref}"
+    local spec="${NETSIM_CLASS[$class]:-}"
+    [ -n "$spec" ] || { echo "unknown class $class" >&2; return 1; }
+
+    echo ""
+    echo "── tier ${tier} / host ${state} (net=${class}) ──"
+    ci_bench_stop_vpn 2>/dev/null || true
+    netsim_setup 2 >/dev/null || return 1
+    netsim_apply_path 0 "${spec%%|*}" 4242 || return 1
+    netsim_apply_path 1 "${spec##*|}" 4252 || return 1
+
+    # Exported so ci_bench_start_server picks the tier up without every caller
+    # having to thread it through.
+    CI_BENCH_TIER="$tier"
+    ci_bench_host_start "$state" "$tier"
+
+    if ! start_server_with_ctrl "$CI_BENCH_SCHEDULER" >/dev/null; then
+        ci_bench_host_stop
+        CI_BENCH_TIER=""
+        return 1
+    fi
+
+    # A provider throttle is only interesting if it lands on a transfer that is
+    # already running, so it is scheduled rather than pre-applied.
+    local cap_pid=""
+    if [ "$state" = cpu_capped ]; then
+        ( sleep $(( IPERF_SEC / 2 + 1 )); ci_bench_tier_throttle ) &
+        cap_pid=$!
+    fi
+
+    local dev0 dev1 mp cv
+    dev0="$(netsim_veth_cli 0)"; dev1="$(netsim_veth_cli 1)"
+    read -r mp cv < <(measure_pathset "--path $dev0 --path $dev1")
+
+    local stats rss
+    stats="$(collect_stats)"; rss="$(server_rss_kb)"
+
+    if [ -n "$cap_pid" ]; then
+        kill "$cap_pid" 2>/dev/null || true
+        wait "$cap_pid" 2>/dev/null || true
+    fi
+    ci_bench_host_stop
+    ci_bench_stop_vpn
+    CI_BENCH_TIER=""
+
+    python3 -c "
+import json,sys
+row = {
+  'scenario': sys.argv[1], 'tier': sys.argv[2], 'host_state': sys.argv[3],
+  'net_class': sys.argv[4], 'scheduler': sys.argv[5],
+  'multipath_mbps': float(sys.argv[6]),
+  'multipath_cv_pct': float(sys.argv[7]),
+  'server_rss_peak_kb': int(sys.argv[8]),
+  'tier_props': sys.argv[9],
+  'tier_nominal': 'label only -- a quota ceiling, not this instance\'s latency',
+}
+extra = sys.argv[10]
+if extra: row.update(json.loads('{' + extra + '}'))
+print(json.dumps(row))" \
+        "${tier}+${state}" "$tier" "$state" "$class" "$CI_BENCH_SCHEDULER" \
+        "$mp" "$cv" "$rss" "${CI_BENCH_TIER_PROPS[$tier]:-none}" "$stats" >> "$ROWS"
+
+    echo "   mp=${mp} Mbps  (cv ${cv}%)  rss=${rss}kB"
+    netsim_teardown
+}
+
 # ── scenario: a generated covering set of multipath combinations ──────────
 #
 # The four axes are independent (any access leg composes with any transit, NAT
@@ -365,6 +444,47 @@ print(json.dumps({'scenario':'ack_starvation','dl_idle_mbps':i,'dl_under_ul_load
         ci_bench_stop_vpn || true
         netsim_teardown
     fi
+
+    # 4. Live roaming: the client's source address changes mid-transfer, the
+    #    way a handover looks to the server. Functional rebind coverage already
+    #    exists under scripts/ci_e2e/; what it does not do is move the address
+    #    while the link is saturated, which is where a rebind either costs a
+    #    few hundred milliseconds or wedges the connection.
+    echo ""
+    echo "── special: roam_under_load (source address moves mid-transfer) ──"
+    if netsim_setup 1 >/dev/null \
+       && netsim_apply_path 0 "5g_full:bgp_plain:port_restricted" 4242; then
+        if start_server_with_ctrl >/dev/null \
+           && ci_bench_start_client "--path $(netsim_veth_cli 0)" >/dev/null 2>&1 \
+           && ci_bench_wait_tunnel 25 >/dev/null 2>&1; then
+            local pre post roamed jf3
+            jf3="$(ci_bench_run_iperf TCP DL 5 1)"; pre="$(ci_bench_parse_throughput "$jf3")"; rm -f "$jf3"
+
+            # Move the address underneath a transfer that is already running,
+            # then measure what comes back. Measuring only after the roam would
+            # not distinguish "recovered quickly" from "never noticed".
+            ip netns exec "$NS_CLIENT" iperf3 -c "$TUNNEL_SERVER_IP" -t 14 &>/dev/null &
+            local loadpid=$!
+            sleep 3
+            roamed=0
+            if netsim_roam 0; then roamed=1; else
+                echo "   (no conntrack/iptables — address did not actually move)"
+            fi
+            sleep 2
+            jf3="$(ci_bench_run_iperf TCP DL 5 1)"; post="$(ci_bench_parse_throughput "$jf3")"; rm -f "$jf3"
+            kill "$loadpid" 2>/dev/null || true; wait "$loadpid" 2>/dev/null || true
+
+            python3 -c "
+import json,sys
+p,q,r = float(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])
+print(json.dumps({'scenario':'roam_under_load','pre_roam_mbps':p,'post_roam_mbps':q,
+ 'roam_retention':round(q/p,3) if p else 0,'roam_applied':r,
+ 'recovered':1 if q>0.5 else 0}))" "$pre" "$post" "$roamed" >> "$ROWS"
+            echo "   pre=${pre} post=${post} Mbps (roam_applied=${roamed})"
+        fi
+        ci_bench_stop_vpn || true
+        netsim_teardown
+    fi
 }
 
 # ── main ───────────────────────────────────────────────────────────────────
@@ -388,6 +508,55 @@ case "$MODE" in
              asym_latency one_flapping carrier_pair nat_split mtu_split \
              home_plus_tether dual_mobile sat_plus_cell; do
         run_class "$c" || echo "  (class $c failed, continuing)"
+    done
+    ;;
+  mtu)
+    # The MTU axis on its own: three sizes against a 1500 reference, the same
+    # sizes under a packet-rate cap (where goodput tracks bytes-per-packet
+    # rather than bandwidth), and the black hole that stalls instead of slowing.
+    TEST_NAME="netsim_mtu"
+    REPEATS="${CI_BENCH_REPEATS:-3}"
+    for c in mtu_1500 mtu_1400 mtu_split mtu_pps_1500 mtu_pps_1280 mtu_blackhole; do
+        run_class "$c" || echo "  (class $c failed, continuing)"
+    done
+    ;;
+  sched)
+    # Scheduler comparison, restricted to the three classes where the
+    # schedulers should actually disagree — a sweep over the classes where they
+    # agree costs runner minutes and produces three identical lines.
+    TEST_NAME="netsim_sched"
+    REPEATS="${CI_BENCH_REPEATS:-3}"
+    SCHEDS="wlb minrtt"
+    if grep -q "define XQC_ENABLE_FEC" \
+           "${SCRIPT_DIR}/../../third_party/xquic/include/xquic/xqc_configure.h" 2>/dev/null \
+       && grep -q "define XQC_ENABLE_XOR" \
+           "${SCRIPT_DIR}/../../third_party/xquic/include/xquic/xqc_configure.h" 2>/dev/null; then
+        SCHEDS="$SCHEDS backup_fec"
+    else
+        echo "::notice::xquic built without FEC+XOR — backup_fec omitted from the sweep"
+    fi
+    for c in hetero_extreme asym_latency one_flapping; do
+        for s in $SCHEDS; do
+            run_class "$c" "$s" || echo "  (class $c/$s failed, continuing)"
+        done
+    done
+    ;;
+  tiers)
+    # Server box as the variable, network held constant. Every tier at healthy
+    # for the ceiling, then the four host states on one mid tier — the states
+    # are about contention, and repeating them per tier multiplies runtime
+    # without adding an axis.
+    TEST_NAME="netsim_tiers"
+    REPEATS="${CI_BENCH_REPEATS:-3}"
+    if ! ci_bench_have_tiers; then
+        echo "::warning::transient scopes unavailable — tier rows will be untiered" \
+             "and must not be read as instance ceilings"
+    fi
+    for t in vps_1c1g vps_1c1g_std vps_2c2g vps_2c2g_fast; do
+        run_tier "$t" healthy || echo "  (tier $t failed, continuing)"
+    done
+    for s in noisy_neighbour softirq_storm cpu_capped; do
+        run_tier vps_2c2g "$s" || echo "  (host $s failed, continuing)"
     done
     ;;
   combo)

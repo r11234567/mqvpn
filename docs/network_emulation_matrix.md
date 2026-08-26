@@ -8,29 +8,30 @@ to `main`) is a fast smoke test on one bad network; **weekly**
 
 ## 0. Honest status
 
-Roughly **40%** of the requested scope is implemented. The path-shape half
-exists; the endpoint half does not, and the geographic routing that was called
-out explicitly is absent.
+The endpoint half now exists. What remains undone is the topology half — hop
+count and geography — plus one item that turns out to be blocked on the client
+rather than on the harness.
 
 | Requested | Status | Where |
 |---|---|---|
-| 6 backbone classes (IPLC, optimized/plain/junk/flapping BGP, carrier QoS) | **done** — 7 profiles | `NETSIM_TRANSIT` |
+| 6 backbone classes (IPLC, optimized/plain/junk/flapping BGP, carrier QoS) | **done** — 8 profiles incl. an unconstrained `lan` reference | `NETSIM_TRANSIT` |
 | Client access: eth / WiFi / 5G / satellite / tethering | **approximated** — 10 legs stand in for ~32 combinations | `NETSIM_ACCESS` |
-| Heterogeneity-class aggregation | **done** — 7 classes | `NETSIM_CLASS` |
+| Heterogeneity-class aggregation | **done** — 19 classes | `NETSIM_CLASS` |
 | **Many hops to the server** | **NOT done** — exactly one intermediate namespace (2 hops) | — |
 | **Geographic detours (Asia→EU via US, Asia→US via EU)** | **NOT done** | — |
-| **Asymmetric routing (forward ≠ return)** | **NOT done** — every leg is shaped identically both ways | — |
-| MTU large/small | **barely** — one leg at 1400; no 1280, no sweep | `NETSIM_LEG_MTU` |
-| Client NAT: public + 4 types | **NOT done** — only one MASQUERADE inside the NAT-aging test | — |
-| **Server tier (1c1g / 2c2g, GB5 400–2000)** | **NOT done** — designed, zero code | — |
-| **Host (母鸡) state: healthy / loaded / softirq storm** | **NOT done** | — |
+| Asymmetric routing (forward ≠ return) | **done** — four netem qdiscs per path, independently seeded per direction | `netsim_apply_path` |
+| MTU large/small | **done** — 1500/1400/1280 axis, crossed with a PPS cap, plus a PMTUD black hole | `mtu` mode |
+| Client NAT: public + 4 types | **done** — all five, at the access hop | `NETSIM_NAT` |
+| **Server tier (1c1g / 2c2g, GB5 400–2000)** | **done** — four tiers as cgroup caps, labelled nominal | `ci_bench_host.sh` |
+| **Host (母鸡) state: healthy / loaded / softirq storm** | **done** — plus a mid-run CPU throttle | `ci_bench_host.sh` |
 | Server 2.5G / client 1G line rates | **NOT done, and partly infeasible** — see §5 | — |
-| 5 special conditions | **3 of 5** — NAT aging, corrupt/reorder, ACK starvation | `run_special` |
-| Scheduler comparison across classes | **NOT done** — one scheduler per run | — |
+| 5 special conditions | **4 of 5** — NAT aging, corrupt/reorder, ACK starvation, roaming under load | `run_special` |
+| Dual-stack routing split | **blocked on the client, not the harness** — see §2.5 | — |
+| Scheduler comparison across classes | **done** — WLB / MinRTT / backup-FEC over the three diverging classes | `sched` mode |
 
-Nothing here is wasted: the leg-composition engine is what makes the rest cheap
-to add. But the matrix as it stands answers "how does a bad *link* behave",
-not "how does a real deployment behave".
+The matrix now answers "how does a real deployment behave" for everything
+except *where the server is*: every path is still one hop wide, so a detour
+through another continent is modelled as latency rather than as a route.
 
 ---
 
@@ -231,13 +232,29 @@ rather than slowing it. Cross MTU with `carrier_qos`, because under a PPS cap
 goodput scales with bytes-per-packet: that pairing is what turns MTU choice and
 GSO batching into a measurable number instead of a guess.
 
-### 2.5 The two remaining special conditions
+### 2.5 The remaining special condition
 
-- **Dual-stack routing split.** v4 and v6 paths with divergent delay/loss;
-  assert no stall when the preferred family degrades mid-transfer. Needs v6
-  addressing threaded through the hop chain — the reason it was deferred.
-- **Live roaming under load.** The existing rebind e2e, but with traffic
-  saturating the link across the address change.
+- **Live roaming under load.** **Done** — `run_special`'s `roam_under_load`
+  rotates the hop's SNAT source mid-transfer and flushes conntrack, because
+  without the flush the live UDP flow keeps its old translation, the server
+  never sees a new peer address, and the test passes having exercised nothing.
+  The row carries `roam_applied` so a run on a box without conntrack is not
+  mistaken for a clean result.
+
+- **Dual-stack routing split.** **Blocked on the client, not on the harness.**
+  This was filed as "needs v6 addressing threaded through the hop chain", which
+  understated it. The condition to test is one session with a v4 path and a v6
+  path, asserting no stall when the preferred family degrades. But the client
+  takes a single `--server HOST:PORT` — the option is not repeatable, while
+  `--path IFACE` is — so every path in a session dials the same endpoint and
+  therefore the same address family. No amount of netns plumbing expresses a
+  per-path family split.
+
+  Adding v6 addresses to the hop chain on its own would be dead code, so
+  nothing was added. Unblocking it needs a product change first: either a
+  repeatable `--server`, or per-path endpoint selection. Until then the honest
+  scope is v6 *instead of* v4 (a v6-only topology, which would exercise the v6
+  data path but is a different test), not v4 *and* v6 in one session.
 
 ### 2.6 Scheduler sweep
 
@@ -317,12 +334,24 @@ standard-runner minutes are free.
 
 ## 6. Build order
 
-1. **Fix the `XQC_ELIMIT` connection kill.** Everything lossy is unmeasurable
-   until this is done.
-2. **Fix the `ci_bench_run_iperf` hang.** Every long matrix depends on it.
-3. **N-hop chain + per-direction netem**, then the geographic route table.
-4. **Server tiers + host contention** — the whole missing half, and cheap once
-   the wrapper exists.
-5. NAT matrix and MTU axis (including the PMTUD black hole).
-6. Dashboard descriptions and glossary.
-7. Scheduler sweep, remaining two special conditions, endurance jobs.
+1. ~~Fix the `XQC_ELIMIT` connection kill.~~ **Done** — the buffered-frame cap
+   was raised to match the receive window and `-XQC_ELIMIT` was made a tolerant
+   error, so a full buffer drops a packet and retransmits instead of killing the
+   connection.
+2. ~~Fix the `ci_bench_run_iperf` hang.~~ **Done** — client `timeout` plus
+   killing the server before waiting on it. A follow-up fixed the related port
+   collision: consecutive samples share one port, and the listener check could
+   match the *previous* sample's server still shutting down.
+3. **N-hop chain**, then the geographic route table. The only remaining item,
+   and the one that needs `netsim_setup`'s veth chain and routing rewritten
+   rather than extended. Per-direction netem is already in place.
+4. ~~Server tiers + host contention.~~ **Done** — `ci_bench_host.sh`, `tiers`
+   mode.
+5. ~~NAT matrix and MTU axis (including the PMTUD black hole).~~ **Done** —
+   `NETSIM_NAT`, `mtu` mode, `netsim_set_pmtud_blackhole`.
+6. ~~Dashboard descriptions and glossary.~~ **Done** — per-test descriptions,
+   a direction-aware metric glossary, and the emulated profile shown on each
+   card via the series API's new `context` map.
+7. ~~Scheduler sweep~~ (**done**, `sched` mode) and ~~roaming under load~~
+   (**done**). The dual-stack split is blocked on the client; see §2.5.
+   Endurance jobs remain unscheduled.

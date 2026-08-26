@@ -10,6 +10,8 @@
 export const MAX_LIMIT = 100;
 /** Guard against one pathological document (a sweep with thousands of points) swamping a response. */
 export const MAX_METRICS = 400;
+/** Same guard for the context strings that ride alongside those metrics. */
+export const MAX_CONTEXT = 200;
 
 /**
  * Benchmark id from a result filename: `raw_throughput_20260823_080000.json`
@@ -74,6 +76,38 @@ export function flattenNumbers(value, prefix = '', out = {}, depth = 0) {
 }
 
 /**
+ * Collect every string in a document, keyed by the same dotted paths
+ * flattenNumbers uses.
+ *
+ * These are not plottable, which is exactly why they matter: they are the
+ * emulated profile a number was produced under (`path_a`, `tier_props`,
+ * `mode`). A throughput figure read without them is unattributable, so the
+ * page shows them beside the value.
+ *
+ * Long strings are dropped rather than truncated — anything past label length
+ * is prose that belongs in the raw document, not on a card.
+ */
+export function flattenStrings(value, prefix = '', out = {}, depth = 0) {
+  if (depth > 8) return out;
+  if (typeof value === 'string') {
+    if (prefix && value.length <= 120) out[prefix] = value;
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      flattenStrings(value[i], `${prefix}[${arrayLabel(value[i], i)}]`, out, depth + 1);
+    }
+    return out;
+  }
+  if (value && typeof value === 'object') {
+    for (const k of Object.keys(value)) {
+      flattenStrings(value[k], prefix ? `${prefix}.${k}` : k, out, depth + 1);
+    }
+  }
+  return out;
+}
+
+/**
  * Choose which runs to chart, oldest-first.
  *
  * index.json is newest-first, so the newest `limit` matching entries are taken
@@ -132,5 +166,16 @@ export function buildSeries(docs) {
   for (const name of kept) {
     metrics[name] = flat.map((f) => (name in f ? f[name] : null));
   }
-  return { metrics, truncated, totalMetrics: names.length };
+
+  // Context comes from the newest document only. It describes the conditions a
+  // run was measured under, and showing the oldest run's emulated profile next
+  // to the newest run's number would be worse than showing none.
+  const newest = docs.length ? docs[docs.length - 1] : null;
+  const allContext = newest ? flattenStrings(newest) : {};
+  const context = {};
+  for (const k of Object.keys(allContext).slice(0, MAX_CONTEXT)) {
+    context[k] = allContext[k];
+  }
+
+  return { metrics, context, truncated, totalMetrics: names.length };
 }

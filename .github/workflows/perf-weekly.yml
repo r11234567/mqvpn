@@ -51,7 +51,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3 netcat-openbsd
+          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3 netcat-openbsd \
+            conntrack stress-ng
 
       - name: Compute xquic SHA
         id: xqsha
@@ -184,6 +185,13 @@ jobs:
           # The five special conditions, run under saturating load — they all
           # have functional coverage already; load is what was missing.
           - { id: special,     args: special }
+          # The MTU axis on its own, including the PMTUD black hole.
+          - { id: mtu,         args: mtu }
+          # WLB / MinRTT / backup-FEC, only over the classes where they diverge.
+          - { id: sched,       args: sched }
+          # Server tiers and host contention: the network is held wide open so
+          # the server's own CPU budget is what the number moves with.
+          - { id: tiers,       args: tiers }
           # One transit profile against all ten access legs.
           - { id: cat_iplc,    args: catalog iplc }
           - { id: cat_opt,     args: catalog bgp_opt }
@@ -204,7 +212,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3 netcat-openbsd
+          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3 netcat-openbsd \
+            conntrack stress-ng
 
       - name: Compute xquic SHA
         id: xqsha

@@ -183,7 +183,14 @@ ci_bench_start_server() {
         -keyout "${_CB_WORK_DIR}/server.key" -out "${_CB_WORK_DIR}/server.crt" \
         -days 365 -nodes -subj "/CN=ci-bench" 2>/dev/null
 
-    ip netns exec "$NS_SERVER" "$MQVPN" \
+    # Tier prefix, empty for every caller that does not set CI_BENCH_TIER.
+    # Unquoted on purpose: it expands to several systemd-run arguments.
+    local tier_prefix=""
+    if [ -n "${CI_BENCH_TIER:-}" ]; then
+        tier_prefix="$(ci_bench_tier_prefix "$CI_BENCH_TIER")" || return 1
+    fi
+
+    ${tier_prefix} ip netns exec "$NS_SERVER" "$MQVPN" \
         --mode server \
         --listen "0.0.0.0:${VPN_LISTEN_PORT}" \
         --subnet 10.0.0.0/24 \
@@ -272,6 +279,12 @@ ci_bench_stop_vpn() {
         wait "$_CB_SERVER_PID" 2>/dev/null || true
         _CB_SERVER_PID=""
         sleep 1
+    fi
+    # A tiered server runs inside a transient scope, and the pid above is
+    # systemd-run's rather than the server's, so the kill can return with the
+    # server still holding its listen port.
+    if [ -n "${CI_BENCH_TIER:-}" ] && declare -F ci_bench_tier_cleanup >/dev/null; then
+        ci_bench_tier_cleanup
     fi
 }
 

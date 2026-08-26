@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 
-import { buildSeries, flattenNumbers, pickRuns, testIdFromFile } from '../src/metrics.js';
+import { buildSeries, flattenNumbers, flattenStrings, pickRuns, testIdFromFile } from '../src/metrics.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const samples = join(here, '..', '..', '..', 'bench_results');
@@ -109,6 +109,36 @@ check('every series has one value per run', () => {
   for (const [name, values] of Object.entries(metrics)) {
     assert.equal(values.length, docs.length, `${name} has ${values.length} points`);
   }
+});
+
+console.log('flattenStrings / scenario context');
+check('strings are collected on the same paths the numbers use', () => {
+  const flat = flattenStrings({
+    results: [{ scenario: 'mtu_split', path_a: 'eth:bgp_plain:public:1500', multipath_mbps: 12 }],
+  });
+  assert.equal(flat['results[scenario=mtu_split].path_a'], 'eth:bgp_plain:public:1500');
+  // The number is not a string and must not appear here.
+  assert.ok(!('results[scenario=mtu_split].multipath_mbps' in flat));
+});
+
+check('prose-length strings are dropped rather than shown as a label', () => {
+  const flat = flattenStrings({ note: 'x'.repeat(200), short: 'ok' });
+  assert.ok(!('note' in flat));
+  assert.equal(flat.short, 'ok');
+});
+
+check('context describes the newest run, not an older one', () => {
+  const { context } = buildSeries([
+    { results: [{ scenario: 's', path_a: 'old-spec', v: 1 }] },
+    { results: [{ scenario: 's', path_a: 'new-spec', v: 2 }] },
+  ]);
+  assert.equal(context['results[scenario=s].path_a'], 'new-spec');
+});
+
+check('a cyclic-depth document terminates in flattenStrings too', () => {
+  let deep = { s: 'leaf' };
+  for (let i = 0; i < 40; i++) deep = { nested: deep };
+  assert.doesNotThrow(() => flattenStrings(deep));
 });
 
 console.log('pickRuns');
