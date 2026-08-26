@@ -33,7 +33,7 @@ The matrix now answers "how does a real deployment behave" for everything
 except *where the server is*: every path is still one hop wide, so a detour
 through another continent is modelled as latency rather than as a route.
 
-### 0.1 The matrix is built, but it has never produced a measurement
+### 0.1 The matrix is built, but it had never produced a measurement
 
 Everything marked **done** above means *the scenario exists and runs*, not that
 it has yielded a usable number. In the 2026-08-26 weekly run
@@ -43,7 +43,10 @@ jobs, not one of them non-zero — and three of the eleven jobs never finished a
 all. The per-commit `netsim_percommit` row is 0.0 as well, so this has been true
 since the harness was first wired in, not a recent regression.
 
-Two independent defects, both in the harness rather than in mqvpn:
+Two independent defects, both in the harness rather than in mqvpn. **Both are
+fixed below; neither is confirmed yet.** The deadlock (B) is proven fixed by
+local reproduction, but nothing here can be called verified until a weekly run
+comes back with non-zero numbers — read the next run before trusting §2-§4.
 
 **A. The tunnel never establishes, so every scenario reads zero.**
 `NETSIM_SERVER_ADDR` (`10.99.0.1`) exists only as a `/32` on `lo` in the server
@@ -64,8 +67,8 @@ xqc_conn_destroy ... hsk_recv:0 | handshake_time:0 | close_msg:idle timeout
 dialled destination coincide. netsim is the first topology to put the service
 address behind a router hop.
 
-Fix: give every server-side route back to a client subnet an explicit preferred
-source, in `netsim_setup`:
+**Fixed** by giving every server-side route back to a client subnet an explicit
+preferred source, in `netsim_setup`:
 
 ```bash
 ip netns exec "$NETSIM_NS_SERVER" ip route add "10.${NETSIM_OCTETS[$i]}.1.0/24" \
@@ -73,9 +76,12 @@ ip netns exec "$NETSIM_NS_SERVER" ip route add "10.${NETSIM_OCTETS[$i]}.1.0/24" 
 ```
 
 The `ping -I <dev>` reachability check that closes `netsim_setup` sources from
-the veth address, so it passes on a topology whose service address is
-unusable. It has to assert the *reply's* source address too, or it will keep
-certifying a broken path as healthy.
+the veth address, so it passed on a topology whose service address was
+unusable — it certified the broken path as healthy for as long as this bug
+existed. `netsim_setup` now also asserts, per path, that
+`ip route get <client>` in the server namespace reports
+`src $NETSIM_SERVER_ADDR`, and fails the scenario when it does not. A
+regression here now stops the job instead of publishing zeros.
 
 **B. Any class with a flapping transit hangs its job until the 60-minute cap.**
 `netsim_spike_start` backgrounds an infinite loop and reports its PID on stdout,
@@ -94,10 +100,11 @@ modes containing `one_flapping` or a `bgp_flappy` leg) time out, while `mtu`,
 last lines are the two `path` announcements of `one_flapping`, then fifty
 minutes of silence.
 
-Fix: do not return the PID through stdout — have `netsim_spike_start` assign a
-global (`NETSIM_SPIKE_PID`) in the caller's own shell, or redirect the loop's
-stdout away from the pipe so the substitution can close. `netsim_spike_stop`'s
-`wait` must also tolerate a PID that is not its child.
+**Fixed** by not returning the PID through stdout at all: `netsim_spike_start`
+now assigns `NETSIM_SPIKE_PID` in the caller's own shell and redirects the
+loop's own output to `/dev/null`, and `netsim_spike_stop` reads that global.
+The driver is now a direct child of the calling shell, so its `wait` is
+meaningful rather than an error the old code had to swallow.
 
 **C. A job that times out loses even the scenarios that succeeded.** The results
 JSON is written once, after the mode's loop finishes, so all three hung jobs
@@ -105,9 +112,10 @@ uploaded nothing (`No files were found with the provided path:
 ci_bench_results/*.json`). Append each row as it is produced, or emit the
 document from the `EXIT` trap.
 
-Until A and B are fixed, nothing in §2-§4 can be concluded from this harness's
-output, and the §0 table should be read as "scenario implemented", never as
-"scenario measured".
+Until a run comes back green *with numbers in it*, the §0 table should still be
+read as "scenario implemented", never as "scenario measured". The estimates in
+§4 are built on timings from runs that carried no traffic and will need redoing
+against a real one.
 
 ---
 
@@ -410,12 +418,13 @@ standard-runner minutes are free.
 
 ## 6. Build order
 
-0. **Make the harness measure anything at all** — the service-address source
-   bug (§0.1 A) and the spike-driver deadlock (§0.1 B). Everything numbered
-   below is already written and already running; none of it has produced a
-   non-zero result, so this is the only item that currently blocks value. Add
-   the reply-source assertion to `netsim_setup` at the same time, so a
-   regression here fails the job instead of publishing zeros.
+0. ~~**Make the harness measure anything at all** — the service-address source
+   bug (§0.1 A) and the spike-driver deadlock (§0.1 B).~~ **Fixed, unconfirmed.**
+   Both defects are addressed and `netsim_setup` now asserts the reply source
+   address, but no run has yet come back with a non-zero measurement. Confirm
+   against the next weekly before reading anything into §2-§4, and re-estimate
+   §4's budget from that run — the timings there came from jobs that carried no
+   traffic.
 
 1. ~~Fix the `XQC_ELIMIT` connection kill.~~ **Done** — the buffered-frame cap
    was raised to match the receive window and `-XQC_ELIMIT` was made a tolerant

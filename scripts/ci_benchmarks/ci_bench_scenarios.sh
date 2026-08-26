@@ -51,7 +51,7 @@ REPEATS="${CI_BENCH_REPEATS:-2}"
 CI_BENCH_RESULTS="${CI_BENCH_RESULTS:-${SCRIPT_DIR}/../../ci_bench_results}"
 mkdir -p "$CI_BENCH_RESULTS"
 ROWS="$(mktemp)"
-trap 'rm -f "$ROWS"; netsim_spike_stop "${SPIKE_PID:-}"; ci_bench_host_stop 2>/dev/null || true; ci_bench_stop_vpn 2>/dev/null || true; ci_bench_tier_cleanup 2>/dev/null || true; netsim_teardown' EXIT
+trap 'rm -f "$ROWS"; netsim_spike_stop; ci_bench_host_stop 2>/dev/null || true; ci_bench_stop_vpn 2>/dev/null || true; ci_bench_tier_cleanup 2>/dev/null || true; netsim_teardown' EXIT
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -171,14 +171,17 @@ run_pair() {
 
     # A flapping path needs its storm running for the whole measurement,
     # otherwise the scenario degenerates into its stable base profile.
-    SPIKE_PID=""
+    # netsim_spike_start reports through NETSIM_SPIKE_PID rather than stdout:
+    # reading it back with $(...) blocked forever, because the backgrounded
+    # loop holds the substitution's pipe open for as long as it runs.
+    netsim_spike_stop
     local t0 t1
     t0="$(netsim_path_field "$a_spec" transit)"
     t1="$(netsim_path_field "$b_spec" transit)"
     if [ -n "${NETSIM_SPIKE[$t1]:-}" ]; then
-        SPIKE_PID="$(netsim_spike_start 1 "$t1" 8 20 35)"
+        netsim_spike_start 1 "$t1" 8 20 35
     elif [ -n "${NETSIM_SPIKE[$t0]:-}" ]; then
-        SPIKE_PID="$(netsim_spike_start 0 "$t0" 8 20 35)"
+        netsim_spike_start 0 "$t0" 8 20 35
     fi
 
     start_server_with_ctrl "$sched" >/dev/null || return 1
@@ -191,7 +194,7 @@ run_pair() {
 
     local stats rss
     stats="$(collect_stats)"; rss="$(server_rss_kb)"
-    netsim_spike_stop "${SPIKE_PID:-}"; SPIKE_PID=""
+    netsim_spike_stop
     ci_bench_stop_vpn
 
     # Ratios are the gate-able numbers: they divide out the runner's speed,

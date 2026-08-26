@@ -490,8 +490,19 @@ netsim_setup() {
         # independent (a flap on one must not perturb the other).
         ip netns exec "$hop" ip route add "${NETSIM_SERVER_ADDR}/32" \
             via "$(netsim_srv_ip "$i")" dev "$vhs" 2>/dev/null || true
+        # `src` is load-bearing, not cosmetic. mqvpn's server answers on ONE
+        # wildcard-bound UDP socket with a plain sendto() and never sets
+        # IP_PKTINFO, so the kernel chooses the reply's source address by
+        # looking up this route. NETSIM_SERVER_ADDR lives only on lo, so
+        # without `src` the reply goes out as 10.<octet>.2.2 — an address the
+        # client never dialled. The client drops it, the handshake never
+        # completes, and every scenario reports 0 Mbps. ci_bench_env.sh is
+        # immune only because there the service address *is* the directly
+        # connected server veth; netsim is the first topology to put it behind
+        # a router hop.
         ip netns exec "$NETSIM_NS_SERVER" ip route add "10.${NETSIM_OCTETS[$i]}.1.0/24" \
-            via "$(netsim_hop_srv_ip "$i")" dev "$vs" 2>/dev/null || true
+            via "$(netsim_hop_srv_ip "$i")" dev "$vs" \
+            src "$NETSIM_SERVER_ADDR" 2>/dev/null || true
     done
 
     # Loose rp_filter: several /32 routes to one address over different devices
@@ -507,6 +518,22 @@ netsim_setup() {
         if ! ip netns exec "$NETSIM_NS_CLIENT" ping -c 1 -W 2 \
                 -I "$(netsim_veth_cli "$i")" "$NETSIM_SERVER_ADDR" >/dev/null 2>&1; then
             echo "netsim_setup: path $i cannot reach $NETSIM_SERVER_ADDR" >&2
+            return 1
+        fi
+    done
+
+    # Reachability is not enough. The ping above is sourced from the client's
+    # veth address, so it succeeds on a topology whose *service* address is
+    # unusable — which is exactly the state that made every scenario read zero
+    # while this check reported the path healthy. Assert the other direction
+    # too: the server must answer each client from NETSIM_SERVER_ADDR.
+    local want_src
+    for (( i=0; i<n; i++ )); do
+        want_src="$(ip netns exec "$NETSIM_NS_SERVER" ip -o route get "$(netsim_cli_ip "$i")" \
+                    2>/dev/null | sed -n 's/.* src \([0-9.][0-9.]*\).*/\1/p')"
+        if [ "$want_src" != "$NETSIM_SERVER_ADDR" ]; then
+            echo "netsim_setup: server would answer path $i from ${want_src:-<none>}," \
+                 "not $NETSIM_SERVER_ADDR — the client would drop the reply" >&2
             return 1
         fi
     done
@@ -641,12 +668,24 @@ netsim_apply_pps_cap() {
 
 # ── Time-varying paths ─────────────────────────────────────────────────────
 
+# The running spike driver, or empty. A global rather than a return value on
+# purpose: reporting the PID on stdout meant the caller had to read it through
+# `$(...)`, and the backgrounded loop inherits the write end of that command
+# substitution's pipe. Because the loop never exits, the pipe never reached
+# EOF and the substitution blocked forever — before the server was even
+# started, which is how `classes`, `combo` and `sched` each burned their full
+# 60-minute job timeout while the modes with no flapping transit finished in
+# 3-10 minutes. Assigning here also makes the job a direct child of the calling
+# shell, so netsim_spike_stop's `wait` is meaningful instead of an error it has
+# to swallow.
+NETSIM_SPIKE_PID=""
+
 # netsim_spike_start <slot> <profile> <on_sec> <off_min> <off_max>
 #
 # Background driver for bgp_flappy / starlink. Uses `tc qdisc change` so the
 # path mutates in place: tearing it down and re-adding would reset the queue
 # and conntrack, which is a different event than a flap and would let the code
-# under test off easy. Echoes the driver PID for netsim_spike_stop.
+# under test off easy. Sets NETSIM_SPIKE_PID for netsim_spike_stop.
 netsim_spike_start() {
     local slot="$1" profile="$2" on_sec="${3:-10}" off_min="${4:-45}" off_max="${5:-90}"
     local base="${NETSIM_TRANSIT[$profile]:-}" spike="${NETSIM_SPIKE[$profile]:-}"
@@ -666,15 +705,17 @@ netsim_spike_start() {
             ip netns exec "$hop" tc qdisc change dev "$dev_up" root netem ${base} 2>/dev/null
             ip netns exec "$NETSIM_NS_SERVER" tc qdisc change dev "$dev_dn" root netem ${base} 2>/dev/null
         done
-    ) &
-    echo $!
+    ) >/dev/null 2>&1 &
+    NETSIM_SPIKE_PID=$!
 }
 
+# Stops the driver started above. Takes no argument; an ignored one is accepted
+# so an older call site cannot silently stop stopping anything.
 netsim_spike_stop() {
-    local pid="${1:-}"
-    [ -n "$pid" ] || return 0
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    [ -n "${NETSIM_SPIKE_PID:-}" ] || return 0
+    kill "$NETSIM_SPIKE_PID" 2>/dev/null || true
+    wait "$NETSIM_SPIKE_PID" 2>/dev/null || true
+    NETSIM_SPIKE_PID=""
 }
 
 # netsim_apply_class <class> [seed] — build both paths of a heterogeneity class.
