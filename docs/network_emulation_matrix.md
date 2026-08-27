@@ -117,6 +117,99 @@ read as "scenario implemented", never as "scenario measured". The estimates in
 §4 are built on timings from runs that carried no traffic and will need redoing
 against a real one.
 
+### 0.2 First run with the fixes: it measures now, but the multipath numbers do not hold up
+
+Run [33024352078](https://github.com/r11234567/mqvpn/actions/runs/33024352078)
+(2026-08-26, commit `90b746c`) is the first weekly to finish. All eleven netsim
+jobs completed — `classes` 19m10s, `combo` 14m54s, `sched` 12m36s, the three
+that used to be cancelled at the 60-minute cap — and **76 of 97 result rows
+carry a non-zero throughput, against 0 of 64 the run before**. Both §0.1
+defects are confirmed fixed in CI, not just locally.
+
+That is as far as the good news goes. With numbers finally coming out, five
+things are visible that zeros were hiding. A blocks every multipath conclusion
+in the matrix and should be fixed before anything in §2 is read.
+
+**A. `run_pair` measures one path three times.** `hetero_extreme`'s path B is
+`5g_edge:bgp_junk:symmetric:1400` — one-way 95 ms + 120 ms and a 12 Mbit cap,
+so RTT ≈ 430 ms and no more than 12 Mbps. It reported `solo_b = 111.8 Mbps`
+with `min_rtt_ms = 71`, which is path A's `eth:bgp_opt` (2 x (0.2 + 40) ≈ 80 ms).
+`asym_latency`'s path B is `geo_sat:bgp_plain` — RTT ≈ 800 ms, 20 Mbit — and
+reported 108.3 Mbps at `min_rtt_ms = 75`. `asym_capacity` put `eth:iplc`
+against `eth:bgp_plain` and returned 36.9 / 37.4 / 37.4 at `min_rtt 127`, all
+three of them path A's private line. `min_rtt_ms` is `max()` over the server's
+path list, so a second, slower path would raise it; it never does.
+
+Every such row lands at `aggregation_efficiency` ≈ 0.50 and `vs_best_single`
+≈ 1.00, which is just the arithmetic of `mp == a == b`. The core suite, which
+runs on `ci_bench_env.sh`'s topology and is untouched by this, shows what a
+working pair looks like in the same run: `equal_paths` single 45.3 → WLB 89.1.
+
+The cause is that `measure_pathset` is invoked as `< <(measure_pathset ...)`.
+Process substitution is a subshell, so the `_CB_CLIENT_PID` that
+`ci_bench_start_client` assigns never reaches `run_pair`'s shell. Its
+"kill previous client" guard therefore always sees an empty PID, and
+`ci_bench_stop_vpn` only ever kills the server. Three clients accumulate inside
+one `netsim_setup` and stay connected; the first owns the TUN and the route to
+the tunnel address, so measurements two and three travel over path 0, and
+`collect_stats` reads `clients[0]` — that same first client, which has one
+path. `catalog` and `tiers` escape it: catalog tears the namespaces down
+between scenarios, which strands a leaked client in a dead netns, and
+`run_tier` measures only once.
+
+Fix: get the PID out of the subshell (start the client in `run_pair`'s own
+shell, or have `measure_pathset` write the PID to a file the caller reads), and
+give `ci_bench_stop_vpn` a way to reap a client it did not start — matching on
+the netns and binary — so a leak cannot persist silently. Until that lands,
+`solo_b`, `multipath_mbps`, `aggregation_efficiency` and `vs_best_single` are
+invalid for every `run_pair` mode: `classes`, `combo`, `mtu`, `sched` and the
+per-commit gate.
+
+**B. 21 rows are still zero, and a zero still means two different things.** They
+cluster on exactly the profiles whose loss is `loss gemodel` — `bgp_junk`,
+`carrier_qos`, `5g_throttled` — plus the legs that pair with them. Each carries
+`bytes_tx: 684`, `bytes_rx: 0`, `gso_factor: 1.0`: the handshake never
+completed and `ci_bench_wait_tunnel` expired three times over (87 s for such a
+scenario against ~77 s for one that measures). It is marginal rather than
+impossible — `catalog bgp_junk+eth` reaches 0.5 Mbps and `+5g_half` 0.9 — so
+the wait deserves to be longer and configurable. Separately, a `0.0` that means
+"never connected" must stop being written as the same value as a `0.0` that
+means "measured, and it was zero"; the row needs a reason field.
+
+**C. `carrier_qos` measures the policer, not a carrier.** Every row on that
+transit is 0.2-0.5 Mbps whatever the access leg. At the configured 8000 pps and
+a 1400-byte MTU its ceiling should be around 90 Mbps, so the profile sits two
+orders of magnitude under its own design intent. Note also that
+`netsim_apply_pps_cap` attaches the policer to the **ingress** qdisc of the
+hop's server-facing device, which is the server→client direction, while the
+comment at its call site says it throttles the uplink. Settle which was meant
+before recalibrating.
+
+**D. A 6-second single-stream sample cannot fill a high-BDP path.**
+`ci_bench_run_iperf` is called as `TCP DL`, 6 s, one stream. One inner TCP
+stream needs rate x RTT of window, and `bgp_plain` at 380 Mbit / 160 ms RTT
+needs 7.6 MB, which six seconds of slow start will not reach. The catalog says
+so directly: the widest transit is the slowest, `bgp_plain+eth` at 20.6 Mbps
+against `iplc+eth` at 37.6 on a pipe less than a seventh the size, and
+`bgp_opt+eth` at 110.3. Above roughly 100 Mbit x 100 ms the number describes
+the sample, not the path. Lengthen the sample, raise the stream count, or say
+in the results that the high-capacity profiles are not measurable this way.
+
+**E. `special` silently reported half of itself.** `run_special` writes four
+rows by construction; the artifact has two, `corrupt_reorder` and
+`ack_starvation`. `nat_aging` and `roam_under_load` sit inside
+`if start_server && start_client && wait_tunnel; then` and emit nothing when
+that fails — no row, no warning, and the job still reports success. It finished
+in 2m52s, less than `nat_aging`'s own 35-second idle. The failure path has to
+write a row saying why.
+
+**What does look right.** `tiers` is the one multipath mode not built on
+`run_pair`, and it behaves: 813 / 900 / 917 / 925 Mbps across the four
+instance sizes on the unconstrained `lan` profile, falling to 715 under a
+softirq storm and 445 under a mid-run CPU throttle. The `catalog` modes rank
+their access legs sensibly within a transit. Those are the rows worth reading
+today.
+
 ---
 
 ## 1. Three blockers, before more coverage is worth adding
@@ -400,6 +493,27 @@ About 11 parallel jobs, longest ~95 min, roughly 5 job-hours/week. Inside the
 6 h job cap and the 20-concurrent-job limit; the repo is public so
 standard-runner minutes are free.
 
+### Measured, from run 33024352078
+
+The first weekly that finished, for calibration against the estimates above:
+
+| Job | Wall | Job | Wall |
+|---|---|---|---|
+| `perf-weekly` (core) | 57m00s | `cat_carrier` | 9m24s |
+| `classes` | 19m10s | `cat_plain` | 7m37s |
+| `combo` | 14m54s | `cat_iplc` | 6m50s |
+| `sched` | 12m36s | `cat_opt` | 6m45s |
+| `mtu` | 12m21s | `tiers` | 3m52s |
+| `cat_junk` | 9m56s | `special` | 2m52s |
+
+Total wall-clock 57m23s, set by the core job, with the whole scenario matrix
+running inside it. Every job is comfortably under the 60-minute cap, so the
+`netsim` timeout does not need raising yet — but these are still not final
+numbers. Roughly a fifth of the rows never established a tunnel (§0.2 B) and
+spent 25 s per attempt failing instead of 18 s measuring, and fixing §0.2 A
+makes each `run_pair` do three real measurements where today it does one and
+two cheap repeats of it. Re-measure before sharding further.
+
 ## 5. What this cannot model — state it with the results
 
 - **GB5 scores.** `CPUQuota` caps throughput, not IPC. Tier labels are nominal.
@@ -419,12 +533,23 @@ standard-runner minutes are free.
 ## 6. Build order
 
 0. ~~**Make the harness measure anything at all** — the service-address source
-   bug (§0.1 A) and the spike-driver deadlock (§0.1 B).~~ **Fixed, unconfirmed.**
-   Both defects are addressed and `netsim_setup` now asserts the reply source
-   address, but no run has yet come back with a non-zero measurement. Confirm
-   against the next weekly before reading anything into §2-§4, and re-estimate
-   §4's budget from that run — the timings there came from jobs that carried no
-   traffic.
+   bug (§0.1 A) and the spike-driver deadlock (§0.1 B).~~ **Done and confirmed**
+   by run 33024352078: no job timed out and 76 of 97 rows carry a throughput.
+
+0a. **Make the multipath rows mean something** — the leaked-client bug in
+   `run_pair` (§0.2 A). This is now the item that blocks value: `classes`,
+   `combo`, `mtu`, `sched` and the per-commit gate all currently compare a path
+   against itself, so every aggregation figure in the matrix is an artefact.
+   Nothing below is worth tuning until it is fixed.
+
+0b. **Stop a failure from looking like a measurement** — a reason field instead
+   of a bare `0.0` (§0.2 B), and a row from `special`'s failure path (§0.2 E).
+   Cheap, and it is what turned §0.1 into a seven-hour investigation.
+
+0c. **Recalibrate what the numbers rest on** — the `carrier_qos` policer
+   (§0.2 C) and the 6-second single-stream sample that cannot fill a high-BDP
+   path (§0.2 D). Both make a profile report something other than what its
+   table entry claims.
 
 1. ~~Fix the `XQC_ELIMIT` connection kill.~~ **Done** — the buffered-frame cap
    was raised to match the receive window and `-XQC_ELIMIT` was made a tolerant
