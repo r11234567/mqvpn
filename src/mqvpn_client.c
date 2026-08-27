@@ -1238,7 +1238,10 @@ cb_cert_verify(const unsigned char *certs[], const size_t cert_len[], size_t cer
                                 sizeof(error)) == 0) {
         return 0;
     }
-    LOG_E(conn->client, "TLS certificate verification failed: %s",
+    /* Name the identity that was checked. It is either ServerName or the
+     * --server host, and which one it came from decides whether a mismatch is
+     * a misconfiguration or a real rejection. */
+    LOG_E(conn->client, "TLS certificate verification failed for '%s': %s", hostname,
           error[0] ? error : "unknown error");
     return -1;
 }

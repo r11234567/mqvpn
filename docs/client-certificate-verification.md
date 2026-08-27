@@ -2,10 +2,14 @@
 
 This document describes the secure-by-default client certificate verification
 carried by this fork, the code paths that implement it, and the procedure for
-preserving it while merging future upstream releases. Windows uses its native
-trust store. Non-Windows builds use the default CA paths exposed by the bundled
-OpenSSL-compatible X.509 implementation; packagers must make those paths usable
-on their target.
+preserving it while merging future upstream releases.
+
+Verification is split in two: **who is trusted**, which is a platform question,
+and **which names a certificate may speak for**, which is not. Windows answers
+the first with its native trust store, Android with the framework's own trust
+manager, and every other platform with the default CA paths of the bundled
+OpenSSL-compatible X.509 implementation — packagers must make those paths usable
+on their target. The identity check lives in one place for all of them.
 
 ## Why this patch exists
 
@@ -40,6 +44,11 @@ sudo mqvpn --mode client \
 verification. When it is omitted, mqvpn uses the host portion of `--server`.
 Deployments that connect to an IP address while presenting a DNS certificate
 must set this option (or `[Server] ServerName`) to the certificate's DNS name.
+
+When the effective name is an IP literal, it is matched against the
+certificate's `iPAddress` SANs rather than its `dNSName` SANs, so a certificate
+issued for the address verifies without `--tls-server-name`. Both forms of the
+same IPv6 address match, because the comparison is on the decoded bytes.
 
 A self-signed development server requires an explicit bypass:
 
@@ -76,12 +85,44 @@ On Windows, verification uses `CertGetCertificateChain` and
 Windows trust store and the expected server name.
 
 On non-Windows builds, verification uses the OpenSSL-compatible X.509 API
-provided by the bundled BoringSSL build. `X509_STORE_set_default_paths` loads
-the configured default CA locations, `X509_VERIFY_PARAM_set1_host` enforces the
-hostname, and `X509_CHECK_FLAG_NEVER_CHECK_SUBJECT` requires a Subject
-Alternative Name rather than accepting the legacy certificate Common Name.
-Packagers must ensure that their target supplies a usable default CA bundle or
-directory. This code does not currently provide a custom CA-file option.
+provided by the bundled BoringSSL build, in two independent steps:
+
+- **Identity.** `check_hostname` matches the leaf against the effective name.
+  An IP literal — recognised with `a2i_IPADDRESS`, the same parser the check
+  itself uses — goes to `X509_check_ip_asc`; anything else goes to
+  `X509_check_host` with `X509_CHECK_FLAG_NEVER_CHECK_SUBJECT`, which requires a
+  Subject Alternative Name rather than accepting the legacy Common Name. This
+  runs before the chain is walked, so a mismatch is reported as a mismatch and
+  not buried under a trust failure.
+- **Trust.** `X509_STORE_set_default_paths` loads the configured default CA
+  locations and `X509_verify_cert` builds a path to one of them. Packagers must
+  ensure that their target supplies a usable default CA bundle or directory.
+  This code does not currently provide a custom CA-file option.
+
+Hostname enforcement is deliberately *not* delegated to the store context via
+`X509_VERIFY_PARAM_set1_host`. That routes every name through the `dNSName`
+comparison, which cannot match an `iPAddress` SAN — so a bare-IP server was
+rejected however correct its certificate was, and the reported reason was a
+hostname mismatch. `tests/test_cert_verify.c` pins both halves.
+
+### Platform trust hook
+
+`mqvpn_set_cert_trust_check` (`src/cert_verify.h`) replaces the trust step, and
+only the trust step, with a callback. The identity check above still runs first,
+so installing a hook cannot widen which names a certificate speaks for.
+
+Android requires this. `X509_STORE_set_default_paths` finds nothing there: the
+CA store is at none of the paths BoringSSL compiles in, it moved into an
+updatable APEX in Android 14, and user-installed CAs are reachable only through
+the framework. Every server certificate therefore failed verification and the
+client reconnected forever. `android/sdk-native/.../PlatformTrust.kt` answers
+with the platform's own `X509TrustManager`; `mqvpn_jni.c` resolves it in
+`JNI_OnLoad` and installs it there.
+
+If that resolution fails — a stripped keep rule, a renamed class — the hook is
+*not* installed, the built-in verifier stays in place, and on Android it trusts
+nothing. That is deliberate: the failure mode is refusing every server, not
+accepting any, and `JNI_OnLoad` logs the reason at `ERROR`.
 
 The hostname length argument to `xqc_h3_connect` must be `0` for its
 NUL-terminated hostname API. Do not replace it with `strlen(sni)` without first
@@ -104,6 +145,11 @@ Future changes must preserve all of these properties:
 - SNI and the verification hostname are derived from the same effective name.
 - POSIX hostname verification requires SAN and does not fall back to Common
   Name.
+- An IP literal is matched against `iPAddress` SANs, never against `dNSName`
+  SANs, and a DNS name is never matched against an `iPAddress` SAN.
+- A platform trust hook may replace the trust step only. It is never consulted
+  before the identity check passes, and failing to install one leaves the
+  built-in verifier in place rather than accepting the chain.
 - The PSK/authentication result never overrides a certificate failure.
 
 ## Merging a future upstream release
@@ -118,8 +164,9 @@ Useful checks after fetching upstream are:
 ```bash
 git grep -n "cert_verify_cb" upstream/main -- src include
 git grep -n "XQC_TLS_CERT_FLAG_NEED_VERIFY" upstream/main -- src
-git grep -n "X509_VERIFY_PARAM_set1_host\|CertVerifyCertificateChainPolicy" \
+git grep -n "X509_check_host\|X509_check_ip_asc\|X509_VERIFY_PARAM_set1_host" \
     upstream/main -- src
+git grep -n "CertVerifyCertificateChainPolicy" upstream/main -- src
 ```
 
 If upstream now provides equivalent or stronger behavior, prefer its design and
@@ -174,6 +221,10 @@ reorganization. After resolving conflicts, verify each item explicitly:
 7. The `xqc_h3_connect` hostname and hostname-length arguments match the pinned
    xquic signature.
 8. CLI, INI, JSON, and `libmqvpn` callers still default to secure mode.
+9. `mqvpn_set_cert_trust_check` still exists and is still consulted only after
+   the identity check, and `JNI_OnLoad` still installs `PlatformTrust`. Losing
+   the hook does not fail any build — it makes every Android handshake reject
+   the server, which only `ctest`'s `test_cert_verify` and a real device show.
 
 Do not resolve an xquic conflict by returning success unconditionally from the
 certificate callback or by setting `ALLOW_SELF_SIGNED` in normal mode. Both
@@ -202,6 +253,13 @@ Android to pass. For a production certificate, perform one positive connection
 test without `--insecure` using the real DNS name. A complete certificate test
 matrix should additionally cover a wrong hostname, expired leaf, untrusted root,
 missing intermediate, and malformed DER chain whenever the verifier is changed.
+
+`test_cert_verify` covers the identity rules and the trust-hook contract without
+a network, but it cannot prove the *Android* hook works: that needs a real
+device, because the thing under test is the platform's trust store. Confirm it
+by connecting once to a server with a publicly-issued certificate and checking
+that the log carries no `TLS certificate verification failed` line — the failure
+names both the identity that was checked and the reason.
 
 ## Release policy for this fork
 

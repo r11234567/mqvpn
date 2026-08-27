@@ -83,13 +83,23 @@ chain itself in `src/cert_verify.c`, against the platform's own trust store:
 - **Windows** — `CertGetCertificateChain` and
   `CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL)` against the native
   certificate store (linked via `crypt32`).
-- **POSIX** — the default CA paths of the bundled OpenSSL-compatible X.509
+- **Android** — the framework's own `X509TrustManager`, reached through
+  `mqvpn_set_cert_trust_check`. Nothing else works there: Android's CA store is
+  at none of the paths BoringSSL compiles in, it moved into an updatable APEX in
+  Android 14, and user-installed CAs are only reachable through the framework.
+- **Other POSIX** — the default CA paths of the bundled OpenSSL-compatible X.509
   implementation. Packagers must make those paths resolvable on the target.
 
-Both paths check expiry, chaining to a trusted root, and that the certificate
-identity matches the hostname, and both report *why* a handshake was refused
-rather than failing opaquely. Verification is on by default, and `--insecure`
-is an explicit opt-out that logs a warning for as long as it is active.
+Every path checks expiry, chaining to a trusted root, and that the certificate
+identity matches the hostname, and every one reports *why* a handshake was
+refused rather than failing opaquely. Verification is on by default, and
+`--insecure` is an explicit opt-out that logs a warning for as long as it is
+active.
+
+The identity check is shared rather than per-platform, so all of them agree on
+which names a certificate may speak for. An IP literal is matched against the
+certificate's `iPAddress` SANs, and a DNS name against its `dNSName` SANs; the
+deprecated commonName is never accepted as an identity.
 
 ```ini
 # /etc/mqvpn/client.conf
@@ -101,9 +111,11 @@ ServerName = vpn.example.com   # TLS SNI, and the name the certificate is checke
 ```
 
 `ServerName` (CLI: `--tls-server-name`) is the setting to reach for when
-connecting to a bare IP that presents a DNS certificate: without it the IP
-literal is what gets matched and the handshake is refused. Full details, and the
-procedure for preserving this while merging upstream releases, are in
+connecting to a bare IP that presents a **DNS** certificate: without it the IP
+literal is what gets matched, and a certificate naming only DNS hosts does not
+match it. A certificate issued *for the address* needs no `ServerName`. Full
+details, and the procedure for preserving this while merging upstream releases,
+are in
 [docs/client-certificate-verification.md](docs/client-certificate-verification.md).
 
 ### Server fallback proxy — share one UDP port with another QUIC service

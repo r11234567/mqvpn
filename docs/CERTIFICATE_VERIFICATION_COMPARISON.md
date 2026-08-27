@@ -87,7 +87,9 @@ cb_cert_verify(const unsigned char *certs[], const size_t cert_len[],
 | Feature | Upstream | Your Fork |
 |---------|----------|-----------|
 | **Chain Building** | ⚠️ BoringSSL only | ✅ OS-native chain building |
-| **Hostname Verification** | ⚠️ Basic SNI check | ✅ Explicit `X509_VERIFY_PARAM_set1_host` (POSIX)<br>✅ `CertVerifyCertificateChainPolicy` with HTTPS policy (Windows) |
+| **Hostname Verification** | ⚠️ Basic SNI check | ✅ Explicit `X509_check_host` / `X509_check_ip_asc` (POSIX, incl. Android)<br>✅ `CertVerifyCertificateChainPolicy` with HTTPS policy (Windows) |
+| **Bare-IP servers** | ⚠️ Not verified | ✅ Matched against `iPAddress` SANs |
+| **Android trust store** | ❌ Empty (no BoringSSL default path exists) | ✅ Platform `X509TrustManager` via JNI |
 | **Revocation Checking** | ❌ No | ⚠️ Platform-dependent (Windows CRL/OCSP, Linux depends on system config) |
 | **Certificate Transparency** | ❌ No | ⚠️ Platform-dependent |
 | **Error Reporting** | ❌ Generic message | ✅ Detailed error descriptions |
@@ -108,18 +110,27 @@ for (size_t i = 1; i < certs_len; i++) {
     sk_X509_push(untrusted, cert);
 }
 
-// 3. Load system trust store
+// 3. Check the identity FIRST, and against the right kind of SAN. An IP
+//    literal must go to X509_check_ip_asc: the dNSName comparison can never
+//    match an iPAddress SAN.
+if (hostname_is_ip(hostname)) {
+    X509_check_ip_asc(leaf, hostname, 0);
+} else {
+    X509_check_host(leaf, hostname, strlen(hostname),
+                    X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, NULL);
+}
+
+// 4. Load system trust store
 store = X509_STORE_new();
 X509_STORE_set_default_paths(store);  // /etc/ssl/certs, /System/Library/Keychains, etc.
-
-// 4. Configure hostname verification
-X509_VERIFY_PARAM *param = X509_STORE_CTX_get0_param(ctx);
-X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
-X509_VERIFY_PARAM_set1_host(param, hostname, strlen(hostname));
 
 // 5. Verify chain against system roots
 X509_verify_cert(ctx);
 ```
+
+On Android step 4/5 is replaced by the platform's own `X509TrustManager`
+(`mqvpn_set_cert_trust_check`), because no filesystem path BoringSSL knows about
+holds Android's CA store. Step 3 is unchanged on every platform.
 
 **Security benefits**:
 - ✅ Uses system-wide trusted CA certificates

@@ -747,6 +747,17 @@ if(BUILD_TESTING)
     set_target_properties(test_conn_settings PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_conn_settings COMMAND test_conn_settings)
+
+    # test_cert_verify — twin of the Linux definition below. macOS clients run
+    # the same verify_posix path, so the identity rules (SAN-only, IP literals
+    # against iPAddress SANs) are worth pinning on both.
+    add_executable(test_cert_verify tests/test_cert_verify.c src/cert_verify.c)
+    target_link_libraries(test_cert_verify ${SSL_LIB} ${CRYPTO_LIB} c++)
+    target_include_directories(test_cert_verify PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${BORINGSSL_INCLUDE_DIR})
+    set_target_properties(test_cert_verify PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_test(NAME test_cert_verify COMMAND test_cert_verify)
 endif()
 
 else() # NOT WIN32, NOT APPLE — Linux
@@ -883,6 +894,17 @@ if(BUILD_TESTING)
     # links reorder_tx.c (for the peek it wraps) + icmp.c (for the PTB send).
     add_executable(test_reorder_gate tests/test_reorder_gate.c src/reorder_tx.c src/icmp.c src/log.c)
 
+    # Certificate verifier test — mints its own certificates, so it needs
+    # BoringSSL for both the subject under test and the fixtures. Keep in sync
+    # with the Darwin twin above: macOS is a supported client and reaches the
+    # same verify_posix path.
+    add_executable(test_cert_verify tests/test_cert_verify.c src/cert_verify.c)
+    target_link_libraries(test_cert_verify ${SSL_LIB} ${CRYPTO_LIB} stdc++)
+    target_include_directories(test_cert_verify PRIVATE ${BORINGSSL_INCLUDE_DIR})
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_cert_verify PRIVATE -Wall -Wextra -Werror)
+    endif()
+
     # SNI router test (Linux/POSIX server path only)
     if(NOT WIN32)
         add_executable(test_sni_router tests/test_sni_router.c src/sni_router.c src/log.c)
@@ -911,7 +933,7 @@ if(BUILD_TESTING)
             target_compile_options(test_h2_proxy PRIVATE -Wall -Wextra -Werror)
         endif()
     endif()
-    set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_classifier test_icmp test_reorder_gate)
+    set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_classifier test_icmp test_reorder_gate test_cert_verify)
     if(NOT WIN32)
         list(APPEND MQVPN_UNIT_TESTS test_sni_router)
     endif()

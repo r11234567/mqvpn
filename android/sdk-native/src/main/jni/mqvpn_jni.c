@@ -16,6 +16,8 @@
  */
 
 #include <jni.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -26,6 +28,7 @@
 #include <netinet/in.h>
 #include <android/log.h>
 
+#include "cert_verify.h"
 #include "libmqvpn.h"
 #include "mqvpn_internal.h"
 #include "reorder.h"
@@ -63,21 +66,30 @@ static JavaVM *g_jvm = NULL;
 static jni_ctx_t *s_active_ctx = NULL;
 
 /*
+ * PlatformTrust.checkServerTrusted, resolved once in JNI_OnLoad. The class ref
+ * is global (the method ID stays valid as long as the class is not unloaded).
+ * NULL means resolution failed — see JNI_OnLoad.
+ */
+static jclass s_trust_cls = NULL;
+static jmethodID s_mid_check_server_trusted = NULL;
+
+/*
  * Helper: get JNIEnv for the current thread.
  * Since all libmqvpn callbacks fire on the executor thread (which is a JNI
  * thread), GetEnv should succeed without AttachCurrentThread.
  *
  * If fallback attachment is needed (non-JNI thread), *did_attach is set to 1.
- * Caller MUST call detach_if_needed() after the JNI upcall to prevent leaks.
+ * Caller MUST call vm_detach_if_needed() after the JNI upcall to prevent leaks.
  */
 static JNIEnv *
-get_env(jni_ctx_t *ctx, int *did_attach)
+vm_get_env(JavaVM *vm, int *did_attach)
 {
     JNIEnv *env = NULL;
     *did_attach = 0;
-    if ((*ctx->jvm)->GetEnv(ctx->jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+    if (vm == NULL) return NULL;
+    if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
         /* Fallback: attach if called from a non-JNI thread */
-        if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, &env, NULL) != JNI_OK) {
+        if ((*vm)->AttachCurrentThread(vm, &env, NULL) != JNI_OK) {
             LOGE("Failed to attach thread");
             return NULL;
         }
@@ -87,9 +99,121 @@ get_env(jni_ctx_t *ctx, int *did_attach)
 }
 
 static void
+vm_detach_if_needed(JavaVM *vm, int did_attach)
+{
+    if (did_attach) (*vm)->DetachCurrentThread(vm);
+}
+
+static JNIEnv *
+get_env(jni_ctx_t *ctx, int *did_attach)
+{
+    return vm_get_env(ctx->jvm, did_attach);
+}
+
+static void
 detach_if_needed(jni_ctx_t *ctx, int did_attach)
 {
-    if (did_attach) (*ctx->jvm)->DetachCurrentThread(ctx->jvm);
+    vm_detach_if_needed(ctx->jvm, did_attach);
+}
+
+/* ─── Certificate trust (Android CA store via PlatformTrust) ─── */
+
+static void
+trust_error(char *error, size_t error_len, const char *message)
+{
+    if (error != NULL && error_len > 0) snprintf(error, error_len, "%s", message);
+}
+
+/* Marshal the DER chain into a Java byte[][]. Returns NULL on failure with any
+ * pending exception cleared; the caller owns the returned local ref. */
+static jobjectArray
+build_der_chain(JNIEnv *env, const unsigned char *certs[], const size_t cert_len[],
+                size_t certs_len)
+{
+    jclass byte_array_cls = (*env)->FindClass(env, "[B");
+    if (byte_array_cls == NULL) goto fail;
+
+    jobjectArray chain =
+        (*env)->NewObjectArray(env, (jsize)certs_len, byte_array_cls, NULL);
+    (*env)->DeleteLocalRef(env, byte_array_cls);
+    if (chain == NULL) goto fail;
+
+    for (size_t i = 0; i < certs_len; i++) {
+        if (certs[i] == NULL || cert_len[i] == 0 || cert_len[i] > (size_t)INT32_MAX) {
+            (*env)->DeleteLocalRef(env, chain);
+            goto fail;
+        }
+        jbyteArray der = (*env)->NewByteArray(env, (jsize)cert_len[i]);
+        if (der == NULL) {
+            (*env)->DeleteLocalRef(env, chain);
+            goto fail;
+        }
+        (*env)->SetByteArrayRegion(env, der, 0, (jsize)cert_len[i],
+                                   (const jbyte *)certs[i]);
+        (*env)->SetObjectArrayElement(env, chain, (jsize)i, der);
+        (*env)->DeleteLocalRef(env, der);
+    }
+    return chain;
+
+fail:
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    return NULL;
+}
+
+/*
+ * Hand the DER chain to PlatformTrust.checkServerTrusted and translate its
+ * answer (null = trusted, anything else = a reason) into the cert_verify.h
+ * contract. Identity was already checked in cert_verify.c, so this is trust
+ * only.
+ */
+static int
+jni_cert_trust(const unsigned char *certs[], const size_t cert_len[], size_t certs_len,
+               char *error, size_t error_len, void *ctx)
+{
+    (void)ctx;
+
+    if (s_trust_cls == NULL || s_mid_check_server_trusted == NULL || certs_len == 0) {
+        trust_error(error, error_len, "platform trust check unavailable");
+        return -1;
+    }
+
+    int did_attach;
+    JNIEnv *env = vm_get_env(g_jvm, &did_attach);
+    if (env == NULL) {
+        trust_error(error, error_len, "platform trust check: no JNI env");
+        return -1;
+    }
+
+    int result = -1;
+    jobjectArray chain = build_der_chain(env, certs, cert_len, certs_len);
+    if (chain == NULL) {
+        trust_error(error, error_len, "platform trust check: marshalling failed");
+        vm_detach_if_needed(g_jvm, did_attach);
+        return -1;
+    }
+
+    jstring reason = (jstring)(*env)->CallStaticObjectMethod(
+        env, s_trust_cls, s_mid_check_server_trusted, chain);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        trust_error(error, error_len, "platform trust check threw");
+    } else if (reason == NULL) {
+        result = 0; /* trusted */
+    } else {
+        const char *text = (*env)->GetStringUTFChars(env, reason, NULL);
+        if (text != NULL) {
+            trust_error(error, error_len, text);
+            (*env)->ReleaseStringUTFChars(env, reason, text);
+        } else {
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+            trust_error(error, error_len, "platform rejected the certificate chain");
+        }
+    }
+
+    if (reason != NULL) (*env)->DeleteLocalRef(env, reason);
+    (*env)->DeleteLocalRef(env, chain);
+    vm_detach_if_needed(g_jvm, did_attach);
+    return result;
 }
 
 /* ─── JNI_OnLoad ─── */
@@ -99,6 +223,39 @@ JNI_OnLoad(JavaVM *vm, void *reserved)
 {
     (void)reserved;
     g_jvm = vm;
+
+    /*
+     * Resolve PlatformTrust here, not on first use: JNI_OnLoad runs with the
+     * class loader that loaded this library, which is the only context where
+     * FindClass reliably reaches application classes.
+     */
+    JNIEnv *env = NULL;
+    if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) == JNI_OK) {
+        jclass cls = (*env)->FindClass(env, "com/mqvpn/sdk/native_/PlatformTrust");
+        if (cls != NULL) {
+            jmethodID mid = (*env)->GetStaticMethodID(env, cls, "checkServerTrusted",
+                                                     "([[B)Ljava/lang/String;");
+            if (mid != NULL) {
+                s_trust_cls = (*env)->NewGlobalRef(env, cls);
+                s_mid_check_server_trusted = mid;
+            }
+            (*env)->DeleteLocalRef(env, cls);
+        }
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    }
+
+    if (s_trust_cls != NULL && s_mid_check_server_trusted != NULL) {
+        mqvpn_set_cert_trust_check(jni_cert_trust, NULL);
+    } else {
+        /*
+         * Leave the built-in verifier in place, which on Android trusts
+         * nothing, so this fails closed rather than open. Say so at ERROR: the
+         * symptom is every connection failing certificate verification, and
+         * the cause is not otherwise visible in the log.
+         */
+        LOGE("PlatformTrust not resolved (keep rule stripped it?) -- "
+             "certificate verification will reject every server");
+    }
     return JNI_VERSION_1_6;
 }
 
