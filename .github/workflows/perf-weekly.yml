@@ -168,7 +168,15 @@ jobs:
   # downstream writer publishes them.
   netsim:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 90, not 60. The three fixes in docs/network_emulation_matrix.md §0.3
+    # each cost wall-clock: run_pair now performs three real measurements
+    # instead of one and two repeats of it, the sample is 4 x 10 s rather than
+    # 1 x 6 s, and the tunnel wait is 40 s rather than 25. `classes` is the
+    # longest mode at 13 pairs -- about 28 min typical, but ~49 min if every
+    # tunnel wait runs to its cap, which leaves no headroom at 60. Partial
+    # results now survive a cancellation, but the tail of the mode still would
+    # not.
+    timeout-minutes: 90
     strategy:
       fail-fast: false   # one bad scenario must not hide the other five
       matrix:

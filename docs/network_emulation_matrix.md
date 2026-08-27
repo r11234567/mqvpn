@@ -110,7 +110,7 @@ meaningful rather than an error the old code had to swallow.
 JSON is written once, after the mode's loop finishes, so all three hung jobs
 uploaded nothing (`No files were found with the provided path:
 ci_bench_results/*.json`). Append each row as it is produced, or emit the
-document from the `EXIT` trap.
+document from the `EXIT` trap. **Fixed in §0.3.**
 
 Until a run comes back green *with numbers in it*, the §0 table should still be
 read as "scenario implemented", never as "scenario measured". The estimates in
@@ -176,14 +176,39 @@ the wait deserves to be longer and configurable. Separately, a `0.0` that means
 "never connected" must stop being written as the same value as a `0.0` that
 means "measured, and it was zero"; the row needs a reason field.
 
-**C. `carrier_qos` measures the policer, not a carrier.** Every row on that
-transit is 0.2-0.5 Mbps whatever the access leg. At the configured 8000 pps and
-a 1400-byte MTU its ceiling should be around 90 Mbps, so the profile sits two
-orders of magnitude under its own design intent. Note also that
-`netsim_apply_pps_cap` attaches the policer to the **ingress** qdisc of the
-hop's server-facing device, which is the server→client direction, while the
-comment at its call site says it throttles the uplink. Settle which was meant
-before recalibrating.
+**C. The `loss gemodel` profiles were calibrated far heavier than intended.**
+Every `carrier_qos` row is 0.2-0.5 Mbps whatever the access leg, against a
+ceiling of roughly 90 Mbps from its own 8000 pps cap at 1400 bytes — two orders
+of magnitude under the profile's design intent.
+
+The cause is the loss parameters, not the packet-rate cap. `loss gemodel p r
+(1-h) (1-k)` takes P(good→bad), P(bad→good), loss in the bad state, and loss in
+the good state, so the average loss is `p/(p+r)·(1-h) + r/(p+r)·(1-k)` — a
+figure none of the four terms resembles on its own. Worked out for the four
+profiles as they were configured:
+
+| Profile | Configured | Average loss | Mean burst |
+|---|---|---|---|
+| `bgp_junk` | `3% 20% 88% 0.5%` | **11.9%** | 5 pkt |
+| `carrier_qos` | `2% 15% 80% 0.3%` | **9.7%** | 6.7 pkt |
+| `5g_edge` | `4% 25% 80% 1%` | **11.9%** | 4 pkt |
+| `5g_throttled` | `5% 20% 85% 1.5%` | **18.2%** | 5 pkt |
+
+A transit that loses an eighth of its packets is not a junk route, it is an
+outage: it explains both the low readings *and* B's 21 handshake failures,
+which cluster on exactly this set of profiles. It also defeats the purpose of
+`carrier_qos`, whose whole reason to exist is that goodput should track
+bytes-per-packet rather than congestion control — at 9.7% loss, congestion
+control is the only thing being measured.
+
+A second, smaller point about the policer, since it was mis-stated when this
+section was first written: a tc `ingress` qdisc filters what *arrives* on a
+device, so attaching the policer to the hop's server-facing veth polices the
+server→client direction, i.e. the downlink. The benchmark measures a download,
+so the cap did apply to the traffic under test — it was the call-site comment
+claiming it throttled "the uplink" that was wrong, not the placement. Both
+directions are policed now, which is what a subscriber-level carrier cap does
+anyway and removes the ambiguity.
 
 **D. A 6-second single-stream sample cannot fill a high-BDP path.**
 `ci_bench_run_iperf` is called as `TCP DL`, 6 s, one stream. One inner TCP
@@ -209,6 +234,74 @@ instance sizes on the unconstrained `lan` profile, falling to 715 under a
 softirq storm and 445 under a mid-run CPU throttle. The `catalog` modes rank
 their access legs sensibly within a transit. Those are the rows worth reading
 today.
+
+### 0.3 All five are fixed, plus the artifact loss from §0.1 C
+
+Written, syntax-checked and committed; **none of it is confirmed in CI yet** —
+read the next weekly before trusting any number below §1.
+
+**A — the leaked client.** `measure_pathset` no longer echoes its result, so it
+no longer has to be called through `< <( )`. It returns through
+`MEASURED_MBPS` / `MEASURED_CV` / `MEASURED_STATUS`, and all six call sites are
+plain calls in the caller's own shell; there is a comment on the function
+saying why, because the subshell form reads perfectly natural and will be
+reintroduced by anyone who does not know what it cost. Belt and braces:
+`ci_bench_start_client` also appends its pid to a file whose name derives from
+`$$` (unchanged inside a subshell), `ci_bench_start_client` now begins by
+calling `ci_bench_stop_client`, and that function reaps every live pid in the
+file. It refuses to do so silently — reaping more than one prints
+
+```
+WARNING: reaped N concurrent VPN clients -- an earlier measurement leaked
+one, and its paths carried the traffic
+```
+
+so the next occurrence of this class of bug announces itself in the job log
+instead of being absorbed into the numbers. A pid is only killed after
+`/proc/<pid>/exe` (or `comm`) confirms it is still the mqvpn that was recorded,
+so a recycled pid cannot make the harness kill something unrelated.
+
+**B — zero versus never-connected.** Every row now carries a `status` field:
+`ok`, `client_start_failed`, `tunnel_never_up`, or `measured_zero`. The
+`run_pair` rows carry one per measurement (`a=... b=... mp=...`) since the three
+can fail independently. The tunnel wait moved from a hard-coded 25 s to
+`CI_BENCH_TUNNEL_WAIT_SEC`, default 40; the failing profiles were marginal
+rather than impossible, so the old wait was converting "slow to connect" into a
+published zero.
+
+**C — profile recalibration.** The four `loss gemodel` profiles are re-set to
+2.0% / 1.5% / 3.3% / 4.1% average loss, keeping bursts of 3-4 packets. The
+arithmetic is written out beside each one in `ci_bench_netsim.sh` so the next
+person to tune them does not have to rediscover that the four terms are not the
+average.
+
+> **This breaks comparability.** `bgp_junk`, `carrier_qos`, `5g_edge` and
+> `5g_throttled` rows from run 33024352078 and earlier are not comparable with
+> anything measured after commit `15f5f3b`. Any trend line crossing that
+> boundary on those four profiles is an artifact of the recalibration, not a
+> change in mqvpn.
+
+**D — sample size.** `CI_BENCH_IPERF_STREAMS`, default 4, and the default
+sample length raised from 6 s to 10 s. The per-commit gate pins itself back to
+6 s so it stays out of the way of the push path. This narrows D rather than
+closing it: 4 streams x 10 s still does not fill `bgp_plain` at 380 Mbit over
+160 ms, and the profiles above roughly 100 Mbit x 100 ms should still be read as
+lower bounds until §1.3's budget allows a longer sample.
+
+**E — `special`'s silent half.** A `skip_row` helper writes
+`{"scenario": ..., "status": "setup_failed" | "tunnel_never_up"}`, and all four
+scenarios call it on every path that used to fall through to nothing. Four rows
+now appear whatever happens.
+
+**§0.1 C — a cancelled job losing the scenarios that had succeeded.** The
+results document used to be written once, after the mode's loop returned, which
+is why the three timed-out jobs uploaded nothing at all. `emit_results` is now
+called after every row and from the `EXIT` trap, `SIGTERM`/`SIGINT` are
+converted to a normal exit so that trap actually runs under a
+`timeout-minutes` cancellation, and the document carries `complete: 0` until
+the mode finishes normally. A consumer can therefore tell a partial artifact
+from a finished one, and a cancelled job still ships everything it managed to
+measure.
 
 ---
 
@@ -507,12 +600,16 @@ The first weekly that finished, for calibration against the estimates above:
 | `cat_junk` | 9m56s | `special` | 2m52s |
 
 Total wall-clock 57m23s, set by the core job, with the whole scenario matrix
-running inside it. Every job is comfortably under the 60-minute cap, so the
-`netsim` timeout does not need raising yet — but these are still not final
-numbers. Roughly a fifth of the rows never established a tunnel (§0.2 B) and
-spent 25 s per attempt failing instead of 18 s measuring, and fixing §0.2 A
-makes each `run_pair` do three real measurements where today it does one and
-two cheap repeats of it. Re-measure before sharding further.
+running inside it. These are not final numbers, and the §0.3 fixes make them
+obsolete upward on purpose: `run_pair` now performs three real measurements
+where it used to do one and two repeats of it, the sample went from 1 x 6 s to
+4 x 10 s, and the tunnel wait from 25 s to 40 s. For `classes`, the longest
+mode at 13 pairs, that is about 28 minutes typically and about 49 if every
+tunnel wait runs to its cap — against the 19m10s above. **The `netsim`
+`timeout-minutes` was raised 60 → 90 for that reason**; the incremental result
+writing in §0.3 keeps a cancellation from destroying the whole artifact, but it
+cannot recover the scenarios that never ran. Re-measure from the next run
+before sharding further.
 
 ## 5. What this cannot model — state it with the results
 
@@ -536,20 +633,22 @@ two cheap repeats of it. Re-measure before sharding further.
    bug (§0.1 A) and the spike-driver deadlock (§0.1 B).~~ **Done and confirmed**
    by run 33024352078: no job timed out and 76 of 97 rows carry a throughput.
 
-0a. **Make the multipath rows mean something** — the leaked-client bug in
-   `run_pair` (§0.2 A). This is now the item that blocks value: `classes`,
-   `combo`, `mtu`, `sched` and the per-commit gate all currently compare a path
-   against itself, so every aggregation figure in the matrix is an artefact.
-   Nothing below is worth tuning until it is fixed.
+0a. ~~**Make the multipath rows mean something** — the leaked-client bug in
+   `run_pair` (§0.2 A).~~ **Fixed, not yet confirmed** (§0.3 A). Until a weekly
+   run comes back, treat `aggregation_efficiency` and `vs_best_single` from
+   33024352078 and earlier as invalid rather than as a baseline.
 
-0b. **Stop a failure from looking like a measurement** — a reason field instead
-   of a bare `0.0` (§0.2 B), and a row from `special`'s failure path (§0.2 E).
-   Cheap, and it is what turned §0.1 into a seven-hour investigation.
+0b. ~~**Stop a failure from looking like a measurement** — a reason field
+   instead of a bare `0.0` (§0.2 B), and a row from `special`'s failure path
+   (§0.2 E).~~ **Fixed** (§0.3 B, §0.3 E). The same commit also closes §0.1 C,
+   so a cancelled job no longer discards the scenarios that succeeded.
 
-0c. **Recalibrate what the numbers rest on** — the `carrier_qos` policer
-   (§0.2 C) and the 6-second single-stream sample that cannot fill a high-BDP
-   path (§0.2 D). Both make a profile report something other than what its
-   table entry claims.
+0c. **Recalibrate what the numbers rest on** — the `loss gemodel` profiles
+   (§0.2 C) and the short single-stream sample that cannot fill a high-BDP path
+   (§0.2 D). The profiles are recalibrated (§0.3 C) and the sample is 4 streams
+   x 10 s (§0.3 D); **D is narrowed, not closed** — the widest transits still
+   need a longer sample than the weekly budget currently allows, so read them as
+   lower bounds.
 
 1. ~~Fix the `XQC_ELIMIT` connection kill.~~ **Done** — the buffered-frame cap
    was raised to match the receive window and `-XQC_ELIMIT` was made a tolerant
@@ -576,9 +675,10 @@ two cheap repeats of it. Re-measure before sharding further.
    (**done**). The dual-stack split is blocked on the client; see §2.5.
    Endurance jobs remain unscheduled.
 
-Still open, in short: item 0 (both defects), the N-hop chain and geographic
-routes (§2.1), the 2.5 G/1 G line rates (not feasible on a shared runner — §5),
-the dual-stack routing split (blocked on the client — §2.5), the fifth special
-condition, per-scenario incremental result writing (§0.1 C), and the endurance
-jobs. Everything else in §0 is implemented; none of it is yet verified against a
-run that carried traffic.
+Still open, in short: the N-hop chain and geographic routes (§2.1), the sample
+length on the widest transits (§0.2 D, narrowed but not closed), the 2.5 G/1 G
+line rates (not feasible on a shared runner — §5), the dual-stack routing split
+(blocked on the client — §2.5), the fifth special condition, and the endurance
+jobs. Item 0 and its three follow-ups are all written; item 0's two original
+defects are confirmed in CI, the five §0.2 defects and §0.1 C are not yet — the
+next weekly run is what decides that.

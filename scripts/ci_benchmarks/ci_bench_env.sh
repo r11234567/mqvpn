@@ -41,6 +41,14 @@ CI_BENCH_SCHEDULER="${CI_BENCH_SCHEDULER:-wlb}"
 CI_BENCH_LOG_LEVEL="${CI_BENCH_LOG_LEVEL:-error}"
 
 # Process PIDs
+#
+# _CB_CLIENT_PID alone is not enough. ci_bench_start_client is sometimes
+# reached from inside a command substitution, and that subshell's copy of the
+# variable dies with the subshell -- so the next call's "kill the previous
+# client" guard sees nothing and starts a second client beside the first. Every
+# pid also goes to a file, whose path is derived from $$ (the ORIGINAL shell's
+# pid, unchanged inside a subshell) so every caller agrees on it.
+_CB_CLIENT_PIDS="${TMPDIR:-/tmp}/mqvpn-cibench-clients.$$"
 _CB_SERVER_PID=""
 _CB_CLIENT_PID=""
 _CB_WORK_DIR=""
@@ -216,13 +224,8 @@ ci_bench_start_client() {
     local paths="$1"
     local scheduler="${2:-$CI_BENCH_SCHEDULER}"
 
-    # Kill previous client
-    if [ -n "$_CB_CLIENT_PID" ] && kill -0 "$_CB_CLIENT_PID" 2>/dev/null; then
-        kill "$_CB_CLIENT_PID" 2>/dev/null || true
-        wait "$_CB_CLIENT_PID" 2>/dev/null || true
-        _CB_CLIENT_PID=""
-        sleep 1
-    fi
+    # Kill every previous client, including one a subshell lost track of.
+    ci_bench_stop_client
 
     ip netns exec "$NS_CLIENT" "$MQVPN" \
         --mode client \
@@ -233,6 +236,7 @@ ci_bench_start_client() {
         --insecure \
         --log-level "$CI_BENCH_LOG_LEVEL" &
     _CB_CLIENT_PID=$!
+    echo "$_CB_CLIENT_PID" >> "$_CB_CLIENT_PIDS" 2>/dev/null || true
     sleep 3
 
     if ! kill -0 "$_CB_CLIENT_PID" 2>/dev/null; then
@@ -263,13 +267,55 @@ ci_bench_wait_tunnel() {
 
 # ── Stop VPN ──
 
+# True only while `pid` is still the mqvpn we recorded. A pid in the file may
+# have exited already and had its number handed to something unrelated, so
+# `kill -0` on its own is not enough to justify killing it. Prefer /proc/exe
+# (exact, and readable because these scripts run as root); comm is the fallback
+# and is compared on its first 15 bytes because that is all the kernel keeps.
+_cb_pid_is_client() {
+    local exe comm want
+    exe="$(readlink "/proc/$1/exe" 2>/dev/null)" || exe=""
+    if [ -n "$exe" ]; then
+        [ "${exe% (deleted)}" = "$MQVPN" ]
+        return
+    fi
+    comm="$(cat "/proc/$1/comm" 2>/dev/null)" || return 1
+    want="$(basename "$MQVPN")"
+    [ "$comm" = "${want:0:15}" ]
+}
+
 ci_bench_stop_client() {
-    if [ -n "$_CB_CLIENT_PID" ]; then
+    local pid live=0
+    # `wait` only works on our own children, and a pid from the file may be a
+    # subshell's child -- hence the `|| true` and the settle sleep below.
+    if [ -f "$_CB_CLIENT_PIDS" ]; then
+        while read -r pid; do
+            [ -n "$pid" ] || continue
+            kill -0 "$pid" 2>/dev/null || continue
+            _cb_pid_is_client "$pid" || continue
+            live=$((live + 1))
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        done < "$_CB_CLIENT_PIDS"
+        : > "$_CB_CLIENT_PIDS"
+    fi
+    if [ -n "$_CB_CLIENT_PID" ] && kill -0 "$_CB_CLIENT_PID" 2>/dev/null \
+       && _cb_pid_is_client "$_CB_CLIENT_PID"; then
         kill "$_CB_CLIENT_PID" 2>/dev/null || true
         wait "$_CB_CLIENT_PID" 2>/dev/null || true
-        _CB_CLIENT_PID=""
-        sleep 1
+        live=$((live + 1))
     fi
+    _CB_CLIENT_PID=""
+
+    # Two live clients at once is never intended and is not cosmetic: the first
+    # one still owns the tunnel address and the TUN, so a measurement aimed at
+    # another path set silently travels over the first client's paths instead.
+    # Report it rather than tidying it away.
+    if [ "$live" -gt 1 ]; then
+        echo "WARNING: reaped ${live} concurrent VPN clients -- an earlier" \
+             "measurement leaked one, and its paths carried the traffic"
+    fi
+    [ "$live" -eq 0 ] || sleep 1
 }
 
 ci_bench_stop_vpn() {

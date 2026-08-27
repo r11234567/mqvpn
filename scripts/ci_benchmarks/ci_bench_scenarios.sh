@@ -43,7 +43,20 @@ NS_CLIENT="$NETSIM_NS_CLIENT"
 IP_A_SERVER_ADDR="$NETSIM_SERVER_ADDR"
 
 CTRL_PORT=9099
-IPERF_SEC="${CI_BENCH_IPERF_SEC:-6}"
+IPERF_SEC="${CI_BENCH_IPERF_SEC:-10}"
+
+# Streams per sample. One stream cannot fill a high-BDP path: bgp_plain at
+# 380mbit over ~160ms RTT needs 7.6 MB of in-flight window, which a single
+# inner TCP connection does not reach inside a short sample. That is how the
+# widest transit in the catalog came back at 20.6 Mbps while a 50mbit private
+# line measured 37.6 -- the sample was the bottleneck, not the emulated link.
+IPERF_STREAMS="${CI_BENCH_IPERF_STREAMS:-4}"
+
+# How long to wait for the tunnel before recording a failure. The bad profiles
+# are marginal rather than impossible (catalog bgp_junk+eth does reach 0.5
+# Mbps), so a wait tuned for a clean path turns "slow to connect" into "never
+# connected" and publishes it as a zero.
+TUNNEL_WAIT_SEC="${CI_BENCH_TUNNEL_WAIT_SEC:-40}"
 # Repeats per measurement. Two on the per-commit gate (it must not become the
 # slowest thing in the push path), three where the number feeds a trend line.
 REPEATS="${CI_BENCH_REPEATS:-2}"
@@ -51,9 +64,55 @@ REPEATS="${CI_BENCH_REPEATS:-2}"
 CI_BENCH_RESULTS="${CI_BENCH_RESULTS:-${SCRIPT_DIR}/../../ci_bench_results}"
 mkdir -p "$CI_BENCH_RESULTS"
 ROWS="$(mktemp)"
-trap 'rm -f "$ROWS"; netsim_spike_stop; ci_bench_host_stop 2>/dev/null || true; ci_bench_stop_vpn 2>/dev/null || true; ci_bench_tier_cleanup 2>/dev/null || true; netsim_teardown' EXIT
+# Fixed at startup so emit_results always rewrites the same file rather than
+# leaving one document per scenario behind.
+RESULTS_STAMP="$(date -u '+%Y%m%d_%H%M%S')"
+trap 'emit_results; rm -f "$ROWS" "${_CB_CLIENT_PIDS:-}"; netsim_spike_stop; ci_bench_host_stop 2>/dev/null || true; ci_bench_stop_vpn 2>/dev/null || true; ci_bench_tier_cleanup 2>/dev/null || true; netsim_teardown' EXIT
+# An untrapped SIGTERM kills the shell without running the EXIT trap, and a
+# job-level `timeout-minutes` cancellation is delivered as one. Convert both to
+# a normal exit so the partial results survive the way they do on any other
+# failure.
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 # ── helpers ────────────────────────────────────────────────────────────────
+
+# Write every row collected so far as the results document.
+#
+# Called after each scenario, not only at the end. The 2026-08-26 weekly lost
+# three entire jobs this way: the document used to be written once, after the
+# mode's loop returned, so a job cancelled at the 60-minute cap uploaded
+# nothing at all -- "No files were found with the provided path:
+# ci_bench_results/*.json" -- and the scenarios that HAD completed went with
+# it. Rewriting after every row costs one python invocation against a scenario
+# that takes 40-100 s, and means the artifact is never further behind than the
+# scenario currently running.
+emit_results() {
+    [ -n "${TEST_NAME:-}" ] || return 0
+    [ -s "$ROWS" ] || return 0
+    RESULTS_OUT="${CI_BENCH_RESULTS}/${TEST_NAME}_${RESULTS_STAMP}.json"
+    python3 -c "
+import json, sys, os
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+doc = {
+  'test': sys.argv[2],
+  'commit': os.environ.get('CI_BENCH_COMMIT', 'unknown'),
+  'timestamp': sys.argv[3],
+  'mode': sys.argv[4],
+  'iperf_sec': int(sys.argv[5]),
+  'iperf_streams': int(sys.argv[6]),
+  'repeats': int(sys.argv[7]),
+  'complete': int(sys.argv[8]),
+  'caps': {'netem_seed': int(sys.argv[9]), 'pps_police': int(sys.argv[10]),
+           'nat': int(sys.argv[11])},
+  'results': rows,
+}
+json.dump(doc, open(sys.argv[12], 'w'), indent=2)" \
+        "$ROWS" "$TEST_NAME" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$MODE" \
+        "$IPERF_SEC" "$IPERF_STREAMS" "$REPEATS" "${RESULTS_COMPLETE:-0}" \
+        "$NETSIM_HAVE_SEED" "$NETSIM_HAVE_PPS" "$NETSIM_HAVE_NAT" \
+        "$RESULTS_OUT" 2>/dev/null || true
+}
 
 netsim_query_control() {
     ip netns exec "$NS_SERVER" bash -c \
@@ -71,20 +130,51 @@ import sys, statistics as s
 v=[float(x) for x in sys.argv[1:] if x]
 print('0.0' if len(v)<2 or s.fmean(v)==0 else f'{s.stdev(v)/abs(s.fmean(v))*100:.1f}')" "$@"; }
 
-# measure_pathset "<--path args>" -> echoes "mbps_median cv_pct"
+# measure_pathset "<--path args>"
+#   -> MEASURED_MBPS / MEASURED_CV / MEASURED_STATUS
+#
 # Restarts the client so only the requested paths exist, then measures.
+#
+# NEVER call this through $(...) or < <(...). Both are subshells, and
+# ci_bench_start_client records the client pid in a shell variable that the
+# subshell takes with it when it exits -- so the next call starts a second
+# client beside the first, three end up coexisting inside one netsim_setup, and
+# the first one keeps the tunnel address and the TUN. Every solo_b and
+# multipath figure this harness produced before that was found was really path
+# 0 measured a second and third time, which is why aggregation_efficiency sat
+# at exactly 0.50 across the whole matrix. Results come back in globals for
+# that reason; keep it that way.
+MEASURED_MBPS=0.0
+MEASURED_CV=0.0
+MEASURED_STATUS=ok
+
 measure_pathset() {
     local paths="$1"
-    ci_bench_start_client "$paths" >/dev/null 2>&1 || { echo "0.0 0.0"; return; }
-    if ! ci_bench_wait_tunnel 25 >/dev/null 2>&1; then echo "0.0 0.0"; return; fi
+    MEASURED_MBPS=0.0; MEASURED_CV=0.0; MEASURED_STATUS=ok
+
+    if ! ci_bench_start_client "$paths" >/dev/null 2>&1; then
+        MEASURED_STATUS=client_start_failed
+        return 0
+    fi
+    if ! ci_bench_wait_tunnel "$TUNNEL_WAIT_SEC" >/dev/null 2>&1; then
+        MEASURED_STATUS=tunnel_never_up
+        return 0
+    fi
 
     local samples=() i jf
     for (( i=0; i<REPEATS; i++ )); do
-        jf="$(ci_bench_run_iperf TCP DL "$IPERF_SEC" 1)"
+        jf="$(ci_bench_run_iperf TCP DL "$IPERF_SEC" "$IPERF_STREAMS")"
         samples+=("$(ci_bench_parse_throughput "$jf")")
         rm -f "$jf"
     done
-    echo "$(med "${samples[@]}") $(cv_pct "${samples[@]}")"
+    MEASURED_MBPS="$(med "${samples[@]}")"
+    MEASURED_CV="$(cv_pct "${samples[@]}")"
+
+    # A tunnel that came up and then carried nothing is a different finding
+    # from one that never came up, and the row has to be able to say which --
+    # both used to be written as a bare 0.0.
+    awk -v v="$MEASURED_MBPS" 'BEGIN{exit !(v+0>0)}' || MEASURED_STATUS=measured_zero
+    return 0
 }
 
 # Scrape the control API for everything that is not throughput. Echoes a JSON
@@ -186,11 +276,19 @@ run_pair() {
 
     start_server_with_ctrl "$sched" >/dev/null || return 1
 
-    local dev0 dev1 a b mp
+    local dev0 dev1 a b mp cv st_a st_b st_mp status
     dev0="$(netsim_veth_cli 0)"; dev1="$(netsim_veth_cli 1)"
-    read -r a _   < <(measure_pathset "--path $dev0")
-    read -r b _   < <(measure_pathset "--path $dev1")
-    read -r mp cv < <(measure_pathset "--path $dev0 --path $dev1")
+    # Plain calls, not $( ) -- see measure_pathset.
+    measure_pathset "--path $dev0"
+    a="$MEASURED_MBPS"; st_a="$MEASURED_STATUS"
+    measure_pathset "--path $dev1"
+    b="$MEASURED_MBPS"; st_b="$MEASURED_STATUS"
+    measure_pathset "--path $dev0 --path $dev1"
+    mp="$MEASURED_MBPS"; cv="$MEASURED_CV"; st_mp="$MEASURED_STATUS"
+
+    status=ok
+    [ "${st_a}${st_b}${st_mp}" = okokok ] ||
+        status="a=${st_a} b=${st_b} mp=${st_mp}"
 
     local stats rss
     stats="$(collect_stats)"; rss="$(server_rss_kb)"
@@ -210,14 +308,16 @@ row = {
   'vs_best_single': round(mp/max(a,b), 3) if max(a,b) else 0,
   'multipath_cv_pct': float(sys.argv[8]),
   'server_rss_peak_kb': int(sys.argv[9]),
+  'status': sys.argv[11],
 }
 extra = sys.argv[10]
 if extra: row.update(json.loads('{' + extra + '}'))
 print(json.dumps(row))" \
         "$a" "$b" "$mp" "$class" "$sched" \
-        "${spec%%|*}" "${spec##*|}" "$cv" "$rss" "$stats" >> "$ROWS"
+        "${spec%%|*}" "${spec##*|}" "$cv" "$rss" "$stats" "$status" >> "$ROWS"
 
-    echo "   solo_a=${a} solo_b=${b} mp=${mp} Mbps  (cv ${cv}%)"
+    echo "   solo_a=${a} solo_b=${b} mp=${mp} Mbps  (cv ${cv}%)  [${status}]"
+    emit_results
     netsim_teardown
 }
 
@@ -264,7 +364,8 @@ run_tier() {
 
     local dev0 dev1 mp cv
     dev0="$(netsim_veth_cli 0)"; dev1="$(netsim_veth_cli 1)"
-    read -r mp cv < <(measure_pathset "--path $dev0 --path $dev1")
+    measure_pathset "--path $dev0 --path $dev1"
+    mp="$MEASURED_MBPS"; cv="$MEASURED_CV"
 
     local stats rss
     stats="$(collect_stats)"; rss="$(server_rss_kb)"
@@ -287,14 +388,17 @@ row = {
   'server_rss_peak_kb': int(sys.argv[8]),
   'tier_props': sys.argv[9],
   'tier_nominal': 'label only -- a quota ceiling, not this instance\'s latency',
+  'status': sys.argv[11],
 }
 extra = sys.argv[10]
 if extra: row.update(json.loads('{' + extra + '}'))
 print(json.dumps(row))" \
         "${tier}+${state}" "$tier" "$state" "$class" "$CI_BENCH_SCHEDULER" \
-        "$mp" "$cv" "$rss" "${CI_BENCH_TIER_PROPS[$tier]:-none}" "$stats" >> "$ROWS"
+        "$mp" "$cv" "$rss" "${CI_BENCH_TIER_PROPS[$tier]:-none}" "$stats" \
+        "$MEASURED_STATUS" >> "$ROWS"
 
-    echo "   mp=${mp} Mbps  (cv ${cv}%)  rss=${rss}kB"
+    echo "   mp=${mp} Mbps  (cv ${cv}%)  rss=${rss}kB  [${MEASURED_STATUS}]"
+    emit_results
     netsim_teardown
 }
 
@@ -341,8 +445,9 @@ run_catalog() {
         netsim_apply_path 0 "${leg}:${transit}" 4242 || { netsim_teardown; continue; }
         start_server_with_ctrl >/dev/null || { netsim_teardown; continue; }
 
-        local mbps cv stats rss
-        read -r mbps cv < <(measure_pathset "--path $(netsim_veth_cli 0)")
+        local mbps cv stats rss st
+        measure_pathset "--path $(netsim_veth_cli 0)"
+        mbps="$MEASURED_MBPS"; cv="$MEASURED_CV"; st="$MEASURED_STATUS"
         stats="$(collect_stats)"; rss="$(server_rss_kb)"
         ci_bench_stop_vpn
 
@@ -350,13 +455,15 @@ run_catalog() {
 import json,sys
 row={'scenario':sys.argv[1],'access':sys.argv[2],'transit':sys.argv[3],
      'single_path_mbps':float(sys.argv[4]),'cv_pct':float(sys.argv[5]),
-     'server_rss_peak_kb':int(sys.argv[6])}
+     'server_rss_peak_kb':int(sys.argv[6]),'status':sys.argv[8]}
 extra=sys.argv[7]
 if extra: row.update(json.loads('{'+extra+'}'))
 print(json.dumps(row))" \
-            "${transit}+${leg}" "$leg" "$transit" "$mbps" "$cv" "$rss" "$stats" >> "$ROWS"
+            "${transit}+${leg}" "$leg" "$transit" "$mbps" "$cv" "$rss" "$stats" \
+            "$st" >> "$ROWS"
 
-        echo "   ${mbps} Mbps (cv ${cv}%)"
+        echo "   ${mbps} Mbps (cv ${cv}%)  [${st}]"
+        emit_results
         netsim_teardown
     done
 }
@@ -365,6 +472,19 @@ print(json.dumps(row))" \
 # All of these already have functional coverage under scripts/ci_e2e/. What
 # was missing is running them while traffic is in flight, which is where the
 # timing and buffering bugs actually live.
+# A scenario that could not be set up still has to leave a row. run_special
+# emitted nothing on its failure paths, so nat_aging and roam_under_load
+# vanished from the artifact whenever their tunnel did not come up -- no row,
+# no warning, and the job still reported success. The 2026-08-26 weekly shipped
+# two rows where four were expected and nothing said so.
+skip_row() {
+    python3 -c "
+import json,sys
+print(json.dumps({'scenario': sys.argv[1], 'status': sys.argv[2]}))" "$1" "$2" >> "$ROWS"
+    echo "   SKIPPED ($2)"
+    emit_results
+}
+
 run_special() {
     local hop dev_up
 
@@ -377,21 +497,27 @@ run_special() {
     if netsim_setup 1 >/dev/null && netsim_apply_path 0 "5g_half:bgp_plain:port_restricted" 4242; then
         if start_server_with_ctrl >/dev/null \
            && ci_bench_start_client "--path $(netsim_veth_cli 0)" >/dev/null 2>&1 \
-           && ci_bench_wait_tunnel 25 >/dev/null 2>&1; then
+           && ci_bench_wait_tunnel "$TUNNEL_WAIT_SEC" >/dev/null 2>&1; then
             local before after jf
-            jf="$(ci_bench_run_iperf TCP DL 4 1)"; before="$(ci_bench_parse_throughput "$jf")"; rm -f "$jf"
+            jf="$(ci_bench_run_iperf TCP DL 4 "$IPERF_STREAMS")"; before="$(ci_bench_parse_throughput "$jf")"; rm -f "$jf"
             sleep 35
-            jf="$(ci_bench_run_iperf TCP DL 4 1)"; after="$(ci_bench_parse_throughput "$jf")"; rm -f "$jf"
+            jf="$(ci_bench_run_iperf TCP DL 4 "$IPERF_STREAMS")"; after="$(ci_bench_parse_throughput "$jf")"; rm -f "$jf"
             python3 -c "
 import json,sys
 b,a=float(sys.argv[1]),float(sys.argv[2])
 print(json.dumps({'scenario':'nat_aging','before_idle_mbps':b,'after_idle_mbps':a,
- 'survived_ratio':round(a/b,3) if b else 0,'recovered':1 if a>0.5 else 0}))" \
+ 'survived_ratio':round(a/b,3) if b else 0,'recovered':1 if a>0.5 else 0,
+ 'status':'ok'}))" \
                 "$before" "$after" >> "$ROWS"
             echo "   before=${before} after=${after} Mbps"
+            emit_results
+        else
+            skip_row nat_aging tunnel_never_up
         fi
         ci_bench_stop_vpn || true
         netsim_teardown
+    else
+        skip_row nat_aging setup_failed
     fi
 
     # 2. Corrupt / reorder / duplicate: radio-grade damage under load.
@@ -401,17 +527,22 @@ print(json.dumps({'scenario':'nat_aging','before_idle_mbps':b,'after_idle_mbps':
     if netsim_setup 1 >/dev/null && netsim_apply_path 0 "_damaged:bgp_plain" 4242 \
        && start_server_with_ctrl >/dev/null; then
         local mbps cv stats
-        read -r mbps cv < <(measure_pathset "--path $(netsim_veth_cli 0)")
+        measure_pathset "--path $(netsim_veth_cli 0)"
+        mbps="$MEASURED_MBPS"; cv="$MEASURED_CV"
         stats="$(collect_stats)"
         python3 -c "
 import json,sys
 row={'scenario':'corrupt_reorder','single_path_mbps':float(sys.argv[1]),
-     'cv_pct':float(sys.argv[2]),'survived':1 if float(sys.argv[1])>0 else 0}
+     'cv_pct':float(sys.argv[2]),'survived':1 if float(sys.argv[1])>0 else 0,
+     'status':sys.argv[4]}
 extra=sys.argv[3]
 if extra: row.update(json.loads('{'+extra+'}'))
-print(json.dumps(row))" "$mbps" "$cv" "$stats" >> "$ROWS"
-        echo "   ${mbps} Mbps"
+print(json.dumps(row))" "$mbps" "$cv" "$stats" "$MEASURED_STATUS" >> "$ROWS"
+        echo "   ${mbps} Mbps  [${MEASURED_STATUS}]"
+        emit_results
         ci_bench_stop_vpn || true
+    else
+        skip_row corrupt_reorder setup_failed
     fi
     netsim_teardown
 
@@ -427,25 +558,30 @@ print(json.dumps(row))" "$mbps" "$cv" "$stats" >> "$ROWS"
             netem delay 30ms rate 5mbit limit 12000 || true
         if start_server_with_ctrl >/dev/null \
            && ci_bench_start_client "--path $(netsim_veth_cli 0)" >/dev/null 2>&1 \
-           && ci_bench_wait_tunnel 25 >/dev/null 2>&1; then
+           && ci_bench_wait_tunnel "$TUNNEL_WAIT_SEC" >/dev/null 2>&1; then
             local dl_idle dl_busy ulpid jf2
-            jf2="$(ci_bench_run_iperf TCP DL 5 1)"; dl_idle="$(ci_bench_parse_throughput "$jf2")"; rm -f "$jf2"
+            jf2="$(ci_bench_run_iperf TCP DL 5 "$IPERF_STREAMS")"; dl_idle="$(ci_bench_parse_throughput "$jf2")"; rm -f "$jf2"
             ip netns exec "$NS_SERVER" iperf3 -s -B "$TUNNEL_SERVER_IP" -p 5202 -1 &>/dev/null &
             sleep 1
             ip netns exec "$NS_CLIENT" iperf3 -c "$TUNNEL_SERVER_IP" -p 5202 -t 12 &>/dev/null &
             ulpid=$!
             sleep 3
-            jf2="$(ci_bench_run_iperf TCP DL 5 1)"; dl_busy="$(ci_bench_parse_throughput "$jf2")"; rm -f "$jf2"
+            jf2="$(ci_bench_run_iperf TCP DL 5 "$IPERF_STREAMS")"; dl_busy="$(ci_bench_parse_throughput "$jf2")"; rm -f "$jf2"
             kill "$ulpid" 2>/dev/null || true; wait "$ulpid" 2>/dev/null || true
             python3 -c "
 import json,sys
 i,b=float(sys.argv[1]),float(sys.argv[2])
 print(json.dumps({'scenario':'ack_starvation','dl_idle_mbps':i,'dl_under_ul_load_mbps':b,
- 'dl_retention':round(b/i,3) if i else 0}))" "$dl_idle" "$dl_busy" >> "$ROWS"
+ 'dl_retention':round(b/i,3) if i else 0,'status':'ok'}))" "$dl_idle" "$dl_busy" >> "$ROWS"
             echo "   dl_idle=${dl_idle} dl_under_load=${dl_busy} Mbps"
+            emit_results
+        else
+            skip_row ack_starvation tunnel_never_up
         fi
         ci_bench_stop_vpn || true
         netsim_teardown
+    else
+        skip_row ack_starvation setup_failed
     fi
 
     # 4. Live roaming: the client's source address changes mid-transfer, the
@@ -459,9 +595,9 @@ print(json.dumps({'scenario':'ack_starvation','dl_idle_mbps':i,'dl_under_ul_load
        && netsim_apply_path 0 "5g_full:bgp_plain:port_restricted" 4242; then
         if start_server_with_ctrl >/dev/null \
            && ci_bench_start_client "--path $(netsim_veth_cli 0)" >/dev/null 2>&1 \
-           && ci_bench_wait_tunnel 25 >/dev/null 2>&1; then
+           && ci_bench_wait_tunnel "$TUNNEL_WAIT_SEC" >/dev/null 2>&1; then
             local pre post roamed jf3
-            jf3="$(ci_bench_run_iperf TCP DL 5 1)"; pre="$(ci_bench_parse_throughput "$jf3")"; rm -f "$jf3"
+            jf3="$(ci_bench_run_iperf TCP DL 5 "$IPERF_STREAMS")"; pre="$(ci_bench_parse_throughput "$jf3")"; rm -f "$jf3"
 
             # Move the address underneath a transfer that is already running,
             # then measure what comes back. Measuring only after the roam would
@@ -474,7 +610,7 @@ print(json.dumps({'scenario':'ack_starvation','dl_idle_mbps':i,'dl_under_ul_load
                 echo "   (no conntrack/iptables — address did not actually move)"
             fi
             sleep 2
-            jf3="$(ci_bench_run_iperf TCP DL 5 1)"; post="$(ci_bench_parse_throughput "$jf3")"; rm -f "$jf3"
+            jf3="$(ci_bench_run_iperf TCP DL 5 "$IPERF_STREAMS")"; post="$(ci_bench_parse_throughput "$jf3")"; rm -f "$jf3"
             kill "$loadpid" 2>/dev/null || true; wait "$loadpid" 2>/dev/null || true
 
             python3 -c "
@@ -482,11 +618,16 @@ import json,sys
 p,q,r = float(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])
 print(json.dumps({'scenario':'roam_under_load','pre_roam_mbps':p,'post_roam_mbps':q,
  'roam_retention':round(q/p,3) if p else 0,'roam_applied':r,
- 'recovered':1 if q>0.5 else 0}))" "$pre" "$post" "$roamed" >> "$ROWS"
+ 'recovered':1 if q>0.5 else 0,'status':'ok'}))" "$pre" "$post" "$roamed" >> "$ROWS"
             echo "   pre=${pre} post=${post} Mbps (roam_applied=${roamed})"
+            emit_results
+        else
+            skip_row roam_under_load tunnel_never_up
         fi
         ci_bench_stop_vpn || true
         netsim_teardown
+    else
+        skip_row roam_under_load setup_failed
     fi
 }
 
@@ -500,8 +641,10 @@ netsim_detect_caps
 case "$MODE" in
   percommit)
     # One bad network, the highest-signal one: a scheduler regression shows up
-    # in hetero_extreme before anywhere else.
+    # in hetero_extreme before anywhere else. Shorter samples than the weekly
+    # modes on purpose -- this one sits in the push path.
     TEST_NAME="netsim_percommit"
+    IPERF_SEC="${CI_BENCH_IPERF_SEC:-6}"
     run_class hetero_extreme
     ;;
   classes)
@@ -579,26 +722,12 @@ case "$MODE" in
   *) echo "unknown mode '$MODE'" >&2; exit 2 ;;
 esac
 
-OUT="${CI_BENCH_RESULTS}/${TEST_NAME}_$(date -u '+%Y%m%d_%H%M%S').json"
-python3 -c "
-import json, sys, os
-rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-doc = {
-  'test': sys.argv[2],
-  'commit': os.environ.get('CI_BENCH_COMMIT', 'unknown'),
-  'timestamp': sys.argv[3],
-  'mode': sys.argv[4],
-  'iperf_sec': int(sys.argv[5]),
-  'repeats': int(sys.argv[6]),
-  'caps': {'netem_seed': int(sys.argv[7]), 'pps_police': int(sys.argv[8]),
-           'nat': int(sys.argv[9])},
-  'results': rows,
-}
-json.dump(doc, open(sys.argv[10], 'w'), indent=2)
-print('scenarios recorded: %d' % len(rows))" \
-    "$ROWS" "$TEST_NAME" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$MODE" \
-    "$IPERF_SEC" "$REPEATS" "$NETSIM_HAVE_SEED" "$NETSIM_HAVE_PPS" \
-    "$NETSIM_HAVE_NAT" "$OUT"
+# Only here does the document get to call itself complete; every earlier write
+# carries complete=0 so a consumer can tell a cancelled job's partial results
+# from a finished mode.
+RESULTS_COMPLETE=1
+emit_results
 
 echo ""
-echo "Result: $OUT"
+echo "scenarios recorded: $(grep -c . "$ROWS")"
+echo "Result: ${RESULTS_OUT:-<no rows>}"

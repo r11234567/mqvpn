@@ -98,7 +98,17 @@ declare -gA NETSIM_TRANSIT=(
   # `loss N%`: real bad lines lose in BURSTS, and burst loss is what defeats
   # congestion control. Uniform loss at the same average is a much easier
   # network and would flatter the scheduler. limit ~5x BDP = bloated.
-  [bgp_junk]="delay 120ms 45ms distribution paretonormal loss gemodel 3% 20% 88% 0.5% rate 80mbit limit 6000"
+  #
+  # The four gemodel terms are P(good->bad), P(bad->good), loss in the bad
+  # state, loss in the good state, so the AVERAGE loss is
+  # p/(p+r) x (1-h) + r/(p+r) x (1-k) -- which is not what any of them reads
+  # like individually. `3% 20% 88% 0.5%` worked out to 11.9% average, and a
+  # transit losing an eighth of its packets is not junk, it is unusable: it is
+  # why bgp_junk returned 0.5 Mbps where it measured at all and failed its
+  # handshake on seven of ten access legs. 1%/25% keeps the bursts (mean 4
+  # packets) at a 2.0% average, which is what a bad commodity port actually
+  # looks like.
+  [bgp_junk]="delay 120ms 45ms distribution paretonormal loss gemodel 1% 25% 50% 0.1% rate 80mbit limit 6000"
 
   # Flapping BGP: base is bgp_plain; netsim_spike_start injects the storm.
   [bgp_flappy]="delay 80ms 8ms distribution normal loss 0.1% rate 300mbit limit 2500"
@@ -106,8 +116,13 @@ declare -gA NETSIM_TRANSIT=(
   # Carrier QoS (the China-carrier shape): the pipe looks huge but the PACKET
   # rate is capped, so bitrate collapses at small MTU. netsim_apply_pps_cap
   # adds the policer. This is the only profile whose optimization signal is
-  # packet size rather than congestion control.
-  [carrier_qos]="delay 150ms 90ms distribution paretonormal loss gemodel 2% 15% 80% 0.3% rate 900mbit limit 10000"
+  # packet size rather than congestion control -- which means its loss term
+  # must NOT be the thing that dominates. `2% 15% 80% 0.3%` averaged 9.7% and
+  # did dominate: every carrier_qos row came back at 0.2-0.5 Mbps whatever the
+  # access leg, against a ~90 Mbps ceiling from its own 8000 pps cap at 1400
+  # bytes. Now 1.5% average, so the packet-rate cap is the constraint the
+  # profile exists to measure.
+  [carrier_qos]="delay 150ms 90ms distribution paretonormal loss gemodel 0.8% 25% 45% 0.1% rate 900mbit limit 10000"
 
   # Not a product tier: a deliberately unconstrained path, so a benchmark whose
   # subject is the *server* has no network ceiling in the way. Used by the tier
@@ -140,8 +155,13 @@ declare -gA NETSIM_ACCESS=(
   [wifi_busy]="delay 18ms 30ms distribution paretonormal loss 1.2% rate 60mbit limit 3000"
   [5g_full]="delay 18ms 6ms distribution normal loss 0.05% rate 350mbit"
   [5g_half]="delay 45ms 25ms distribution paretonormal loss 0.4% rate 90mbit"
-  [5g_edge]="delay 95ms 60ms distribution paretonormal loss gemodel 4% 25% 80% 1% rate 12mbit limit 4000"
-  [5g_throttled]="delay 130ms 85ms distribution paretonormal loss gemodel 5% 20% 85% 1.5% rate 8mbit limit 5000"
+  # Same gemodel arithmetic as the transit profiles above: `4% 25% 80% 1%` was
+  # 11.9% average and `5% 20% 85% 1.5%` was 18.2%, so both legs were beyond
+  # what a cell delivers even at the edge of coverage, and 5g_throttled failed
+  # to complete a handshake on every transit it was paired with. 3.3% and 4.1%
+  # average, bursts of 3-4 packets.
+  [5g_edge]="delay 95ms 60ms distribution paretonormal loss gemodel 2% 30% 45% 0.5% rate 12mbit limit 4000"
+  [5g_throttled]="delay 130ms 85ms distribution paretonormal loss gemodel 2% 28% 50% 0.8% rate 8mbit limit 5000"
   [starlink]="delay 45ms 30ms distribution paretonormal loss 1% rate 200mbit"
   [geo_sat]="delay 320ms 25ms distribution normal loss 0.5% rate 20mbit limit 2000"
   # Phone tethering over PAN/USB-OTG. The duplicate/corrupt terms are the
@@ -594,8 +614,8 @@ netsim_apply_path() {
 
     netsim_apply_nat "$slot" "$nat" || return 1
 
-    # Packet-rate cap, if either leg calls for one. Applied on the hop's
-    # server-facing side so it throttles the uplink the way a carrier does.
+    # Packet-rate cap, if either leg calls for one. Applied at the hop in both
+    # directions, the way a subscriber-level carrier cap works.
     local pps="${NETSIM_PPS_CAP[$transit]:-${NETSIM_PPS_CAP[$access]:-}}"
     if [ -n "$pps" ]; then netsim_apply_pps_cap "$slot" "$pps"; fi
 
@@ -655,15 +675,27 @@ netsim_set_pmtud_blackhole() {
 # depends on bytes-per-packet. Silently skipped when the kernel/iproute2 lacks
 # `police pkts_rate` — netsim_detect_caps already warned, and a missing cap is
 # better than a hard failure that blocks every other scenario.
+# Both directions, on the hop's two ingress qdiscs. A carrier packet-rate cap
+# is a subscriber-level cap, not a one-way one, and the direction matters to
+# the reading: a tc `ingress` qdisc filters what ARRIVES on a device, so the
+# single cap this used to install -- on the hop's server-facing device -- was
+# policing the downlink while its call site said it throttled "the uplink the
+# way a carrier does". The benchmark measures a download, so the cap did apply
+# to the traffic under test; the comment was simply describing the opposite
+# device. Policing both ends removes the ambiguity.
 netsim_apply_pps_cap() {
-    local slot="$1" pps="$2" hop
+    local slot="$1" pps="$2" hop dev
     [ "$NETSIM_HAVE_PPS" = 1 ] || return 0
     hop="$(netsim_hop_ns "$slot")"
-    local dev; dev="$(netsim_veth_hop_srv "$slot")"
-    ip netns exec "$hop" tc qdisc replace dev "$dev" handle ffff: ingress 2>/dev/null || true
-    ip netns exec "$hop" tc filter add dev "$dev" parent ffff: protocol ip u32 \
-        match ip protocol 17 0xff \
-        action police pkts_rate "$pps" pkts_burst "$((pps / 40 + 50))" drop 2>/dev/null || true
+
+    #   vhc ingress = packets from the client  -> uplink
+    #   vhs ingress = packets from the server  -> downlink
+    for dev in "$(netsim_veth_hop_cli "$slot")" "$(netsim_veth_hop_srv "$slot")"; do
+        ip netns exec "$hop" tc qdisc replace dev "$dev" handle ffff: ingress 2>/dev/null || true
+        ip netns exec "$hop" tc filter add dev "$dev" parent ffff: protocol ip u32 \
+            match ip protocol 17 0xff \
+            action police pkts_rate "$pps" pkts_burst "$((pps / 40 + 50))" drop 2>/dev/null || true
+    done
 }
 
 # ── Time-varying paths ─────────────────────────────────────────────────────
