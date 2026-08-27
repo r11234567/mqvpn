@@ -42,6 +42,7 @@ class SettingsRepository @Inject constructor(
         val REORDER_PORTS = stringPreferencesKey("reorder_ports")
         val HYBRID_ENABLED = booleanPreferencesKey("hybrid_enabled")
         val HYBRID_TCP_MODE = stringPreferencesKey("hybrid_tcp_mode")
+        val LOG_LEVEL = stringPreferencesKey("log_level")
         val SCHEMA = intPreferencesKey("settings_schema_version")
     }
 
@@ -88,6 +89,7 @@ class SettingsRepository @Inject constructor(
                 reorderPorts = prefs[Keys.REORDER_PORTS] ?: defaults.reorderPorts,
                 hybridEnabled = prefs[Keys.HYBRID_ENABLED] ?: defaults.hybridEnabled,
                 hybridTcpMode = prefs[Keys.HYBRID_TCP_MODE] ?: defaults.hybridTcpMode,
+                logLevel = prefs[Keys.LOG_LEVEL] ?: defaults.logLevel,
             )
         }
 
@@ -104,6 +106,7 @@ class SettingsRepository @Inject constructor(
             prefs[Keys.REORDER_PORTS] = newSettings.reorderPorts
             prefs[Keys.HYBRID_ENABLED] = newSettings.hybridEnabled
             prefs[Keys.HYBRID_TCP_MODE] = newSettings.hybridTcpMode
+            prefs[Keys.LOG_LEVEL] = newSettings.logLevel
         }
     }
 }

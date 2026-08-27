@@ -88,3 +88,28 @@ name beside a corrupted arrow, because the adapter name arrived from Win32
 already in the console's codepage. `docs/windows_build.md` has the byte-level
 walkthrough and explains why `SetConsoleOutputCP(CP_UTF8)` is not a sufficient
 answer.
+
+## Reading the log on Android
+
+A phone has no console, and several failures are named nowhere else — a
+certificate rejection says *why* only in this log. So the SDK keeps its own copy:
+`MqvpnLogBuffer` (`android/sdk-core/.../MqvpnLogBuffer.kt`) is a bounded ring
+that `MqvpnVpnService.onNativeLog` fills, and the sample app renders it under
+the Logs action on the dashboard, with a level filter, a text filter, and a copy
+button.
+
+Two details are deliberate:
+
+- **It is a process-wide singleton, not state on `MqvpnManager`.** The lines
+  that matter most are emitted while `startTunnel` is still running, which can
+  be before the Activity's `bindService` has completed. A sink that existed only
+  once something was listening would miss exactly the failure being diagnosed.
+- **The viewer polls it; the ring does not push.** At `debug` the engine emits
+  far faster than a screen can render, so a fixed-interval read costs the same
+  whatever the log rate. Lines evicted by the ring are counted and shown, so a
+  truncated log is never mistaken for a whole one.
+
+The level is per-connection (`[General] LogLevel` / `MqvpnConfig.logLevel`, in
+the app under Settings > Logging) and applies from the next connect. Remember the
+forward map above: mqvpn `info` already asks xquic for `WARN`, so raising this to
+`debug` is what makes xquic's own lines appear.

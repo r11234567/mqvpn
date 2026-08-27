@@ -23,6 +23,7 @@ data class DemoSettings(
     val reorderPorts: String = "443",
     val hybridEnabled: Boolean = false,
     val hybridTcpMode: String = MqvpnConfig.HybridTcpMode.AUTO.name,
+    val logLevel: String = MqvpnConfig.LogLevel.INFO.name,
 ) {
     fun reorderProfileEnum(): MqvpnConfig.ReorderProfile =
         MqvpnConfig.ReorderProfile.entries.firstOrNull { it.name == reorderProfile }
@@ -31,6 +32,10 @@ data class DemoSettings(
     fun hybridTcpModeEnum(): MqvpnConfig.HybridTcpMode =
         MqvpnConfig.HybridTcpMode.entries.firstOrNull { it.name == hybridTcpMode }
             ?: MqvpnConfig.HybridTcpMode.AUTO
+
+    fun logLevelEnum(): MqvpnConfig.LogLevel =
+        MqvpnConfig.LogLevel.entries.firstOrNull { it.name == logLevel }
+            ?: MqvpnConfig.LogLevel.INFO
 
     fun parsedReorderPorts(): List<Int> =
         reorderPorts.split(",")
@@ -57,6 +62,7 @@ data class DemoSettings(
         reorderPorts = parsedReorderPorts(),
         hybridEnabled = hybridEnabled,
         hybridTcpMode = hybridTcpModeEnum(),
+        logLevel = logLevelEnum(),
     )
 
     fun hostValid(): Boolean = serverAddress.trim().isNotBlank()

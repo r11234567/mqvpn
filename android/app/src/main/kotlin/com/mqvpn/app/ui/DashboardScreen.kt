@@ -22,6 +22,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddCircle
+import androidx.compose.material.icons.filled.Article
 import androidx.compose.material.icons.filled.Autorenew
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.ErrorOutline
@@ -60,6 +61,7 @@ import java.util.Locale
 fun DashboardScreen(
     viewModel: MqvpnViewModel,
     onOpenSettings: () -> Unit,
+    onOpenLogs: () -> Unit,
 ) {
     val state by viewModel.vpnState.collectAsStateWithLifecycle()
     val stats by viewModel.stats.collectAsStateWithLifecycle()
@@ -103,6 +105,9 @@ fun DashboardScreen(
             TopAppBar(
                 title = { Text("mqvpn") },
                 actions = {
+                    IconButton(onClick = onOpenLogs) {
+                        Icon(Icons.Filled.Article, contentDescription = "Logs")
+                    }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Filled.Settings, contentDescription = "Settings")
                     }

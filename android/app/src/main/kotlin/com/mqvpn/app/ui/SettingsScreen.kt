@@ -85,6 +85,7 @@ fun SettingsScreen(
     var hybridTcpModeName by rememberSaveable {
         mutableStateOf(MqvpnConfig.HybridTcpMode.AUTO.name)
     }
+    var logLevelName by rememberSaveable { mutableStateOf(MqvpnConfig.LogLevel.INFO.name) }
 
     // Seed during composition (not LaunchedEffect) to avoid a one-frame flash
     // of empty fields; seeded gate makes it write-once.
@@ -101,6 +102,7 @@ fun SettingsScreen(
         reorderPorts = current.reorderPorts
         hybridEnabled = current.hybridEnabled
         hybridTcpModeName = current.hybridTcpMode
+        logLevelName = current.logLevel
         seeded = true
     }
 
@@ -116,6 +118,7 @@ fun SettingsScreen(
         reorderPorts = reorderPorts,
         hybridEnabled = hybridEnabled,
         hybridTcpMode = hybridTcpModeName,
+        logLevel = logLevelName,
     )
 
     val fieldsEnabled = isEditable && !isSaving
@@ -328,6 +331,24 @@ fun SettingsScreen(
             Spacer(modifier = Modifier.height(4.dp))
             Text(
                 "Requires hybrid support on the server; TCP connections fail otherwise.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text("Logging", style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(8.dp))
+            EnumDropdownField(
+                label = "Log Level",
+                options = MqvpnConfig.LogLevel.entries,
+                selected = draft.logLevelEnum(),
+                displayName = { it.name },
+                onSelect = { logLevelName = it.name },
+                enabled = fieldsEnabled,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                "Applied when the tunnel starts. DEBUG is verbose enough to " +
+                    "outrun the log buffer; view the log from the Logs screen.",
                 style = MaterialTheme.typography.bodySmall,
             )
 

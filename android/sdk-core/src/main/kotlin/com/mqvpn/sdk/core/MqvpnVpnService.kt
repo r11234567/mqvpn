@@ -232,6 +232,10 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
     }
 
     override fun onNativeLog(level: Int, message: String) {
+        // Buffered here rather than behind the app's onLog override: the ring
+        // is the only copy of the log reachable from the device itself, and it
+        // has to fill whether or not anything is bound to observe it.
+        MqvpnLogBuffer.append(level, message)
         onLog(level, message)
     }
 

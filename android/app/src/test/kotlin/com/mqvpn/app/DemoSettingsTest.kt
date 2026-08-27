@@ -55,6 +55,28 @@ class DemoSettingsTest {
         assertEquals(MqvpnConfig.HybridTcpMode.AUTO, settings.hybridTcpModeEnum())
     }
 
+    @Test
+    fun `logLevelEnum round-trips known name`() {
+        val settings = DemoSettings(logLevel = MqvpnConfig.LogLevel.DEBUG.name)
+        assertEquals(MqvpnConfig.LogLevel.DEBUG, settings.logLevelEnum())
+    }
+
+    @Test
+    fun `logLevelEnum falls back to INFO on unknown name`() {
+        val settings = DemoSettings(logLevel = "TRACE")
+        assertEquals(MqvpnConfig.LogLevel.INFO, settings.logLevelEnum())
+    }
+
+    @Test
+    fun `logLevel reaches the native config`() {
+        val config = DemoSettings(
+            serverAddress = "vpn.example.org",
+            authKey = "k",
+            logLevel = MqvpnConfig.LogLevel.DEBUG.name,
+        ).toMqvpnConfig()
+        assertEquals(MqvpnConfig.LogLevel.DEBUG, config.logLevel)
+    }
+
     // -- reorder port text parsing -------------------------------------------
 
     @Test

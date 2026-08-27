@@ -28,10 +28,17 @@ class MainActivity : ComponentActivity() {
                 val nav = rememberNavController()
                 NavHost(nav, startDestination = "dashboard") {
                     composable("dashboard") {
-                        DashboardScreen(vm, onOpenSettings = { nav.navigate("settings") })
+                        DashboardScreen(
+                            vm,
+                            onOpenSettings = { nav.navigate("settings") },
+                            onOpenLogs = { nav.navigate("logs") },
+                        )
                     }
                     composable("settings") {
                         SettingsScreen(onNavigateUp = { nav.navigateUp() })
+                    }
+                    composable("logs") {
+                        LogScreen(onNavigateUp = { nav.navigateUp() })
                     }
                 }
             }
