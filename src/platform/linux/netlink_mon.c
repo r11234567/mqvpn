@@ -551,7 +551,7 @@ recover_dropped_paths_cb(evutil_socket_t fd, short what, void *arg)
              * rewording it silently disables that e2e's gate check. */
             if (p->route_gate_blocked[i]++ % 10 == 0)
                 LOG_WRN("netlink: %s has a usable address but no route to "
-                        "the server — re-add deferred until a route appears",
+                        "the server -- re-add deferred until a route appears",
                         ifname);
             continue;
         }

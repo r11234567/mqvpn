@@ -294,7 +294,7 @@ mqvpn_lwip_ctx_free(mqvpn_lwip_ctx_t *ctx)
      * and is not the leak this warning exists to catch — the log line is
      * a coarse signal for triage, not proof of a tcp_lane bug. */
     if (tcp_active_pcbs)
-        LOG_WRN("lwip: ctx_free with active pcbs — tcp_lane must abort flows first "
+        LOG_WRN("lwip: ctx_free with active pcbs -- tcp_lane must abort flows first "
                 "(or a half-open pre-accept SYN_RCVD pcb, which is expected/bounded)");
     if (ctx->listen_pcb) {
         tcp_close(ctx->listen_pcb); /* LISTEN pcb: closes + frees */

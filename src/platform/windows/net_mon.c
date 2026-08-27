@@ -703,7 +703,7 @@ reconcile_all(platform_win_ctx_t *p)
              * (that e2e is Linux-only) — no e2e marker constraint here yet. */
             if (p->route_gate_blocked[i]++ % 10 == 0)
                 LOG_WRN("netmon: %s has a usable address but no route to "
-                        "the server — re-add deferred until a route appears",
+                        "the server -- re-add deferred until a route appears",
                         ifname);
             continue;
         }

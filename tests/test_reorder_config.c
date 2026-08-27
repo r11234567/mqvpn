@@ -266,9 +266,9 @@ test_ini_defaults_no_section(void)
     if (path) unlink(path);
 
     ASSERT_EQ_INT(rc, 0, "parse ok");
-    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_OFF, "no section → OFF");
-    ASSERT_EQ_INT(cfg.reorder.max_wait_ms, 30, "no section → default wait");
-    ASSERT_EQ_INT(cfg.reorder.n_rules, 0, "no section → no rules");
+    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_OFF, "no section -> OFF");
+    ASSERT_EQ_INT(cfg.reorder.max_wait_ms, 30, "no section -> default wait");
+    ASSERT_EQ_INT(cfg.reorder.n_rules, 0, "no section -> no rules");
 }
 
 static void
@@ -295,7 +295,7 @@ test_ini_reorder_full(void)
     if (path) unlink(path);
 
     ASSERT_EQ_INT(rc, 0, "parse ok");
-    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_ON, "Enabled=on → ON");
+    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_ON, "Enabled=on -> ON");
     ASSERT_EQ_INT(cfg.reorder.max_wait_ms, 40, "MaxWaitMs");
     ASSERT_EQ_INT(cfg.reorder.cap_packets_per_flow, 2048, "CapPackets");
     ASSERT_TRUE(cfg.reorder.max_buffer_bytes_per_flow == 3145728ULL, "MaxBytesPerFlow");
@@ -558,7 +558,7 @@ test_json_reorder_basic(void)
      * test_json_ini_parity. */
     ASSERT_EQ_INT(rc, 0, "json parse ok");
     ASSERT_EQ_INT(mqvpn_reorder_config_validate(&cfg.reorder), 0, "json config valid");
-    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_ON, "json enabled=on → ON");
+    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_ON, "json enabled=on -> ON");
     ASSERT_EQ_INT(cfg.reorder.max_wait_ms, 40, "json max_wait_ms");
     ASSERT_EQ_INT(cfg.reorder.cap_packets_per_flow, 2048, "json cap_packets");
 }
@@ -622,9 +622,9 @@ test_json_reorder_absent(void)
     int rc = mqvpn_config_load_json_filecfg(&cfg, json);
 
     ASSERT_EQ_INT(rc, 0, "json parse ok");
-    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_OFF, "absent → OFF");
-    ASSERT_EQ_INT(cfg.reorder.max_wait_ms, 30, "absent → default wait");
-    ASSERT_EQ_INT(cfg.reorder.n_rules, 0, "absent → no rules");
+    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_OFF, "absent -> OFF");
+    ASSERT_EQ_INT(cfg.reorder.max_wait_ms, 30, "absent -> default wait");
+    ASSERT_EQ_INT(cfg.reorder.n_rules, 0, "absent -> no rules");
 }
 
 /* Regression: a reorder object larger than the old 512-byte stack buffer must
@@ -1066,7 +1066,7 @@ test_json_rule_params_and_parity(void)
     ASSERT_EQ_INT(jcfg.reorder.rules[0].explicit_wait_ms, 80, "(a) json rule wait");
     ASSERT_EQ_INT(jcfg.reorder.rules[0].explicit_cap, 2048, "(a) json rule cap");
     ASSERT_EQ_INT(memcmp(&icfg.reorder, &jcfg.reorder, sizeof(icfg.reorder)), 0,
-                  "(a) JSON↔INI per-rule param parity");
+                  "(a) JSON<->INI per-rule param parity");
 }
 
 static void

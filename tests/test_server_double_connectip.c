@@ -975,7 +975,7 @@ main(void)
          * path before we tear the server down. */
         pump_once(svr, svr_fd, &cli_addr, cli_fd);
     } else {
-        printf("  no client ever connected — cannot exercise sessions[] via TUN "
+        printf("  no client ever connected -- cannot exercise sessions[] via TUN "
                "routing                                                    FAIL\n");
         rc = 1;
     }

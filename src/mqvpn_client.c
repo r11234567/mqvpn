@@ -1305,7 +1305,7 @@ cli_signal_connect_fail(cli_conn_t *conn, mqvpn_error_t reason, int status_for_l
     if (conn->tunnel_notified) return; /* once (calloc-zeroed at conn start) */
     assert(!conn->tunnel_ok);          /* every caller gates on !tunnel_ok / non-200 */
     conn->tunnel_notified = 1;
-    LOG_W(c, "CONNECT-IP request failed (status=%d) → tunnel_closed(%d)", status_for_log,
+    LOG_W(c, "CONNECT-IP request failed (status=%d) -> tunnel_closed(%d)", status_for_log,
           (int)reason);
     if (c->cbs.tunnel_closed) c->cbs.tunnel_closed(reason, c->user_ctx);
 }

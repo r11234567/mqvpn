@@ -286,7 +286,7 @@ ip netns exec "$NS_CLIENT" ip link set "$VETH_B0" up
 # server's /24 is gone and stays gone until we add it back below.
 
 READD_PATTERN="path ${VETH_B0} re-added|timer re-added path ${VETH_B0}"
-GATE_PATTERN="netlink: ${VETH_B0} has a usable address but no route to the server — re-add deferred until a route appears"
+GATE_PATTERN="netlink: ${VETH_B0} has a usable address but no route to the server -- re-add deferred until a route appears"
 
 echo "Observing for 15s: gate log must appear, no re-add, no PENDING stuck..."
 if ! wait_for_log_after "${WORK_DIR}/client.log" "$GATE_PATTERN" "$UP_MARK" 15; then

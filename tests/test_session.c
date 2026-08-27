@@ -450,12 +450,12 @@ test_ipv6_pool_get6(void)
     struct in6_addr cli6;
     mqvpn_addr_pool_get6(&pool, 2, &cli6);
     inet_ntop(AF_INET6, &cli6, str, sizeof(str));
-    ASSERT_EQ_STR(str, "fd00:abcd::2", "offset 2 → ::2");
+    ASSERT_EQ_STR(str, "fd00:abcd::2", "offset 2 -> ::2");
 
     /* Client offset=100 → fd00:abcd::64 */
     mqvpn_addr_pool_get6(&pool, 100, &cli6);
     inet_ntop(AF_INET6, &cli6, str, sizeof(str));
-    ASSERT_EQ_STR(str, "fd00:abcd::64", "offset 100 → ::64");
+    ASSERT_EQ_STR(str, "fd00:abcd::64", "offset 100 -> ::64");
 }
 
 static void
@@ -479,7 +479,7 @@ test_ipv6_pool_offset6(void)
     struct in6_addr bad;
     inet_pton(AF_INET6, "2001:db8::1", &bad);
     off = mqvpn_addr_pool_offset6(&pool, &bad);
-    ASSERT_EQ_INT(off, 0, "out-of-range v6 addr → offset 0");
+    ASSERT_EQ_INT(off, 0, "out-of-range v6 addr -> offset 0");
 }
 
 static void
@@ -641,7 +641,7 @@ test_ipv6_offset6_below_base(void)
     struct in6_addr below;
     inet_pton(AF_INET6, "fd00:abcd::50", &below);
     uint32_t off = mqvpn_addr_pool_offset6(&pool, &below);
-    ASSERT_EQ_INT(off, 0, "v6 addr below base → offset 0");
+    ASSERT_EQ_INT(off, 0, "v6 addr below base -> offset 0");
 }
 
 static void
@@ -656,10 +656,10 @@ test_ipv6_get6_offset_zero(void)
     mqvpn_addr_pool_get6(&pool, 0, &addr);
     char str[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET6, &addr, str, sizeof(str));
-    ASSERT_EQ_STR(str, "fd00:abcd::", "offset 0 → base v6 addr");
+    ASSERT_EQ_STR(str, "fd00:abcd::", "offset 0 -> base v6 addr");
 
     uint32_t off = mqvpn_addr_pool_offset6(&pool, &addr);
-    ASSERT_EQ_INT(off, 0, "base v6 addr → offset 0");
+    ASSERT_EQ_INT(off, 0, "base v6 addr -> offset 0");
 }
 
 static void
@@ -675,7 +675,7 @@ test_ipv6_get6_large_offset(void)
     mqvpn_addr_pool_get6(&pool, 254, &addr);
     char str[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET6, &addr, str, sizeof(str));
-    ASSERT_EQ_STR(str, "fd00::fe", "offset 254 → ::fe");
+    ASSERT_EQ_STR(str, "fd00::fe", "offset 254 -> ::fe");
 
     uint32_t off = mqvpn_addr_pool_offset6(&pool, &addr);
     ASSERT_EQ_INT(off, 254, "offset 254 round-trip");

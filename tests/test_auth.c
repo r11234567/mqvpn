@@ -246,7 +246,7 @@ test_b64_encode_32_bytes(void)
     char buf[64];
     int ret = mqvpn_auth_b64_encode(buf, sizeof(buf), raw, 32);
     ASSERT_EQ_INT(ret, 0, "b64 32 bytes ok");
-    ASSERT_EQ_INT((int)strlen(buf), 44, "b64 32 bytes → 44 chars");
+    ASSERT_EQ_INT((int)strlen(buf), 44, "b64 32 bytes -> 44 chars");
 
     /* No padding for 32 bytes (32 % 3 = 2 → 1 '=' pad) */
     ASSERT_TRUE(buf[43] == '=', "b64 32 bytes has padding");

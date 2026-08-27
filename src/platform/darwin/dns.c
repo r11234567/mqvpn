@@ -490,7 +490,7 @@ validate_existing_backup(const mqvpn_dns_t *dns)
          * whole, and the leftover tail must not be misread as a second
          * line. */
         if (!strchr(line, '\n') && !feof(fp)) {
-            LOG_ERR("dns: existing backup %s line %d exceeds %d bytes — it may be the "
+            LOG_ERR("dns: existing backup %s line %d exceeds %d bytes -- it may be the "
                     "only copy of your original DNS settings; inspect or move the file "
                     "manually, then retry",
                     dns->backup_path, lineno, MQVPN_DNS_BACKUP_LINE - 1);
@@ -498,7 +498,7 @@ validate_existing_backup(const mqvpn_dns_t *dns)
             return -1;
         }
         if (mqvpn_dns_backup_parse_line(line, svc, sizeof(svc), srv, sizeof(srv)) < 0) {
-            LOG_ERR("dns: existing backup %s line %d is unparseable — it may be the "
+            LOG_ERR("dns: existing backup %s line %d is unparseable -- it may be the "
                     "only copy of your original DNS settings; inspect or move the file "
                     "manually, then retry",
                     dns->backup_path, lineno);
@@ -1008,7 +1008,7 @@ mqvpn_dns_restore(mqvpn_dns_t *dns)
      * or the lock released, permanently losing the only record of the
      * services that are still dirty. Keep backup + active + lock so a
      * later mqvpn_dns_restore() call can retry. */
-    LOG_ERR("dns: restore incomplete; some service(s) could not be reverted — backup "
+    LOG_ERR("dns: restore incomplete; some service(s) could not be reverted -- backup "
             "retained at %s for retry",
             dns->backup_path);
 }
@@ -1049,7 +1049,7 @@ mqvpn_dns_restore_stale(mqvpn_dns_t *dns)
                 dns->backup_path);
     } else {
         LOG_ERR("dns: stale-backup restore incomplete; some service(s) could not be "
-                "reverted — backup retained at %s for the next attempt",
+                "reverted -- backup retained at %s for the next attempt",
                 dns->backup_path);
     }
 

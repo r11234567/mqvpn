@@ -579,7 +579,7 @@ path_on_manual_reactivate(mqvpn_client_t *c, path_entry_t *p, const path_event_c
         p->state != PATH_LC_DEGRADED) {
         client_log(c, MQVPN_LOG_WARN,
                    "path[%s] MANUAL_REACTIVATE in unexpected state %s "
-                   "(API gate bug — reactivate_slot_eligible should have rejected)",
+                   "(API gate bug -- reactivate_slot_eligible should have rejected)",
                    p->name, path_lifecycle_name(p->state));
         return; /* still bail to avoid touching an invalid-state slot */
     }

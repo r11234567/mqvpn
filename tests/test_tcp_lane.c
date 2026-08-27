@@ -734,7 +734,7 @@ test_marker_isn_stored_and_retrieved(void)
     ASSERT_EQ_INT(mqvpn_tcp_lane_on_syn(lane, &k, 0, 0xdeadbeefu), 0,
                   "on_syn to_tcp=0 records sticky-RAW with an ISN");
     ASSERT_EQ_INT(mqvpn_tcp_lane_marker_isn(lane, &k), 0xdeadbeefu,
-                  "marker_isn returns the stored ISN — same-ISN retransmit "
+                  "marker_isn returns the stored ISN -- same-ISN retransmit "
                   "case: tun_decide_lane compares this and stays RAW without "
                   "ever calling on_syn again");
 
@@ -774,7 +774,7 @@ test_syn_isn_mismatch_replaces_marker_raw_to_raw(void)
      * again — a single-path client that briefly saw >=2 paths and then
      * dropped back to one, for instance). */
     ASSERT_EQ_INT(mqvpn_tcp_lane_on_syn(lane, &k, 0, 200), 0,
-                  "on_syn succeeds on ISN mismatch — stale marker replaced");
+                  "on_syn succeeds on ISN mismatch -- stale marker replaced");
     ASSERT_EQ_INT(mqvpn_tcp_lane_marker_isn(lane, &k), 200u,
                   "marker now holds the NEW ISN, not the stale one");
 
@@ -783,7 +783,7 @@ test_syn_isn_mismatch_replaces_marker_raw_to_raw(void)
                   "flows_total counts the replacement as a new insert (not "
                   "a no-op re-affirmation)");
     ASSERT_EQ_INT(stats.raw_markers_active, 1,
-                  "exactly one marker live — the stale one was actually "
+                  "exactly one marker live -- the stale one was actually "
                   "removed, not left as a shadowing duplicate");
     ASSERT_EQ_INT(stats.flows_rejected_other, 0, "NOT treated as a caller-bug duplicate");
 
@@ -805,15 +805,15 @@ test_syn_isn_mismatch_replaces_marker_raw_to_tcp(void)
     /* Different ISN, and this time the re-run policy lands on TCP (e.g. a
      * second path came up between the two connections). */
     ASSERT_EQ_INT(mqvpn_tcp_lane_on_syn(lane, &k, 1, 400), 0,
-                  "on_syn succeeds — RAW marker replaced by a real TCP-lane flow");
+                  "on_syn succeeds -- RAW marker replaced by a real TCP-lane flow");
 
     int out_raw = -1, out_closing = -1;
     ASSERT_EQ_INT(mqvpn_tcp_lane_lookup(lane, &k, &out_raw, &out_closing), 1,
                   "lookup finds the new entry");
     ASSERT_EQ_INT(out_raw, 0, "no longer sticky-RAW");
-    ASSERT_EQ_INT(out_closing, 0, "not CLOSING either — a fresh PENDING_ACCEPT flow");
+    ASSERT_EQ_INT(out_closing, 0, "not CLOSING either -- a fresh PENDING_ACCEPT flow");
     ASSERT_EQ_INT(mqvpn_tcp_lane_marker_isn(lane, &k), 0,
-                  "marker_isn is 0 now — this key is a real flow, not a marker");
+                  "marker_isn is 0 now -- this key is a real flow, not a marker");
 
     mqvpn_tcp_lane_stats_t stats;
     mqvpn_tcp_lane_get_stats(lane, &stats);
@@ -1498,7 +1498,7 @@ test_relay_full_accept(void)
     ASSERT_TRUE(memcmp(g_h3_capture, g_expected, 500) == 0,
                 "relayed bytes match the exact source sequence");
     ASSERT_EQ_INT(g_recved_calls, 1, "tcp_recved called once, immediately");
-    ASSERT_EQ_INT(g_recved_total, 500, "tcp_recved(500) — full accept, no withholding");
+    ASSERT_EQ_INT(g_recved_total, 500, "tcp_recved(500) -- full accept, no withholding");
     ASSERT_EQ_INT(f->uplink_withheld, 0, "not withheld");
     ASSERT_EQ_INT(f->uplink_queued_bytes, 0, "queue empty after full accept");
     ASSERT_TRUE(f->uplink_q_head == NULL, "no queued node");
@@ -1764,7 +1764,7 @@ test_relay_repeated_eagain_writable(void)
                   "only the first recv attempted a send (FIFO backlog)");
     ASSERT_EQ_INT(f->uplink_queued_bytes, 90000, "all three segments queued");
     ASSERT_EQ_INT(f->uplink_withheld, 1, "withheld after the EAGAIN");
-    ASSERT_EQ_INT(g_recved_calls, 0, "withheld — nothing recved yet");
+    ASSERT_EQ_INT(g_recved_calls, 0, "withheld -- nothing recved yet");
 
     for (int i = 0; i < 4; i++) {
         ASSERT_EQ_INT(mqvpn_tcp_lane_on_h3_writable(lane, &fake_stream), 0,
@@ -1776,9 +1776,9 @@ test_relay_repeated_eagain_writable(void)
     ASSERT_EQ_INT(f->uplink_queued_bytes, 90000,
                   "backlog unchanged across repeated EAGAIN");
     ASSERT_TRUE(f->uplink_q_head != NULL && f->uplink_q_head->offset == 0,
-                "head node offset unchanged — no partial corruption");
+                "head node offset unchanged -- no partial corruption");
     ASSERT_EQ_INT(f->uplink_withheld, 1,
-                  "still withheld — backlog never dropped below low-water");
+                  "still withheld -- backlog never dropped below low-water");
     ASSERT_EQ_INT(g_recved_calls, 0, "still withheld");
 
     /* Final writable notify: script exhausted -> full accept drains all
@@ -2019,7 +2019,7 @@ test_relay_fin_during_pending_stream(void)
     ASSERT_TRUE(memcmp(g_h3_capture, g_expected, 600) == 0, "data byte-exact");
     ASSERT_EQ_INT(g_h3_fin_attempts, 1, "fin attempted after the data drained");
     ASSERT_EQ_INT(f->fin_sent_to_h3, 0, "fin still pending after EAGAIN");
-    ASSERT_TRUE(f->uplink_q_head == NULL, "data queue empty — only the fin is pending");
+    ASSERT_TRUE(f->uplink_q_head == NULL, "data queue empty -- only the fin is pending");
 
     /* Writable notify: queue already empty, so flush goes straight to
      * maybe_fin; script exhausted -> accepted. */
@@ -2110,13 +2110,13 @@ test_downlink_err_mem_stash_and_resume(void)
     mqvpn_tcp_lane_downlink_pump(lane, &fake_stream);
 
     ASSERT_EQ_INT(g_h3_recv_calls, 1,
-                  "recv stopped after the failed write — c2 not read yet");
+                  "recv stopped after the failed write -- c2 not read yet");
     ASSERT_EQ_INT(g_tcp_write_calls, 1, "one write attempt");
     ASSERT_EQ_INT(g_tcp_write_capture_len, 0, "nothing captured on ERR_MEM");
     ASSERT_EQ_INT(f->downlink_paused, 1, "paused on ERR_MEM");
     ASSERT_TRUE(f->downlink_stash != NULL, "stash allocated");
     ASSERT_EQ_INT(f->downlink_stash_len, 400, "stash holds the failed chunk");
-    ASSERT_EQ_INT(g_tcp_output_calls, 0, "no output attempted — nothing was written");
+    ASSERT_EQ_INT(g_tcp_output_calls, 0, "no output attempted -- nothing was written");
 
     /* M1: a pump call while paused now attempts the stash retry INLINE
      * (guarded — tcp_lane_downlink_stash_retry, never a recursive call
@@ -2129,8 +2129,8 @@ test_downlink_err_mem_stash_and_resume(void)
     ASSERT_EQ_INT(mqvpn_tcp_lane_downlink_pump(lane, &fake_stream), 0,
                   "pump while paused returns 0 (flow still live either way)");
     ASSERT_EQ_INT(g_tcp_write_calls, 2, "retry attempted, still fails");
-    ASSERT_EQ_INT(g_tcp_write_capture_len, 0, "nothing captured — retry failed again");
-    ASSERT_EQ_INT(f->downlink_paused, 1, "still paused — retry failed");
+    ASSERT_EQ_INT(g_tcp_write_capture_len, 0, "nothing captured -- retry failed again");
+    ASSERT_EQ_INT(f->downlink_paused, 1, "still paused -- retry failed");
     ASSERT_EQ_INT(g_h3_recv_calls, 1, "drain not resumed while still paused");
 
     /* Now let the retry succeed (no more scripted failures, ample sndbuf):
@@ -2225,7 +2225,7 @@ test_downlink_sndbuf_gate(void)
     ASSERT_EQ_INT(g_tcp_write_calls, 1,
                   "no tcp_write attempt for the sndbuf-blocked chunk");
     ASSERT_EQ_INT(g_tcp_write_capture_len, 200,
-                  "capture unchanged — second chunk not written");
+                  "capture unchanged -- second chunk not written");
     ASSERT_EQ_INT(f->downlink_paused, 1, "paused on the sndbuf gate");
     ASSERT_TRUE(f->downlink_stash != NULL, "stash allocated");
     ASSERT_EQ_INT(f->downlink_stash_len, 300, "stash holds the blocked chunk");
@@ -2289,7 +2289,7 @@ test_downlink_fin_only(void)
     ASSERT_EQ_INT(f->fin_received_from_h3, 1, "fin_received_from_h3 set");
     ASSERT_EQ_INT(g_tcp_shutdown_calls, 1, "tcp_shutdown called exactly once");
     ASSERT_EQ_INT(g_tcp_output_calls, 0,
-                  "tcp_output NOT called — nothing was written this pump");
+                  "tcp_output NOT called -- nothing was written this pump");
 
     f->pcb = NULL;
     mqvpn_tcp_lane_free(lane);
@@ -2322,7 +2322,7 @@ test_downlink_fin_while_paused(void)
     ASSERT_EQ_INT(g_h3_recv_calls, 1, "only c1 read before the pause");
     ASSERT_EQ_INT(f->downlink_paused, 1, "paused");
     ASSERT_EQ_INT(f->downlink_stash_len, 300, "c1 stashed");
-    ASSERT_EQ_INT(g_tcp_shutdown_calls, 0, "fin not reached yet — no shutdown");
+    ASSERT_EQ_INT(g_tcp_shutdown_calls, 0, "fin not reached yet -- no shutdown");
     ASSERT_EQ_INT(f->fin_received_from_h3, 0, "fin not observed yet");
 
     /* Resume: stash flush writes c1, then the pump's own resume call reads
@@ -2337,7 +2337,7 @@ test_downlink_fin_while_paused(void)
     ASSERT_TRUE(memcmp(g_tcp_write_capture, g_expected, 500) == 0,
                 "c1 then c2, no dup/gap");
     ASSERT_EQ_INT(f->fin_received_from_h3, 1, "fin observed on resume");
-    ASSERT_EQ_INT(g_tcp_shutdown_calls, 1, "shutdown fired on resume — fin never lost");
+    ASSERT_EQ_INT(g_tcp_shutdown_calls, 1, "shutdown fired on resume -- fin never lost");
 
     f->pcb = NULL;
     mqvpn_tcp_lane_free(lane);
@@ -2373,7 +2373,7 @@ test_downlink_fin_stashed_with_data(void)
     ASSERT_EQ_INT(f->downlink_paused, 1, "paused on the failed write");
     ASSERT_EQ_INT(f->downlink_stash_len, 350, "data+fin chunk stashed");
     ASSERT_EQ_INT(f->fin_received_from_h3, 0,
-                  "local fin dropped at the stash boundary — not yet acted on");
+                  "local fin dropped at the stash boundary -- not yet acted on");
     ASSERT_EQ_INT(g_tcp_shutdown_calls, 0, "no shutdown before the data is delivered");
 
     /* Resume: stash flush writes the data, the resumed pump's recv gets the
@@ -2386,7 +2386,7 @@ test_downlink_fin_stashed_with_data(void)
     ASSERT_TRUE(memcmp(g_tcp_write_capture, g_expected, 350) == 0, "byte-exact");
     ASSERT_EQ_INT(f->fin_received_from_h3, 1, "fin recovered via the re-report");
     ASSERT_EQ_INT(g_tcp_shutdown_calls, 1,
-                  "tcp_shutdown exactly once — fin not lost across the stash boundary");
+                  "tcp_shutdown exactly once -- fin not lost across the stash boundary");
     ASSERT_EQ_INT(g_tcp_shutdown_last_tx, 1, "TX-side half-close");
 
     /* And a further pump stays idempotent even though recv keeps
@@ -2456,7 +2456,7 @@ test_downlink_pump_on_torn_down_flow(void)
 
     ASSERT_EQ_INT(mqvpn_tcp_lane_downlink_pump(lane, &fake_stream), 0,
                   "pump on a removed flow's stream returns 0");
-    ASSERT_EQ_INT(g_h3_recv_calls, 0, "recv_body never called — unknown stream");
+    ASSERT_EQ_INT(g_h3_recv_calls, 0, "recv_body never called -- unknown stream");
     ASSERT_EQ_INT(g_tcp_write_calls, 0, "no write for an unknown stream");
     ASSERT_EQ_INT(g_tcp_output_calls, 0, "no output for an unknown stream");
 
@@ -2781,8 +2781,8 @@ test_lwip_err_teardown(void)
                   "flow removed on lwIP-initiated err");
     /* The defining difference from every LOCALLY-initiated kill: no
      * tcp_abort here — lwIP already freed the pcb itself. */
-    ASSERT_EQ_INT(g_tcp_abort_calls, 0, "no tcp_abort — lwIP already freed the pcb");
-    ASSERT_EQ_INT(g_tcp_close_calls, 0, "no tcp_close either — not the graceful path");
+    ASSERT_EQ_INT(g_tcp_abort_calls, 0, "no tcp_abort -- lwIP already freed the pcb");
+    ASSERT_EQ_INT(g_tcp_close_calls, 0, "no tcp_close either -- not the graceful path");
     ASSERT_EQ_INT(g_h3_close_calls, 1, "H3 request RST on lwIP err");
     ASSERT_TRUE(g_h3_close_last_req == &fake_req, "the RIGHT request was RST");
 
@@ -3024,7 +3024,7 @@ test_clean_close_uplink_fin_first(void)
                   "recv(NULL) tolerated");
     ASSERT_EQ_INT(f->fin_sent_to_h3, 1, "uplink fin forwarded to H3");
     ASSERT_EQ_INT(f->fin_received_from_h3, 0, "downlink fin not yet observed");
-    ASSERT_EQ_INT(g_tcp_close_calls, 0, "not done yet — only one side FIN'd");
+    ASSERT_EQ_INT(g_tcp_close_calls, 0, "not done yet -- only one side FIN'd");
 
     /* Downlink FIN second: the H3 response body ends, forwarded to the pcb
      * via tcp_shutdown — THIS side observes both flags set and triggers the
@@ -3050,13 +3050,13 @@ test_clean_close_uplink_fin_first(void)
     ASSERT_EQ_INT(g_tcp_shutdown_last_tx, 1, "shut_tx == 1");
     ASSERT_EQ_INT(g_tcp_close_calls, 1, "graceful tcp_close called exactly once");
     ASSERT_TRUE(g_tcp_close_last_pcb == &pcb, "the RIGHT pcb was closed");
-    ASSERT_EQ_INT(g_tcp_abort_calls, 0, "NOT aborted — this is the graceful path");
-    ASSERT_EQ_INT(g_h3_close_calls, 0, "NOT RST — both directions FIN'd cleanly");
+    ASSERT_EQ_INT(g_tcp_abort_calls, 0, "NOT aborted -- this is the graceful path");
+    ASSERT_EQ_INT(g_h3_close_calls, 0, "NOT RST -- both directions FIN'd cleanly");
 
     mqvpn_tcp_lane_stats_t stats;
     mqvpn_tcp_lane_get_stats(lane, &stats);
     ASSERT_EQ_INT(stats.flows_active, 0,
-                  "n_tcp_flows decremented — a CLOSING marker is not an active flow");
+                  "n_tcp_flows decremented -- a CLOSING marker is not an active flow");
     ASSERT_EQ_INT(lane->n_closing, 1, "n_closing incremented for the new marker");
 
     mqvpn_tcp_lane_free(lane);
@@ -3078,7 +3078,7 @@ test_clean_close_downlink_fin_first(void)
      * client's TCP FIN arrives. Only one side is done — no clean-close. */
     h3_recv_push_data(NULL, 0, 1);
     ASSERT_EQ_INT(mqvpn_tcp_lane_downlink_pump(lane, &fake_stream), 0,
-                  "pump completes normally — only one side FIN'd so far");
+                  "pump completes normally -- only one side FIN'd so far");
     ASSERT_EQ_INT(f->fin_received_from_h3, 1, "downlink fin forwarded to the pcb");
     ASSERT_EQ_INT(f->fin_sent_to_h3, 0, "uplink fin not yet observed");
     ASSERT_EQ_INT(g_tcp_close_calls, 0, "not done yet");
@@ -3105,13 +3105,13 @@ test_clean_close_downlink_fin_first(void)
     ASSERT_EQ_INT(g_tcp_shutdown_calls, 1, "downlink tcp_shutdown called once");
     ASSERT_EQ_INT(g_tcp_close_calls, 1, "graceful tcp_close called exactly once");
     ASSERT_TRUE(g_tcp_close_last_pcb == &pcb, "the RIGHT pcb was closed");
-    ASSERT_EQ_INT(g_tcp_abort_calls, 0, "NOT aborted — this is the graceful path");
-    ASSERT_EQ_INT(g_h3_close_calls, 0, "NOT RST — both directions FIN'd cleanly");
+    ASSERT_EQ_INT(g_tcp_abort_calls, 0, "NOT aborted -- this is the graceful path");
+    ASSERT_EQ_INT(g_h3_close_calls, 0, "NOT RST -- both directions FIN'd cleanly");
 
     mqvpn_tcp_lane_stats_t stats;
     mqvpn_tcp_lane_get_stats(lane, &stats);
     ASSERT_EQ_INT(stats.flows_active, 0,
-                  "n_tcp_flows decremented — a CLOSING marker is not an active flow");
+                  "n_tcp_flows decremented -- a CLOSING marker is not an active flow");
     ASSERT_EQ_INT(lane->n_closing, 1, "n_closing incremented for the new marker");
 
     mqvpn_tcp_lane_free(lane);
@@ -3216,7 +3216,7 @@ test_closing_grace_sweep_runs_with_idle_timeout_zero(void)
     mqvpn_tcp_lane_tick(lane, g_fake_now);
 
     ASSERT_EQ_INT(mqvpn_tcp_lane_lookup(lane, &key, NULL, NULL), 0,
-                  "CLOSING grace sweep runs even with tcp_idle_timeout_sec == 0 — a "
+                  "CLOSING grace sweep runs even with tcp_idle_timeout_sec == 0 -- a "
                   "DIFFERENT mechanism/rationale than idle-eviction");
     ASSERT_EQ_INT(lane->n_closing, 0, "n_closing decremented");
 
@@ -3256,7 +3256,7 @@ test_closing_cap_eviction(void)
                                             &reqs[idx], &streams[idx]);
     ASSERT_TRUE(f != NULL, "cap-overflow closing flow created");
 
-    ASSERT_EQ_INT(lane->n_closing, TCP_LANE_CLOSING_CAP, "still at cap — one evicted");
+    ASSERT_EQ_INT(lane->n_closing, TCP_LANE_CLOSING_CAP, "still at cap -- one evicted");
     ASSERT_EQ_INT(mqvpn_tcp_lane_lookup(lane, &keys[0], NULL, NULL), 0,
                   "oldest CLOSING entry evicted on cap overflow");
     for (uint16_t i = 1; i <= TCP_LANE_CLOSING_CAP; i++) {
@@ -3291,7 +3291,7 @@ test_syn_during_closing_reevaluates(void)
     ASSERT_EQ_INT(mqvpn_tcp_lane_lookup(lane, &key, &out_raw, &out_closing), 1,
                   "lookup finds the CLOSING marker");
     ASSERT_EQ_INT(out_closing, 1,
-                  "confirmed CLOSING — tun_decide_lane's cue to re-run "
+                  "confirmed CLOSING -- tun_decide_lane's cue to re-run "
                   "policy on a pure SYN");
 
     /* tun_decide_lane's contract (mqvpn_client.c): a pure SYN hitting a
@@ -3299,7 +3299,7 @@ test_syn_during_closing_reevaluates(void)
      * marker itself. Pin on_syn's side of that contract directly. */
     ASSERT_EQ_INT(
         mqvpn_tcp_lane_on_syn(lane, &key, 1, 0), 0,
-        "on_syn succeeds — stale CLOSING marker removed, fresh commit inserted");
+        "on_syn succeeds -- stale CLOSING marker removed, fresh commit inserted");
 
     ASSERT_EQ_INT(lane->n_closing, 0, "the stale marker is gone, not just shadowed");
     int is_raw = -1;

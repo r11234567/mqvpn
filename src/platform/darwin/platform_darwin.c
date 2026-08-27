@@ -149,7 +149,7 @@ cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
             LOG_WRN("failed to set IPv6 address on TUN (continuing IPv4-only)");
     }
 
-    LOG_INF("TUN %s configured: %s → %s (mtu=%d)", p->tun.name, local_ip, peer_ip,
+    LOG_INF("TUN %s configured: %s -> %s (mtu=%d)", p->tun.name, local_ip, peer_ip,
             info->mtu);
 
     /* Set up routes, killswitch, DNS.
@@ -251,7 +251,7 @@ cb_state_changed(mqvpn_client_state_t old_state, mqvpn_client_state_t new_state,
                                   "CLOSED"};
     const char *os = (old_state < 7) ? names[old_state] : "?";
     const char *ns = (new_state < 7) ? names[new_state] : "?";
-    LOG_INF("state: %s → %s", os, ns);
+    LOG_INF("state: %s -> %s", os, ns);
 
     /* On RECONNECTING or CLOSED, tear down TUN and platform resources so
      * that stale fd events don't fire ("tun read: Bad file descriptor").

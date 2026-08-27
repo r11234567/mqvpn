@@ -109,3 +109,30 @@ Multipath (multiple NICs):
 mqvpn.exe --mode client --server 203.0.113.1:443 --auth-key <key> ^
   --path "Ethernet" --path "Ethernet 3" --scheduler wlb
 ```
+
+## Console output encoding
+
+Log messages contain ASCII only, deliberately, and
+`scripts/lint/check_log_string_ascii.py` fails CI if a non-ASCII character
+appears inside a C string literal. Comments are exempt — they never reach a
+console.
+
+The reason is that the Windows console decodes bytes with the system ANSI
+codepage, which is CP936 on a Simplified Chinese install, while the sources are
+UTF-8. A `→` written in a log message is emitted as its three UTF-8 bytes
+`E2 86 92`; CP936 reads `E2 86` as one hanzi and cannot pair the remaining
+`92`, so it prints as a stray character. That is what produced
+
+```
+TUN mqvpn0 addr: 10.203.0.10 鈫?10.203.0.1 /32
+```
+
+Adapter names are not affected, because they arrive from Win32 already encoded
+in the console's codepage — which is why a single log line could show a correct
+`以太网 4` beside a corrupted `→`. Two encodings, one line.
+
+`SetConsoleOutputCP(CP_UTF8)` was considered and rejected: it fixes the console
+and nothing else. Logs are also redirected to files, captured by a GUI, and
+read by other tools, and each of those picks an encoding for itself. Staying
+inside ASCII is the only form that is correct for every consumer, so write
+`->` and `--` rather than `→` and `—`.

@@ -450,7 +450,7 @@ test_mode_detection(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.is_server, 1, "Listen → server mode");
+    ASSERT_EQ_INT(cfg.is_server, 1, "Listen -> server mode");
 
     /* Client: has [Server] Address → is_server=0 */
     const char *ini_client = "[Server]\n"
@@ -460,7 +460,7 @@ test_mode_detection(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.is_server, 0, "Address → client mode");
+    ASSERT_EQ_INT(cfg.is_server, 0, "Address -> client mode");
 }
 
 static void
@@ -594,7 +594,7 @@ test_max_clients_edge_cases(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=0 → default 64");
+    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=0 -> default 64");
 
     /* MaxClients = -1 → should fallback to 64 */
     const char *ini_neg = "[Auth]\n"
@@ -604,7 +604,7 @@ test_max_clients_edge_cases(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=-1 → default 64");
+    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=-1 -> default 64");
 
     /* MaxClients = abc → invalid, fallback to 64 */
     const char *ini_abc = "[Auth]\n"
@@ -614,7 +614,7 @@ test_max_clients_edge_cases(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=abc → default 64");
+    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=abc -> default 64");
 
     /* MaxClients = 128 → valid */
     const char *ini_valid = "[Auth]\n"
@@ -624,7 +624,7 @@ test_max_clients_edge_cases(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.max_clients, 128, "MaxClients=128 → 128");
+    ASSERT_EQ_INT(cfg.max_clients, 128, "MaxClients=128 -> 128");
 }
 
 static void
@@ -661,7 +661,7 @@ test_reinjection_out_of_range_falls_back(void)
     mqvpn_config_load(&cfg, path);
     unlink(path);
     ASSERT_EQ_INT(cfg.reinjection_srtt_factor_pct, 110,
-                  "ReinjectionSrttFactorPct=50 → default 110");
+                  "ReinjectionSrttFactorPct=50 -> default 110");
 
     /* ReinjectionHardDeadlineMs = 0 → below min (1) → fallback to 500 */
     path = write_tmp("[Multipath]\nReinjectionHardDeadlineMs = 0\n");
@@ -669,7 +669,7 @@ test_reinjection_out_of_range_falls_back(void)
     mqvpn_config_load(&cfg, path);
     unlink(path);
     ASSERT_EQ_INT(cfg.reinjection_hard_deadline_ms, 500,
-                  "ReinjectionHardDeadlineMs=0 → default 500");
+                  "ReinjectionHardDeadlineMs=0 -> default 500");
 
     /* ReinjectionDeadlineLowerBoundMs = 999999 → above max (60000) → fallback to 20 */
     path = write_tmp("[Multipath]\nReinjectionDeadlineLowerBoundMs = 999999\n");
@@ -677,7 +677,7 @@ test_reinjection_out_of_range_falls_back(void)
     mqvpn_config_load(&cfg, path);
     unlink(path);
     ASSERT_EQ_INT(cfg.reinjection_deadline_lower_bound_ms, 20,
-                  "ReinjectionDeadlineLowerBoundMs=999999 → default 20");
+                  "ReinjectionDeadlineLowerBoundMs=999999 -> default 20");
 }
 
 static void
@@ -693,7 +693,7 @@ test_empty_value(void)
     mqvpn_config_load(&cfg, path);
     unlink(path);
 
-    ASSERT_EQ_STR(cfg.tun_name, "", "empty value → empty string");
+    ASSERT_EQ_STR(cfg.tun_name, "", "empty value -> empty string");
 }
 
 static void
@@ -909,7 +909,7 @@ test_reconnect_interval_invalid(void)
     mqvpn_config_load(&cfg, path);
     unlink(path);
 
-    ASSERT_EQ_INT(cfg.reconnect_interval, 5, "negative interval → default 5");
+    ASSERT_EQ_INT(cfg.reconnect_interval, 5, "negative interval -> default 5");
 }
 
 static void
@@ -924,7 +924,7 @@ test_reconnect_interval_invalid_string(void)
     mqvpn_config_load(&cfg, path);
     unlink(path);
 
-    ASSERT_EQ_INT(cfg.reconnect_interval, 5, "invalid interval → default 5");
+    ASSERT_EQ_INT(cfg.reconnect_interval, 5, "invalid interval -> default 5");
 }
 
 /* ================================================================
@@ -960,7 +960,7 @@ test_mtu_below_floor_ignored(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.tun_mtu, 0, "MTU < 1280 ignored → stays 0");
+    ASSERT_EQ_INT(cfg.tun_mtu, 0, "MTU < 1280 ignored -> stays 0");
 }
 
 static void
@@ -972,7 +972,7 @@ test_mtu_above_ceiling_ignored(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.tun_mtu, 0, "MTU > 9000 ignored → stays 0");
+    ASSERT_EQ_INT(cfg.tun_mtu, 0, "MTU > 9000 ignored -> stays 0");
 }
 
 static void
@@ -1685,7 +1685,7 @@ test_advanced_recv_rate_limit(void)
     mqvpn_config_defaults(&cfg);
     ASSERT_EQ_INT(mqvpn_config_load(&cfg, p), 0, "over-max ini warns, load rc 0");
     unlink(p);
-    ASSERT_EQ_INT(cfg.recv_rate_limit == 0, 1, "over-max ini rejected → default 0");
+    ASSERT_EQ_INT(cfg.recv_rate_limit == 0, 1, "over-max ini rejected -> default 0");
 
     snprintf(over, sizeof(over), "[Advanced]\nRecvRateLimit = %llu\n",
              (unsigned long long)MQVPN_RECV_RATE_LIMIT_MAX);
@@ -1702,7 +1702,7 @@ test_advanced_recv_rate_limit(void)
     mqvpn_config_defaults(&cfg);
     ASSERT_EQ_INT(mqvpn_config_load(&cfg, p), 0, "over-max json warns, load rc 0");
     unlink(p);
-    ASSERT_EQ_INT(cfg.recv_rate_limit == 0, 1, "over-max json rejected → default 0");
+    ASSERT_EQ_INT(cfg.recv_rate_limit == 0, 1, "over-max json rejected -> default 0");
 }
 
 static void

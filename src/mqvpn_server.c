@@ -2410,7 +2410,7 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
      * smaller) or add an explicit EgressAllow for the pool subnet. */
     if (s->config.hybrid.enabled && s->pool.prefix_len < 24) {
         LOG_W(s,
-              "hybrid TCP-lane: pool subnet is wider than /24 (prefix_len=%u) — "
+              "hybrid TCP-lane: pool subnet is wider than /24 (prefix_len=%u) -- "
               "client-to-client TCP between clients outside a shared /24 will be "
               "denied by the egress ACL; use a /24-or-narrower pool or add an "
               "EgressAllow entry",

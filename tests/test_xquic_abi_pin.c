@@ -33,7 +33,7 @@
 
 #define PIN_PATH_STATE(mirror, real)                                                 \
     _Static_assert((mirror) == (real), "mqvpn " #mirror " drifted from xquic " #real \
-                                       " — update the mirror in mqvpn_internal.h")
+                                       " -- update the mirror in mqvpn_internal.h")
 
 PIN_PATH_STATE(MQVPN_XQC_PATH_STATE_INIT, XQC_PATH_STATE_INIT);
 PIN_PATH_STATE(MQVPN_XQC_PATH_STATE_VALIDATING, XQC_PATH_STATE_VALIDATING);

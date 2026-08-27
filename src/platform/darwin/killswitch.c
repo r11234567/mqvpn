@@ -444,7 +444,7 @@ cleanup_killswitch(platform_ctx_t *p)
          * (item 3, file header): confirm pf's reference counting actually
          * behaves this way before relying on it in production. */
         LOG_WRN("kill switch cleanup: no pf enable token captured; flushed anchor %s "
-                "but leaving pf's enable reference count as-is (leaked +1, harmless — "
+                "but leaving pf's enable reference count as-is (leaked +1, harmless -- "
                 "no filtering rules remain after the flush)",
                 MQVPN_PF_ANCHOR);
     }

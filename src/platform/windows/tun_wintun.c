@@ -96,7 +96,7 @@ mqvpn_tun_win_create(mqvpn_tun_win_t *tun, const char *dev_name)
         DWORD err = GetLastError();
         const char *hint = "";
         if (err == ERROR_ACCESS_DENIED) {
-            hint = " — run as Administrator (right-click PowerShell -> Run as "
+            hint = " -- run as Administrator (right-click PowerShell -> Run as "
                    "Administrator)";
         }
         LOG_ERR("WintunCreateAdapter failed (error %lu)%s", err, hint);
@@ -177,7 +177,7 @@ mqvpn_tun_win_set_addr(mqvpn_tun_win_t *tun, const char *addr, const char *peer_
     inet_pton(AF_INET, addr, &tun->addr);
     inet_pton(AF_INET, peer_addr, &tun->peer_addr);
 
-    LOG_INF("TUN %s addr: %s → %s /%d", tun->name, addr, peer_addr, prefix_len);
+    LOG_INF("TUN %s addr: %s -> %s /%d", tun->name, addr, peer_addr, prefix_len);
     return 0;
 }
 

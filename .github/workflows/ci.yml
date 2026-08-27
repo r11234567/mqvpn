@@ -34,6 +34,13 @@ jobs:
             exit 1
           fi
 
+      # A UTF-8 character in a printed string is mojibake on a non-UTF-8
+      # console, and the log line it lands in can end up half-readable: the
+      # interface name comes from a Win32 API already in the console codepage
+      # while our own literal does not. See the script header.
+      - name: Check log strings are ASCII
+        run: python3 scripts/lint/check_log_string_ascii.py
+
   build:
     # Cache key conventions for BoringSSL / xquic / libevent-msan in this
     # workflow: keys carry a trailing `-vN`. Bump that suffix in *every*

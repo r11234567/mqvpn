@@ -652,7 +652,7 @@ ctrl_socket_create(struct event_base *eb, const char *addr, int port,
 
     /* Warn if exposed beyond loopback — the control API has no auth */
     if (strcmp(addr, "127.0.0.1") != 0 && strcmp(addr, "::1") != 0)
-        LOG_WRN("control API: binding to non-loopback address %s — "
+        LOG_WRN("control API: binding to non-loopback address %s -- "
                 "the control API has no authentication",
                 addr);
 

@@ -121,7 +121,7 @@ cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
             LOG_WRN("failed to set IPv6 address on TUN (continuing IPv4-only)");
     }
 
-    LOG_INF("TUN %s configured: %s → %s (mtu=%d)", p->tun.name, local_ip, peer_ip,
+    LOG_INF("TUN %s configured: %s -> %s (mtu=%d)", p->tun.name, local_ip, peer_ip,
             info->mtu);
 
     /* Set up routes, killswitch, DNS.
@@ -223,7 +223,7 @@ cb_state_changed(mqvpn_client_state_t old_state, mqvpn_client_state_t new_state,
                                   "CLOSED"};
     const char *os = (old_state < 7) ? names[old_state] : "?";
     const char *ns = (new_state < 7) ? names[new_state] : "?";
-    LOG_INF("state: %s → %s", os, ns);
+    LOG_INF("state: %s -> %s", os, ns);
 
     /* On RECONNECTING or CLOSED, tear down TUN and platform resources so
      * that stale fd events don't fire ("tun read: Bad file descriptor").
@@ -1348,10 +1348,10 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
          * event loop. */
         sp.ctrl = ctrl_socket_create(sp.eb, cfg->control_addr, cfg->control_port,
                                      sp.server, &sp.gro_receives, &sp.gro_datagrams);
-        if (!sp.ctrl) LOG_WRN("control API setup failed — continuing without it");
+        if (!sp.ctrl) LOG_WRN("control API setup failed -- continuing without it");
     }
 
-    LOG_INF("mqvpn server ready — listening on %s:%d, subnet %s",
+    LOG_INF("mqvpn server ready -- listening on %s:%d, subnet %s",
             cfg->listen_addr ? cfg->listen_addr : "0.0.0.0", cfg->listen_port,
             cfg->subnet);
 

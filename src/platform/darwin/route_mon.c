@@ -629,7 +629,7 @@ recover_dropped_paths_cb(evutil_socket_t fd, short what, void *arg)
              * "netlink:" prefix, so this line is NOT covered by it today. */
             if (p->route_gate_blocked[i]++ % 10 == 0)
                 LOG_WRN("routemon: %s has a usable address but no route to "
-                        "the server — re-add deferred until a route appears",
+                        "the server -- re-add deferred until a route appears",
                         ifname);
             continue;
         }
@@ -1171,7 +1171,7 @@ darwin_scoped_route_probe(unsigned int ifindex, const struct sockaddr_storage *d
         /* BSD scoped route-get typically reports "no route" via write()
          * errno rather than a reply carrying rtm_errno. */
         if (err == ESRCH || err == ENETUNREACH || err == EHOSTUNREACH) return 0;
-        LOG_DBG("routemon: RTM_GET write errno=%d — treating as unknown "
+        LOG_DBG("routemon: RTM_GET write errno=%d -- treating as unknown "
                 "(fail open)",
                 err);
         return -1;
@@ -1205,7 +1205,7 @@ darwin_scoped_route_probe(unsigned int ifindex, const struct sockaddr_storage *d
                    rtm->rtm_errno == EHOSTUNREACH) {
             ret = 0;
         } else {
-            LOG_DBG("routemon: RTM_GET rtm_errno=%d — treating as unknown "
+            LOG_DBG("routemon: RTM_GET rtm_errno=%d -- treating as unknown "
                     "(fail open)",
                     rtm->rtm_errno);
         }

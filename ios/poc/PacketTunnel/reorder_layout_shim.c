@@ -18,4 +18,5 @@ mqvpn_ext_reorder_layout_id(void)
 // Secondary compile-time guard: pin the struct size so an accidental local
 // reorder.h edit that changes the layout fails the build here.
 _Static_assert(sizeof(mqvpn_reorder_stats_t) == 27 * sizeof(uint64_t),
-               "mqvpn_reorder_stats_t layout changed — update the monitor + this assert");
+               "mqvpn_reorder_stats_t layout changed -- update the monitor "
+               "+ this assert");
