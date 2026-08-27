@@ -80,8 +80,14 @@ remove_path_by_index(platform_win_ctx_t *p, int idx, mqvpn_platform_reason_t rea
 {
     if (p->path_mgr.paths[idx].fd < 0) return; /* already removed */
 
-    LOG_WRN("netmon: interface %s %s, closing path %d", p->path_mgr.paths[idx].iface,
-            drop_reason_str(reason), idx);
+    /* handle, not idx: idx is this layer's private slot number and appears
+     * nowhere else, while the handle is what the next two lines ("platform
+     * path dropped: handle=", "path <handle> -> CLOSED") and every other
+     * path log use. Printing the slot here made one drop read as two
+     * different paths. */
+    LOG_WRN("netmon: interface %s %s, closing path handle=%lld",
+            p->path_mgr.paths[idx].iface, drop_reason_str(reason),
+            (long long)p->lib_path_handles[idx]);
 
     /* PR5: emit PLATFORM_DROP via new public API with diagnostic info.
      * Library transitions slot to CLOSED_DROPPED; fd close is reported

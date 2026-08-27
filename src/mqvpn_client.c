@@ -1032,13 +1032,26 @@ cb_xqc_log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *user_d
      * below — the forward map shifts INFO→WARN to suppress xquic's
      * per-packet noise at the engine level; this reverse map keeps
      * incoming severity honest so a real xquic warning is shown as a
-     * warning, not relabelled as INFO. Don't symmetrize the two. */
+     * warning, not relabelled as INFO. Don't symmetrize the two.
+     *
+     * REPORT is numerically the lowest value but it is NOT the most severe:
+     * xquic groups it with STATS as a statistics channel ("XQC_LOG_STATS &
+     * XQC_LOG_REPORT are levels for statistic", xqc_log.c) and routes both to
+     * xqc_log_write_stat, which is this same function. It carries the
+     * end-of-request and end-of-connection summaries -- the
+     * "|stream_id:..|close_msg:..|err:..|rcvd_bdy_sz:..|" line that every
+     * completed request emits. Mapping it to ERROR made ordinary teardown
+     * indistinguishable from failure: a hybrid TCP-lane proxy closes a stream
+     * per client connection, so idle browsing produced a continuous stream of
+     * ERROR lines carrying err:268 (H3_REQUEST_CANCELLED) and -626
+     * (XQC_ESTREAM_RESET) while both paths were healthy. It belongs with
+     * STATS at INFO. */
     mqvpn_log_level_t ml;
     switch (lvl) {
-    case XQC_LOG_REPORT:
     case XQC_LOG_FATAL:
     case XQC_LOG_ERROR: ml = MQVPN_LOG_ERROR; break;
     case XQC_LOG_WARN: ml = MQVPN_LOG_WARN; break;
+    case XQC_LOG_REPORT:
     case XQC_LOG_STATS:
     case XQC_LOG_INFO: ml = MQVPN_LOG_INFO; break;
     case XQC_LOG_DEBUG:

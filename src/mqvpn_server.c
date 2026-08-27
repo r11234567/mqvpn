@@ -732,13 +732,19 @@ cb_xqc_log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *user_d
      * forward map shifts INFO→WARN to suppress xquic's per-packet noise
      * at the engine level; this reverse map keeps incoming severity
      * honest so a real xquic warning is shown as a warning, not
-     * relabelled as INFO. Don't symmetrize the two. */
+     * relabelled as INFO. Don't symmetrize the two.
+     *
+     * REPORT sits with STATS, not with the errors: despite being the lowest
+     * enum value it is a statistics channel, not a severity ("XQC_LOG_STATS &
+     * XQC_LOG_REPORT are levels for statistic", xqc_log.c), and it carries the
+     * per-request and per-connection close summaries. See the fuller note on
+     * the client's copy of this map in mqvpn_client.c. */
     mqvpn_log_level_t ml;
     switch (lvl) {
-    case XQC_LOG_REPORT:
     case XQC_LOG_FATAL:
     case XQC_LOG_ERROR: ml = MQVPN_LOG_ERROR; break;
     case XQC_LOG_WARN: ml = MQVPN_LOG_WARN; break;
+    case XQC_LOG_REPORT:
     case XQC_LOG_STATS:
     case XQC_LOG_INFO: ml = MQVPN_LOG_INFO; break;
     case XQC_LOG_DEBUG:

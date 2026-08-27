@@ -53,3 +53,32 @@ mqvpn_log(mqvpn_log_level_t level, const char *fmt, ...)
 
     fprintf(stderr, "\n");
 }
+
+/* Direct-mapped, 4x MQVPN_MAX_PATHS so the live set never self-evicts;
+ * handles rise monotonically across re-adds, so an old entry is eventually
+ * displaced by a newer handle landing on its slot. A collision only costs a
+ * repeated log line, never a suppressed real transition -- the fallible
+ * direction here is the harmless one. */
+#define LOG_PATH_STATUS_SLOTS 32
+
+static struct {
+    int64_t handle;
+    int status;
+    int seen;
+} g_path_status[LOG_PATH_STATUS_SLOTS];
+
+int
+mqvpn_log_path_status_changed(int64_t handle, int status)
+{
+    uint64_t u = (uint64_t)handle;
+    size_t i = (size_t)(u % LOG_PATH_STATUS_SLOTS);
+
+    if (g_path_status[i].seen && g_path_status[i].handle == handle &&
+        g_path_status[i].status == status)
+        return 0;
+
+    g_path_status[i].handle = handle;
+    g_path_status[i].status = status;
+    g_path_status[i].seen = 1;
+    return 1;
+}

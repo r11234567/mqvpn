@@ -136,3 +136,6 @@ and nothing else. Logs are also redirected to files, captured by a GUI, and
 read by other tools, and each of those picks an encoding for itself. Staying
 inside ASCII is the only form that is correct for every consumer, so write
 `->` and `--` rather than `→` and `—`.
+
+See `docs/logging.md` for the rest of the log conventions, including what the
+levels mean and how a path is identified across lines.

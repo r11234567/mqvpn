@@ -443,7 +443,15 @@ path_on_event(mqvpn_client_t *c, path_entry_t *p, path_event_t ev,
     case PATH_EVENT_FD_CLOSED: path_on_fd_closed(c, p, ctx); break;
     }
 
-    /* Single invariant + path_event emission point. */
+    /* Single invariant + path_event emission point.
+     *
+     * Gated on the LIFECYCLE, not the public status, and deliberately so: an
+     * internal-only step (CLOSED_RECOVERABLE -> CLOSED_DROPPED, PENDING ->
+     * CREATE_WAIT) repeats the same public status, and observers use that
+     * repeat as a cue to re-read mqvpn_client_get_paths. Do not narrow this
+     * to public-status edges -- rollback_after_activation_failure_emits_
+     * event_then_closed pins the PENDING -> CREATE_WAIT emission. The
+     * repeats are made readable at the log layer instead (cb_path_event). */
     path_invariant_check(p);
     if (prior != p->state) path_fsm_fire_path_event(c, p);
 }

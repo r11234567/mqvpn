@@ -292,9 +292,15 @@ static void
 cb_path_event(mqvpn_path_handle_t path, mqvpn_path_status_t status, void *user_ctx)
 {
     (void)user_ctx;
-    static const char *snames[] = {"PENDING", "ACTIVE", "DEGRADED", "STANDBY", "CLOSED"};
-    const char *sn = (status < 5) ? snames[status] : "?";
-    LOG_INF("path %lld -> %s", (long long)path, sn);
+    /* PR5: path lifecycle state is owned entirely by libmqvpn. Platform no
+     * longer mirrors recoverable / removed state -- try_reactivate_by_ifname
+     * queries lib state directly via mqvpn_client_get_paths().
+     *
+     * mqvpn_path_status_string rather than a local name table: the local one
+     * had to be kept in step with the enum by hand and spelled the states
+     * differently from the Linux and macOS builds. */
+    if (!mqvpn_log_path_status_changed((int64_t)path, (int)status)) return;
+    LOG_INF("path %lld -> %s", (long long)path, mqvpn_path_status_string(status));
 }
 
 static void

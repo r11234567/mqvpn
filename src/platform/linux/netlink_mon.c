@@ -93,8 +93,10 @@ remove_path_by_index(platform_ctx_t *p, int idx, mqvpn_platform_reason_t reason)
 {
     if (p->path_mgr.paths[idx].fd < 0) return; /* already removed */
 
-    LOG_WRN("netlink: interface %s %s, closing path %d", p->path_mgr.paths[idx].iface,
-            drop_reason_str(reason), idx);
+    /* handle, not idx: see the sibling comment in windows/net_mon.c. */
+    LOG_WRN("netlink: interface %s %s, closing path handle=%lld",
+            p->path_mgr.paths[idx].iface, drop_reason_str(reason),
+            (long long)p->lib_path_handles[idx]);
 
     /* PR5: emit PLATFORM_DROP via new public API with diagnostic info.
      * Library transitions slot to CLOSED_DROPPED; fd close is reported
