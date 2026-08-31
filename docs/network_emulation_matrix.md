@@ -21,13 +21,13 @@ rather than on the harness.
 | **Geographic detours (Asia→EU via US, Asia→US via EU)** | **NOT done** | — |
 | Asymmetric routing (forward ≠ return) | **done** — four netem qdiscs per path, independently seeded per direction | `netsim_apply_path` |
 | MTU large/small | **done** — 1500/1400/1280 axis, crossed with a PPS cap, plus a PMTUD black hole | `mtu` mode |
-| Client NAT: public + 4 types | **done** — all five, at the access hop | `NETSIM_NAT` |
+| Client NAT: public + 4 types | **built, and measured nothing until now** — no NAT'd path ever completed a handshake (§0.4 F); `cgnat` is one translation, not two | `NETSIM_NAT` |
 | **Server tier (1c1g / 2c2g, GB5 400–2000)** | **done** — four tiers as cgroup caps, labelled nominal | `ci_bench_host.sh` |
 | **Host (母鸡) state: healthy / loaded / softirq storm** | **done** — plus a mid-run CPU throttle | `ci_bench_host.sh` |
 | Server 2.5G / client 1G line rates | **NOT done, and partly infeasible** — see §5 | — |
 | 5 special conditions | **4 of 5** — NAT aging, corrupt/reorder, ACK starvation, roaming under load | `run_special` |
 | Dual-stack routing split | **blocked on the client, not the harness** — see §2.5 | — |
-| Scheduler comparison across classes | **done** — WLB / MinRTT / backup-FEC over the three diverging classes | `sched` mode |
+| Scheduler comparison across classes | **built; two of its three classes were vacuous** — §0.4 F left path B dead in `hetero_extreme` and `asym_latency`, so all three schedulers measured the same single path. `one_flapping` did separate them (§1.3.5) | `sched` mode |
 
 The matrix now answers "how does a real deployment behave" for everything
 except *where the server is*: every path is still one hop wide, so a detour
@@ -286,7 +286,7 @@ sample length raised from 6 s to 10 s. The per-commit gate pins itself back to
 6 s so it stays out of the way of the push path. This narrows D rather than
 closing it: 4 streams x 10 s still does not fill `bgp_plain` at 380 Mbit over
 160 ms, and the profiles above roughly 100 Mbit x 100 ms should still be read as
-lower bounds until §1.3's budget allows a longer sample.
+lower bounds until §1.4's budget allows a longer sample.
 
 **E — `special`'s silent half.** A `skip_row` helper writes
 `{"scenario": ..., "status": "setup_failed" | "tunnel_never_up"}`, and all four
@@ -303,9 +303,147 @@ the mode finishes normally. A consumer can therefore tell a partial artifact
 from a finished one, and a cancelled job still ships everything it managed to
 measure.
 
+### 0.4 The run that was supposed to confirm §0.3 — three fixes hold, and a larger defect was underneath them
+
+Run [33302660068](https://github.com/r11234567/mqvpn/actions/runs/33302660068)
+(2026-08-30, commit `1ead625`) is the weekly §0.3 said would decide. All eleven
+netsim jobs went green and every artifact carries `complete: 1`, which is the
+first thing in this section that should not be trusted.
+
+**Confirmed fixed.** §0.3 A holds: `hetero_extreme` now reports
+`solo_b = 0.0` with `b=tunnel_never_up` instead of echoing path A's number, so
+the leaked client is gone and a second measurement is genuinely a second path.
+§0.3 B, §0.3 E and §0.1 C hold too — every row carries a `status`, `special`
+ships four rows, and the documents are written incrementally.
+
+**F. The entire non-`public` NAT axis never established a tunnel.** This is the
+finding that subsumes most of the rest. Sorting the run's rows by NAT type is
+unambiguous:
+
+| NAT | Rows | Result |
+|---|---|---|
+| `public` | every one | measured |
+| `port_restricted`, `symmetric`, `cgnat` | every one | `tunnel_never_up` |
+
+6 of 13 `classes` rows, 4 of 10 `combo` rows, 6 of 9 `sched` rows and 2 of 4
+`special` rows, plus every `:1400`-and-NAT leg in between. `catalog` and `tiers`
+escaped it only because every path they build is `public`.
+
+The cause is §0.1 A again, one translation later. That fix gave the server a
+route back to the *client's* subnet with `src $NETSIM_SERVER_ADDR`. A NAT'd path
+never presents that address: the hop masquerades the client to its own
+server-facing address, `10.<octet>.2.1`, which lives in the **directly
+connected** `10.<octet>.2.0/24` — a route the kernel installs itself, with no
+preferred source. The server therefore answered from `10.<octet>.2.2`, the
+client dropped a reply from an address it never dialled, and the handshake never
+completed. Exactly the §0.1 A failure, reached through the one address family of
+paths that §0.1 A's fix did not cover.
+
+The assertion added to stop §0.1 A recurring could not see it: it probes
+`ip route get $(netsim_cli_ip i)` only, which is the *pre-NAT* address, and it
+runs inside `netsim_setup` — before `netsim_apply_path` installs any NAT at all.
+
+**Fixed** by giving the post-NAT source addresses a preferred source too, as
+host routes so they beat the connected prefix without disturbing it, and by
+probing all three addresses in the assertion:
+
+```bash
+for nat_src in "$(netsim_hop_srv_ip "$i")" "$(netsim_hop_srv_ip_alt "$i")"; do
+    ip netns exec "$NETSIM_NS_SERVER" ip route replace "${nat_src}/32" \
+        dev "$vs" scope link src "$NETSIM_SERVER_ADDR"
+done
+```
+
+**G. `carrier_qos` still does not measure the thing it exists to measure.** The
+§0.3 C recalibration to 1.5% average loss did not work: every row is 0.5–2.3
+Mbps across all ten access legs, against the 96 Mbps its own 8000 pps cap allows
+at 1500 bytes — 2.4% of its ceiling. Loss was only half the reason. The other
+half is the delay term: `150ms` shaped on **both** ends of the transit leg is a
+300 ms RTT floor, and four TCP streams at 1400 B over 300 ms cannot exceed about
+`(MSS/RTT)·sqrt(1.5/p)` each, i.e. roughly 1.3 Mbps in total at p = 1.5%. That
+is what was measured, twice, and congestion control is precisely the term this
+profile is defined not to measure.
+
+**Fixed** by moving the latency and loss character to the access leg, where it
+belongs — the `5g_*` legs already carry it — and leaving the transit as what
+makes it a carrier: a wide pipe with a hard packet-rate ceiling. At 25 ms/end and
+0.005% loss the loss-limited ceiling is ~140 Mbps, comfortably above the 96 Mbps
+pps cap, so the cap binds and bytes-per-packet becomes the signal.
+
+**H. Two access legs erase the axis they are crossed with.** `5g_throttled`
+returned 0.5–0.9 Mbps under *every* transit — `carrier_qos` 0.5, `iplc` 0.9,
+`bgp_junk` 0.6, `bgp_opt` 0.8, `bgp_plain` 0.8 — and `5g_edge` 0.5–1.9. A leg
+that reports the same number against a 50 Mbit private line and a 380 Mbit
+transit port has deleted the transit dimension: for those two rows, six transits
+× ten legs bought nothing. Same arithmetic as G, at 190–260 ms of access RTT.
+Recalibrated to 0.53% / 0.44% average, bursts of 3.3 packets.
+
+**I. `wifi_busy` is a loss profile wearing a congestion label.** It took
+`bgp_opt` from 128.3 to 4.0 Mbps — a 32× collapse — while `min_rtt` moved 77 →
+81 ms. Contention that costs 97% of throughput and 4 ms of latency is not
+contention. Loss dropped 1.2% → 0.15%; the jitter tail and queue carry the
+congestion, and the 60 Mbit rate cap becomes the leg's headline number.
+
+**J. Four metric defects, all of which publish a plausible-looking number for
+something that did not happen.**
+
+- `min_rtt_ms` was `max()` over the paths. xquic initialises `ctl_minrtt` to
+  `XQC_MAX_UINT32_VALUE`, so an unsampled path publishes `4294967` ms and `max()`
+  selects it deterministically. Every row with a dead leg carried
+  `min_rtt_ms: 4294967`. The connection's RTT floor is the **minimum**; it is
+  now computed over sampled paths only, and the sentinel is filtered.
+- `rtt_inflation` was `max(srtt)/max(min_rtt)`, so those same rows published
+  `0.0` for a ratio that cannot be below 1. It is now computed per path and the
+  worst reported, since srtt and min_rtt from *different* paths do not form a
+  ratio that means anything.
+- In `tiers`, six of seven rows had `min_rtt_ms: 0` and therefore
+  `rtt_inflation: 0` — the control API reports `min_rtt_us / 1000`, and the
+  unshaped `lan` profile is sub-millisecond. Now `null` with a note, not `0`.
+- `path_minshare` was `min/max`, which ranges to 1.0 and is not a share:
+  `sched/one_flapping/minrtt` published `0.833` for a "minimum share". It is now
+  `min/total`, comparable against the `path_share_fair` it is published beside;
+  the old ratio is kept as `path_load_ratio`.
+
+**K. `aggregation_efficiency` and `vs_best_single` were computed on scenarios
+where a leg never came up.** `hetero_extreme` published `1.009` for both with
+path B dead — `mp/(a+0)` on what was really a single-path run, reading as
+near-perfect aggregation. These two are the gate-able numbers in §4, so a
+plausible value from a half-dead scenario is worse than no value. Both are now
+`null` with a `ratio_note` unless all three measurements completed.
+
+**L. None of this affected the exit status.** Every scenario loop swallows its
+own failure with `|| echo "(continuing)"`, and every mode ends by setting
+`RESULTS_COMPLETE=1`, so `complete: 1` only ever meant "the loop reached the
+end". A mode in which 9 of 13 rows produced no usable measurement reported
+success. There is now a gate, and it distinguishes the two kinds of bad row:
+
+- a scenario that could not **run** is a harness defect and fails the job
+  (`CI_BENCH_MAX_FAIL_PCT`, default 25%, counting partial rows against it);
+- a scenario that ran and produced a **bad number** is a finding about the code
+  under test — annotated, counted, never fatal, because gating on those would
+  leave the weekly red until xquic is fixed and it would stop reporting anything.
+
+Replayed against this run's `classes` rows the gate reports
+`complete=4 partial=4 dead=5` and exits 1.
+
+> **Comparability breaks.** `carrier_qos`, `5g_edge`, `5g_throttled` and
+> `wifi_busy` rows from run 33302660068 and earlier are not comparable with
+> anything measured after this commit. `path_minshare` changed meaning in the
+> same commit — earlier values are `min/max`, later ones are `min/total`; the
+> old quantity is still published as `path_load_ratio`. `min_rtt_ms` and
+> `rtt_inflation` changed for the rows that carried the sentinel, where the old
+> values were not measurements at all.
+
+**Still not confirmed.** Everything in §0.4 is static analysis plus a replay of
+this run's own numbers through the new code — the arithmetic, the metric
+handling and the gate were exercised against the artifacts, the emulation was
+not. The NAT fix in particular is reasoned from Linux source-address selection
+and matches the failure exactly, but no run has demonstrated it. Read the next
+weekly before trusting any of it.
+
 ---
 
-## 1. Three blockers, before more coverage is worth adding
+## 1. Blockers and product defects, before more coverage is worth adding
 
 ### 1.1 A product bug that invalidates lossy measurements — `XQC_ELIMIT`
 
@@ -375,7 +513,99 @@ still burns its full 60 minutes, and it is now tempting to re-diagnose it here.
 It is not this. The remaining hang is the spike-driver deadlock in §0.1 B, which
 blocks before iperf3 is ever invoked.
 
-### 1.3 Budget structure
+### 1.3 What the matrix now names in the code under test
+
+The point of the harness is to find these, and until this run it had been
+finding its own bugs instead. Each item below is stated from rows that are
+**not** confounded by §0.4 F or §0.4 G — both legs `public`, both `ok`, default
+MTU unless the finding is about MTU — and each is now emitted as a named
+`findings[]` entry on the row that produced it, plus a `::warning` in the job
+log. They are deliberately not gated (§0.4 L): a gate on these would leave the
+weekly permanently red and stop it reporting anything.
+
+**1.3.1 A path's packet size can only ever go up, so a smaller-MTU path
+blackholes.** The strongest of these, and the only one that is legible from
+source alone:
+
+- `xqc_conn.c:2105` — `xqc_conn_try_to_update_mss` computes the minimum
+  `curr_pkt_out_size` across live paths and then applies it only
+  `if (min_pkt_out_size > conn->pkt_out_size)`. A path with a *smaller* usable
+  MTU can therefore never lower the connection.
+- `xqc_send_ctl.c:1723` — a path's own `curr_pkt_out_size` is likewise only ever
+  raised, on a successful probe.
+- `xqc_multipath.c:309` — a **new** path is seeded from the connection-wide
+  `pkt_out_size`, not from the QUIC-safe base, so it inherits a size the new
+  path may not support and starts probing from there.
+
+There is no downward adjustment anywhere in that chain. Combined with mqvpn's
+`MQVPN_MAX_PKT_OUT_SIZE` of 1400 — a 1428-byte datagram once UDP and IPv4
+headers are on it — any leg whose MTU is below 1428 receives packets it cannot
+forward, and every drop is fed to congestion control as congestion. Note what
+that makes of the matrix's own MTU axis: `1400` is not "a slightly smaller MTU",
+it is *below the floor*, and it is the level used by `hetero_extreme`,
+`carrier_pair`, `home_plus_tether`, `dual_mobile`, `sat_plus_cell` and six of
+ten `combo` legs. `netsim_mtu_class` now classifies every MTU as
+`fits`/`boundary`/`below` and the row says which.
+
+The measurements are consistent with it: `mtu_1400` 83.8 solo → 26.6 multipath
+(`vs_best_single` 0.317), `mtu_split` 74.3 → 19.8 (0.266), `mtu_blackhole`
+98.4 → 19.2 (0.195). Adding a second, otherwise healthy path costs up to 80% of
+throughput. Also worth fixing while in there: the `max_pkt_out_size` captured at
+`xqc_conn.c:2101` sits *inside* the branch that tracks the minimum, so the PMTUD
+probe ceiling is taken from whichever path currently holds the smallest packet
+size rather than the maximum its name claims.
+
+**1.3.2 Two identical healthy paths do not aggregate.** `homo_good` is two
+`eth:bgp_opt:public` legs — same profile, same NAT, same MTU — measuring 129.5
+and 129.6 Mbps alone and **135.1 Mbps together**: `aggregation_efficiency`
+0.521, `vs_best_single` 1.042. A 4% gain from doubling the paths. `mtu_1500`,
+the other all-identical pair, gives 0.665 / 1.012. For comparison the core suite
+on `ci_bench_env.sh`'s topology shows what a working pair looks like in the same
+run: `equal_paths` single 45.3 → WLB 89.1.
+
+**1.3.3 Multipath is *worse* than the best single path when the legs disagree.**
+`asym_capacity` pairs `eth:iplc:public` (50 Mbit) with `eth:bgp_plain:public`
+(380 Mbit); both came up, both `public`, default MTU. Solo 42.6 and 85.9,
+together **45.6** — `vs_best_single` 0.531. Adding the private line to the
+commodity port halved it. This is the head-of-line case the matrix was built to
+find, and it is the one `NETSIM_CLASS` documents as "aggregation has to use both
+without letting the small one become the head-of-line".
+
+**1.3.4 The scheduler does not split evenly between identical paths.** `tiers`
+runs `tier_ref` — two unshaped `lan` legs with nothing to tell them apart — and
+the byte split came back between 0.126 and 0.338 (`min/max`) on all seven rows.
+Nothing in the emulated network accounts for it, which is what makes `tiers` the
+right place to read fairness. `run_tier` now raises `share_imbalance` when the
+minority path carries under half its fair share.
+
+**1.3.5 WLB falls below single-path where MinRTT does not.** From `sched`, on
+`one_flapping` (both legs `eth`, `public`), the three schedulers separate
+properly for once:
+
+| Scheduler | `vs_best_single` | Byte split (min/max) |
+|---|---|---|
+| `wlb` | 0.978 | 0.096 |
+| `minrtt` | **1.164** | 0.833 |
+| `backup_fec` | 1.101 | 0.131 |
+
+WLB leaves 90% of the second path unused and ends up slower than not using it at
+all. §2.6 predicted the opposite ("WLB beats MinRTT at every stream count"), so
+whichever is right, one of them changed and neither had a regression guard. The
+other six `sched` rows are worthless for this — §0.4 F left path B dead, so all
+three schedulers measured the same single path to within 0.3%.
+
+**1.3.6 The control API publishes an unset sentinel as a measurement.**
+`ctl_minrtt` is initialised to `XQC_MAX_UINT32_VALUE` and reset to it on a route
+change (`xqc_send_ctl.c:129`, `:215`, `:320`, `:1588`); `xqc_multipath.c:955`
+copies it to `path_min_rtt`, mqvpn forwards it as `min_rtt_us`, and
+`control_socket.c:283` divides by 1000 — so a path that has never taken an RTT
+sample reports `min_rtt_ms: 4294967`. The path stats carry no "no sample yet"
+flag to read instead, so every consumer has to know the sentinel by value. The
+harness now filters it (§0.4 J); the API should expose the state instead. The
+same rows show `srtt_ms: 250`, which is xquic's initial RTT default — an
+unvalidated path is indistinguishable from a 250 ms one.
+
+### 1.4 Budget structure
 
 `classes` at 60 minutes is the §0.1 B deadlock, not real work: ~95 s per class
 x 13 is about 20 minutes. But the additions below multiply the scenario count,
@@ -482,10 +712,23 @@ Documented, not implemented. All five at the access hop, with nftables/iptables:
 | Type | Rule |
 |---|---|
 | `public` | none |
-| `full_cone` | `masquerade persistent` (mapping stable across destinations) |
+| `full_cone` | `masquerade --persistent` (mapping stable across destinations) |
 | `port_restricted` | plain `masquerade` (conntrack default) |
-| `symmetric` | `masquerade random` (fresh port per destination) |
-| `cgnat` | masquerade at the access hop **and** at a transit hop (double NAT) |
+| `symmetric` | `masquerade --random` (fresh port per destination) |
+| `cgnat` | `masquerade --random --to-ports 20000-20255` — one translation with a carrier port block |
+
+`cgnat` was specified here as a double NAT and implemented as two `MASQUERADE`
+rules in the same `POSTROUTING` chain on the same device. `MASQUERADE`
+terminates, so the second rule was unreachable and `cgnat` was byte-for-byte
+`port_restricted`. A real second translation needs a second routing hop, which
+is the N-hop chain in §2.1 and is not built. What *is* expressible at one hop is
+the other defining property of carrier-grade NAT — the subscriber port block —
+so that is what the level now models, and it is labelled as a single
+translation rather than claiming two.
+
+`full_cone` likewise carried `--random-fully --persistent`, which asks for two
+opposite things: a fresh random port per flow, and a mapping that does not move.
+With both set it differed from `symmetric` only in degree.
 
 `nf_conntrack_udp_timeout` already defaults to 30 s, so the "silent killer" is
 the default; the aging test only has to idle past it. Worth adding on top:
@@ -502,6 +745,27 @@ rather than slowing it. Cross MTU with `carrier_qos`, because under a PPS cap
 goodput scales with bytes-per-packet: that pairing is what turns MTU choice and
 GSO batching into a measurable number instead of a guess.
 
+**The axis has a floor, and two of its three levels are under it.** mqvpn emits a
+1400-byte QUIC packet, which is a 1428-byte datagram once UDP and IPv4 headers
+are on it, so `1400` and `1280` are not smaller MTUs — they are MTUs the
+client's default packet does not fit through at all. Every reading on those
+levels is dominated by §1.3.1 rather than by MTU sensitivity, and since `1400`
+is also the level `hetero_extreme`, `carrier_pair`, `home_plus_tether`,
+`dual_mobile`, `sat_plus_cell` and six of ten `combo` legs use, that reaches
+well beyond `mtu` mode. `netsim_mtu_class` now labels each level
+`fits` / `boundary` / `below` against the 1428-byte floor, every row carries
+`mtu_class_a` / `mtu_class_b`, and a `below` leg is called out in the job log
+when the path is built. Reading MTU sensitivity as such needs either §1.3.1
+fixed or levels chosen above the floor — 1500 / 1450 / 1428 would be an axis
+this client can actually traverse.
+
+The `carrier_qos` crossing is separately blocked on §0.4 G: `mtu_pps_1500` and
+`mtu_pps_1280` came back at 0.6 and 0.3 Mbps, because both legs are
+`5g_throttled:carrier_qos` and so carried both defects at once. With the profile
+recalibrated the pps ceiling is 96 Mbps at 1500 and 81 at 1280 — a 16% gap,
+which is the signal that pairing exists to produce, and which needs the
+measurement CV (17–45% in this run) brought down before it is readable.
+
 ### 2.5 The remaining special condition
 
 - **Live roaming under load.** **Done** — `run_special`'s `roam_under_load`
@@ -510,6 +774,13 @@ GSO batching into a measurable number instead of a guess.
   never sees a new peer address, and the test passes having exercised nothing.
   The row carries `roam_applied` so a run on a box without conntrack is not
   mistaken for a clean result.
+
+  It has still never executed. Its path is `5g_full:bgp_plain:port_restricted`,
+  so §0.4 F killed it before the roam: run 33302660068 reported
+  `roam_under_load` and `nat_aging` as `tunnel_never_up`, which is half of
+  `special`. Both should run once the NAT reply-source fix lands, and both now
+  derive their `status` from the samples rather than writing the literal `ok`
+  the way all three of `special`'s measuring scenarios used to.
 
 - **Dual-stack routing split.** **Blocked on the client, not on the harness.**
   This was filed as "needs v6 addressing threaded through the hop chain", which
@@ -535,6 +806,13 @@ beats MinRTT at every stream count on the plain asymmetric profile, and MinRTT
 goes *negative* at 1 stream (multipath slower than single path), which deserves
 its own regression guard.
 
+Run 33302660068 reverses that on the one class where the comparison was valid:
+on `one_flapping` MinRTT reached `vs_best_single` 1.164 while WLB sat at 0.978,
+below single-path (§1.3.5). The other two classes were vacuous — §0.4 F left
+their B leg dead — so this mode has produced exactly one usable comparison so
+far, and it disagrees with the paragraph above. The regression guard is still
+the right idea; what it should guard is no longer obvious.
+
 ---
 
 ## 3. Dashboard: say what each test and metric is
@@ -549,6 +827,21 @@ throughput benchmark from a smoke test. Three additions, all in the page:
 2. **A metric glossary** — one line per metric explaining what it is and which
    direction is good. `aggregation_efficiency` and `vs_best_single` are not
    self-evident, and `rtt_inflation` needs "this is bufferbloat" spelled out.
+
+   §0.4 changed what several of these carry, and the page has to keep up.
+   `aggregation_efficiency`, `vs_best_single`, `rtt_inflation`, `srtt_ms`,
+   `min_rtt_ms`, `path_minshare`, `roam_retention`, `survived_ratio` and
+   `dl_retention` are now **nullable**, and a null means "not measurable here",
+   which is a different thing from zero — plotting it as zero would reintroduce
+   exactly the error §0.4 J and §0.4 K removed. New fields worth surfacing:
+   `findings[]` and `finding_count` (defects the harness named on that row),
+   `status_a` / `status_b` / `status_mp`, `mtu_class_a` / `mtu_class_b`,
+   `paths_seen` / `paths_rtt_sampled` / `stats_source` (why a metric is
+   missing), `path_share_fair` (the value `path_minshare` should be compared
+   against), `path_load_ratio` (the old `path_minshare` quantity), and
+   `binding_constraint` / `ceiling_utilisation` / `rate_ceiling_mbps` /
+   `pps_ceiling_mbps` on catalog rows. A card showing `findings[]` is the
+   cheapest version of the whole dashboard ask.
 3. **Scenario context on each card.** Documents already carry `netem`,
    `mode`, `caps`, `repeats`; surface the emulated profile next to the number
    so a value is never read without knowing which network produced it.
@@ -634,9 +927,21 @@ before sharding further.
    by run 33024352078: no job timed out and 76 of 97 rows carry a throughput.
 
 0a. ~~**Make the multipath rows mean something** — the leaked-client bug in
-   `run_pair` (§0.2 A).~~ **Fixed, not yet confirmed** (§0.3 A). Until a weekly
-   run comes back, treat `aggregation_efficiency` and `vs_best_single` from
-   33024352078 and earlier as invalid rather than as a baseline.
+   `run_pair` (§0.2 A).~~ **Done and confirmed** by run 33302660068: `solo_b`
+   now reports its own path's state instead of echoing path A's number. Treat
+   `aggregation_efficiency` and `vs_best_single` from 33024352078 and earlier as
+   invalid rather than as a baseline.
+
+0d. **Make the NAT axis connect at all** — the post-NAT reply source (§0.4 F).
+   Nothing behind a NAT has ever completed a handshake, so `cgnat`,
+   `port_restricted` and `symmetric` have never produced a measurement, and
+   `sched` and `special` are half-vacuous because of it. **Written, not
+   confirmed.** This is now the item that blocks the most: it is the difference
+   between 4 and 13 usable rows in `classes`.
+
+0e. **Stop a dead matrix from reporting success** — the completeness gate
+   (§0.4 L). Written. Until it runs, `complete: 1` in any artifact from
+   33302660068 or earlier means only that the loop reached the end.
 
 0b. ~~**Stop a failure from looking like a measurement** — a reason field
    instead of a bare `0.0` (§0.2 B), and a row from `special`'s failure path
@@ -645,10 +950,16 @@ before sharding further.
 
 0c. **Recalibrate what the numbers rest on** — the `loss gemodel` profiles
    (§0.2 C) and the short single-stream sample that cannot fill a high-BDP path
-   (§0.2 D). The profiles are recalibrated (§0.3 C) and the sample is 4 streams
-   x 10 s (§0.3 D); **D is narrowed, not closed** — the widest transits still
-   need a longer sample than the weekly budget currently allows, so read them as
-   lower bounds.
+   (§0.2 D). The profiles were recalibrated once (§0.3 C) and **it was not
+   enough**: `carrier_qos` still measured congestion control rather than its
+   packet-rate cap, and two access legs still erased the transit axis
+   (§0.4 G, §0.4 H). Recalibrated again, this time by moving the latency out of
+   `carrier_qos` rather than only lowering loss. Every catalog row now carries
+   `binding_constraint`, so the next time a profile fails to measure what it
+   exists to measure the artifact says which term bound it instead of leaving it
+   to be rediscovered. The sample is 4 streams x 10 s (§0.3 D); **D is narrowed,
+   not closed** — `bgp_plain+eth` sits at 13.8% of its configured ceiling and
+   reports `loss_or_rtt`, so the widest transits are still lower bounds.
 
 1. ~~Fix the `XQC_ELIMIT` connection kill.~~ **Done** — the buffered-frame cap
    was raised to match the receive window and `-XQC_ELIMIT` was made a tolerant
@@ -666,19 +977,48 @@ before sharding further.
    change fixed or broke the handshake.
 4. ~~Server tiers + host contention.~~ **Done** — `ci_bench_host.sh`, `tiers`
    mode.
-5. ~~NAT matrix and MTU axis (including the PMTUD black hole).~~ **Done** —
-   `NETSIM_NAT`, `mtu` mode, `netsim_set_pmtud_blackhole`.
+5. NAT matrix and MTU axis (including the PMTUD black hole). Built —
+   `NETSIM_NAT`, `mtu` mode, `netsim_set_pmtud_blackhole` — but **neither axis
+   has produced a valid reading yet.** The NAT axis never connected (§0.4 F),
+   and on the MTU axis every level below 1428 is under mqvpn's own outer
+   datagram, so those rows measure §1.3.1 rather than MTU sensitivity. Both are
+   addressed above; both need a run.
+
+5a. **Fix the one-way PMTU state in xquic** (§1.3.1). Until a path's packet
+   size can go *down*, the MTU axis cannot measure MTU, the `:1400` legs
+   scattered through `NETSIM_CLASS` are measuring a blackhole, and multipath is
+   actively harmful on any pair whose legs differ in MTU. This is a product fix,
+   not a harness one, and it gates the reading of items 3 and 5.
 6. ~~Dashboard descriptions and glossary.~~ **Done** — per-test descriptions,
    a direction-aware metric glossary, and the emulated profile shown on each
    card via the series API's new `context` map.
-7. ~~Scheduler sweep~~ (**done**, `sched` mode) and ~~roaming under load~~
-   (**done**). The dual-stack split is blocked on the client; see §2.5.
-   Endurance jobs remain unscheduled.
+7. Scheduler sweep (`sched` mode) and roaming under load are both **built and
+   both still largely unmeasured** — §0.4 F left two of `sched`'s three classes
+   vacuous and `roam_under_load` never past its handshake. The dual-stack split
+   is blocked on the client; see §2.5. Endurance jobs remain unscheduled.
 
-Still open, in short: the N-hop chain and geographic routes (§2.1), the sample
-length on the widest transits (§0.2 D, narrowed but not closed), the 2.5 G/1 G
-line rates (not feasible on a shared runner — §5), the dual-stack routing split
-(blocked on the client — §2.5), the fifth special condition, and the endurance
-jobs. Item 0 and its three follow-ups are all written; item 0's two original
-defects are confirmed in CI, the five §0.2 defects and §0.1 C are not yet — the
-next weekly run is what decides that.
+8. **Investigate what §1.3 names.** The aggregation deficit (§1.3.2), the
+   multipath regression on disagreeing legs (§1.3.3), the byte-split imbalance
+   on identical paths (§1.3.4) and the WLB/MinRTT inversion (§1.3.5) are all
+   findings about mqvpn and xquic rather than about the harness, and all four
+   are now emitted as named `findings[]` on the rows that produce them. They are
+   not gated on purpose. §1.3.1 is the one to start with, since it plausibly
+   explains part of §1.3.3.
+
+Still open, in short: the NAT axis actually connecting (§0.4 F) and the
+completeness gate (§0.4 L), both written and unconfirmed; the one-way PMTU state
+in xquic (§1.3.1) and the four scheduler findings behind it (§1.3.2–§1.3.5); the
+N-hop chain and geographic routes (§2.1); the sample length on the widest
+transits (§0.2 D, narrowed but not closed); the 2.5 G/1 G line rates (not
+feasible on a shared runner — §5); the dual-stack routing split (blocked on the
+client — §2.5); the fifth special condition; and the endurance jobs.
+
+The pattern across §0.1, §0.2 and §0.4 is worth stating once: every round of
+this has been the harness certifying itself healthy while measuring nothing,
+and each round's guard was narrower than the bug class it was written for. The
+`ping -I` check passed on an unusable service address; the `ip route get` check
+that replaced it passed on an unusable NAT'd address; `complete: 1` and a green
+job passed on a matrix that was two-thirds dead. §0.4 L's gate is the first one
+that fails the job on the *outcome* — how many scenarios produced a measurement
+— rather than on a proxy for it, which is the only form of this check that does
+not need to anticipate the next variant.

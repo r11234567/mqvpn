@@ -43,6 +43,46 @@ NETSIM_SERVER_ADDR="10.99.0.1"
 # a reason to emit packets the far side cannot forward.
 NETSIM_FULL_MTU=1500
 
+# The smallest link MTU that still fits the client's default outer datagram.
+#
+# src/mqvpn_internal.h pins MQVPN_MAX_PKT_OUT_SIZE at 1400, which is the QUIC
+# packet size — the UDP payload. On the wire that is 1400 + 8 (UDP) + 20 (IPv4)
+# = 1428 bytes. So the `1400` level this matrix leans on hardest — it appears in
+# hetero_extreme, carrier_pair, home_plus_tether, dual_mobile, sat_plus_cell and
+# six of the ten combo legs — is not "a slightly smaller MTU". It is a link that
+# cannot carry the client's default packet at all, and whether it carries
+# anything depends on PMTUD converging DOWNWARD, which is exactly what xquic
+# does not do (see netsim_mtu_class).
+NETSIM_CLIENT_PKT_SIZE=1400
+NETSIM_MIN_FITTING_MTU=$(( NETSIM_CLIENT_PKT_SIZE + 8 + 20 ))
+
+# netsim_mtu_class <mtu> — how an MTU level relates to what the client emits.
+#
+#   fits     >= 1428: the default packet goes through unmodified
+#   boundary == 1428: exact fit, no headroom for any option
+#   below     < 1428: the default packet does NOT fit; the path only carries
+#                     traffic if the sender shrinks, and xquic's packet size is
+#                     monotonically non-decreasing:
+#                       - xqc_conn.c:2105  applies the cross-path minimum only
+#                         `if (min_pkt_out_size > conn->pkt_out_size)`, so a
+#                         smaller path can never lower the connection
+#                       - xqc_send_ctl.c:1723 only ever raises a path's
+#                         curr_pkt_out_size
+#                       - xqc_multipath.c:309 seeds a NEW path from the
+#                         connection-wide size, not from the QUIC-safe base
+#                     A `below` leg in a pair therefore blackholes whatever the
+#                     scheduler puts on it, and the drops are fed to congestion
+#                     control as congestion. That is the mechanism behind
+#                     vs_best_single 0.195-0.317 on the mtu classes.
+netsim_mtu_class() {
+    local mtu="${1#bh}"
+    [ -n "$mtu" ] || { echo unset; return 0; }
+    if   [ "$mtu" -gt "$NETSIM_MIN_FITTING_MTU" ]; then echo fits
+    elif [ "$mtu" -eq "$NETSIM_MIN_FITTING_MTU" ]; then echo boundary
+    else echo below
+    fi
+}
+
 netsim_hop_ns()          { echo "${NETSIM_NS_HOP_PREFIX}$1"; }
 netsim_veth_cli()        { echo "ns${1}-c"; }   # in NS_CLIENT, faces the hop
 netsim_veth_hop_cli()    { echo "ns${1}-hc"; }  # in the hop, faces the client
@@ -117,12 +157,25 @@ declare -gA NETSIM_TRANSIT=(
   # rate is capped, so bitrate collapses at small MTU. netsim_apply_pps_cap
   # adds the policer. This is the only profile whose optimization signal is
   # packet size rather than congestion control -- which means its loss term
-  # must NOT be the thing that dominates. `2% 15% 80% 0.3%` averaged 9.7% and
-  # did dominate: every carrier_qos row came back at 0.2-0.5 Mbps whatever the
-  # access leg, against a ~90 Mbps ceiling from its own 8000 pps cap at 1400
-  # bytes. Now 1.5% average, so the packet-rate cap is the constraint the
-  # profile exists to measure.
-  [carrier_qos]="delay 150ms 90ms distribution paretonormal loss gemodel 0.8% 25% 45% 0.1% rate 900mbit limit 10000"
+  # must NOT be the thing that dominates.
+  #
+  # Two rounds of getting this wrong. `2% 15% 80% 0.3%` averaged 9.7%; the
+  # recalibration to `0.8% 25% 45% 0.1%` brought the average to 1.5% and the
+  # rows still came back at 0.5-2.3 Mbps on all ten access legs, against the
+  # ~90 Mbps its own 8000 pps cap allows at 1400 bytes. Loss was only half the
+  # reason. The other half is the delay: 150ms shaped on BOTH ends of the leg
+  # is a 300ms RTT floor, and 4 TCP streams at 1400 B over 300ms cannot exceed
+  # roughly (MSS/RTT)*sqrt(1.5/p) per stream -- about 1.3 Mbps in total at
+  # p=1.5%, which is exactly what was measured. Congestion control was the
+  # binding constraint both times, i.e. the one thing this profile is defined
+  # not to measure.
+  #
+  # So the latency and loss character belong to the ACCESS leg (the 5g_* legs
+  # carry it), and this profile keeps only what makes it a carrier: a wide pipe
+  # with a hard packet-rate ceiling. At 25ms/end (50ms RTT) and 0.005% loss the
+  # loss-limited ceiling is ~140 Mbps, comfortably above the 90 Mbps pps cap,
+  # so the cap binds and bytes-per-packet becomes the signal.
+  [carrier_qos]="delay 25ms 8ms distribution paretonormal loss 0.005% rate 900mbit limit 10000"
 
   # Not a product tier: a deliberately unconstrained path, so a benchmark whose
   # subject is the *server* has no network ceiling in the way. Used by the tier
@@ -152,16 +205,35 @@ declare -gA NETSIM_PPS_CAP=(
 declare -gA NETSIM_ACCESS=(
   [eth]="delay 0.2ms rate 1000mbit"
   [wifi_good]="delay 3ms 2ms distribution normal loss 0.05% rate 400mbit"
-  [wifi_busy]="delay 18ms 30ms distribution paretonormal loss 1.2% rate 60mbit limit 3000"
+  # A busy cell is contention -- queueing and a variable rate -- not a lossy
+  # link. At 1.2% loss it behaved as one: it took bgp_opt from 128.3 to 4.0
+  # Mbps, a 32x collapse, while min_rtt moved only 77 -> 81ms. A 32x throughput
+  # change with no latency change is not what congestion looks like from the
+  # inside. The queue (jitter tail + limit) carries the contention now, and
+  # 0.15% leaves the 60mbit rate cap as the leg's headline number.
+  [wifi_busy]="delay 18ms 30ms distribution paretonormal loss 0.15% rate 60mbit limit 3000"
   [5g_full]="delay 18ms 6ms distribution normal loss 0.05% rate 350mbit"
   [5g_half]="delay 45ms 25ms distribution paretonormal loss 0.4% rate 90mbit"
   # Same gemodel arithmetic as the transit profiles above: `4% 25% 80% 1%` was
   # 11.9% average and `5% 20% 85% 1.5%` was 18.2%, so both legs were beyond
   # what a cell delivers even at the edge of coverage, and 5g_throttled failed
-  # to complete a handshake on every transit it was paired with. 3.3% and 4.1%
-  # average, bursts of 3-4 packets.
-  [5g_edge]="delay 95ms 60ms distribution paretonormal loss gemodel 2% 30% 45% 0.5% rate 12mbit limit 4000"
-  [5g_throttled]="delay 130ms 85ms distribution paretonormal loss gemodel 2% 28% 50% 0.8% rate 8mbit limit 5000"
+  # to complete a handshake on every transit it was paired with. The 3.3% /
+  # 4.1% recalibration fixed the handshakes and nothing else: in the catalog
+  # 5g_throttled read 0.5-0.9 Mbps under EVERY transit (carrier_qos 0.5, iplc
+  # 0.9, bgp_junk 0.6, bgp_opt 0.8, bgp_plain 0.8) and 5g_edge 0.5-1.9. A leg
+  # that returns the same number against a 50mbit private line and a 380mbit
+  # transit port has erased the axis it was crossed with -- 6 transits x 10
+  # legs bought nothing on those two rows.
+  #
+  # The cause is again loss x RTT rather than the rate cap: at 190-260ms of
+  # access RTT, 3-4% loss holds 4 streams near 1 Mbps whatever the pipe. These
+  # keep the bursty shape (mean burst 3.3 packets) at 0.53% / 0.44% average, so
+  # each leg reads against its own rate cap and the transit axis is legible
+  # again. They remain loss-limited rather than rate-limited at these RTTs, so
+  # every catalog row now carries `binding_constraint` naming which term bound
+  # it -- the residual gap is attributable instead of reading as a path property.
+  [5g_edge]="delay 95ms 60ms distribution paretonormal loss gemodel 1% 30% 15% 0.05% rate 12mbit limit 4000"
+  [5g_throttled]="delay 130ms 85ms distribution paretonormal loss gemodel 1% 30% 12% 0.05% rate 8mbit limit 5000"
   [starlink]="delay 45ms 30ms distribution paretonormal loss 1% rate 200mbit"
   [geo_sat]="delay 320ms 25ms distribution normal loss 0.5% rate 20mbit limit 2000"
   # Phone tethering over PAN/USB-OTG. The duplicate/corrupt terms are the
@@ -178,19 +250,37 @@ declare -gA NETSIM_LEG_MTU=(
 
 # ── Client NAT behaviours ──────────────────────────────────────────────────
 # Applied at the access hop, which is where a CPE or carrier NAT actually sits.
-# `cgnat` additionally NATs at the transit hop, so the client is behind two
-# translations — the shape a mobile subscriber usually has.
+#
+# Every level here rewrites the client's source address to the hop's
+# server-facing address, which is why netsim_setup has to give THAT address a
+# preferred source too — see the host routes it installs. Without them no NAT'd
+# path can complete a handshake at all.
 #
 # These are the four RFC 3489 behaviours plus no-NAT. What separates them for a
 # QUIC tunnel is whether the source port stays put: `symmetric` allocates a new
 # port per destination, so a path that re-resolves or migrates looks like a
 # different peer to the server and has to be re-validated.
+# `full_cone` used to carry `--random-fully --persistent`, which asks for two
+# opposite things: --random-fully picks a fresh random source port per flow,
+# and full-cone is defined by the mapping NOT moving. With both set, full_cone
+# and symmetric differed only in degree, so the level tested nothing of its own.
+# --persistent alone is what the design doc specifies and what a full-cone CPE
+# does.
+#
+# `cgnat` is ONE translation, not two. The topology has exactly one hop
+# namespace per path, and the two masquerade rules the old code appended went
+# into the same POSTROUTING chain on the same device — MASQUERADE terminates,
+# so the second rule was unreachable and cgnat was byte-for-byte
+# port_restricted. A real double translation needs the N-hop chain (§2.1),
+# which is not built. What IS expressible at one hop, and is the defining
+# observable of carrier-grade NAT, is the subscriber port block: a small range
+# shared by the whole flow set, so port exhaustion and reuse are reachable.
 declare -gA NETSIM_NAT=(
   [public]=""                                  # routed, no translation
-  [full_cone]="--random-fully --persistent"    # one stable mapping for all peers
+  [full_cone]="--persistent"                   # one stable mapping for all peers
   [port_restricted]=""                         # plain masquerade (conntrack default)
   [symmetric]="--random"                       # fresh port per destination
-  [cgnat]=""                                   # masquerade twice; see below
+  [cgnat]="--random --to-ports 20000-20255"    # carrier port block, single NAT
 )
 
 # netsim_apply_nat <slot> <nat_type>
@@ -212,19 +302,20 @@ netsim_apply_nat() {
     # Degrade to 'public' rather than failing the scenario; detect_caps said so.
     [ "$NETSIM_HAVE_NAT" = 1 ] || return 0
 
+    # -C before -A: the comment above claimed idempotency, but a bare -A stacks
+    # a duplicate rule on every call. It held only because each caller happens
+    # to run netsim_setup first (which deletes the namespace) — an invariant
+    # worth enforcing rather than depending on, since netsim_roam flushes this
+    # same chain mid-scenario.
     # shellcheck disable=SC2086  # flags are intentionally word-split
+    ip netns exec "$hop" iptables -t nat -C POSTROUTING -o "$out" \
+        -j MASQUERADE ${NETSIM_NAT[$nat]} 2>/dev/null ||
     ip netns exec "$hop" iptables -t nat -A POSTROUTING -o "$out" \
         -j MASQUERADE ${NETSIM_NAT[$nat]} 2>/dev/null ||
-        ip netns exec "$hop" iptables -t nat -A POSTROUTING -o "$out" \
-            -j MASQUERADE 2>/dev/null || true
-
-    # A second translation at the transit hop: the client's packets are
-    # rewritten twice before they reach the server.
-    if [ "$nat" = "cgnat" ]; then
-        ip netns exec "$NETSIM_NS_SERVER" sysctl -qw net.ipv4.ip_forward=1 2>/dev/null || true
-        ip netns exec "$hop" iptables -t nat -A POSTROUTING -o "$out" \
-            -j MASQUERADE 2>/dev/null || true
-    fi
+    ip netns exec "$hop" iptables -t nat -C POSTROUTING -o "$out" \
+        -j MASQUERADE 2>/dev/null ||
+    ip netns exec "$hop" iptables -t nat -A POSTROUTING -o "$out" \
+        -j MASQUERADE 2>/dev/null || true
 
     # UDP conntrack ages out in 30 s by default, which IS the "silent killer"
     # every mobile user meets. Pin it explicitly so the value is part of the
@@ -523,6 +614,23 @@ netsim_setup() {
         ip netns exec "$NETSIM_NS_SERVER" ip route add "10.${NETSIM_OCTETS[$i]}.1.0/24" \
             via "$(netsim_hop_srv_ip "$i")" dev "$vs" \
             src "$NETSIM_SERVER_ADDR" 2>/dev/null || true
+
+        # The same `src` problem, one translation later. The route above covers
+        # the client's own subnet, which is the address the server replies to
+        # only on a `public` path. Behind any NAT the hop rewrites the source to
+        # its own server-facing address (10.<octet>.2.1, or .9 after a roam),
+        # and that lives in the DIRECTLY CONNECTED 10.<octet>.2.0/24 — a route
+        # the kernel installed itself, with no preferred source. So replies to a
+        # NAT'd client went out as 10.<octet>.2.2, the client dropped them, and
+        # every scenario with nat != public reported tunnel_never_up: the entire
+        # cgnat / port_restricted / symmetric axis, plus nat_aging and
+        # roam_under_load. A host route is more specific than the connected
+        # prefix, so it wins the lookup without disturbing it.
+        local nat_src
+        for nat_src in "$(netsim_hop_srv_ip "$i")" "$(netsim_hop_srv_ip_alt "$i")"; do
+            ip netns exec "$NETSIM_NS_SERVER" ip route replace "${nat_src}/32" \
+                dev "$vs" scope link src "$NETSIM_SERVER_ADDR" 2>/dev/null || true
+        done
     done
 
     # Loose rp_filter: several /32 routes to one address over different devices
@@ -547,15 +655,24 @@ netsim_setup() {
     # unusable — which is exactly the state that made every scenario read zero
     # while this check reported the path healthy. Assert the other direction
     # too: the server must answer each client from NETSIM_SERVER_ADDR.
-    local want_src
+    # Every address the server can see a client AT, not just the un-translated
+    # one. Checking only netsim_cli_ip is what let the NAT'd variant of this
+    # exact bug ship green for a whole weekly: a masqueraded path presents the
+    # hop's server-facing address instead, and that lookup resolved to the veth
+    # source while this assertion looked at a different route and passed.
+    local want_src probe
     for (( i=0; i<n; i++ )); do
-        want_src="$(ip netns exec "$NETSIM_NS_SERVER" ip -o route get "$(netsim_cli_ip "$i")" \
-                    2>/dev/null | sed -n 's/.* src \([0-9.][0-9.]*\).*/\1/p')"
-        if [ "$want_src" != "$NETSIM_SERVER_ADDR" ]; then
-            echo "netsim_setup: server would answer path $i from ${want_src:-<none>}," \
-                 "not $NETSIM_SERVER_ADDR — the client would drop the reply" >&2
-            return 1
-        fi
+        for probe in "$(netsim_cli_ip "$i")" "$(netsim_hop_srv_ip "$i")" \
+                     "$(netsim_hop_srv_ip_alt "$i")"; do
+            want_src="$(ip netns exec "$NETSIM_NS_SERVER" ip -o route get "$probe" \
+                        2>/dev/null | sed -n 's/.* src \([0-9.][0-9.]*\).*/\1/p')"
+            if [ "$want_src" != "$NETSIM_SERVER_ADDR" ]; then
+                echo "netsim_setup: server would answer path $i at $probe from" \
+                     "${want_src:-<none>}, not $NETSIM_SERVER_ADDR — the client" \
+                     "would drop the reply" >&2
+                return 1
+            fi
+        done
     done
 
     echo "OK: netsim topology up — $n path(s), 2 hops each, server ${NETSIM_SERVER_ADDR}"
@@ -619,7 +736,21 @@ netsim_apply_path() {
     local pps="${NETSIM_PPS_CAP[$transit]:-${NETSIM_PPS_CAP[$access]:-}}"
     if [ -n "$pps" ]; then netsim_apply_pps_cap "$slot" "$pps"; fi
 
-    echo "  path $slot: ${access} + ${transit} + nat=${nat}${mtu:+ mtu=$mtu}$([ -n "$pps" ] && echo " pps<=${pps}")"
+    # Say out loud when a leg's MTU is below what the client emits. A row that
+    # reads 15 Mbps because its packets do not fit is a different finding from
+    # one that reads 15 Mbps because the pipe is small, and the job log is where
+    # that distinction has to start.
+    local mtu_note=""
+    if [ -n "$mtu" ]; then
+        local mclass; mclass="$(netsim_mtu_class "$mtu")"
+        mtu_note=" mtu=${mtu}(${mclass})"
+        if [ "$mclass" = below ]; then
+            echo "  note: path $slot MTU ${mtu#bh} < ${NETSIM_MIN_FITTING_MTU} —" \
+                 "mqvpn's ${NETSIM_CLIENT_PKT_SIZE}-byte packet plus 28 bytes of" \
+                 "UDP/IP does not fit; this leg depends on the sender shrinking"
+        fi
+    fi
+    echo "  path $slot: ${access} + ${transit} + nat=${nat}${mtu_note}$([ -n "$pps" ] && echo " pps<=${pps}")"
 }
 
 # netsim_set_mtu <slot> <mtu> — clamp every device on the path.
@@ -776,6 +907,57 @@ netsim_path_field() {
       mtu)     echo "${mtu:-}" ;;
       *)       return 1 ;;
     esac
+}
+
+# _netsim_rate_mbps <netem spec> — the `rate N(mbit|kbit)` term, in Mbps.
+_netsim_rate_mbps() {
+    local spec="$1" v
+    v="$(printf '%s\n' "$spec" | sed -n 's/.*rate \([0-9][0-9]*\)mbit.*/\1/p')"
+    if [ -n "$v" ]; then echo "$v"; return 0; fi
+    v="$(printf '%s\n' "$spec" | sed -n 's/.*rate \([0-9][0-9]*\)kbit.*/\1/p')"
+    if [ -n "$v" ]; then echo "$(( v / 1000 ))"; return 0; fi
+    echo 0
+}
+
+# netsim_path_ceilings <spec> -> "<rate_mbps> <pps_ceiling_mbps>"
+#
+# The two ceilings a path's CONFIGURATION imposes, so a measurement can be told
+# apart from the profile that produced it. A reading far below both means that
+# neither the pipe nor the packet rate bound it — loss x RTT did. carrier_qos and
+# the two throttled 5g legs sat in exactly that state for three consecutive
+# weeklies while their rows were read as path properties, and nothing in the
+# artifact said which term was binding. 0 means "no such ceiling configured".
+netsim_path_ceilings() {
+    local spec="$1" access transit nat mtu
+    local IFS=:
+    read -r access transit nat mtu <<<"$spec"
+    unset IFS
+    # An empty subscript is a hard error on a bash associative array, and a
+    # one-field or empty spec would otherwise spray "bad array subscript" onto
+    # the job log while still returning a number. Name the miss instead.
+    access="${access:-__unset}"
+    transit="${transit:-__unset}"
+    mtu="${mtu#bh}"
+    mtu="${mtu:-${NETSIM_LEG_MTU[$access]:-$NETSIM_FULL_MTU}}"
+
+    local ar tr rate
+    ar="$(_netsim_rate_mbps "${NETSIM_ACCESS[$access]:-}")"
+    tr="$(_netsim_rate_mbps "${NETSIM_TRANSIT[$transit]:-}")"
+    if [ "$ar" -gt 0 ] && [ "$tr" -gt 0 ]; then
+        rate=$(( ar < tr ? ar : tr ))
+    else
+        rate=$(( ar > tr ? ar : tr ))
+    fi
+
+    # The pps cap only exists if the kernel could install the policer;
+    # netsim_detect_caps already said so, and reporting a ceiling that was never
+    # applied would be worse than reporting none.
+    local pps ppsc=0
+    pps="${NETSIM_PPS_CAP[$transit]:-${NETSIM_PPS_CAP[$access]:-}}"
+    if [ -n "$pps" ] && [ "$NETSIM_HAVE_PPS" = 1 ]; then
+        ppsc=$(( pps * mtu * 8 / 1000000 ))
+    fi
+    echo "${rate} ${ppsc}"
 }
 
 # Which transit profile a class puts on a given slot — the spike driver needs
