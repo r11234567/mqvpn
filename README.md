@@ -178,15 +178,65 @@ in favour of PMTUD plus the header reserve
 combination that actually works and does not assume a 1500-byte path. One
 residual limitation remains — see [Known issues](#known-issues).
 
+### Multipath MTU: a narrow path used to black hole
+
+Symptom, from a two-path run on an ordinary laptop — WiFi plus a handset
+tethered over USB:
+
+- adding the second path made throughput *worse* than either path alone;
+- availability tracked the WiFi link exactly. Pulling WiFi stalled the tunnel
+  for three minutes even though the tethered path stayed `ACTIVE` the whole
+  time, and it only recovered when WiFi came back.
+
+The cause was in xquic, and it is visible in the log as a packet size that
+moves in one direction only:
+
+```
+20:10:34 [INF] [conn:1] datagram MSS updated: 1384     <- one path up
+20:10:35 [INF] [conn:1] datagram MSS updated: 1404     <- second path up, MSS RISES
+20:10:35 [INF] TUN MTU updated to 1402
+```
+
+A second path joining a connection can only ever *lower* the size every path
+has to carry, never raise it. It rose because `conn->pkt_out_size` was
+monotonically non-decreasing: the cross-path minimum was applied only when it
+came out larger than the current value, a new path was seeded from the
+connection's size rather than the size QUIC guarantees, and the PMTU search
+could not probe below the value already in use. Details and the fix are in the
+[xquic README](https://github.com/r11234567/xquic#per-path-pmtu-discovery).
+
+`MQVPN_MAX_PKT_OUT_SIZE` is 1400, which is 1428 bytes on the wire once IPv4 and
+UDP headers are on the datagram. Any link whose MTU is below that — 1400 is the
+common case for tethered cellular — received packets it could not forward, and
+every drop reached congestion control as congestion rather than as "too big".
+Because the size had been raised while the wide path was up, the surviving
+narrow path could carry only ACKs and other small packets after failover, which
+is why availability followed WiFi: the connection was sized for a link that was
+no longer there.
+
+The fix makes the PMTU search per path, starts a new path at the guaranteed
+size, and recomputes the connection's size in both directions — so losing a
+path now gives the size back instead of stranding the connection above what it
+can send. This repo needed no change to consume it: `cb_dgram_mss_updated`
+already reacts to any change in the MSS, so the TUN MTU follows a decrease as
+readily as an increase.
+
+Two caveats. Adding a path now causes a brief dip while the new path confirms
+its size, which is the price of one buffer size serving every path. And nothing
+here is backed by a throughput measurement yet — the change is static analysis
+plus unit tests, so read a weekly netsim run before believing the aggregation
+numbers moved.
+
 ### End-to-end fixes carried in the pinned xquic
 
 `third_party/xquic` is pinned at
-[`2ae918c`](https://github.com/r11234567/xquic/commit/2ae918c). Enabling the
+[`be82b29`](https://github.com/r11234567/xquic/commit/be82b29). Enabling the
 features above exposed transport bugs that the e2e suite caught and that had to
 be fixed in xquic rather than here:
 
 | xquic commit | What it fixes |
 |---|---|
+| [be82b29](https://github.com/r11234567/xquic/commit/be82b29) | **A path's packet size could only go up, so the narrower path black-holed.** See [Multipath MTU](#multipath-mtu-a-narrow-path-used-to-black-hole) below — this is the one that made a second path cost throughput instead of adding it. |
 | [a40cbd5](https://github.com/r11234567/xquic/commit/a40cbd5) | **A Retry could not follow a full Initial.** `xqc_conn_reassemble_packet()` rebuilt the Initial with the Retry token in the header but copied the payload in verbatim, sized against the shorter header. With a PQC key share filling the packet, AEAD needed 1453 bytes of a 1452-byte buffer and encryption failed with `XQC_TLS_ENCRYPT_DATA_ERROR` (-736), so no handshake completed at all. Surfaced as a 10 s dispatch timeout in `tests/test_tcp_egress.c`. Fixed by reserving worst-case header growth; the payload copy is now bounds-checked too. |
 | [513a991](https://github.com/r11234567/xquic/commit/513a991) | **A full receive buffer killed the connection.** Multipath bulk transfers died tens of MB in with `FRAME_ENCODING_ERROR`, traced to a buffered-frame cap of 8192 sitting *below* the 16 MiB receive window being advertised — a peer obeying flow control was rejected for exceeding a limit it was never told. Raised to `window/1KiB` and tied to the window by a `_Static_assert` so the two cannot drift apart again. |
 | [2ae918c](https://github.com/r11234567/xquic/commit/2ae918c) | Hardens `xqc_var_buf_reduce` against a wrapping subtraction and casts both operands in `xqc_submatrix`, replacing the equivalent hunks this repo carried in `patches/xquic/`. |

@@ -51,8 +51,8 @@ NETSIM_FULL_MTU=1500
 # hetero_extreme, carrier_pair, home_plus_tether, dual_mobile, sat_plus_cell and
 # six of the ten combo legs — is not "a slightly smaller MTU". It is a link that
 # cannot carry the client's default packet at all, and whether it carries
-# anything depends on PMTUD converging DOWNWARD, which is exactly what xquic
-# does not do (see netsim_mtu_class).
+# anything depends on PMTUD converging DOWNWARD — which xquic could not do until
+# be82b29 and now can (see netsim_mtu_class).
 NETSIM_CLIENT_PKT_SIZE=1400
 NETSIM_MIN_FITTING_MTU=$(( NETSIM_CLIENT_PKT_SIZE + 8 + 20 ))
 
@@ -60,20 +60,20 @@ NETSIM_MIN_FITTING_MTU=$(( NETSIM_CLIENT_PKT_SIZE + 8 + 20 ))
 #
 #   fits     >= 1428: the default packet goes through unmodified
 #   boundary == 1428: exact fit, no headroom for any option
-#   below     < 1428: the default packet does NOT fit; the path only carries
-#                     traffic if the sender shrinks, and xquic's packet size is
-#                     monotonically non-decreasing:
-#                       - xqc_conn.c:2105  applies the cross-path minimum only
-#                         `if (min_pkt_out_size > conn->pkt_out_size)`, so a
-#                         smaller path can never lower the connection
-#                       - xqc_send_ctl.c:1723 only ever raises a path's
-#                         curr_pkt_out_size
-#                       - xqc_multipath.c:309 seeds a NEW path from the
-#                         connection-wide size, not from the QUIC-safe base
-#                     A `below` leg in a pair therefore blackholes whatever the
-#                     scheduler puts on it, and the drops are fed to congestion
-#                     control as congestion. That is the mechanism behind
-#                     vs_best_single 0.195-0.317 on the mtu classes.
+#   below     < 1428: the default packet does NOT fit, so the path carries
+#                     traffic only if the sender shrinks. It could not: xquic's
+#                     packet size was monotonically non-decreasing, which is the
+#                     mechanism behind vs_best_single 0.195-0.317 on the mtu
+#                     classes. Fixed in xquic be82b29 -- the PMTU search is now
+#                     per path, a new path starts at the QUIC-guaranteed size
+#                     rather than inheriting the connection's, and the
+#                     connection's size is recomputed in both directions.
+#
+#                     A `below` leg is therefore expected to aggregate now, and
+#                     the class exists to keep checking that it does: run_pair
+#                     raises `pmtu_blackhole_regression` when such a leg still
+#                     costs throughput. Do not read a `below` class as a known
+#                     defect any more -- read the finding.
 netsim_mtu_class() {
     local mtu="${1#bh}"
     [ -n "$mtu" ] || { echo unset; return 0; }

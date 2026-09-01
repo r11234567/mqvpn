@@ -493,11 +493,22 @@ if agg is not None and agg < 0.60:
 if share is not None and fair and share < fair * 0.5:
     f.append('share_imbalance: minority path carried %.1f%% of bytes against a '
              '%.1f%% fair share' % (share*100, fair*100))
+# A leg below the outer datagram size used to be a standing defect: xquic could
+# only ever raise a path's packet size, so such a leg was sent packets it could
+# not forward for the life of the connection. xquic be82b29 makes the PMTU
+# search per path and lets the connection size come down, so this is now a
+# regression guard rather than a restatement of the bug -- the scenario is
+# expected to aggregate, and only a failure to is worth reporting.
 if 'below' in (mcls_a, mcls_b):
-    f.append('mtu_below_client_pkt: a leg MTU is under the 1428-byte outer '
-             'datagram mqvpn emits; xquic never lowers a path packet size '
-             '(xqc_conn.c:2105, xqc_send_ctl.c:1723), so the scheduler keeps '
-             'sending what that leg cannot carry')
+    if vsb is not None and vsb < 0.90:
+        f.append('pmtu_blackhole_regression: a leg MTU is under the outer '
+                 'datagram size and multipath came out %.3fx the best single '
+                 'path -- the per-path PMTU search (xquic be82b29) should have '
+                 'lowered the connection to fit that leg' % vsb)
+    elif vsb is None:
+        f.append('pmtu_below_unmeasured: a leg MTU is under the outer datagram '
+                 'size, but one measurement did not complete, so whether the '
+                 'PMTU search handled it is unknown on this row')
 row['findings'] = f
 row['finding_count'] = len(f)
 print(json.dumps(row))" \

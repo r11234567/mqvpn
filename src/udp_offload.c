@@ -173,10 +173,17 @@ send_batch_mmsg(int fd, const struct iovec *iov, unsigned int cnt,
  * fragmentation (Linux default IP_PMTUDISC_WANT), a pre-existing RFC 9000
  * §14 deviation this module inherits rather than introduces, and one that
  * still blackholes on fragment-dropping middleboxes. The EMSGSIZE consumed
- * here is exactly the signal a PLPMTU reduction would want; routing it to
- * the QUIC layer requires a PLPMTUD that can lower max_pkt_out_size, which
- * xquic does not have yet (issue #7). When that lands, packets shrink
- * below the route PMTU and this classification simply stops firing. */
+ * here is exactly the signal a PLPMTU reduction would want.
+ *
+ * xquic can now lower its packet size: the PMTU search is per path, a path
+ * starts at the size QUIC guarantees rather than inheriting the connection's,
+ * and persistent congestion resets it to that base. So the oversized-packet
+ * case does resolve itself, and this fallback should stop firing once the
+ * search converges. What is still missing is the shortcut: nothing routes this
+ * EMSGSIZE -- the kernel's own answer for the route PMTU, available
+ * immediately -- into that search, which therefore has to rediscover the same
+ * number over a few probe intervals. Feeding it in needs an xquic API to
+ * report a path's PMTU from outside the library. */
 static int
 gso_class_error(int e)
 {

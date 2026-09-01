@@ -524,8 +524,28 @@ log. They are deliberately not gated (§0.4 L): a gate on these would leave the
 weekly permanently red and stop it reporting anything.
 
 **1.3.1 A path's packet size can only ever go up, so a smaller-MTU path
-blackholes.** The strongest of these, and the only one that is legible from
-source alone:
+blackholes. — FIXED in xquic [`be82b29`](https://github.com/r11234567/xquic/commit/be82b29),
+not yet confirmed by a run.** The strongest of these, and the only one that is
+legible from source alone. It was also reproduced outside the matrix, on a
+laptop pairing WiFi with a USB-tethered handset: adding the second path cost
+throughput, and pulling WiFi stalled the tunnel for three minutes while the
+tethered path sat `ACTIVE`, because the connection was still sized for the link
+that had gone away.
+
+The fix makes the PMTU search per path, seeds a new path at the QUIC-guaranteed
+size instead of the connection's current one, recomputes `conn->pkt_out_size`
+in both directions over the paths whose limit is actually known, and resets a
+path to the base size on persistent congestion (RFC 8899 §5.2). Unit coverage
+is in `tests/unittest/xqc_pmtud_mp_test.c` in the xquic tree.
+
+**What this means for the numbers below.** The `mtu_*` rows should move, and so
+may any row on a `:1400` leg — which is six of ten `combo` legs and five named
+classes. It does **not** explain §1.3.2 or §1.3.3: `homo_good` and
+`asym_capacity` both ran at default MTU, so their aggregation failures are
+still open and still unexplained. Read the next weekly before crossing anything
+off.
+
+The original analysis follows.
 
 - `xqc_conn.c:2105` — `xqc_conn_try_to_update_mss` computes the minimum
   `curr_pkt_out_size` across live paths and then applies it only
