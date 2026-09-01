@@ -495,7 +495,7 @@ if share is not None and fair and share < fair * 0.5:
              '%.1f%% fair share' % (share*100, fair*100))
 # A leg below the outer datagram size used to be a standing defect: xquic could
 # only ever raise a path's packet size, so such a leg was sent packets it could
-# not forward for the life of the connection. xquic 55de779 makes the PMTU
+# not forward for the life of the connection. xquic 6ba4261 makes the PMTU
 # search per path and lets the connection size come down, so this is now a
 # regression guard rather than a restatement of the bug -- the scenario is
 # expected to aggregate, and only a failure to is worth reporting.
@@ -503,7 +503,7 @@ if 'below' in (mcls_a, mcls_b):
     if vsb is not None and vsb < 0.90:
         f.append('pmtu_blackhole_regression: a leg MTU is under the outer '
                  'datagram size and multipath came out %.3fx the best single '
-                 'path -- the per-path PMTU search (xquic 55de779) should have '
+                 'path -- the per-path PMTU search (xquic 6ba4261) should have '
                  'lowered the connection to fit that leg' % vsb)
     elif vsb is None:
         f.append('pmtu_below_unmeasured: a leg MTU is under the outer datagram '

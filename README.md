@@ -178,18 +178,25 @@ in favour of PMTUD plus the header reserve
 combination that actually works and does not assume a 1500-byte path. One
 residual limitation remains — see [Known issues](#known-issues).
 
-### Multipath MTU: a narrow path used to black hole
+### Two paths were worse than one: what a WiFi + tethered-5G run exposed
 
 Symptom, from a two-path run on an ordinary laptop — WiFi plus a handset
-tethered over USB:
+tethered over USB (which appears as an Ethernet adapter, so it is the
+`以太网 4` path in the log below, not the `WLAN` one):
 
 - adding the second path made throughput *worse* than either path alone;
 - availability tracked the WiFi link exactly. Pulling WiFi stalled the tunnel
   for three minutes even though the tethered path stayed `ACTIVE` the whole
   time, and it only recovered when WiFi came back.
 
-The cause was in xquic, and it is visible in the log as a packet size that
-moves in one direction only:
+These turned out to be **two independent defects in xquic**, both fixed:
+the packet size could only ever grow (below), and WLB could lock out the last
+remaining path ([further down](#the-three-minute-stall-wlb-locked-out-the-last-path)).
+The first accounts for the throughput loss, the second for the stall.
+
+#### The packet size could only go up
+
+Visible in the log as a size that moves in one direction only:
 
 ```
 20:10:34 [INF] [conn:1] datagram MSS updated: 1384     <- one path up
@@ -209,17 +216,23 @@ could not probe below the value already in use. Details and the fix are in the
 UDP headers are on the datagram. Any link whose MTU is below that — 1400 is the
 common case for tethered cellular — received packets it could not forward, and
 every drop reached congestion control as congestion rather than as "too big".
-Because the size had been raised while the wide path was up, the surviving
-narrow path could carry only ACKs and other small packets after failover, which
-is why availability followed WiFi: the connection was sized for a link that was
-no longer there.
+Worse after a failover than before it: the size had been raised while both paths
+were up, and losing the wide path could not bring it back down, so the surviving
+narrow path was left being sent packets sized for a link that no longer existed.
 
 The fix makes the PMTU search per path, starts a new path at the guaranteed
 size, and recomputes the connection's size in both directions — so losing a
 path now gives the size back instead of stranding the connection above what it
-can send. This repo needed no change to consume it: `cb_dgram_mss_updated`
-already reacts to any change in the MSS, so the TUN MTU follows a decrease as
-readily as an increase.
+can send.
+
+Consuming it needed one more xquic change. `cb_dgram_mss_updated` does react to
+whatever it is told, but xquic only *told* it when the MSS grew: the notify flag
+was raised on an increase alone, which was very nearly complete back when the
+packet size could only rise. Left that way, the connection would have shrunk to
+fit the tethered link while the TUN MTU stayed at 1402, and mqvpn would have
+gone on handing over datagrams that no longer fit — trading a black hole for a
+stream of rejected sends. The callback now fires on any change, so the TUN MTU
+follows the size down as readily as up.
 
 Two caveats. Adding a path now causes a brief dip while the new path confirms
 its size, which is the price of one buffer size serving every path. And nothing
@@ -227,16 +240,52 @@ here is backed by a throughput measurement yet — the change is static analysis
 plus unit tests, so read a weekly netsim run before believing the aggregation
 numbers moved.
 
+#### The three-minute stall: WLB locked out the last path
+
+The availability half of the report is a different bug, in the scheduler mqvpn
+uses by default ([WLB](#schedulers)).
+
+WLB declines to schedule onto a path whose consecutive-PTO count suggests it is
+blackholed — a link that is down while `sendto()` still succeeds. Sensible as a
+*preference*; it was written as an absolute exclusion, in the single-path fast
+path and in the MinRTT fallback that carries control and ACK traffic alike.
+
+So when the path over the threshold was the only path left, every branch
+returned "no path" and nothing was sent. `ctl_pto_count` is cleared only when an
+ACK arrives, and no ACK can arrive on a path nothing is sent on — the exclusion
+kept itself true. The loss burst that accompanies a link disappearing is exactly
+what drives the surviving path's PTO count up in the first place.
+
+The log shows the shape of it precisely:
+
+```
+20:13:57 [WRN] netmon: interface WLAN carrier lost, closing path 1
+20:14:02 [INF] xquic removed path: path_id=1 iface=WLAN state=CLOSED_DROPPED
+20:14:12 [LATENCY] Real connection latency test failed: The operation was canceled.
+   ... 以太网 4 ACTIVE throughout, nothing moving ...
+20:16:54 [INF] path[1] activated: path_id=2 iface=WLAN state=ACTIVE
+20:17:16 [LATENCY] Real connection latency test recovered
+```
+
+Recovery arrives 22 seconds after a *new* path appears, not from the surviving
+one healing — because a new path brings a fresh `send_ctl` with `pto_count` at
+zero. That is what made availability look like it followed WiFi.
+
+The guard now applies only while a healthier path actually exists. With an
+alternative present nothing changes; with none, the suspect path is used rather
+than nothing at all.
+
 ### End-to-end fixes carried in the pinned xquic
 
 `third_party/xquic` is pinned at
-[`55de779`](https://github.com/r11234567/xquic/commit/55de779). Enabling the
+[`6ba4261`](https://github.com/r11234567/xquic/commit/6ba4261). Enabling the
 features above exposed transport bugs that the e2e suite caught and that had to
 be fixed in xquic rather than here:
 
 | xquic commit | What it fixes |
 |---|---|
-| [55de779](https://github.com/r11234567/xquic/commit/55de779) | **A path's packet size could only go up, so the narrower path black-holed.** See [Multipath MTU](#multipath-mtu-a-narrow-path-used-to-black-hole) below — this is the one that made a second path cost throughput instead of adding it. |
+| [6ba4261](https://github.com/r11234567/xquic/commit/6ba4261) | **WLB's PTO guard could exclude the last usable path**, so nothing was sent at all and the ACK that would have cleared the guard could never arrive. See [the three-minute stall](#the-three-minute-stall-wlb-locked-out-the-last-path). |
+| [f3c05a2](https://github.com/r11234567/xquic/commit/f3c05a2) · [be82b29](https://github.com/r11234567/xquic/commit/be82b29) | **A path's packet size could only go up, so the narrower path black-holed.** The PMTU search is now per path and the connection's size moves in both directions. See [the packet size](#the-packet-size-could-only-go-up) — this is the one that made a second path cost throughput instead of adding it. |
 | [a40cbd5](https://github.com/r11234567/xquic/commit/a40cbd5) | **A Retry could not follow a full Initial.** `xqc_conn_reassemble_packet()` rebuilt the Initial with the Retry token in the header but copied the payload in verbatim, sized against the shorter header. With a PQC key share filling the packet, AEAD needed 1453 bytes of a 1452-byte buffer and encryption failed with `XQC_TLS_ENCRYPT_DATA_ERROR` (-736), so no handshake completed at all. Surfaced as a 10 s dispatch timeout in `tests/test_tcp_egress.c`. Fixed by reserving worst-case header growth; the payload copy is now bounds-checked too. |
 | [513a991](https://github.com/r11234567/xquic/commit/513a991) | **A full receive buffer killed the connection.** Multipath bulk transfers died tens of MB in with `FRAME_ENCODING_ERROR`, traced to a buffered-frame cap of 8192 sitting *below* the 16 MiB receive window being advertised — a peer obeying flow control was rejected for exceeding a limit it was never told. Raised to `window/1KiB` and tied to the window by a `_Static_assert` so the two cannot drift apart again. |
 | [2ae918c](https://github.com/r11234567/xquic/commit/2ae918c) | Hardens `xqc_var_buf_reduce` against a wrapping subtraction and casts both operands in `xqc_submatrix`, replacing the equivalent hunks this repo carried in `patches/xquic/`. |
