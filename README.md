@@ -230,13 +230,13 @@ numbers moved.
 ### End-to-end fixes carried in the pinned xquic
 
 `third_party/xquic` is pinned at
-[`be82b29`](https://github.com/r11234567/xquic/commit/be82b29). Enabling the
+[`55de779`](https://github.com/r11234567/xquic/commit/55de779). Enabling the
 features above exposed transport bugs that the e2e suite caught and that had to
 be fixed in xquic rather than here:
 
 | xquic commit | What it fixes |
 |---|---|
-| [be82b29](https://github.com/r11234567/xquic/commit/be82b29) | **A path's packet size could only go up, so the narrower path black-holed.** See [Multipath MTU](#multipath-mtu-a-narrow-path-used-to-black-hole) below — this is the one that made a second path cost throughput instead of adding it. |
+| [55de779](https://github.com/r11234567/xquic/commit/55de779) | **A path's packet size could only go up, so the narrower path black-holed.** See [Multipath MTU](#multipath-mtu-a-narrow-path-used-to-black-hole) below — this is the one that made a second path cost throughput instead of adding it. |
 | [a40cbd5](https://github.com/r11234567/xquic/commit/a40cbd5) | **A Retry could not follow a full Initial.** `xqc_conn_reassemble_packet()` rebuilt the Initial with the Retry token in the header but copied the payload in verbatim, sized against the shorter header. With a PQC key share filling the packet, AEAD needed 1453 bytes of a 1452-byte buffer and encryption failed with `XQC_TLS_ENCRYPT_DATA_ERROR` (-736), so no handshake completed at all. Surfaced as a 10 s dispatch timeout in `tests/test_tcp_egress.c`. Fixed by reserving worst-case header growth; the payload copy is now bounds-checked too. |
 | [513a991](https://github.com/r11234567/xquic/commit/513a991) | **A full receive buffer killed the connection.** Multipath bulk transfers died tens of MB in with `FRAME_ENCODING_ERROR`, traced to a buffered-frame cap of 8192 sitting *below* the 16 MiB receive window being advertised — a peer obeying flow control was rejected for exceeding a limit it was never told. Raised to `window/1KiB` and tied to the window by a `_Static_assert` so the two cannot drift apart again. |
 | [2ae918c](https://github.com/r11234567/xquic/commit/2ae918c) | Hardens `xqc_var_buf_reduce` against a wrapping subtraction and casts both operands in `xqc_submatrix`, replacing the equivalent hunks this repo carried in `patches/xquic/`. |

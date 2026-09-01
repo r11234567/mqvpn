@@ -52,7 +52,7 @@ NETSIM_FULL_MTU=1500
 # six of the ten combo legs — is not "a slightly smaller MTU". It is a link that
 # cannot carry the client's default packet at all, and whether it carries
 # anything depends on PMTUD converging DOWNWARD — which xquic could not do until
-# be82b29 and now can (see netsim_mtu_class).
+# 55de779 and now can (see netsim_mtu_class).
 NETSIM_CLIENT_PKT_SIZE=1400
 NETSIM_MIN_FITTING_MTU=$(( NETSIM_CLIENT_PKT_SIZE + 8 + 20 ))
 
@@ -64,7 +64,7 @@ NETSIM_MIN_FITTING_MTU=$(( NETSIM_CLIENT_PKT_SIZE + 8 + 20 ))
 #                     traffic only if the sender shrinks. It could not: xquic's
 #                     packet size was monotonically non-decreasing, which is the
 #                     mechanism behind vs_best_single 0.195-0.317 on the mtu
-#                     classes. Fixed in xquic be82b29 -- the PMTU search is now
+#                     classes. Fixed in xquic 55de779 -- the PMTU search is now
 #                     per path, a new path starts at the QUIC-guaranteed size
 #                     rather than inheriting the connection's, and the
 #                     connection's size is recomputed in both directions.

@@ -524,7 +524,7 @@ log. They are deliberately not gated (§0.4 L): a gate on these would leave the
 weekly permanently red and stop it reporting anything.
 
 **1.3.1 A path's packet size can only ever go up, so a smaller-MTU path
-blackholes. — FIXED in xquic [`be82b29`](https://github.com/r11234567/xquic/commit/be82b29),
+blackholes. — FIXED in xquic [`55de779`](https://github.com/r11234567/xquic/commit/55de779),
 not yet confirmed by a run.** The strongest of these, and the only one that is
 legible from source alone. It was also reproduced outside the matrix, on a
 laptop pairing WiFi with a USB-tethered handset: adding the second path cost
