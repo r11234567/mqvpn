@@ -61,7 +61,7 @@ test_builder_default_embedded(void)
     if (!cfg) return;
 
     /* mqvpn_config_new must seed the embedded reorder config with defaults. */
-    ASSERT_EQ_INT(cfg->reorder.mode, MQVPN_REORDER_ON, "default mode ON");
+    ASSERT_EQ_INT(cfg->reorder.mode, MQVPN_REORDER_OFF, "default mode OFF");
     ASSERT_EQ_INT(cfg->reorder.max_wait_ms, 30, "default max_wait_ms");
     ASSERT_EQ_INT(cfg->reorder.cap_packets_per_flow, 1024, "default cap");
     ASSERT_EQ_INT(cfg->reorder.n_rules, 0, "default n_rules");
@@ -266,7 +266,7 @@ test_ini_defaults_no_section(void)
     if (path) unlink(path);
 
     ASSERT_EQ_INT(rc, 0, "parse ok");
-    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_ON, "no section -> default ON");
+    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_OFF, "no section -> OFF");
     ASSERT_EQ_INT(cfg.reorder.max_wait_ms, 30, "no section -> default wait");
     ASSERT_EQ_INT(cfg.reorder.n_rules, 0, "no section -> no rules");
 }
@@ -622,7 +622,7 @@ test_json_reorder_absent(void)
     int rc = mqvpn_config_load_json_filecfg(&cfg, json);
 
     ASSERT_EQ_INT(rc, 0, "json parse ok");
-    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_ON, "absent -> default ON");
+    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_OFF, "absent -> OFF");
     ASSERT_EQ_INT(cfg.reorder.max_wait_ms, 30, "absent -> default wait");
     ASSERT_EQ_INT(cfg.reorder.n_rules, 0, "absent -> no rules");
 }
@@ -774,9 +774,10 @@ test_bridge_ini_reaches_libmqvpn_config(void)
     if (path) unlink(path);
     ASSERT_EQ_INT(rc, 0, "parse ok");
 
-    /* The mode assertion below only means something if the bridge had to
-     * change the value. Now that ON is the default, force OFF first so a
-     * bridge that silently dropped the field would still fail here. */
+    /* Seed OFF explicitly. It matches the default today, but the assertion
+     * below only proves the bridge carried the field if the starting value
+     * differs from the one being asserted -- so it must not depend on what the
+     * default happens to be. */
     mqvpn_config_t *lib = mqvpn_config_new();
     ASSERT_TRUE(lib != NULL, "config_new");
     ASSERT_EQ_INT(mqvpn_config_set_reorder_enabled(lib, MQVPN_REORDER_OFF), MQVPN_OK,

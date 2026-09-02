@@ -203,7 +203,7 @@ test_cfg_defaults(void)
     ASSERT_EQ_INT(c.ingress_idle_timeout_sec, 30, "cfg ingress_idle");
     ASSERT_EQ_INT(c.egress_idle_timeout_sec, 300, "cfg egress_idle");
     ASSERT_EQ_U64(c.max_buffer_bytes_per_flow, 1572864ULL, "cfg max_bytes_per_flow");
-    ASSERT_EQ_INT(c.mode, MQVPN_REORDER_ON, "cfg mode on");
+    ASSERT_EQ_INT(c.mode, MQVPN_REORDER_OFF, "cfg mode off");
     ASSERT_EQ_INT(c.n_rules, 0, "cfg n_rules");
     ASSERT_EQ_INT(c.eval_force_no_demotion, 0, "cfg eval_force_no_demotion");
 }

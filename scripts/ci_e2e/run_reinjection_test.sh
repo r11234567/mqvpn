@@ -612,10 +612,10 @@ _dgram_body() {
     # traffic rides the connect-ip DATAGRAM lane — dgram-mode reinjection's
     # target, per MQVPN_REINJ_DGRAM in libmqvpn.h.
     #
-    # [Reorder] is set explicitly rather than left to the default, which is now
-    # ON: the shim deduplicates, and dgram-mode reinjection duplicates every
-    # DATAGRAM on purpose. This scenario exercises the documented un-deduped
-    # semantics, so it has to pin the shim off itself.
+    # [Reorder] is pinned off explicitly rather than left to the default: the
+    # shim deduplicates, and dgram-mode reinjection duplicates every DATAGRAM on
+    # purpose. This scenario exercises the documented un-deduped semantics, so
+    # it states the requirement instead of inheriting it.
     cat >"$ini" <<EOF
 [Multipath]
 Reinjection = dgram

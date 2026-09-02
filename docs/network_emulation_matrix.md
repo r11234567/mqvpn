@@ -673,6 +673,59 @@ an advancing round counter refute it, and that outcome is worth as much as
 confirmation — it would move the search to the reorder path or to congestion
 control. No scheduler change should be made before this run exists.
 
+**Run 33610604131 (all 11 modes, reorder A/B, both arms in one dispatch) says
+the reading above is probably wrong, and points somewhere simpler.**
+
+The core suite's own stream sweep is stable across three runs and settles it.
+Over a 300 Mbit/20 ms + 80 Mbit/60 ms pair (380 Mbit theoretical), the multipath
+gain is a function of the *inner stream count*, and it is the same for WLB and
+MinRTT at every point:
+
+| streams | WLB gain | MinRTT gain |
+|---|---|---|
+| 1 | −5.0% / +3.8% / −3.6% | −4.1% / +4.2% / −0.2% |
+| 4 | +9.6% / −0.9% / +0.1% | +1.1% / +1.1% / +0.4% |
+| 16 | +21.7% / +19.8% / +15.2% | +20.4% / +19.5% / +19.8% |
+| 64 | +22.4% / +25.8% / +23.1% | +26.7% / +24.5% / +25.6% |
+
+(three figures per cell: runs 7903d0c, 08ca716, a61eb14.)
+
+MinRTT has no weight model and no flow pinning. If a cwnd-driven weight or a
+frozen pin were the cause, MinRTT could not track WLB curve-for-curve — so
+§1.3.7's mechanism cannot be what limits these rows. And `equal_paths` in the
+same suite gets 89.0 Mbps from two 45.3 Mbps legs, a 1.96× aggregation on two
+identical paths under WLB, which is the thing §1.3.2 reports as broken.
+
+**`IPERF_STREAMS` is 4 here.** At four streams the core suite measures ≈0% gain,
+which is exactly `homo_good`'s `vs_best_single` 1.04. So §1.3.2's
+`aggregation_efficiency` 0.52 is the expected four-stream result against a
+metric — `mp/(a+b)` with a 0.60 floor — that assumes an aggregation four streams
+over a high-BDP pair cannot deliver. §1.3.4 follows from the same number:
+four pinned flows across two paths split 3:1, and 1/4 = 0.25 is where the
+observed `path_minshare` sits (0.18–0.28 across all 14 tier rows, both arms).
+
+The `iperf_streams` dispatch input exists to test this. The prediction is that at
+16 streams `homo_good`'s efficiency rises toward 0.85 and tier `path_minshare`
+toward 0.4; if it does, §1.3.2–§1.3.5 are a harness-configuration finding and the
+scheduler is not implicated. Keep it off the scheduled run: it changes what is
+measured, so such a run is not comparable with the series.
+
+**What the same run says about resolution.** The `catalog` rows are single-path,
+so the reorder arm can only cost them an 8-byte stamp — yet the two arms
+disagreed by −45% to +71%, stdev 21.6%, with 19 of 50 moving more than 15%. Solo
+baselines for the same emulated leg differed by a median 11% and up to 343%
+(`nat_split` 24.4 vs 108.2 Mbps), and since `vs_best_single` and
+`aggregation_efficiency` both divide by those, both gate-able ratios inherit it —
+`nat_split` duly published `vs_best_single` 2.103 on one arm and 1.083 on the
+other. **Nothing below roughly ±40% is resolvable at three repeats**, which
+retires several entries above as measurements rather than defects: §1.3.3's 0.531
+and §1.3.5's WLB-vs-MinRTT ordering both flip sign between arms of this run. The
+A/B report now measures this floor from each run's own control rows and prints it
+above the comparison.
+
+The two findings that *do* reproduce in both arms are §1.3.2's efficiency and
+§1.3.4's split — and the stream-count reading above accounts for both.
+
 **The first instrumented run (33595998135) produced no counters at all** —
 `wlb_instr: no_lines` on all 22 rows — so §1.3.7 is still untested. Two causes,
 both since fixed: the line was emitted at xquic INFO while mqvpn maps its own
@@ -681,6 +734,15 @@ before the callback; and the harness read the *client* log, while every
 measurement here is iperf3 DL and therefore scheduled by the *server*. The line
 now goes out on xquic's REPORT statistics channel, which passes any level, and
 `collect_wlb_instr` reads a marked window of the server log.
+
+**Run 33610604131 came back empty too**, and for a third reason: the line was
+emitted and unreadable. `xqc_vsprintf` is xquic's own formatter and has no length
+modifiers, so `deficit:%lld` rendered as `deficit:19ld|` and the parser -- which
+expects a `|` after the digits -- matched nothing. Fixed in xquic 54f98ef by
+using `%i`, the int64 conversion this formatter does have, and verified by
+linking `xqc_str.c` against a probe that renders the committed format string and
+feeds it back through the harness regex. The same `%lld` had been in the
+`round_start` line all along, printing deficits as `3ld`.
 
 That run also cost more than the missing data. It narrowed the matrix to three
 modes and changed two things at once — the per-path PMTU work and the reorder

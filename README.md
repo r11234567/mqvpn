@@ -362,13 +362,13 @@ the first place.
 ### End-to-end fixes carried in the pinned xquic
 
 `third_party/xquic` is pinned at
-[`77ede10`](https://github.com/r11234567/xquic/commit/77ede10). Enabling the
+[`54f98ef`](https://github.com/r11234567/xquic/commit/54f98ef). Enabling the
 features above exposed transport bugs that the e2e suite caught and that had to
 be fixed in xquic rather than here:
 
 | xquic commit | What it fixes |
 |---|---|
-| [e1abe04](https://github.com/r11234567/xquic/commit/e1abe04) · [77ede10](https://github.com/r11234567/xquic/commit/77ede10) | **The WLB counters emitted nothing**, so the first instrumented netsim run came back with `wlb_instr: no_lines` on all 22 rows. They were logged at xquic INFO, and mqvpn deliberately maps its own INFO to xquic WARN to keep per-packet traffic out of the log, so xquic's own filter dropped the line before the callback. Moved to the REPORT statistics channel, which passes any level — and `77ede10` then had to give the unit-test fixture logs a callback sink, since REPORT is level 0 and so passes their filter too, where `xqc_log_implement()` dereferenced their NULL `log_callbacks`. Do not bisect onto `e1abe04` alone. |
+| [e1abe04](https://github.com/r11234567/xquic/commit/e1abe04) · [77ede10](https://github.com/r11234567/xquic/commit/77ede10) · [54f98ef](https://github.com/r11234567/xquic/commit/54f98ef) | **The WLB counters emitted nothing**, so the first instrumented netsim run came back with `wlb_instr: no_lines` on all 22 rows. They were logged at xquic INFO, and mqvpn deliberately maps its own INFO to xquic WARN to keep per-packet traffic out of the log, so xquic's own filter dropped the line before the callback. Moved to the REPORT statistics channel, which passes any level — and `77ede10` then had to give the unit-test fixture logs a callback sink, since REPORT is level 0 and so passes their filter too, where `xqc_log_implement()` dereferenced their NULL `log_callbacks`. And `54f98ef` fixed the last reason they stayed empty: `%lld` is not a specifier xquic's own `xqc_vsprintf` knows, so the line rendered `deficit:19ld|` and the parser matched nothing. Do not bisect onto `e1abe04` or `77ede10` alone. |
 | [bcb7381](https://github.com/r11234567/xquic/commit/bcb7381) | **A converged PMTU search never reopened**, so a path MTU that *grew* mid-connection was never found and a long-lived connection kept the size it first settled on. Convergence now rearms the probing timer as RFC 8899 §5.3's PMTU_RAISE_TIMER (600 s). The reopen raises only the search's ceiling, not the size in use, so it costs probe packets and no throughput. Also fixes an error-code collision: `XQC_EAEAD_LIMIT` shared the value 623 with `XQC_ESTREAM_NFOUND`, so an AEAD-integrity-limit close and a stream-not-found were indistinguishable to a caller comparing codes. |
 | [8b9e4b5](https://github.com/r11234567/xquic/commit/8b9e4b5) | **WLB instrumentation**, no behaviour change: per-path pin/packet/round counters emitted once a second, with the three per-packet log statements dropped to DEBUG so measuring the split does not move it. Read by `CI_BENCH_WLB_INSTR=1`; see [the aggregation numbers](#what-the-scheduler-numbers-still-do-not-explain). |
 | [0caa07c](https://github.com/r11234567/xquic/commit/0caa07c) | **`xqc_conn_set_path_pmtu()`**, so a path MTU the kernel already knows can be handed to the PLPMTU search instead of being rediscovered over several probe intervals. Also drops the request-cancellation log path from ERROR to DEBUG — see [the log noise](#the-loudest-line-in-the-log-was-not-an-error). |
@@ -669,14 +669,13 @@ reordered, and many inner protocols treat reorder as loss and back off. The
 reorder buffer holds datagrams in a short receive-side window and releases them
 in order, so one inner flow can aggregate both paths — the datagram-lane
 counterpart to what the [hybrid TCP stream lane](#hybrid-mode-tcp-lane) does for
-TCP. **On by default** since it is the mechanism that stops a second path from
-reading as loss to the inner protocol. Negotiated end-to-end: a sender waits for
-the peer's advertisement before stamping anything, so it is a no-op — and safe —
-against a peer that has it off or does not know about it.
+TCP. **Off by default**; negotiated end-to-end, so a sender waits for the peer's
+advertisement before stamping anything and it is a no-op — and safe — against a
+peer that has it off or does not know about it.
 
 ```ini
 [Reorder]
-Enabled = on             # default; set to off to disable
+Enabled = on             # default is off
 MaxWaitMs = 50           # reorder window: hold out-of-order datagrams up to this long
 CapPackets = 1024        # per-flow buffer cap (packets)
 
@@ -687,12 +686,24 @@ Port = 443
 Profile = cellular_bond  # cellular_bond (wait=50ms, cap=1024) | fiber_lte (wait=50ms, cap=2048)
 ```
 
-INI/JSON only (no CLI flag). Best on asymmetric-RTT path pairs (e.g. Wi-Fi +
-LTE); for symmetric, loss-dominated paths it buys little, and `Enabled = off`
-turns it back off. It also has to be off wherever duplicates are the point —
-`Reinjection = dgram` deliberately sends every datagram twice, and the shim
-would deduplicate them. See [docs/report/](docs/report/) for the parameter sweep
-and measured numbers.
+INI/JSON only (no CLI flag). It has to stay off wherever duplicates are the
+point — `Reinjection = dgram` deliberately sends every datagram twice, and the
+shim would deduplicate them. See [docs/report/](docs/report/) for the parameter
+sweep and measured numbers.
+
+**Why it is not on by default.** It was, briefly. A netsim A/B — both arms in one
+dispatch, all 11 modes, 96 paired measurements — put the median difference at
+**+0.1%**, with no mode showing a consistent direction. Against that, the shim
+costs 8 bytes of inner MTU, and with no `[ReorderRule]` entries §15.1 makes
+*every* inner flow eligible, TCP included, so a default ON puts all of them
+through a hold window. Enable it deliberately for the traffic it was measured on;
+the general case has no measured gain to justify the cost.
+
+Read the same run for what it says about the harness rather than the shim: on
+`catalog` rows, which are single-path measurements the shim can barely touch, the
+two arms still disagreed by −45% to +71% (stdev 21.6%). Effects smaller than
+roughly ±40% are not resolvable at three repeats, which is worth knowing before
+reading any single row of this matrix as a result.
 
 ## Reinjection (speculative duplication)
 

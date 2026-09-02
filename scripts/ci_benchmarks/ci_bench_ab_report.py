@@ -22,13 +22,29 @@ gate on these would leave the weekly permanently red (docs section 0.4 L).
 import argparse
 import json
 import os
+import statistics
 import sys
 
-# A regression has to clear this to be called one, in either direction. Chosen
-# to sit above the run-to-run noise these scenarios show on a shared runner
-# (multipath_cv_pct is routinely 10-30%), so a listed row is worth reading
-# rather than worth re-running.
-MOVE_PCT = 15.0
+# A move has to clear this to be worth reading, in either direction.
+#
+# 40, not the 15 this started at. Run 33610604131 measured the floor directly:
+# the `catalog` rows are single-path, so the reorder arm can only cost them an
+# 8-byte stamp, yet the two arms disagreed by -45% to +71% with a 21.6% stdev,
+# and 19 of 50 such rows moved more than 15%. A 15% threshold therefore called
+# noise a finding on a third of a control group. Anything below roughly this
+# figure needs more repeats, not more interpretation.
+#
+# The report recomputes the floor from each run's own control rows and prints
+# it, so this constant can be checked rather than trusted.
+MOVE_PCT = 40.0
+
+# Modes whose rows are single-path measurements. Useful twice over: they need a
+# different metric field, and because the configuration under test can barely
+# affect them, their spread across arms is this run's own noise floor.
+CONTROL_MODES = {"catalog"}
+
+# Metric fields in preference order. A netsim row carries exactly one.
+METRIC_FIELDS = ("multipath_mbps", "single_path_mbps", "throughput_mbps")
 
 
 def load_rows(root):
@@ -45,9 +61,15 @@ def load_rows(root):
             except (OSError, ValueError) as exc:
                 print(f"<!-- skipped {full}: {exc} -->")
                 continue
+            # `mode` is what makes a document a netsim one. The artifact set
+            # also carries the core benchmarks (aggregate, failover, ...),
+            # which have a results[] of a different shape and no arm -- letting
+            # those in invented a phantom `default` arm and a `?` mode.
             if not isinstance(doc, dict) or "results" not in doc:
                 continue
-            mode = doc.get("mode") or "?"
+            if not doc.get("mode"):
+                continue
+            mode = doc["mode"]
             doc_arm = doc.get("arm") or "default"
             for r in doc.get("results") or []:
                 if not isinstance(r, dict):
@@ -61,6 +83,20 @@ def load_rows(root):
 def key_of(mode, row):
     """What identifies one measurement across arms."""
     return (mode, row.get("scenario") or "?", row.get("scheduler") or "")
+
+
+def metric(row):
+    """The throughput figure this row carries, whatever shape it is.
+
+    Reading only multipath_mbps left every catalog and special row blank, which
+    silently dropped the control group -- more than half the measurements -- out
+    of the comparison.
+    """
+    for f in METRIC_FIELDS:
+        v = row.get(f)
+        if isinstance(v, (int, float)):
+            return v
+    return None
 
 
 def fmt(v, spec="{:.1f}"):
@@ -106,11 +142,11 @@ def emit_ab(by_key, arms):
     for key, per_arm in by_key.items():
         if base not in per_arm:
             continue
-        b = per_arm[base].get("multipath_mbps")
+        b = metric(per_arm[base])
         worst = None
         for a in others:
             if a in per_arm:
-                m = pct_move(b, per_arm[a].get("multipath_mbps"))
+                m = pct_move(b, metric(per_arm[a]))
                 if m is not None and (worst is None or m < worst):
                     worst = m
         ranked.append((worst if worst is not None else 0.0, key, per_arm))
@@ -122,7 +158,7 @@ def emit_ab(by_key, arms):
         cells = [mode, scenario, sched or "-"]
         for a in arms:
             r = per_arm.get(a) or {}
-            cells += [fmt(r.get("multipath_mbps")), fmt(r.get("vs_best_single"), "{:.3f}")]
+            cells += [fmt(metric(r)), fmt(r.get("vs_best_single"), "{:.3f}")]
         has_move = any(a in per_arm for a in others)
         cells += [f"{move:+.1f}%" if has_move else "-"]
         print("| " + " | ".join(cells) + " |")
@@ -232,6 +268,69 @@ def emit_wlb(by_key, arms):
     print()
 
 
+def emit_noise_floor(by_key, arms):
+    """What this run can resolve, measured from the run itself.
+
+    The control modes are single-path, so the configuration being varied can
+    barely reach them; whatever spread they show between arms is the harness
+    disagreeing with itself. Printing it next to the A/B is the difference
+    between "reorder cost 20%" and "20% is inside this run's noise".
+
+    Solo baselines get the same treatment. vs_best_single and
+    aggregation_efficiency both divide by them, so an unstable baseline makes
+    both of the gate-able ratios unstable -- run 33610604131 measured the same
+    emulated leg at 24.4 and 108.2 Mbps in its two arms and duly published
+    vs_best_single 2.103 on one of them.
+    """
+    if len(arms) < 2:
+        return
+    base = arms[0]
+
+    ctl, solo = [], []
+    for (mode, _sc, _sch), per_arm in by_key.items():
+        if base not in per_arm:
+            continue
+        for a in arms[1:]:
+            if a not in per_arm:
+                continue
+            if mode in CONTROL_MODES:
+                m = pct_move(metric(per_arm[base]), metric(per_arm[a]))
+                if m is not None:
+                    ctl.append(abs(m))
+            for leg in ("solo_a_mbps", "solo_b_mbps"):
+                m = pct_move(per_arm[base].get(leg), per_arm[a].get(leg))
+                if m is not None:
+                    solo.append(abs(m))
+
+    if not ctl and not solo:
+        return
+
+    print("## What this run can resolve")
+    print()
+
+    def line(label, vals, why):
+        if not vals:
+            return
+        vals = sorted(vals)
+        med = statistics.median(vals)
+        p90 = vals[int(len(vals) * 0.9)] if len(vals) > 1 else vals[0]
+        over = sum(1 for v in vals if v > MOVE_PCT)
+        print(f"- **{label}** (n={len(vals)}): median |move| {med:.1f}%, "
+              f"p90 {p90:.1f}%, max {vals[-1]:.1f}%; {over} exceeded the "
+              f"{MOVE_PCT:.0f}% reporting threshold. {why}")
+
+    line("control rows (single-path)", ctl,
+         "The varied setting can barely touch these, so this is the floor.")
+    line("solo baselines, same leg across arms", solo,
+         "vs_best_single and aggregation_efficiency divide by these.")
+    print()
+    print(f"Treat a move below roughly {MOVE_PCT:.0f}% as unresolved at this "
+          "repeat count rather than as a result. Raising "
+          "`CI_BENCH_IPERF_SEC`/`REPEATS`, or the `iperf_streams` dispatch "
+          "input, is what buys resolution — not re-reading the same rows.")
+    print()
+
+
 def emit_coverage(rows, by_key, arms):
     modes = sorted({m for m, _a, _r in rows})
     print("## Coverage")
@@ -262,6 +361,7 @@ def main(argv=None):
     arms += sorted(seen - set(arms))
 
     emit_coverage(rows, by_key, arms)
+    emit_noise_floor(by_key, arms)
     if len(arms) >= 2:
         emit_ab(by_key, arms)
         emit_findings(by_key, arms)

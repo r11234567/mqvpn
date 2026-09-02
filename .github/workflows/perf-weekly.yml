@@ -40,6 +40,16 @@ on:
         required: false
         type: boolean
         default: false
+      iperf_streams:
+        description: >-
+          Inner TCP streams per sample (CI_BENCH_IPERF_STREAMS). Empty keeps the
+          harness default of 4. The core suite's own sweep shows the aggregation
+          gain is a function of this and is the same for WLB and MinRTT (~0% at
+          4 streams, +15-25% at 16-64), so 4 is why the netsim rows read as a
+          scheduler failure. Raise it to test that reading. Changing it changes
+          what is measured, so do not compare such a run against the series.
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -293,6 +303,9 @@ jobs:
       # the default arm, which leaves the built-in config untouched.
       CI_BENCH_ARM: ${{ matrix.arm }}
       CI_BENCH_REORDER: ${{ matrix.reorder }}
+      # Empty leaves the script's own default in place, so the scheduled run is
+      # unaffected and stays comparable with the series.
+      CI_BENCH_IPERF_STREAMS: ${{ github.event.inputs.iperf_streams }}
     steps:
       - uses: actions/checkout@v7
         with:

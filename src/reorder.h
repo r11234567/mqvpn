@@ -567,13 +567,22 @@ static inline void
 mqvpn_reorder_config_default(mqvpn_reorder_config_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
-    /* On by default. Multipath spreads one inner flow's packets across paths
-     * with different latencies; without this shim the inner TCP sees that as
-     * loss and collapses its window, which is why adding a second path could
-     * read as negative optimization. Safe to default on: §19.3 makes a sender
-     * wait for the peer's advertisement before stamping anything, so a peer
-     * that does not support it simply never echoes and both sides stay RAW. */
-    cfg->mode = MQVPN_REORDER_ON;
+    /* OFF, and measured rather than assumed.
+     *
+     * This was briefly defaulted ON on the theory that inner protocols read
+     * cross-path reordering as loss, so the shim should help everywhere. A
+     * netsim A/B over all 11 modes -- both arms in one dispatch, 96 paired
+     * measurements -- put the median difference at +0.1%. There is no measured
+     * benefit to spend a default on, and the shim is not free: it costs 8 bytes
+     * of inner MTU, and with no [ReorderRule] entries §15.1 makes every flow
+     * eligible, TCP included, so a default ON puts every inner flow through a
+     * hold window.
+     *
+     * It stays worth enabling deliberately for the traffic it was built and
+     * measured for (see docs/report/ for the parameter sweep). Turning it on
+     * for everyone is a different claim, and the evidence does not support it.
+     */
+    cfg->mode = MQVPN_REORDER_OFF;
     cfg->max_wait_ms = 30;
     cfg->cap_packets_per_flow = 1024;
     cfg->max_buffer_bytes_per_flow = 1572864ULL;
