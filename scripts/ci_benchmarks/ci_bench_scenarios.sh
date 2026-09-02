@@ -45,6 +45,38 @@ IP_A_SERVER_ADDR="$NETSIM_SERVER_ADDR"
 CTRL_PORT=9099
 IPERF_SEC="${CI_BENCH_IPERF_SEC:-10}"
 
+# ── A/B arm ────────────────────────────────────────────────────────────────
+#
+# CI_BENCH_REORDER = on | off | "" (leave the built-in default alone).
+#
+# One workflow dispatch runs the same modes under several arms in parallel
+# matrix jobs, so an A/B is one run rather than two. That matters beyond
+# convenience: the netsim numbers move several percent between runs on shared
+# runners, and two arms measured in the same run against the same code are
+# comparable in a way that two dispatches are not.
+#
+# The arm is written into every row as `arm`, so the comparison is mechanical
+# rather than a matter of remembering which run was which.
+# Exported: the row builders below read them from the environment rather than
+# taking two more positional arguments through an already long argv.
+export CI_BENCH_ARM="${CI_BENCH_ARM:-default}"
+export CI_BENCH_REORDER="${CI_BENCH_REORDER:-}"
+
+if [ -n "$CI_BENCH_REORDER" ]; then
+    case "$CI_BENCH_REORDER" in
+      on|off) ;;
+      *) echo "CI_BENCH_REORDER must be 'on' or 'off', got '$CI_BENCH_REORDER'" >&2
+         exit 2 ;;
+    esac
+    # Handed to both ends via --config (ci_bench_env.sh). Written once, before
+    # any server starts, and left in place for the whole mode.
+    _CB_ARM_DIR="$(mktemp -d)"
+    CI_BENCH_CONFIG_FILE="${_CB_ARM_DIR}/arm.conf"
+    printf '[Reorder]\nEnabled = %s\n' "$CI_BENCH_REORDER" >"$CI_BENCH_CONFIG_FILE"
+    export CI_BENCH_CONFIG_FILE
+    echo "arm '${CI_BENCH_ARM}': [Reorder] Enabled = ${CI_BENCH_REORDER}"
+fi
+
 # Streams per sample. One stream cannot fill a high-BDP path: bgp_plain at
 # 380mbit over ~160ms RTT needs 7.6 MB of in-flight window, which a single
 # inner TCP connection does not reach inside a short sample. That is how the
@@ -99,6 +131,10 @@ doc = {
   'commit': os.environ.get('CI_BENCH_COMMIT', 'unknown'),
   'timestamp': sys.argv[3],
   'mode': sys.argv[4],
+  # Self-describing arm, so a document read on its own says which side of an
+  # A/B it is rather than relying on the artifact it arrived in.
+  'arm': os.environ.get('CI_BENCH_ARM') or 'default',
+  'arm_reorder': os.environ.get('CI_BENCH_REORDER') or 'default',
   'iperf_sec': int(sys.argv[5]),
   'iperf_streams': int(sys.argv[6]),
   'repeats': int(sys.argv[7]),
@@ -257,6 +293,13 @@ measure_pathset() {
         return 0
     fi
 
+    # One server serves solo-A, solo-B and multipath in turn, and the scheduler
+    # counters in its log are cumulative from process start. Mark the log here
+    # so collect_wlb_instr reads only THIS measurement's window -- otherwise the
+    # multipath row would carry the two solo phases' packets as well, each of
+    # which used exactly one path and would fake a lopsided split.
+    ci_bench_mark_server_log
+
     local samples=() i jf
     for (( i=0; i<REPEATS; i++ )); do
         jf="$(ci_bench_run_iperf TCP DL "$IPERF_SEC" "$IPERF_STREAMS")"
@@ -364,9 +407,25 @@ print(','.join(json.dumps(k) + ':' + json.dumps(v) for k, v in out.items()))
 " "$status" "$stats"
 }
 
-# Read the WLB scheduler's own counters out of the client log. Echoes a JSON
+# Read the WLB scheduler's own counters out of the SERVER log. Echoes a JSON
 # fragment (no braces), same contract as collect_stats; empty when
 # CI_BENCH_WLB_INSTR is off, so the row is unchanged for ordinary runs.
+#
+# Server, not client: every measurement is iperf3 DL, so the bulk data is
+# scheduled by the server's WLB instance and the client's schedules only the
+# returning ACKs. Reading the client would report the ACK split as though it
+# were the throughput split -- and path_minshare next to it already comes from
+# the server's own path stats, so the two would have disagreed by construction.
+#
+# Windowed: one server serves solo-A, solo-B and multipath in turn, and
+# measure_pathset marks the log before its own samples so the earlier phases
+# cannot leak into this row. Within the window the values are read as-is rather
+# than differenced: the scheduler is allocated per connection from conn_pool
+# (xqc_conn.c:1258) and each measurement starts a fresh client, so its counters
+# already begin at zero. Differencing would instead throw away the first
+# reporting interval. A drop in the cumulative `sched` inside one window means a
+# second connection appeared -- a mid-measurement reconnect -- which is reported
+# rather than silently averaged.
 #
 # What this is for. The netsim matrix says WLB fails to aggregate two identical
 # healthy paths and can land under the better single path, while MinRTT does
@@ -385,7 +444,7 @@ print(','.join(json.dumps(k) + ':' + json.dumps(v) for k, v in out.items()))
 # wrong and the cause is elsewhere -- which is equally worth knowing.
 collect_wlb_instr() {
     [ "${CI_BENCH_WLB_INSTR:-0}" = "1" ] || return 0
-    [ -n "${CI_BENCH_CLIENT_LOG:-}" ] && [ -r "$CI_BENCH_CLIENT_LOG" ] || {
+    [ -n "${CI_BENCH_SERVER_LOG:-}" ] && [ -r "$CI_BENCH_SERVER_LOG" ] || {
         echo -n ',"wlb_instr":"no_log"'
         return 0
     }
@@ -396,35 +455,63 @@ import json, re, sys
 pat = re.compile(r'\|wlb_instr\|path:(\d+)\|weight:(\d+)\|deficit:(-?\d+)'
                  r'\|pins:(\d+)\|sched:(\d+)\|rounds:(\d+)\|n_paths:(\d+)\|')
 
-# Last sample per path wins: these are cumulative counters, so the final line
-# for a path is the whole run.
-last = {}
+path_log, mark = sys.argv[1], int(sys.argv[2])
+
+def emit(d):
+    print(',' + ','.join(json.dumps(k) + ':' + json.dumps(v)
+                         for k, v in d.items()))
+    raise SystemExit(0)
+
+W, D, P, S, R = 0, 1, 2, 3, 4
+
+# Last sample per path inside the window, plus whether any counter went
+# backwards (which only a second scheduler instance can cause).
+last, samples, reconnect = {}, {}, False
 try:
-    with open(sys.argv[1], errors='replace') as fh:
+    with open(path_log, errors='replace') as fh:
+        fh.seek(mark)
         for line in fh:
             m = pat.search(line)
-            if m:
-                last[int(m.group(1))] = [int(g) for g in m.groups()[1:]]
+            if not m:
+                continue
+            pid = int(m.group(1))
+            vals = [int(g) for g in m.groups()[1:]]
+            prev = last.get(pid)
+            if prev is not None and vals[S] < prev[S]:
+                reconnect = True
+            last[pid] = vals
+            samples[pid] = samples.get(pid, 0) + 1
 except OSError:
-    print(',' + json.dumps('wlb_instr') + ':' + json.dumps('unreadable'))
-    raise SystemExit(0)
+    emit({'wlb_instr': 'unreadable'})
 
-out = {}
 if not last:
-    out['wlb_instr'] = 'no_lines'
-    print(',' + ','.join(json.dumps(k) + ':' + json.dumps(v)
-                         for k, v in out.items()))
-    raise SystemExit(0)
+    emit({'wlb_instr': 'no_lines'})
 
 ids = sorted(last)
-out['wlb_instr'] = 'ok'
-out['wlb_path_ids'] = ids
-out['wlb_weights'] = [last[i][0] for i in ids]
-out['wlb_pins'] = [last[i][2] for i in ids]
-out['wlb_sched'] = [last[i][3] for i in ids]
-out['wlb_rounds'] = max(last[i][4] for i in ids)
+pins  = [last[i][P] for i in ids]
+sched = [last[i][S] for i in ids]
+rounds = max(last[i][R] for i in ids)
 
-pins, sched = out['wlb_pins'], out['wlb_sched']
+out = {}
+if sum(sched) == 0:
+    # Lines present but nothing scheduled: no split exists to report, and
+    # emitting 0.0 shares here would read exactly like a collapse.
+    out['wlb_instr'] = 'no_packets_scheduled'
+    out['wlb_samples'] = {str(i): samples[i] for i in ids}
+    emit(out)
+
+out['wlb_instr'] = 'ok'
+out['wlb_samples'] = {str(i): samples[i] for i in ids}
+if reconnect:
+    # The counters below are the surviving connection's only.
+    out['wlb_note'] = 'connection restarted mid-measurement'
+out['wlb_path_ids'] = ids
+out['wlb_weights'] = [last[i][W] for i in ids]
+out['wlb_deficits'] = [last[i][D] for i in ids]
+out['wlb_pins'] = pins
+out['wlb_sched'] = sched
+out['wlb_rounds'] = rounds
+
 tp, ts = sum(pins), sum(sched)
 # Shares, directly comparable against the 1/n a balanced scheduler would give
 # -- same convention as path_minshare above.
@@ -432,15 +519,12 @@ out['wlb_pin_minshare'] = round(min(pins) / tp, 3) if tp else None
 out['wlb_sched_minshare'] = round(min(sched) / ts, 3) if ts else None
 # Packets scheduled per round turned over. Large means the round is not
 # rolling, so the weights behind the split are stale.
-out['wlb_pkts_per_round'] = (round(ts / out['wlb_rounds'], 1)
-                             if out['wlb_rounds'] else None)
+out['wlb_pkts_per_round'] = round(ts / rounds, 1) if rounds else None
 w = out['wlb_weights']
 out['wlb_weight_ratio'] = (round(max(w) / min(w), 2)
                            if w and min(w) > 0 else None)
-
-print(',' + ','.join(json.dumps(k) + ':' + json.dumps(v)
-                     for k, v in out.items()))
-" "$CI_BENCH_CLIENT_LOG"
+emit(out)
+" "$CI_BENCH_SERVER_LOG" "${CI_BENCH_SERVER_LOG_MARK:-0}"
 }
 
 server_rss_kb() {
@@ -519,9 +603,9 @@ run_pair() {
 
     local stats rss
     stats="$(collect_stats)"; rss="$(server_rss_kb)"
-    # Must run before ci_bench_stop_vpn: the client log lives under the work
+    # Must run before ci_bench_stop_vpn: the server log lives under the work
     # dir the teardown removes. The multipath pathset was measured last, so the
-    # log holds exactly that run -- which is the only one whose split matters.
+    # window mark points at that run -- the only one whose split matters.
     stats="${stats}$(collect_wlb_instr)"
     netsim_spike_stop
     ci_bench_stop_vpn
@@ -533,9 +617,14 @@ import json,sys
 a,b,mp = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
 st_a, st_b, st_mp = sys.argv[12], sys.argv[13], sys.argv[14]
 mcls_a, mcls_b = sys.argv[15], sys.argv[16]
+import os
 row = {
   'scenario': sys.argv[4], 'scheduler': sys.argv[5],
   'path_a': sys.argv[6], 'path_b': sys.argv[7],
+  # Which A/B arm produced this row. Stamped on every row so a comparison is a
+  # group-by rather than a matter of recalling which dispatch was which.
+  'arm': os.environ.get('CI_BENCH_ARM') or 'default',
+  'arm_reorder': os.environ.get('CI_BENCH_REORDER') or 'default',
   'solo_a_mbps': a, 'solo_b_mbps': b, 'multipath_mbps': mp,
   'multipath_cv_pct': float(sys.argv[8]),
   'server_rss_peak_kb': int(sys.argv[9]),
@@ -685,6 +774,11 @@ run_tier() {
 
     local stats rss
     stats="$(collect_stats)"; rss="$(server_rss_kb)"
+    # tier_ref is two identical unshaped legs, so this is the row where an
+    # uneven split has no network explanation at all -- the cleanest place to
+    # read the scheduler's own counters. Before ci_bench_stop_vpn: the log lives
+    # under the work dir teardown removes.
+    stats="${stats}$(collect_wlb_instr)"
 
     if [ -n "$cap_pid" ]; then
         kill "$cap_pid" 2>/dev/null || true
@@ -695,10 +789,12 @@ run_tier() {
     CI_BENCH_TIER=""
 
     python3 -c "
-import json,sys
+import json,sys,os
 row = {
   'scenario': sys.argv[1], 'tier': sys.argv[2], 'host_state': sys.argv[3],
   'net_class': sys.argv[4], 'scheduler': sys.argv[5],
+  'arm': os.environ.get('CI_BENCH_ARM') or 'default',
+  'arm_reorder': os.environ.get('CI_BENCH_REORDER') or 'default',
   'multipath_mbps': float(sys.argv[6]),
   'multipath_cv_pct': float(sys.argv[7]),
   'server_rss_peak_kb': int(sys.argv[8]),
@@ -720,6 +816,32 @@ if row.get('status') == 'ok' and share is not None and fair and share < fair * 0
     f.append('share_imbalance: minority path carried %.1f%% of bytes against a '
              '%.1f%% fair share, on two identical unshaped paths'
              % (share*100, fair*100))
+
+# Same scheduler counters as run_pair reads, and they mean more here: with the
+# two legs identical, any imbalance in pins or any stall in the round counter
+# is the scheduler's own doing and nothing the network can account for.
+if row.get('wlb_instr') == 'ok':
+    ps, ss = row.get('wlb_pin_minshare'), row.get('wlb_sched_minshare')
+    ppr, wr = row.get('wlb_pkts_per_round'), row.get('wlb_weight_ratio')
+    n = len(row.get('wlb_path_ids') or [])
+    wfair = (1.0 / n) if n else None
+    if ps is not None and wfair and ps < wfair * 0.5:
+        f.append('wlb_pin_collapse: minority path took %.1f%% of flow pins '
+                 'against a %.1f%% fair share, on identical paths'
+                 % (ps * 100, wfair * 100))
+    if ss is not None and wfair and ss < wfair * 0.5:
+        f.append('wlb_sched_collapse: minority path was chosen for %.1f%% of '
+                 'packets against a %.1f%% fair share, on identical paths'
+                 % (ss * 100, wfair * 100))
+    if ppr is not None and ppr > 100:
+        f.append('wlb_round_stall: %.1f packets per WRR round -- pinned traffic '
+                 'returns from the flow-hit fast path without consuming '
+                 'deficit, so weights are never recomputed' % ppr)
+    if wr is not None and wr > 4:
+        f.append('wlb_weight_skew: LATE weights differ %.2fx between two '
+                 'identical unshaped paths -- the weight is tracking cwnd, not '
+                 'capacity' % wr)
+
 row['findings'] = f
 row['finding_count'] = len(f)
 print(json.dumps(row))" \

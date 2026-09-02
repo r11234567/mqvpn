@@ -76,7 +76,10 @@ NETSIM_MIN_FITTING_MTU=$(( NETSIM_CLIENT_PKT_SIZE + 8 + 20 ))
 #                     defect any more -- read the finding.
 netsim_mtu_class() {
     local mtu="${1#bh}"
-    [ -n "$mtu" ] || { echo unset; return 0; }
+    # No clamp anywhere means the veth default, which is a real MTU and a
+    # fitting one -- not an absence of information. Reporting `unset` here made
+    # most rows say nothing about their MTU when the answer was `fits`.
+    [ -n "$mtu" ] || mtu="$NETSIM_FULL_MTU"
     if   [ "$mtu" -gt "$NETSIM_MIN_FITTING_MTU" ]; then echo fits
     elif [ "$mtu" -eq "$NETSIM_MIN_FITTING_MTU" ]; then echo boundary
     else echo below
@@ -904,7 +907,12 @@ netsim_path_field() {
       access)  echo "$access" ;;
       transit) echo "$transit" ;;
       nat)     echo "${nat:-public}" ;;
-      mtu)     echo "${mtu:-}" ;;
+      # Same fallback netsim_apply_path uses, so the reported MTU is the one
+      # the link actually runs at. Reading only the spec field made a leg
+      # clamped by its access profile (tether_otg) report as if it had no MTU
+      # constraint, which put `unset` on the row and left the
+      # pmtu_blackhole_regression guard blind to it.
+      mtu)     echo "${mtu:-${NETSIM_LEG_MTU[$access]:-}}" ;;
       *)       return 1 ;;
     esac
 }

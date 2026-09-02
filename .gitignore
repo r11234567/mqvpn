@@ -61,3 +61,7 @@ tools/perf-dashboard/.wrangler/
 # local-only bench notes (kept untracked by owner decision)
 docs/report/2026-07-03-hybrid-h2a-microbench.md
 docs/report/2026-07-04-hybrid-h2b-throughput.md
+
+# Python bytecode, e.g. from scripts/ci_benchmarks/ci_bench_ab_report.py
+__pycache__/
+*.pyc

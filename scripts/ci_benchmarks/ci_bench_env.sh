@@ -40,19 +40,45 @@ IPERF3_PORT="5201"
 CI_BENCH_SCHEDULER="${CI_BENCH_SCHEDULER:-wlb}"
 CI_BENCH_LOG_LEVEL="${CI_BENCH_LOG_LEVEL:-error}"
 
-# WLB scheduler instrumentation. With this set to 1 the client runs at
-# --log-level info and its output is captured, so the once-a-second
+# WLB scheduler instrumentation. With this set to 1 both ends run at
+# --log-level info and their output is captured, so the once-a-second
 # |wlb_instr| line xquic emits (pins, packets and round count per path) can be
-# read back after a measurement. Off by default: it raises the client's log
-# level for the whole run.
+# read back after a measurement. Off by default: it raises the log level for
+# the whole run.
 #
 # The counters are aggregates maintained in the scheduler, not per-packet log
 # lines, so the capture itself does not move the throughput being measured --
 # which matters, because the number under investigation IS the throughput.
+#
+# The SERVER log is the one that answers the question. Every measurement here
+# is iperf3 in the DL direction, so the bulk data is scheduled by the server's
+# WLB instance; the client's only schedules the returning ACKs. The first
+# attempt read the client log and would have reported the ACK split as though
+# it were the throughput split.
 CI_BENCH_WLB_INSTR="${CI_BENCH_WLB_INSTR:-0}"
-# Set by ci_bench_start_client when the above is on; truncated per client, so
-# after a measure_pathset it holds exactly that pathset's run.
+# Set by the start helpers when the above is on. The server log is NOT
+# truncated per measurement -- one server serves solo-A, solo-B and multipath
+# in turn -- so readers must take a windowed delta; ci_bench_mark_server_log
+# records where the window starts.
+CI_BENCH_SERVER_LOG=""
 CI_BENCH_CLIENT_LOG=""
+CI_BENCH_SERVER_LOG_MARK=0
+
+# Extra config file handed to BOTH ends via --config. Used to vary one setting
+# across arms of an A/B inside a single run (see CI_BENCH_REORDER in
+# ci_bench_scenarios.sh) without a second workflow dispatch.
+CI_BENCH_CONFIG_FILE="${CI_BENCH_CONFIG_FILE:-}"
+
+# Byte offset of the server log at the start of the current measurement, so a
+# reader can skip the earlier measurements' counters. No-op when the log is not
+# being captured.
+ci_bench_mark_server_log() {
+    if [ -n "$CI_BENCH_SERVER_LOG" ] && [ -r "$CI_BENCH_SERVER_LOG" ]; then
+        CI_BENCH_SERVER_LOG_MARK="$(wc -c <"$CI_BENCH_SERVER_LOG" 2>/dev/null || echo 0)"
+    else
+        CI_BENCH_SERVER_LOG_MARK=0
+    fi
+}
 
 # Process PIDs
 #
@@ -212,16 +238,47 @@ ci_bench_start_server() {
         tier_prefix="$(ci_bench_tier_prefix "$CI_BENCH_TIER")" || return 1
     fi
 
-    ${tier_prefix} ip netns exec "$NS_SERVER" "$MQVPN" \
-        --mode server \
-        --listen "0.0.0.0:${VPN_LISTEN_PORT}" \
-        --subnet 10.0.0.0/24 \
-        --cert "${_CB_WORK_DIR}/server.crt" \
-        --key "${_CB_WORK_DIR}/server.key" \
-        --auth-key "$_CB_PSK" \
-        --scheduler "$scheduler" \
-        ${extra} \
-        --log-level "$CI_BENCH_LOG_LEVEL" &
+    # Arm config (A/B), applied to both ends. Unquoted: expands to two words
+    # or to nothing.
+    local cfg_arg=""
+    if [ -n "$CI_BENCH_CONFIG_FILE" ]; then
+        cfg_arg="--config $CI_BENCH_CONFIG_FILE"
+    fi
+
+    local level="$CI_BENCH_LOG_LEVEL"
+    CI_BENCH_SERVER_LOG=""
+    CI_BENCH_SERVER_LOG_MARK=0
+    if [ "$CI_BENCH_WLB_INSTR" = "1" ]; then
+        level=info
+        CI_BENCH_SERVER_LOG="${_CB_WORK_DIR}/server-instr.log"
+        : >"$CI_BENCH_SERVER_LOG"
+    fi
+
+    if [ -n "$CI_BENCH_SERVER_LOG" ]; then
+        ${tier_prefix} ip netns exec "$NS_SERVER" "$MQVPN" \
+            --mode server \
+            --listen "0.0.0.0:${VPN_LISTEN_PORT}" \
+            --subnet 10.0.0.0/24 \
+            --cert "${_CB_WORK_DIR}/server.crt" \
+            --key "${_CB_WORK_DIR}/server.key" \
+            --auth-key "$_CB_PSK" \
+            --scheduler "$scheduler" \
+            ${cfg_arg} \
+            ${extra} \
+            --log-level "$level" >>"$CI_BENCH_SERVER_LOG" 2>&1 &
+    else
+        ${tier_prefix} ip netns exec "$NS_SERVER" "$MQVPN" \
+            --mode server \
+            --listen "0.0.0.0:${VPN_LISTEN_PORT}" \
+            --subnet 10.0.0.0/24 \
+            --cert "${_CB_WORK_DIR}/server.crt" \
+            --key "${_CB_WORK_DIR}/server.key" \
+            --auth-key "$_CB_PSK" \
+            --scheduler "$scheduler" \
+            ${cfg_arg} \
+            ${extra} \
+            --log-level "$level" &
+    fi
     _CB_SERVER_PID=$!
     sleep 2
 
@@ -241,6 +298,13 @@ ci_bench_start_client() {
     # Kill every previous client, including one a subshell lost track of.
     ci_bench_stop_client
 
+    # Arm config (A/B): the same file the server got, so both ends agree.
+    # Unquoted: expands to two words or to nothing.
+    local cfg_arg=""
+    if [ -n "$CI_BENCH_CONFIG_FILE" ]; then
+        cfg_arg="--config $CI_BENCH_CONFIG_FILE"
+    fi
+
     local level="$CI_BENCH_LOG_LEVEL"
     if [ "$CI_BENCH_WLB_INSTR" = "1" ] && [ -n "$_CB_WORK_DIR" ]; then
         level=info
@@ -256,6 +320,7 @@ ci_bench_start_client() {
             --auth-key "$_CB_PSK" \
             --scheduler "$scheduler" \
             --insecure \
+            ${cfg_arg} \
             --log-level "$level" >>"$CI_BENCH_CLIENT_LOG" 2>&1 &
     else
         ip netns exec "$NS_CLIENT" "$MQVPN" \
@@ -265,6 +330,7 @@ ci_bench_start_client() {
             --auth-key "$_CB_PSK" \
             --scheduler "$scheduler" \
             --insecure \
+            ${cfg_arg} \
             --log-level "$level" &
     fi
     _CB_CLIENT_PID=$!

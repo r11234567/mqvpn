@@ -1151,6 +1151,20 @@ cli_report_route_pmtu(cli_conn_t *conn, path_entry_t *p, uint64_t path_id,
         return;
     }
 
+    /* The route is read from p->fd but the report names path_id, and
+     * get_path_entry_for_send() hands back the primary/first-active slot when
+     * the requested path has no entry -- so in that window the two are
+     * different paths. Reporting anyway would attribute one path's MTU to
+     * another and lower a path that never saw the EMSGSIZE. Skipping costs
+     * only the shortcut: the search still converges on its own. */
+    if (!p->xquic_path_live || p->xqc_path_id != path_id) {
+        LOG_D(conn->client,
+              "pmtu: skipping route report, send used path %lld but xquic asked "
+              "for path_id %llu",
+              (long long)p->handle, (unsigned long long)path_id);
+        return;
+    }
+
     size_t payload = mqvpn_udp_route_payload_max(p->fd, peer, peerlen);
     if (payload == 0 || payload == p->last_pmtu_reported) {
         return;

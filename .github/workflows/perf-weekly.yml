@@ -18,16 +18,25 @@ on:
     inputs:
       netsim_modes:
         description: >-
-          Comma-separated netsim modes to run (e.g. "classes,sched,tiers").
-          Empty runs all of them, which is what the schedule does.
+          Comma-separated netsim modes to narrow to (e.g. "classes,sched,tiers").
+          Leave EMPTY for the full set of 11, which is what the schedule runs and
+          what any conclusion about coverage needs.
+        required: false
+        default: ''
+      arms:
+        description: >-
+          A/B arms, run as parallel matrix jobs in THIS one dispatch so the two
+          sides are measured against the same code on the same day. One of, or a
+          comma-separated list of: default (built-in config), reorder_on,
+          reorder_off. Empty means "default" only.
         required: false
         default: ''
       wlb_instr:
         description: >-
           Collect the WLB scheduler's per-path pin/packet/round counters
-          (CI_BENCH_WLB_INSTR). Raises the client log level to info; the
-          counters are aggregates, so this does not move the throughput being
-          measured.
+          (CI_BENCH_WLB_INSTR). Raises both ends' log level to info; the counters
+          are once-a-second aggregates, so this does not move the throughput
+          being measured.
         required: false
         type: boolean
         default: false
@@ -182,11 +191,15 @@ jobs:
   # read-modify-write on one index.json, so six matrix jobs racing it would
   # clobber each other's entries. They upload artifacts and a single
   # downstream writer publishes them.
-  # Picks which netsim modes the matrix runs. A static matrix cannot be
-  # narrowed by an input, and investigating one finding should not have to pay
-  # for eleven runner-hours: `netsim_modes: classes,sched,tiers` is the WLB
-  # aggregation question (docs/network_emulation_matrix.md §1.3.7), and the
-  # schedule passes nothing and gets everything.
+  # Builds the netsim matrix as modes x arms. A static matrix can be neither
+  # narrowed nor doubled by an input, and both are wanted:
+  #
+  #   - The full 11 modes are the default, because a conclusion about coverage
+  #     needs all of them. `netsim_modes` only narrows, and only on a dispatch.
+  #   - `arms` runs the same modes twice in ONE dispatch, as parallel jobs. An
+  #     A/B done as two dispatches is not just slower, it is weaker: these
+  #     numbers move several percent run to run on shared runners, so the two
+  #     sides have to be measured in the same run to be compared at all.
   netsim-select:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -196,6 +209,7 @@ jobs:
       - id: pick
         env:
           WANT: ${{ github.event.inputs.netsim_modes }}
+          WANT_ARMS: ${{ github.event.inputs.arms }}
         run: |
           python3 - >> "$GITHUB_OUTPUT" <<'PY'
           import json, os
@@ -214,16 +228,29 @@ jobs:
               {"id": "cat_junk",    "args": "catalog bgp_junk"},
               {"id": "cat_carrier", "args": "catalog carrier_qos"},
           ]
-          known = {m["id"] for m in modes}
+          # arm id -> CI_BENCH_REORDER value ("" leaves the built-in default).
+          arms = {"default": "", "reorder_on": "on", "reorder_off": "off"}
 
-          want = [w.strip() for w in os.environ.get("WANT", "").split(",") if w.strip()]
-          unknown = sorted(set(want) - known)
-          if unknown:
-              raise SystemExit(
-                  f"unknown netsim mode(s): {', '.join(unknown)}; "
-                  f"known: {', '.join(sorted(known))}")
+          def parse(var, known, what):
+              want = [w.strip() for w in os.environ.get(var, "").split(",") if w.strip()]
+              bad = sorted(set(want) - set(known))
+              if bad:
+                  raise SystemExit(f"unknown {what}: {', '.join(bad)}; "
+                                   f"known: {', '.join(sorted(known))}")
+              return want
 
-          sel = [m for m in modes if not want or m["id"] in want]
+          want_modes = parse("WANT", {m["id"] for m in modes}, "netsim mode(s)")
+          want_arms = parse("WANT_ARMS", arms, "arm(s)") or ["default"]
+
+          sel = []
+          for m in modes:
+              if want_modes and m["id"] not in want_modes:
+                  continue
+              for a in want_arms:
+                  # id is the artifact name, so it must be unique per cell.
+                  suffix = "" if a == "default" else f"__{a}"
+                  sel.append({"id": m["id"] + suffix, "args": m["args"],
+                              "arm": a, "reorder": arms[a]})
           print("matrix=" + json.dumps({"include": sel}))
           PY
 
@@ -262,6 +289,10 @@ jobs:
       # '1' only on a dispatch that asked for it; the schedule leaves the input
       # empty and so runs without instrumentation.
       CI_BENCH_WLB_INSTR: ${{ github.event.inputs.wlb_instr == 'true' && '1' || '0' }}
+      # A/B arm for this cell. `arm` names it in the rows; `reorder` is empty on
+      # the default arm, which leaves the built-in config untouched.
+      CI_BENCH_ARM: ${{ matrix.arm }}
+      CI_BENCH_REORDER: ${{ matrix.reorder }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -339,6 +370,34 @@ jobs:
           name: netsim-${{ matrix.id }}
           path: ci_bench_results/*.json
           retention-days: 90
+
+  # Does the subtraction the arms were run for, in the run that produced them.
+  #
+  # Without this the dispatch just leaves a pile of JSON and the comparison
+  # happens by hand afterwards -- which is where the last round went wrong: two
+  # settings were changed together, and nothing in the run said so. Reporting,
+  # not gating: a gate here would leave the weekly permanently red (see
+  # docs/network_emulation_matrix.md 0.4 L).
+  netsim-compare:
+    needs: netsim
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # No merge-multiple: each artifact keeps its own directory, so the two
+      # arms of a mode cannot overwrite each other's identically-named file.
+      - name: Collect scenario artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: netsim-*
+          path: ab
+
+      - name: Compare arms
+        run: |
+          python3 scripts/ci_benchmarks/ci_bench_ab_report.py ab \
+            | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Single writer for the scenario results. Depends on perf-weekly as well as
   # the matrix so the two never rewrite perf-data/weekly/index.json at the same

@@ -673,6 +673,27 @@ an advancing round counter refute it, and that outcome is worth as much as
 confirmation — it would move the search to the reorder path or to congestion
 control. No scheduler change should be made before this run exists.
 
+**The first instrumented run (33595998135) produced no counters at all** —
+`wlb_instr: no_lines` on all 22 rows — so §1.3.7 is still untested. Two causes,
+both since fixed: the line was emitted at xquic INFO while mqvpn maps its own
+INFO to xquic WARN (`map_log_level_to_xquic`), so xquic's filter dropped it
+before the callback; and the harness read the *client* log, while every
+measurement here is iperf3 DL and therefore scheduled by the *server*. The line
+now goes out on xquic's REPORT statistics channel, which passes any level, and
+`collect_wlb_instr` reads a marked window of the server log.
+
+That run also cost more than the missing data. It narrowed the matrix to three
+modes and changed two things at once — the per-path PMTU work and the reorder
+default — so its regressions (`dual_mobile` 13.9 → 1.5 Mbps, `home_plus_tether`
+13.3 → 6.2, and `mobile_dual_lte` in the core suite, which has no MTU constraint
+and no scheduler explanation because MinRTT regressed too) could not be
+attributed. Both lessons are now built into the workflow: `netsim_modes` defaults
+to all 11 modes, and `arms` runs a configuration A/B as parallel jobs inside one
+dispatch, with `netsim-compare` doing the subtraction in the same run. Same-run
+comparison is not a convenience — these scenarios move several percent between
+runs on shared cloud vCPUs, so arms measured in different dispatches are not
+comparable at all.
+
 ### 1.4 Budget structure
 
 `classes` at 60 minutes is the §0.1 B deadlock, not real work: ~95 s per class
