@@ -362,13 +362,13 @@ the first place.
 ### End-to-end fixes carried in the pinned xquic
 
 `third_party/xquic` is pinned at
-[`e1abe04`](https://github.com/r11234567/xquic/commit/e1abe04). Enabling the
+[`77ede10`](https://github.com/r11234567/xquic/commit/77ede10). Enabling the
 features above exposed transport bugs that the e2e suite caught and that had to
 be fixed in xquic rather than here:
 
 | xquic commit | What it fixes |
 |---|---|
-| [e1abe04](https://github.com/r11234567/xquic/commit/e1abe04) | **The WLB counters emitted nothing**, so the first instrumented netsim run came back with `wlb_instr: no_lines` on all 22 rows. They were logged at xquic INFO, and mqvpn deliberately maps its own INFO to xquic WARN to keep per-packet traffic out of the log, so xquic's own filter dropped the line before the callback. Moved to the REPORT statistics channel, which passes any level. |
+| [e1abe04](https://github.com/r11234567/xquic/commit/e1abe04) · [77ede10](https://github.com/r11234567/xquic/commit/77ede10) | **The WLB counters emitted nothing**, so the first instrumented netsim run came back with `wlb_instr: no_lines` on all 22 rows. They were logged at xquic INFO, and mqvpn deliberately maps its own INFO to xquic WARN to keep per-packet traffic out of the log, so xquic's own filter dropped the line before the callback. Moved to the REPORT statistics channel, which passes any level — and `77ede10` then had to give the unit-test fixture logs a callback sink, since REPORT is level 0 and so passes their filter too, where `xqc_log_implement()` dereferenced their NULL `log_callbacks`. Do not bisect onto `e1abe04` alone. |
 | [bcb7381](https://github.com/r11234567/xquic/commit/bcb7381) | **A converged PMTU search never reopened**, so a path MTU that *grew* mid-connection was never found and a long-lived connection kept the size it first settled on. Convergence now rearms the probing timer as RFC 8899 §5.3's PMTU_RAISE_TIMER (600 s). The reopen raises only the search's ceiling, not the size in use, so it costs probe packets and no throughput. Also fixes an error-code collision: `XQC_EAEAD_LIMIT` shared the value 623 with `XQC_ESTREAM_NFOUND`, so an AEAD-integrity-limit close and a stream-not-found were indistinguishable to a caller comparing codes. |
 | [8b9e4b5](https://github.com/r11234567/xquic/commit/8b9e4b5) | **WLB instrumentation**, no behaviour change: per-path pin/packet/round counters emitted once a second, with the three per-packet log statements dropped to DEBUG so measuring the split does not move it. Read by `CI_BENCH_WLB_INSTR=1`; see [the aggregation numbers](#what-the-scheduler-numbers-still-do-not-explain). |
 | [0caa07c](https://github.com/r11234567/xquic/commit/0caa07c) | **`xqc_conn_set_path_pmtu()`**, so a path MTU the kernel already knows can be handed to the PLPMTU search instead of being rediscovered over several probe intervals. Also drops the request-cancellation log path from ERROR to DEBUG — see [the log noise](#the-loudest-line-in-the-log-was-not-an-error). |
