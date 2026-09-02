@@ -354,10 +354,14 @@ def main(argv=None):
         return 0
 
     by_key = collect(rows)
-    # Deterministic order with the control arm first, so `move` always reads
-    # "against the control".
+    # Deterministic order with the baseline arm first, so `move` always reads
+    # "against the baseline". The baseline is whichever arm represents the
+    # shipped default -- for a streams sweep that is the harness default of 4,
+    # which is the whole point of comparing 16 against it.
     seen = {a for _m, a, _r in rows}
-    arms = [a for a in ("reorder_off", "default", "reorder_on") if a in seen]
+    preferred = ("default", "reorder_off", "streams4", "streams16", "streams64",
+                 "reorder_on")
+    arms = [a for a in preferred if a in seen]
     arms += sorted(seen - set(arms))
 
     emit_coverage(rows, by_key, arms)

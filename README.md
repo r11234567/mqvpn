@@ -350,8 +350,12 @@ under two configurations as parallel jobs:
 | input | value |
 |---|---|
 | `netsim_modes` | empty for all 11 modes; a comma-separated subset to narrow |
-| `arms` | e.g. `reorder_on,reorder_off` |
+| `arms` | `default`, `reorder_on`, `reorder_off`, `streams4`, `streams16`, `streams64` |
 | `wlb_instr` | `true` to collect the scheduler counters |
+| `iperf_streams` | applies to every arm; a `streams*` arm overrides it |
+
+An arm is just a named set of environment overrides, so anything worth an A/B can
+be one. Cells are modes x arms, so narrow the modes when using several arms.
 
 Every row is stamped with `arm`, and a `netsim-compare` job diffs the arms and
 writes the table into the run summary. Doing it this way rather than as two
