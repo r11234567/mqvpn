@@ -275,15 +275,73 @@ The guard now applies only while a healthier path actually exists. With an
 alternative present nothing changes; with none, the suspect path is used rather
 than nothing at all.
 
+#### The loudest line in the log was not an error
+
+The most frequent line in the whole capture was
+`xqc_h3_stream_process_data|xqc_stream_recv error|-626`, at ERROR level. `-626`
+is `XQC_ESTREAM_RESET`, and it is what xquic returns to a reader on a stream the
+peer has reset — which is not a failure but the answer to a question the library
+itself asked. `xqc_process_reset_stream_frame()` calls `xqc_stream_ready_to_read()`
+specifically so the application wakes up and discovers the reset.
+
+The volume is explained by what sits on top. Closing a proxied connection calls
+`xqc_h3_request_close()` → `xqc_stream_close()`, which sends RESET_STREAM plus
+STOP_SENDING with `H3_REQUEST_CANCELLED` (`0x10C` = 268, the `err:268` and
+`close_msg:local reset` also in the log). RFC 9000 §3.5 has the peer answer
+STOP_SENDING with a RESET_STREAM of its own, that echo comes back, the reader is
+woken, and one ERROR line is printed. Per cancelled request. A proxy workload
+cancels constantly, so the log filled with the sound of its own request
+teardown. The neighbouring `cannot find stream` warning is the same echo
+arriving after the local stream was already retired.
+
+Nothing was wrong with the handling — `xqc_h3_stream_read_notify()` already maps
+the result to `XQC_OK` and the write side already classified it as routine. Only
+the log level was out of step, and it is DEBUG now
+([`0caa07c`](https://github.com/r11234567/xquic/commit/0caa07c)).
+
+#### What the scheduler numbers still do not explain
+
+The netsim matrix reports things the two fixes above do not account for, because
+those rows ran at the default MTU with both paths healthy: two identical paths
+aggregating at 0.521, `asym_capacity` multipath reaching only 0.531× the better
+single path, and WLB landing below single-path where MinRTT reaches 1.164.
+
+Reading `xqc_scheduler_wlb.c` suggests one cause for all four. WLB weights paths
+by a LATE throughput estimate computed from cwnd, and cwnd is a function of the
+traffic WLB already sent that path — so whichever path warms first wins the
+weight comparison, takes the next flow, and warms further. Flow pins then hold
+for 60 s of idle expiry. Compounding it, weights are recomputed only at a WRR
+round boundary, and pinned traffic returns from the flow-hit fast path before
+the round check runs, so the split can freeze at whatever transient cwnd skew
+existed at pin time. That would also explain why the reported byte split varies
+so widely between runs (0.126–0.338) and why MinRTT, which has neither a weight
+model nor pinning, aggregates where WLB does not.
+
+That is a reading, not a measurement. xquic
+[`8b9e4b5`](https://github.com/r11234567/xquic/commit/8b9e4b5) adds the counters
+needed to settle it — pins, packets and rounds per path, once a second — and
+`CI_BENCH_WLB_INSTR=1` makes the scenario harness collect them into
+`wlb_pin_minshare`, `wlb_sched_minshare`, `wlb_pkts_per_round` and
+`wlb_weight_ratio`, with findings raised when they match the prediction:
+
+```bash
+sudo CI_BENCH_WLB_INSTR=1 scripts/ci_benchmarks/ci_bench_scenarios.sh
+```
+
+Even pins with an advancing round counter would refute the reading, which is why
+it is worth running before touching the scheduler.
+
 ### End-to-end fixes carried in the pinned xquic
 
 `third_party/xquic` is pinned at
-[`6ba4261`](https://github.com/r11234567/xquic/commit/6ba4261). Enabling the
+[`8b9e4b5`](https://github.com/r11234567/xquic/commit/8b9e4b5). Enabling the
 features above exposed transport bugs that the e2e suite caught and that had to
 be fixed in xquic rather than here:
 
 | xquic commit | What it fixes |
 |---|---|
+| [8b9e4b5](https://github.com/r11234567/xquic/commit/8b9e4b5) | **WLB instrumentation**, no behaviour change: per-path pin/packet/round counters emitted once a second, with the three per-packet log statements dropped to DEBUG so measuring the split does not move it. Read by `CI_BENCH_WLB_INSTR=1`; see [the aggregation numbers](#what-the-scheduler-numbers-still-do-not-explain). |
+| [0caa07c](https://github.com/r11234567/xquic/commit/0caa07c) | **`xqc_conn_set_path_pmtu()`**, so a path MTU the kernel already knows can be handed to the PLPMTU search instead of being rediscovered over several probe intervals. Also drops the request-cancellation log path from ERROR to DEBUG — see [the log noise](#the-loudest-line-in-the-log-was-not-an-error). |
 | [6ba4261](https://github.com/r11234567/xquic/commit/6ba4261) | **WLB's PTO guard could exclude the last usable path**, so nothing was sent at all and the ACK that would have cleared the guard could never arrive. See [the three-minute stall](#the-three-minute-stall-wlb-locked-out-the-last-path). |
 | [f3c05a2](https://github.com/r11234567/xquic/commit/f3c05a2) · [be82b29](https://github.com/r11234567/xquic/commit/be82b29) | **A path's packet size could only go up, so the narrower path black-holed.** The PMTU search is now per path and the connection's size moves in both directions. See [the packet size](#the-packet-size-could-only-go-up) — this is the one that made a second path cost throughput instead of adding it. |
 | [a40cbd5](https://github.com/r11234567/xquic/commit/a40cbd5) | **A Retry could not follow a full Initial.** `xqc_conn_reassemble_packet()` rebuilt the Initial with the Retry token in the header but copied the payload in verbatim, sized against the shorter header. With a PQC key share filling the packet, AEAD needed 1453 bytes of a 1452-byte buffer and encryption failed with `XQC_TLS_ENCRYPT_DATA_ERROR` (-736), so no handshake completed at all. Surfaced as a 10 s dispatch timeout in `tests/test_tcp_egress.c`. Fixed by reserving worst-case header growth; the payload copy is now bounds-checked too. |
@@ -581,12 +639,14 @@ reordered, and many inner protocols treat reorder as loss and back off. The
 reorder buffer holds datagrams in a short receive-side window and releases them
 in order, so one inner flow can aggregate both paths — the datagram-lane
 counterpart to what the [hybrid TCP stream lane](#hybrid-mode-tcp-lane) does for
-TCP. Off by default; negotiated end-to-end (both client and server must enable
-it) and a no-op when either side has it off.
+TCP. **On by default** since it is the mechanism that stops a second path from
+reading as loss to the inner protocol. Negotiated end-to-end: a sender waits for
+the peer's advertisement before stamping anything, so it is a no-op — and safe —
+against a peer that has it off or does not know about it.
 
 ```ini
 [Reorder]
-Enabled = on
+Enabled = on             # default; set to off to disable
 MaxWaitMs = 50           # reorder window: hold out-of-order datagrams up to this long
 CapPackets = 1024        # per-flow buffer cap (packets)
 
@@ -598,8 +658,11 @@ Profile = cellular_bond  # cellular_bond (wait=50ms, cap=1024) | fiber_lte (wait
 ```
 
 INI/JSON only (no CLI flag). Best on asymmetric-RTT path pairs (e.g. Wi-Fi +
-LTE); for symmetric, loss-dominated paths leave it off. See
-[docs/report/](docs/report/) for the parameter sweep and measured numbers.
+LTE); for symmetric, loss-dominated paths it buys little, and `Enabled = off`
+turns it back off. It also has to be off wherever duplicates are the point —
+`Reinjection = dgram` deliberately sends every datagram twice, and the shim
+would deduplicate them. See [docs/report/](docs/report/) for the parameter sweep
+and measured numbers.
 
 ## Reinjection (speculative duplication)
 

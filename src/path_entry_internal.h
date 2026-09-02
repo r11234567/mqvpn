@@ -72,6 +72,12 @@ typedef struct path_entry_s {
     int gso_disabled;                   /* runtime sticky: 0 = GSO usable, else the
                                          * GSO-class errno that disabled it (see
                                          * udp_offload.h); reset on fd assignment */
+    size_t last_pmtu_reported;          /* last UDP payload size handed to
+                                         * xqc_conn_set_path_pmtu for this path;
+                                         * 0 = never. Suppresses the repeat route
+                                         * lookup when EMSGSIZE recurs with the
+                                         * route unchanged. Reset on fd assignment,
+                                         * since a new fd is a new route. */
 } path_entry_t;
 
 #endif /* MQVPN_PATH_ENTRY_INTERNAL_H */

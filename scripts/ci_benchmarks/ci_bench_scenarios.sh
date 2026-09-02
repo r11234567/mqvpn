@@ -364,6 +364,85 @@ print(','.join(json.dumps(k) + ':' + json.dumps(v) for k, v in out.items()))
 " "$status" "$stats"
 }
 
+# Read the WLB scheduler's own counters out of the client log. Echoes a JSON
+# fragment (no braces), same contract as collect_stats; empty when
+# CI_BENCH_WLB_INSTR is off, so the row is unchanged for ordinary runs.
+#
+# What this is for. The netsim matrix says WLB fails to aggregate two identical
+# healthy paths and can land under the better single path, while MinRTT does
+# aggregate. Static reading of xqc_scheduler_wlb.c predicts a specific cause,
+# and these counters are what would confirm or refute it:
+#
+#   - LATE weight is derived from cwnd (wlb_compute_weight), and cwnd is a
+#     function of the traffic the scheduler already sent that path. Whichever
+#     path warms first wins the weight comparison, so it gets the next flow,
+#     so it warms further. Expect a lopsided `pins`.
+#   - Weights are recomputed only at a round boundary, and pinned traffic
+#     returns from the flow-hit fast path before the round check ever runs.
+#     Expect `rounds` to stall near-constant while `sched` keeps climbing.
+#
+# If instead pins are near-even and rounds keep advancing, the static reading is
+# wrong and the cause is elsewhere -- which is equally worth knowing.
+collect_wlb_instr() {
+    [ "${CI_BENCH_WLB_INSTR:-0}" = "1" ] || return 0
+    [ -n "${CI_BENCH_CLIENT_LOG:-}" ] && [ -r "$CI_BENCH_CLIENT_LOG" ] || {
+        echo -n ',"wlb_instr":"no_log"'
+        return 0
+    }
+
+    python3 -c "
+import json, re, sys
+
+pat = re.compile(r'\|wlb_instr\|path:(\d+)\|weight:(\d+)\|deficit:(-?\d+)'
+                 r'\|pins:(\d+)\|sched:(\d+)\|rounds:(\d+)\|n_paths:(\d+)\|')
+
+# Last sample per path wins: these are cumulative counters, so the final line
+# for a path is the whole run.
+last = {}
+try:
+    with open(sys.argv[1], errors='replace') as fh:
+        for line in fh:
+            m = pat.search(line)
+            if m:
+                last[int(m.group(1))] = [int(g) for g in m.groups()[1:]]
+except OSError:
+    print(',' + json.dumps('wlb_instr') + ':' + json.dumps('unreadable'))
+    raise SystemExit(0)
+
+out = {}
+if not last:
+    out['wlb_instr'] = 'no_lines'
+    print(',' + ','.join(json.dumps(k) + ':' + json.dumps(v)
+                         for k, v in out.items()))
+    raise SystemExit(0)
+
+ids = sorted(last)
+out['wlb_instr'] = 'ok'
+out['wlb_path_ids'] = ids
+out['wlb_weights'] = [last[i][0] for i in ids]
+out['wlb_pins'] = [last[i][2] for i in ids]
+out['wlb_sched'] = [last[i][3] for i in ids]
+out['wlb_rounds'] = max(last[i][4] for i in ids)
+
+pins, sched = out['wlb_pins'], out['wlb_sched']
+tp, ts = sum(pins), sum(sched)
+# Shares, directly comparable against the 1/n a balanced scheduler would give
+# -- same convention as path_minshare above.
+out['wlb_pin_minshare'] = round(min(pins) / tp, 3) if tp else None
+out['wlb_sched_minshare'] = round(min(sched) / ts, 3) if ts else None
+# Packets scheduled per round turned over. Large means the round is not
+# rolling, so the weights behind the split are stale.
+out['wlb_pkts_per_round'] = (round(ts / out['wlb_rounds'], 1)
+                             if out['wlb_rounds'] else None)
+w = out['wlb_weights']
+out['wlb_weight_ratio'] = (round(max(w) / min(w), 2)
+                           if w and min(w) > 0 else None)
+
+print(',' + ','.join(json.dumps(k) + ':' + json.dumps(v)
+                     for k, v in out.items()))
+" "$CI_BENCH_CLIENT_LOG"
+}
+
 server_rss_kb() {
     [ -n "${_CB_SERVER_PID:-}" ] || { echo 0; return; }
     awk '/VmHWM/{print $2}' "/proc/${_CB_SERVER_PID}/status" 2>/dev/null || echo 0
@@ -440,6 +519,10 @@ run_pair() {
 
     local stats rss
     stats="$(collect_stats)"; rss="$(server_rss_kb)"
+    # Must run before ci_bench_stop_vpn: the client log lives under the work
+    # dir the teardown removes. The multipath pathset was measured last, so the
+    # log holds exactly that run -- which is the only one whose split matters.
+    stats="${stats}$(collect_wlb_instr)"
     netsim_spike_stop
     ci_bench_stop_vpn
 
@@ -509,6 +592,36 @@ if 'below' in (mcls_a, mcls_b):
         f.append('pmtu_below_unmeasured: a leg MTU is under the outer datagram '
                  'size, but one measurement did not complete, so whether the '
                  'PMTU search handled it is unknown on this row')
+
+# WLB scheduler counters, present only under CI_BENCH_WLB_INSTR=1. These test
+# the static reading of xqc_scheduler_wlb.c against a real run; see
+# collect_wlb_instr for what each one would mean.
+if row.get('wlb_instr') == 'ok':
+    pin_share = row.get('wlb_pin_minshare')
+    sch_share = row.get('wlb_sched_minshare')
+    ppr = row.get('wlb_pkts_per_round')
+    wr = row.get('wlb_weight_ratio')
+    npaths = len(row.get('wlb_path_ids') or [])
+    fair = (1.0 / npaths) if npaths else None
+    if pin_share is not None and fair and pin_share < fair * 0.5:
+        f.append('wlb_pin_collapse: the minority path took %.1f%% of flow pins '
+                 'against a %.1f%% fair share -- pin assignment is following a '
+                 'weight that the scheduler\\'s own traffic created'
+                 % (pin_share * 100, fair * 100))
+    if sch_share is not None and fair and sch_share < fair * 0.5:
+        f.append('wlb_sched_collapse: the minority path was chosen for %.1f%% '
+                 'of packets against a %.1f%% fair share' % (sch_share * 100,
+                                                             fair * 100))
+    if ppr is not None and ppr > 100:
+        f.append('wlb_round_stall: %.1f packets scheduled per WRR round -- '
+                 'pinned traffic returns from the flow-hit fast path without '
+                 'consuming deficit, so weights are not being recomputed'
+                 % ppr)
+    if wr is not None and wr > 4 and 'homo' in row.get('scenario', ''):
+        f.append('wlb_weight_skew: LATE weights differ %.2fx between paths the '
+                 'scenario made identical -- the weight is tracking cwnd, not '
+                 'capacity' % wr)
+
 row['findings'] = f
 row['finding_count'] = len(f)
 print(json.dumps(row))" \

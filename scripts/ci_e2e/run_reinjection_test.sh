@@ -608,15 +608,20 @@ _dgram_body() {
     bench_cleanup
     bench_setup_netns
 
-    # [Hybrid] and [Reorder] intentionally omitted: default Hybrid is
-    # disabled (so inner traffic rides the connect-ip DATAGRAM lane —
-    # dgram-mode reinjection's target, per MQVPN_REINJ_DGRAM in libmqvpn.h), and
-    # default Reorder is OFF (MQVPN_REORDER_OFF default in reorder.h) — the shim would dedup
-    # dgram-mode's duplicate datagrams at the tun, and this scenario
-    # exercises the documented un-deduped semantics with it off.
+    # [Hybrid] intentionally omitted: default Hybrid is disabled, so inner
+    # traffic rides the connect-ip DATAGRAM lane — dgram-mode reinjection's
+    # target, per MQVPN_REINJ_DGRAM in libmqvpn.h.
+    #
+    # [Reorder] is set explicitly rather than left to the default, which is now
+    # ON: the shim deduplicates, and dgram-mode reinjection duplicates every
+    # DATAGRAM on purpose. This scenario exercises the documented un-deduped
+    # semantics, so it has to pin the shim off itself.
     cat >"$ini" <<EOF
 [Multipath]
 Reinjection = dgram
+
+[Reorder]
+Enabled = off
 EOF
 
     start_server_with_flags "$server_log" \

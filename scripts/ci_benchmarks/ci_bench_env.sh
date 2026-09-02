@@ -40,6 +40,20 @@ IPERF3_PORT="5201"
 CI_BENCH_SCHEDULER="${CI_BENCH_SCHEDULER:-wlb}"
 CI_BENCH_LOG_LEVEL="${CI_BENCH_LOG_LEVEL:-error}"
 
+# WLB scheduler instrumentation. With this set to 1 the client runs at
+# --log-level info and its output is captured, so the once-a-second
+# |wlb_instr| line xquic emits (pins, packets and round count per path) can be
+# read back after a measurement. Off by default: it raises the client's log
+# level for the whole run.
+#
+# The counters are aggregates maintained in the scheduler, not per-packet log
+# lines, so the capture itself does not move the throughput being measured --
+# which matters, because the number under investigation IS the throughput.
+CI_BENCH_WLB_INSTR="${CI_BENCH_WLB_INSTR:-0}"
+# Set by ci_bench_start_client when the above is on; truncated per client, so
+# after a measure_pathset it holds exactly that pathset's run.
+CI_BENCH_CLIENT_LOG=""
+
 # Process PIDs
 #
 # _CB_CLIENT_PID alone is not enough. ci_bench_start_client is sometimes
@@ -227,14 +241,32 @@ ci_bench_start_client() {
     # Kill every previous client, including one a subshell lost track of.
     ci_bench_stop_client
 
-    ip netns exec "$NS_CLIENT" "$MQVPN" \
-        --mode client \
-        --server "${IP_A_SERVER_ADDR}:${VPN_LISTEN_PORT}" \
-        ${paths} \
-        --auth-key "$_CB_PSK" \
-        --scheduler "$scheduler" \
-        --insecure \
-        --log-level "$CI_BENCH_LOG_LEVEL" &
+    local level="$CI_BENCH_LOG_LEVEL"
+    if [ "$CI_BENCH_WLB_INSTR" = "1" ] && [ -n "$_CB_WORK_DIR" ]; then
+        level=info
+        CI_BENCH_CLIENT_LOG="${_CB_WORK_DIR}/client-instr.log"
+        : > "$CI_BENCH_CLIENT_LOG"
+    fi
+
+    if [ -n "$CI_BENCH_CLIENT_LOG" ]; then
+        ip netns exec "$NS_CLIENT" "$MQVPN" \
+            --mode client \
+            --server "${IP_A_SERVER_ADDR}:${VPN_LISTEN_PORT}" \
+            ${paths} \
+            --auth-key "$_CB_PSK" \
+            --scheduler "$scheduler" \
+            --insecure \
+            --log-level "$level" >>"$CI_BENCH_CLIENT_LOG" 2>&1 &
+    else
+        ip netns exec "$NS_CLIENT" "$MQVPN" \
+            --mode client \
+            --server "${IP_A_SERVER_ADDR}:${VPN_LISTEN_PORT}" \
+            ${paths} \
+            --auth-key "$_CB_PSK" \
+            --scheduler "$scheduler" \
+            --insecure \
+            --log-level "$level" &
+    fi
     _CB_CLIENT_PID=$!
     echo "$_CB_CLIENT_PID" >> "$_CB_CLIENT_PIDS" 2>/dev/null || true
     sleep 3

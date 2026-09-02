@@ -567,7 +567,13 @@ static inline void
 mqvpn_reorder_config_default(mqvpn_reorder_config_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
-    cfg->mode = MQVPN_REORDER_OFF;
+    /* On by default. Multipath spreads one inner flow's packets across paths
+     * with different latencies; without this shim the inner TCP sees that as
+     * loss and collapses its window, which is why adding a second path could
+     * read as negative optimization. Safe to default on: §19.3 makes a sender
+     * wait for the peer's advertisement before stamping anything, so a peer
+     * that does not support it simply never echoes and both sides stay RAW. */
+    cfg->mode = MQVPN_REORDER_ON;
     cfg->max_wait_ms = 30;
     cfg->cap_packets_per_flow = 1024;
     cfg->max_buffer_bytes_per_flow = 1572864ULL;

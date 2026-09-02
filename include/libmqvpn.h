@@ -529,7 +529,9 @@ MQVPN_API int mqvpn_config_set_tun_mtu(mqvpn_config_t *cfg, int mtu);
  * These mirror the reorder design spec's builder surface. Values are validated
  * (cross-side invariants like cap-power-of-two and ingress < egress) when the
  * config is applied by the library, not by the setters. Calling none of these
- * leaves the shim disabled (mode OFF, the default). */
+ * leaves the shim ON with the defaults above; pass MQVPN_REORDER_OFF to
+ * mqvpn_config_set_reorder_enabled() to disable it. The shim only engages once
+ * both peers advertise it (§19.3), so enabling it cannot break an older peer. */
 MQVPN_API int mqvpn_config_set_reorder_enabled(mqvpn_config_t *cfg,
                                                mqvpn_reorder_mode_t mode);
 MQVPN_API int mqvpn_config_set_reorder_wait(mqvpn_config_t *cfg, uint32_t max_wait_ms);

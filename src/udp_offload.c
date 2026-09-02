@@ -178,12 +178,12 @@ send_batch_mmsg(int fd, const struct iovec *iov, unsigned int cnt,
  * xquic can now lower its packet size: the PMTU search is per path, a path
  * starts at the size QUIC guarantees rather than inheriting the connection's,
  * and persistent congestion resets it to that base. So the oversized-packet
- * case does resolve itself, and this fallback should stop firing once the
- * search converges. What is still missing is the shortcut: nothing routes this
- * EMSGSIZE -- the kernel's own answer for the route PMTU, available
- * immediately -- into that search, which therefore has to rediscover the same
- * number over a few probe intervals. Feeding it in needs an xquic API to
- * report a path's PMTU from outside the library. */
+ * case resolves itself, and this fallback should stop firing once the search
+ * converges. The shortcut is wired up too: the client's write callbacks answer
+ * an EMSGSIZE by reading the route MTU (mqvpn_udp_route_payload_max below) and
+ * handing it to xqc_conn_set_path_pmtu, so the search is told the number
+ * instead of rediscovering it over a few probe intervals. This fallback
+ * therefore only has to cover the window before that lands. */
 static int
 gso_class_error(int e)
 {
@@ -237,6 +237,85 @@ mqvpn_udp_send_batch(int fd, const struct iovec *iov, unsigned int cnt,
         sent += (unsigned int)run;
     }
     return sent;
+}
+
+/* IP/UDP header bytes the route MTU has to cover before any QUIC payload.
+ * IPv4 options would make the v4 figure larger, but the route MTU is a
+ * property of the path and options are not, so 20 is the right assumption. */
+#  define MQVPN_IPV4_UDP_OVERHEAD (20 + 8)
+#  define MQVPN_IPV6_UDP_OVERHEAD (40 + 8)
+
+/* getsockopt(IP_MTU) on `s`, which must be connected. 0 if unavailable. */
+static size_t
+route_mtu_of_connected(int s, int family)
+{
+    int mtu = 0;
+    socklen_t len = sizeof(mtu);
+    int level = (family == AF_INET6) ? IPPROTO_IPV6 : IPPROTO_IP;
+    int optname = (family == AF_INET6) ? IPV6_MTU : IP_MTU;
+
+    if (getsockopt(s, level, optname, &mtu, &len) < 0 || mtu <= 0) {
+        return 0;
+    }
+    return (size_t)mtu;
+}
+
+size_t
+mqvpn_udp_route_payload_max(int fd, const struct sockaddr *peer, socklen_t peerlen)
+{
+    struct sockaddr_storage local;
+    socklen_t locallen = sizeof(local);
+    size_t mtu, overhead;
+    int family, probe;
+
+    if (fd < 0 || peer == NULL || peerlen == 0) {
+        return 0;
+    }
+
+    family = peer->sa_family;
+    if (family != AF_INET && family != AF_INET6) {
+        return 0;
+    }
+    overhead = (family == AF_INET6) ? MQVPN_IPV6_UDP_OVERHEAD : MQVPN_IPV4_UDP_OVERHEAD;
+
+    /* Free if the socket happens to be connected. */
+    mtu = route_mtu_of_connected(fd, family);
+
+    if (mtu == 0) {
+        if (getsockname(fd, (struct sockaddr *)&local, &locallen) < 0) {
+            return 0;
+        }
+        if (local.ss_family != family) {
+            return 0;
+        }
+
+        probe = socket(family, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+        if (probe < 0) {
+            return 0;
+        }
+
+        /* Source address decides the route, source port does not; zero the
+         * port so binding cannot collide with the live socket. */
+        if (family == AF_INET) {
+            ((struct sockaddr_in *)&local)->sin_port = 0;
+        } else {
+            ((struct sockaddr_in6 *)&local)->sin6_port = 0;
+        }
+
+        /* A bind failure is not fatal: an unbound probe still resolves the
+         * route for `peer`, just without pinning the source address. */
+        (void)bind(probe, (struct sockaddr *)&local, locallen);
+
+        if (connect(probe, peer, peerlen) == 0) {
+            mtu = route_mtu_of_connected(probe, family);
+        }
+        close(probe);
+    }
+
+    if (mtu <= overhead) {
+        return 0;
+    }
+    return mtu - overhead;
 }
 
 ssize_t

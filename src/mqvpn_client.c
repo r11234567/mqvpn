@@ -1137,6 +1137,44 @@ cb_write_socket(const unsigned char *buf, size_t size, const struct sockaddr *pe
     return res;
 }
 
+#if defined(__linux__)
+/* EMSGSIZE reports that a datagram did not fit; it does not say what would.
+ * The routing table does, and handing that number to xquic collapses the
+ * PLPMTU search from several probe intervals -- black-holing throughout -- to
+ * a single step. Best-effort throughout: when the route cannot be read the
+ * search still converges the slow way, which is the pre-existing behaviour. */
+static void
+cli_report_route_pmtu(cli_conn_t *conn, path_entry_t *p, uint64_t path_id,
+                      const struct sockaddr *peer, socklen_t peerlen)
+{
+    if (conn == NULL || conn->h3_conn == NULL || p == NULL) {
+        return;
+    }
+
+    size_t payload = mqvpn_udp_route_payload_max(p->fd, peer, peerlen);
+    if (payload == 0 || payload == p->last_pmtu_reported) {
+        return;
+    }
+
+    xqc_connection_t *xc = xqc_h3_conn_get_xqc_conn(conn->h3_conn);
+    if (xc == NULL) {
+        return;
+    }
+
+    /* Recorded even when the call below is rejected: a rejection means the
+     * path is gone or closing, and re-querying the route buys nothing. */
+    p->last_pmtu_reported = payload;
+
+    if (xqc_conn_set_path_pmtu(xc, path_id, payload) == XQC_OK) {
+        LOG_I(conn->client, "pmtu: route for path %lld carries %zu B, reported to xquic",
+              (long long)p->handle, payload);
+    } else {
+        LOG_D(conn->client, "pmtu: path %lld would not take a route report of %zu B",
+              (long long)p->handle, payload);
+    }
+}
+#endif /* __linux__ */
+
 static ssize_t
 cb_write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t size,
                    const struct sockaddr *peer, socklen_t peerlen, void *conn_user_data)
@@ -1153,6 +1191,12 @@ cb_write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t size,
     } while (res < 0 && errno == EINTR);
     if (res < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return XQC_SOCKET_EAGAIN;
+#if defined(__linux__)
+        if (errno == EMSGSIZE) {
+            cli_report_route_pmtu(conn, find_path_by_xqc_id(c, path_id), path_id, peer,
+                                  peerlen);
+        }
+#endif
         return path_send_dead_retcode(c);
     }
     c->bytes_tx += (uint64_t)res;
@@ -1200,6 +1244,14 @@ cb_write_mmsg_ex(uint64_t path_id, const struct iovec *msg_iov, unsigned int vle
               "udp-gso: runtime GSO failure (%s), sticky fallback to sendmmsg on "
               "path %lld",
               strerror(p->gso_disabled), (long long)p->handle);
+        /* EMSGSIZE specifically means our segment size exceeded this route's
+         * PMTU -- the one GSO-class errno that is a statement about packet
+         * size rather than about GSO support. The sticky fallback restores
+         * delivery by local fragmentation; this restores correctness by
+         * telling the search the real number. */
+        if (p->gso_disabled == EMSGSIZE) {
+            cli_report_route_pmtu(conn, p, path_id, peer, peerlen);
+        }
     }
     c->bytes_tx += tx.bytes;
     /* bytes attributed to the slot owning the fd actually used — deliberately
@@ -1214,6 +1266,11 @@ cb_write_mmsg_ex(uint64_t path_id, const struct iovec *msg_iov, unsigned int vle
      * from this callback can escalate to connection close; GSO-class errors
      * are absorbed by the sticky fallback in mqvpn_udp_send_batch, so this
      * branch is rare — no spam risk. */
+    /* Also reachable once GSO is already off, when the sendmmsg fallback itself
+     * hits a route too narrow for local fragmentation to paper over. */
+    if (send_errno == EMSGSIZE) {
+        cli_report_route_pmtu(conn, p, path_id, peer, peerlen);
+    }
     LOG_E(c, "batch send: %s", strerror(send_errno));
     return path_send_dead_retcode(c); /* same downgrade policy as cb_write_socket_ex */
 }
@@ -3224,6 +3281,7 @@ mqvpn_client_add_path_fd_with_outcome(mqvpn_client_t *c, int fd,
     p->fd = fd;
     /* fd numbers are kernel-recycled; reset on every assignment */
     p->gso_disabled = 0;
+    p->last_pmtu_reported = 0;
 
     /* Ensure adequate socket buffers for high-throughput UDP (ref: WireGuard) */
     int bufsize = SOCKET_BUF_SIZE;

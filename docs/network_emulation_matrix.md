@@ -542,8 +542,15 @@ is in `tests/unittest/xqc_pmtud_mp_test.c` in the xquic tree.
 may any row on a `:1400` leg — which is six of ten `combo` legs and five named
 classes. It does **not** explain §1.3.2 or §1.3.3: `homo_good` and
 `asym_capacity` both ran at default MTU, so their aggregation failures are
-still open and still unexplained. Read the next weekly before crossing anything
-off.
+still open — see §1.3.7 for what now looks like their common cause. Read the
+next weekly before crossing anything off.
+
+Since then, xquic [`0caa07c`](https://github.com/r11234567/xquic/commit/0caa07c)
+adds `xqc_conn_set_path_pmtu()` so the client can hand the search a route MTU the
+kernel already knows (from `EMSGSIZE` plus `getsockopt(IP_MTU)`) instead of
+spending several probe intervals rediscovering it, black-holing throughout. That
+shortens the window the `mtu_*` rows measure but does not change the mechanism
+being tested here.
 
 The original analysis follows.
 
@@ -624,6 +631,47 @@ flag to read instead, so every consumer has to know the sentinel by value. The
 harness now filters it (§0.4 J); the API should expose the state instead. The
 same rows show `srtt_ms: 250`, which is xquic's initial RTT default — an
 unvalidated path is indistinguishable from a 250 ms one.
+
+**1.3.7 A single mechanism would account for §1.3.2 through §1.3.5 — untested.**
+Those four are all "WLB under-uses the second path", and reading
+`xqc_scheduler_wlb.c` offers one cause for all of them.
+
+WLB weights each path by a LATE throughput estimate (`wlb_compute_weight`) whose
+only real input is cwnd, and cwnd is a function of the traffic WLB already put on
+that path. Whichever path warms first therefore wins the weight comparison, so
+`wlb_pick_pin_path` gives it the next flow, so it warms further; the loser's cwnd
+stays where an idle path's does. Pins then hold for 60 s (`WLB_FLOW_EXPIRE_US`).
+
+Two details make it stick rather than self-correct. Weights are recomputed only
+at a WRR round boundary, and a pinned flow's packets return from the flow-hit
+fast path *before* the round check runs — so with traffic pinned, deficits are
+never consumed, `wlb_needs_new_round` stays false, and the weights behind the
+split freeze at whatever transient cwnd skew existed at pin time. And the LATE
+model's multi-round cwnd-growth simulation never runs for equal-RTT paths:
+`T_us = max(max_rtt/2, srtt)` leaves exactly one iteration, so `N` collapses to
+`cwnd × (1-loss)` and the estimate is cwnd with extra steps.
+
+This predicts each of the four: no aggregation between identical paths (§1.3.2),
+multipath below the better single path when flows pin to the worse one (§1.3.3),
+a byte split that varies run to run because it depends on which path happened to
+warm first (§1.3.4, 0.126–0.338), and MinRTT — which has neither weight model nor
+pinning — aggregating where WLB does not (§1.3.5).
+
+**It is a reading of the source, not a measurement.** xquic
+[`8b9e4b5`](https://github.com/r11234567/xquic/commit/8b9e4b5) adds the counters
+to settle it, and the harness collects them under `CI_BENCH_WLB_INSTR=1`:
+
+```bash
+sudo CI_BENCH_WLB_INSTR=1 scripts/ci_benchmarks/ci_bench_scenarios.sh
+```
+
+Rows then carry `wlb_pins`, `wlb_sched`, `wlb_rounds`, `wlb_pin_minshare`,
+`wlb_sched_minshare`, `wlb_pkts_per_round` and `wlb_weight_ratio`, with
+`wlb_pin_collapse`, `wlb_sched_collapse`, `wlb_round_stall` and
+`wlb_weight_skew` findings raised when they match the prediction. Even pins with
+an advancing round counter refute it, and that outcome is worth as much as
+confirmation — it would move the search to the reorder path or to congestion
+control. No scheduler change should be made before this run exists.
 
 ### 1.4 Budget structure
 

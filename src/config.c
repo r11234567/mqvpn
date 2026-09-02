@@ -1310,7 +1310,7 @@ mqvpn_config_defaults(mqvpn_file_config_t *cfg)
     cfg->manage_routes = 1;
     cfg->udp_gso = 1;
     cfg->udp_gro = 1;
-    mqvpn_reorder_config_default(&cfg->reorder); /* §16: reorder defaults (mode OFF) */
+    mqvpn_reorder_config_default(&cfg->reorder); /* §16: reorder defaults (mode ON) */
     mqvpn_hybrid_config_default(&cfg->hybrid);   /* H1: hybrid defaults (disabled) */
     cfg->proxy_max_connections = 64;
     cfg->proxy_idle_timeout_sec = 60;

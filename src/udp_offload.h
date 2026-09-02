@@ -106,6 +106,23 @@ ssize_t mqvpn_udp_send_batch(int fd, const struct iovec *iov, unsigned int cnt,
                              const struct sockaddr *peer, socklen_t peerlen, int use_gso,
                              int *gso_disabled, mqvpn_tx_counters_t *tx);
 
+/* Largest UDP payload the kernel's route to `peer` can carry, sourced from
+ * `fd`'s local address. Returns 0 when it cannot be determined; callers must
+ * treat 0 as "no answer" and not as a limit.
+ *
+ * Answers the question an EMSGSIZE raises but does not itself answer, so that
+ * the PLPMTU search can be told the number instead of rediscovering it over
+ * several probe intervals (xqc_conn_set_path_pmtu).
+ *
+ * IP_MTU needs a connected socket, and mqvpn's path sockets are unconnected
+ * (they sendto an explicit peer). So this falls back to asking the routing
+ * table through a throwaway socket connected to the same peer from the same
+ * local address — a pure lookup that leaves the live socket's error semantics
+ * alone. Enabling IP_RECVERR on the real socket would be the other way to read
+ * this, at the cost of routing every ICMP error into the send path. */
+size_t mqvpn_udp_route_payload_max(int fd, const struct sockaddr *peer,
+                                   socklen_t peerlen);
+
 /* ── RX ─────────────────────────────────────────────────────────────── */
 
 /* mqvpn_udp_recv_segmented(): the datagram was truncated and discarded — the
