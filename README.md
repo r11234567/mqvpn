@@ -334,13 +334,13 @@ it is worth running before touching the scheduler.
 ### End-to-end fixes carried in the pinned xquic
 
 `third_party/xquic` is pinned at
-[`d41ee3c`](https://github.com/r11234567/xquic/commit/d41ee3c). Enabling the
+[`bcb7381`](https://github.com/r11234567/xquic/commit/bcb7381). Enabling the
 features above exposed transport bugs that the e2e suite caught and that had to
 be fixed in xquic rather than here:
 
 | xquic commit | What it fixes |
 |---|---|
-| [d41ee3c](https://github.com/r11234567/xquic/commit/d41ee3c) | **A converged PMTU search never reopened**, so a path MTU that *grew* mid-connection was never found and a long-lived connection kept the size it first settled on. Convergence now rearms the probing timer as RFC 8899 §5.3's PMTU_RAISE_TIMER (600 s). The reopen raises only the search's ceiling, not the size in use, so it costs probe packets and no throughput. |
+| [bcb7381](https://github.com/r11234567/xquic/commit/bcb7381) | **A converged PMTU search never reopened**, so a path MTU that *grew* mid-connection was never found and a long-lived connection kept the size it first settled on. Convergence now rearms the probing timer as RFC 8899 §5.3's PMTU_RAISE_TIMER (600 s). The reopen raises only the search's ceiling, not the size in use, so it costs probe packets and no throughput. Also fixes an error-code collision: `XQC_EAEAD_LIMIT` shared the value 623 with `XQC_ESTREAM_NFOUND`, so an AEAD-integrity-limit close and a stream-not-found were indistinguishable to a caller comparing codes. |
 | [8b9e4b5](https://github.com/r11234567/xquic/commit/8b9e4b5) | **WLB instrumentation**, no behaviour change: per-path pin/packet/round counters emitted once a second, with the three per-packet log statements dropped to DEBUG so measuring the split does not move it. Read by `CI_BENCH_WLB_INSTR=1`; see [the aggregation numbers](#what-the-scheduler-numbers-still-do-not-explain). |
 | [0caa07c](https://github.com/r11234567/xquic/commit/0caa07c) | **`xqc_conn_set_path_pmtu()`**, so a path MTU the kernel already knows can be handed to the PLPMTU search instead of being rediscovered over several probe intervals. Also drops the request-cancellation log path from ERROR to DEBUG — see [the log noise](#the-loudest-line-in-the-log-was-not-an-error). |
 | [6ba4261](https://github.com/r11234567/xquic/commit/6ba4261) | **WLB's PTO guard could exclude the last usable path**, so nothing was sent at all and the ACK that would have cleared the guard could never arrive. See [the three-minute stall](#the-three-minute-stall-wlb-locked-out-the-last-path). |
