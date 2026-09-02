@@ -328,8 +328,18 @@ needed to settle it — pins, packets and rounds per path, once a second — and
 sudo CI_BENCH_WLB_INSTR=1 scripts/ci_benchmarks/ci_bench_scenarios.sh
 ```
 
-Even pins with an advancing round counter would refute the reading, which is why
-it is worth running before touching the scheduler.
+Run 33621937964 carried them, on 78 rows, and split the reading in two. The
+mechanism is real: on two identical unshaped legs the pins came out 2:13, 12:3
+and 8:43, and the weights between those same legs differed 2.4×–10.4×. Fixed in
+xquic [`4de3bb8`](https://github.com/r11234567/xquic/commit/4de3bb8) by pinning
+each flow to the path furthest below its weight-entitled share.
+
+But it is not what caps the throughput. At 16 streams `homo_good`'s weight ratio
+fell to 1.04 and its packet split improved to 0.28, and its aggregation did not
+move — 0.531 to 0.529. With the mechanism largely gone the deficit is unchanged,
+so the scheduler's split was never the bottleneck for that scenario. What is
+still open is in `docs/network_emulation_matrix.md` §1.3.7: two legs each shaped
+at 150 Mbit, zero loss, both carried, neither saturated, and 140 Mbps total.
 
 Two details of the collection are load-bearing, and both were wrong on the first
 attempt. The counters are read from the **server** log: every measurement is
@@ -366,12 +376,13 @@ the first place.
 ### End-to-end fixes carried in the pinned xquic
 
 `third_party/xquic` is pinned at
-[`54f98ef`](https://github.com/r11234567/xquic/commit/54f98ef). Enabling the
+[`4de3bb8`](https://github.com/r11234567/xquic/commit/4de3bb8). Enabling the
 features above exposed transport bugs that the e2e suite caught and that had to
 be fixed in xquic rather than here:
 
 | xquic commit | What it fixes |
 |---|---|
+| [4de3bb8](https://github.com/r11234567/xquic/commit/4de3bb8) | **WLB pinned flows by deficit, which is downstream of its own traffic.** Measured on two identical unshaped legs: pins 2:13, 12:3, 8:43, and weights 2.4x-10.4x apart. Deficit derives from the LATE weight, the weight from cwnd, and cwnd from the traffic the scheduler already put there, so pinning to it closed a loop. Pins now go to the path furthest below its weight-entitled share of flows. Does not change throughput -- see [the scheduler numbers](#what-the-scheduler-numbers-still-do-not-explain). |
 | [e1abe04](https://github.com/r11234567/xquic/commit/e1abe04) · [77ede10](https://github.com/r11234567/xquic/commit/77ede10) · [54f98ef](https://github.com/r11234567/xquic/commit/54f98ef) | **The WLB counters emitted nothing**, so the first instrumented netsim run came back with `wlb_instr: no_lines` on all 22 rows. They were logged at xquic INFO, and mqvpn deliberately maps its own INFO to xquic WARN to keep per-packet traffic out of the log, so xquic's own filter dropped the line before the callback. Moved to the REPORT statistics channel, which passes any level — and `77ede10` then had to give the unit-test fixture logs a callback sink, since REPORT is level 0 and so passes their filter too, where `xqc_log_implement()` dereferenced their NULL `log_callbacks`. And `54f98ef` fixed the last reason they stayed empty: `%lld` is not a specifier xquic's own `xqc_vsprintf` knows, so the line rendered `deficit:19ld|` and the parser matched nothing. Do not bisect onto `e1abe04` or `77ede10` alone. |
 | [bcb7381](https://github.com/r11234567/xquic/commit/bcb7381) | **A converged PMTU search never reopened**, so a path MTU that *grew* mid-connection was never found and a long-lived connection kept the size it first settled on. Convergence now rearms the probing timer as RFC 8899 §5.3's PMTU_RAISE_TIMER (600 s). The reopen raises only the search's ceiling, not the size in use, so it costs probe packets and no throughput. Also fixes an error-code collision: `XQC_EAEAD_LIMIT` shared the value 623 with `XQC_ESTREAM_NFOUND`, so an AEAD-integrity-limit close and a stream-not-found were indistinguishable to a caller comparing codes. |
 | [8b9e4b5](https://github.com/r11234567/xquic/commit/8b9e4b5) | **WLB instrumentation**, no behaviour change: per-path pin/packet/round counters emitted once a second, with the three per-packet log statements dropped to DEBUG so measuring the split does not move it. Read by `CI_BENCH_WLB_INSTR=1`; see [the aggregation numbers](#what-the-scheduler-numbers-still-do-not-explain). |

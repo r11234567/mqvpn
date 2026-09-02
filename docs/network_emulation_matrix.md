@@ -726,6 +726,44 @@ above the comparison.
 The two findings that *do* reproduce in both arms are §1.3.2's efficiency and
 §1.3.4's split — and the stream-count reading above accounts for both.
 
+**Run 33621937964 finally carried counters (78 rows), and they settle §1.3.7 —
+against both readings recorded above.**
+
+What the counters confirm. On two identical unshaped legs the pin split came out
+2:13, 12:3 and 8:43 — a minority share of 0.13–0.21 against the 0.5 intended, in
+every tier row, at 4 and 16 inner streams alike. The LATE weights between those
+same identical legs differed by 2.4× to 10.4×. So the mechanism §1.3.7 describes
+is real and is now measured, not inferred: the weight tracks cwnd, cwnd tracks
+the traffic the scheduler itself assigned, and pinning to the resulting deficit
+closed the loop. Fixed in xquic
+[`4de3bb8`](https://github.com/r11234567/xquic/commit/4de3bb8), which assigns
+each flow to the path furthest below its weight-entitled share of flows.
+
+What the counters refute — and this is the part that matters for §1.3.2. At 16
+streams `homo_good`'s weight ratio fell to **1.04** and its packet split improved
+to 0.28, with rounds turning over three times faster (128 → 38 packets per
+round). Its aggregation did not move: **0.531 → 0.529**, 137.5 → 140.3 Mbps. With
+the mechanism largely absent the deficit is unchanged, so the scheduler's split
+is not what caps that scenario. §1.3.7's mechanism is a real defect that was
+never the throughput bottleneck.
+
+The stream-count reading recorded above is refuted too, by the same row:
+`homo_good` at 16 streams stayed at 0.529, not the 0.85 predicted. And the
+narrower claim that multipath has a ceiling single-path lacks does not survive
+either — across 38 scenario pairs the median 4→16 scaling was ×1.23 solo against
+×1.44 multipath, and of the 18 scenarios whose best solo scaled past 1.5×, 16 saw
+multipath scale past 1.5× as well.
+
+**What is left, stated as the open question rather than an answer.** `homo_good`
+is two `eth:bgp_opt:public` legs, each shaped at `rate 150mbit` in its own hop
+namespace — 300 Mbit available. It delivers 140. At 16 streams: zero `pkt_lost`,
+97 lost datagrams out of 1.41 M, both paths carrying traffic at a 72/28 split,
+and neither path near its own 150 Mbit cap (the busier one runs at ~101 Mbps).
+Nothing is lost, both paths are used, neither is saturated, and the total still
+sits at one path's worth. `rtt_inflation` is 3.2 (srtt 240 ms against a 75 ms
+floor), which says something between the two ends is queueing deeply without
+ever dropping. That is the next thing to chase, and it is not the scheduler.
+
 **The first instrumented run (33595998135) produced no counters at all** —
 `wlb_instr: no_lines` on all 22 rows — so §1.3.7 is still untested. Two causes,
 both since fixed: the line was emitted at xquic INFO while mqvpn maps its own
