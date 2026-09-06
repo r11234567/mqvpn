@@ -19,10 +19,27 @@ on:
       netsim_modes:
         description: >-
           Comma-separated netsim modes to narrow to (e.g. "classes,sched,tiers").
-          Leave EMPTY for the full set of 11, which is what the schedule runs and
+          Leave EMPTY for the full set of 14, which is what the schedule runs and
           what any conclusion about coverage needs.
         required: false
         default: ''
+      skip_core:
+        description: >-
+          Skip the core benchmark job (raw throughput, failover, aggregation,
+          multipath scheduler, UDP sweep, NTN, backup FEC) and run only the
+          netsim matrix. Narrowing `netsim_modes` alone does NOT make a dispatch
+          faster: the netsim modes run as parallel jobs whose longest is about
+          31 minutes, while the core job takes 57 and sets the whole dispatch's
+          wall clock on its own — run 34026833126 finished in exactly the core
+          job's 57 minutes with that day's 11 netsim modes hidden inside it.
+          Use this together with `netsim_modes` when the question is about a
+          netsim mode, which turns an hour into roughly 20 minutes. Leave it
+          OFF for anything
+          published as a series: the core numbers are what the dashboard tracks,
+          and a run missing them is not comparable with one that has them.
+        required: false
+        type: boolean
+        default: false
       arms:
         description: >-
           A/B arms, run as parallel matrix jobs in THIS one dispatch so every
@@ -70,6 +87,12 @@ concurrency:
 
 jobs:
   perf-weekly:
+    # The schedule always runs this; only a dispatch that explicitly asked to
+    # skip it does not. `github.event.inputs` is null outside workflow_dispatch,
+    # so the comparison is false on a schedule and the job runs -- which is the
+    # behaviour that matters, since the series must never silently lose its
+    # core numbers.
+    if: github.event.inputs.skip_core != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -209,7 +232,7 @@ jobs:
   # Builds the netsim matrix as modes x arms. A static matrix can be neither
   # narrowed nor doubled by an input, and both are wanted:
   #
-  #   - The full 11 modes are the default, because a conclusion about coverage
+  #   - The full 14 modes are the default, because a conclusion about coverage
   #     needs all of them. `netsim_modes` only narrows, and only on a dispatch.
   #   - `arms` runs the same modes twice in ONE dispatch, as parallel jobs. An
   #     A/B done as two dispatches is not just slower, it is weaker: these
@@ -470,6 +493,22 @@ jobs:
         with:
           pattern: netsim-*
           path: ab
+
+      # Say so in the summary itself when the core benchmarks were skipped.
+      # Otherwise a fast dispatch produces a summary that looks exactly like a
+      # full weekly minus a few tables, and the absence is easy to read as "the
+      # core numbers regressed to nothing" rather than "they were not run".
+      - name: Note a partial dispatch
+        if: github.event.inputs.skip_core == 'true'
+        run: |
+          {
+            echo "> **Partial dispatch:** \`skip_core\` was set, so the core"
+            echo "> benchmarks (raw throughput, failover, aggregation, multipath"
+            echo "> scheduler, UDP sweep, NTN, backup FEC) did NOT run. Only the"
+            echo "> netsim matrix below was measured. Do not compare this run"
+            echo "> against the published series."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Compare arms
         run: |
