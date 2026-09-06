@@ -1,0 +1,6 @@
+- Android trusts the system CA store, and TLS to an IP address now
+  checks that address against the certificate's IP SANs.
+- The device log is viewable in the app, with filtering.
+- Normal stream teardown is no longer logged as an error, and printed
+  strings stay ASCII so they survive a CP936 console.
+- Path MTU discovery retries after a black hole clears, per path.
