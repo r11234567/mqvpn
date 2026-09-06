@@ -9,6 +9,14 @@
 #   sudo ./ci_bench_scenarios.sh combo              [mqvpn]
 #   sudo ./ci_bench_scenarios.sh catalog <transit>  [mqvpn]
 #   sudo ./ci_bench_scenarios.sh special            [mqvpn]
+#   sudo ./ci_bench_scenarios.sh quic               [mqvpn]
+#   sudo ./ci_bench_scenarios.sh game               [mqvpn]
+#   sudo ./ci_bench_scenarios.sh vps                [mqvpn]
+#
+# The last three carry INNER traffic that is not TCP. Every other mode measures
+# iperf3 TCP through the tunnel, which for a QUIC proxy leaves the protocol most
+# of its traffic actually is unmeasured -- and leaves wlb and wlb_udp_pin
+# indistinguishable, since they differ only on inner UDP.
 #
 # Paths are built by ci_bench_netsim.sh as access-leg + transit-leg chains;
 # see docs/network_emulation_matrix.md for why the matrix is sampled this way
@@ -30,6 +38,10 @@ source "${SCRIPT_DIR}/ci_bench_env.sh"
 source "${SCRIPT_DIR}/ci_bench_netsim.sh"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/ci_bench_host.sh"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/ci_bench_sampler.sh"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/ci_bench_quic.sh"
 
 MODE="${1:-percommit}"
 case "$MODE" in
@@ -623,9 +635,280 @@ emit(out)
 " "$CI_BENCH_SERVER_LOG" "${CI_BENCH_SERVER_LOG_MARK:-0}"
 }
 
+# Oscillation shape of a per-second rate series, plus the header-overhead ratio.
+#
+# The question: does the rate hold steady, or does it swing? Nested congestion
+# control -- an outer retransmit inflating the inner connection's RTT until the
+# inner stack also backs off, then both ramping together -- produces a mean that
+# looks ordinary and a shape that does not. Every row in this artifact was one
+# scalar before now, so that shape had nowhere to appear.
+#
+# Peak-to-trough ratio rather than an absolute swing, because it is a
+# WITHIN-row quantity. Run 34019491401 vs 34026833126 measured the same
+# single-path control rows 13% apart at the median and 129% apart at worst, so
+# any metric compared across runs is unreadable at this repeat count; a ratio
+# computed inside one measurement is not.
+#
+# Two conditions, not one: a large ratio ALONE is also what a single stall
+# looks like, so a period must be detectable in the autocorrelation before this
+# is called oscillation. One dropout is not a sine wave.
+#
+# What this does NOT show: the inner connection's RTT. The series is the outer
+# tunnel's wire rate; inner behaviour is INFERRED from outer retransmit landing
+# beside a trough. The finding text says "inferred" for that reason.
+collect_oscillation() {
+    [ "${CI_BENCH_SAMPLE:-0}" = "1" ] || return 0
+    [ -n "${SAMPLED_JSON:-}" ] || return 0
+
+    python3 -c '
+import json, sys
+
+frag = sys.argv[1]
+try:
+    samp = json.loads("{" + frag.lstrip(",") + "}")
+except Exception:
+    print(",\"osc\":\"unparsed\"")
+    raise SystemExit(0)
+
+s = samp.get("samp_tx_mbps_series") or []
+out = {}
+
+# Drop the first tick: it covers the interval in which the transfer started, so
+# it is a partial window and always reads low. Counting it would manufacture a
+# trough at t=0 in every single row.
+s = [float(x) for x in s[1:] if isinstance(x, (int, float))]
+
+if len(s) < 6:
+    # Too short for a period to mean anything. Named rather than silently
+    # omitted, so a missing osc column is never mistaken for a flat series.
+    out["osc"] = "too_short"
+    out["osc_ticks"] = len(s)
+    print("," + ",".join(json.dumps(k) + ":" + json.dumps(v)
+                         for k, v in out.items()))
+    raise SystemExit(0)
+
+n = len(s)
+mean = sum(s) / n
+out["osc"] = "ok"
+out["osc_ticks"] = n
+out["osc_mean_mbps"] = round(mean, 2)
+
+if mean <= 0:
+    out["osc"] = "no_throughput"
+    print("," + ",".join(json.dumps(k) + ":" + json.dumps(v)
+                         for k, v in out.items()))
+    raise SystemExit(0)
+
+var = sum((x - mean) ** 2 for x in s) / n
+sd = var ** 0.5
+out["osc_cv_pct"] = round(100.0 * sd / mean, 1)
+
+# Percentiles, not raw min/max: one scheduling hiccup on a shared runner
+# should not define the amplitude of a claimed oscillation.
+srt = sorted(s)
+p10 = srt[max(0, int(0.10 * (n - 1)))]
+p90 = srt[min(n - 1, int(0.90 * (n - 1)))]
+out["osc_p10_mbps"] = round(p10, 2)
+out["osc_p90_mbps"] = round(p90, 2)
+out["osc_peak_trough_ratio"] = round(p90 / p10, 2) if p10 > 0 else None
+
+# Autocorrelation against the WHOLE-SERIES mean with a fixed normaliser (the
+# textbook estimator), rather than re-centering each shifted window on its own
+# mean.
+#
+# Re-centering was the first attempt and it was wrong: a monotonic ramp then
+# scored r = 1.0 at every lag, because each half of a straight line correlates
+# perfectly with the other half once both are separately de-meaned. A ramp is a
+# trend, not an oscillation, and it was duly reported as "oscillating" with a
+# 9x peak-to-trough ratio. The fixed-mean estimator instead drives a trend
+# toward negative correlation at long lags, which is what separates the two
+# shapes.
+#
+# A period is only accepted at a LOCAL MAXIMUM of the correlogram. The first
+# attempt took the global maximum over all lags, which on a period-6 sine
+# returned 12: the second harmonic scores just as highly, and reporting twice
+# the true period would make the number worse than useless for lining an
+# oscillation up against an RTT.
+den = sum((x - mean) ** 2 for x in s)
+acf = {}
+if den > 0:
+    for lag in range(1, max(2, n // 2) + 1):
+        num = sum((s[i] - mean) * (s[i + lag] - mean)
+                  for i in range(n - lag))
+        acf[lag] = num / den
+
+best_lag, best_r = None, 0.0
+for lag in sorted(acf):
+    r = acf[lag]
+    # Interior local maximum, so the fundamental is found before its
+    # harmonics. Lag 1 is excluded: adjacent samples of anything smooth
+    # correlate, which says nothing about periodicity.
+    prev = acf.get(lag - 1)
+    nxt = acf.get(lag + 1)
+    if lag < 2 or prev is None or nxt is None:
+        continue
+    if r > prev and r >= nxt and r > best_r:
+        best_r, best_lag = r, lag
+
+out["osc_autocorr_r"] = round(best_r, 3)
+out["osc_autocorr_period_s"] = best_lag
+# The trend term, reported so a rising or falling transfer is legible as such
+# rather than hidden inside the amplitude figures. Spearman-style sign
+# agreement against time, which needs no numpy.
+mid = n // 2
+first_half = sum(s[:mid]) / mid
+last_half = sum(s[n - mid:]) / mid
+out["osc_trend_ratio"] = (round(last_half / first_half, 2)
+                          if first_half > 0 else None)
+
+# Both conditions. Thresholds are deliberately blunt -- a 2x swing between the
+# 10th and 90th percentile is not subtle, and r >= 0.5 at some lag means the
+# swing recurs. Anything milder is reported as numbers without a verdict.
+ratio = out.get("osc_peak_trough_ratio")
+out["osc_verdict"] = (
+    "oscillating" if (ratio and ratio >= 2.0 and best_r >= 0.5) else
+    "unstable"    if (ratio and ratio >= 2.0) else
+    "steady")
+
+print("," + ",".join(json.dumps(k) + ":" + json.dumps(v)
+                     for k, v in out.items()))
+' "$SAMPLED_JSON" 2>/dev/null || printf '%s' ',"osc":"failed"'
+}
+
+# Wire-to-app byte ratio: what the outer tunnel costs to carry the inner flow.
+#
+# The specific worry with inner QUIC is its pure-ACK datagrams -- a few tens of
+# bytes of inner payload, each wrapped in an outer QUIC DATAGRAM plus UDP/IP.
+# Connection bytes_tx is APP bytes (mqvpn_server.c:3378 assigns
+# total_app_bytes), while per-path bytes_tx and pkt_sent are wire-side
+# (libmqvpn.h:328), so the ratio needs no new counters.
+collect_overhead() {
+    local status
+    status="$(netsim_query_control get_status)"
+    python3 -c '
+import json, sys
+
+def load(s):
+    try:
+        return json.loads(s)
+    except Exception:
+        return {}
+
+st = load(sys.argv[1])
+out = {}
+clients = st.get("clients") or []
+if not clients:
+    print(",\"overhead\":\"no_client\"")
+    raise SystemExit(0)
+
+cl = clients[0]
+app = (cl.get("bytes_tx") or 0) + (cl.get("bytes_rx") or 0)
+paths = cl.get("paths") or []
+wire = sum((p.get("bytes_tx") or 0) + (p.get("bytes_rx") or 0) for p in paths)
+pkts = sum((p.get("pkt_sent") or 0) + (p.get("pkt_recv") or 0) for p in paths)
+
+out["overhead"] = "ok"
+out["overhead_app_bytes"] = app
+out["overhead_wire_bytes"] = wire
+if app > 0:
+    out["overhead_wire_app_ratio"] = round(wire / app, 3)
+else:
+    # A tunnel that carried no app bytes has no ratio. Saying so beats
+    # publishing a division by zero as though it were 1.0.
+    out["overhead"] = "no_app_bytes"
+if pkts > 0:
+    out["overhead_bytes_per_pkt"] = round(wire / pkts, 1)
+
+print("," + ",".join(json.dumps(k) + ":" + json.dumps(v)
+                     for k, v in out.items()))
+' "$status" 2>/dev/null || printf '%s' ',"overhead":"failed"'
+}
+
+# What the box actually looked like, as observed rather than as intended.
+#
+# The target profile is a 1-vCPU VPS with one VirtIO RX queue, one TX queue,
+# RPS disabled, and IRQ/NET_RX on CPU0. Three of those four need no emulation:
+# a veth pair is created with exactly one rx and one tx queue, rps_cpus reads
+# all-zero unless something writes it, and NET_RX lands on CPU0 already. So
+# this records them instead of pretending to have arranged them -- a row that
+# claims an emulation it did not perform is worse than one that admits the
+# default happened to match.
+#
+# What CANNOT be reproduced from inside a guest, and is named on the row rather
+# than quietly omitted: VirtIO interrupt coalescing, and hypervisor steal time.
+# (/proc/stat does report a steal figure, but on a GitHub runner that is the
+# RUNNER being descheduled by its own host, not the emulated tier.)
+collect_host_profile() {
+    local dev="$1"
+    python3 -c "
+import json, os, sys
+
+dev = sys.argv[1]
+base = '/sys/class/net/%s' % dev
+out = {}
+
+def read(path):
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+try:
+    qs = os.listdir(base + '/queues')
+    out['host_rx_queues'] = sum(1 for q in qs if q.startswith('rx-'))
+    out['host_tx_queues'] = sum(1 for q in qs if q.startswith('tx-'))
+except OSError:
+    out['host_queues'] = 'unreadable'
+
+rps = read(base + '/queues/rx-0/rps_cpus')
+if rps is not None:
+    out['host_rps_cpus'] = rps
+    # All-zero (allowing for the comma grouping) means RPS is off.
+    out['host_rps_enabled'] = any(c not in '0,' for c in rps)
+
+out['host_nproc'] = os.cpu_count()
+out['host_tier'] = os.environ.get('CI_BENCH_TIER') or 'untiered'
+out['host_not_emulated'] = ('virtio interrupt coalescing; hypervisor steal '
+                            'time (a guest cannot reproduce either, and the '
+                            'steal figure in /proc/stat is the runner being '
+                            'descheduled, not this tier)')
+print(',' + ','.join(json.dumps(k) + ':' + json.dumps(v)
+                     for k, v in out.items()))
+" "$dev" 2>/dev/null || printf '%s' ',"host_profile":"failed"'
+}
+
+# Peak RSS of the mqvpn server, in KB.
+#
+# _CB_SERVER_PID is not always the server: under a tier, ci_bench_start_server
+# splices `systemd-run --scope` ahead of the binary (ci_bench_env.sh:258), so
+# the recorded pid belongs to systemd-run and its VmHWM is a few MB of systemd
+# rather than the server's footprint. ci_bench_env.sh:427 documents the same
+# mismatch for the kill path. Every tier row published before this read
+# systemd-run's high-water mark and called it the server's, which is precisely
+# the column the vps mode leans on.
+#
+# Resolve through the cgroup when tiered: the scope holds exactly one mqvpn.
 server_rss_kb() {
-    [ -n "${_CB_SERVER_PID:-}" ] || { echo 0; return; }
-    awk '/VmHWM/{print $2}' "/proc/${_CB_SERVER_PID}/status" 2>/dev/null || echo 0
+    local pid="${_CB_SERVER_PID:-}"
+    [ -n "$pid" ] || { echo 0; return; }
+
+    if [ -n "${CI_BENCH_TIER:-}" ]; then
+        local kid
+        # pgrep is bounded to this scope's descendants, so a stray mqvpn from
+        # another namespace cannot be picked up.
+        kid="$(pgrep -P "$pid" -x mqvpn 2>/dev/null | head -1 || true)"
+        # One more level: systemd-run -> ip netns exec -> mqvpn.
+        if [ -z "$kid" ]; then
+            local mid
+            mid="$(pgrep -P "$pid" 2>/dev/null | head -1 || true)"
+            [ -n "$mid" ] && kid="$(pgrep -P "$mid" -x mqvpn 2>/dev/null \
+                                    | head -1 || true)"
+        fi
+        [ -n "$kid" ] && pid="$kid"
+    fi
+
+    awk '/VmHWM/{print $2}' "/proc/${pid}/status" 2>/dev/null || echo 0
 }
 
 start_server_with_ctrl() {
@@ -1036,6 +1319,339 @@ print(json.dumps(row))" \
     done
 }
 
+# ── scenario: inner QUIC over the tunnel ──────────────────────────────────
+#
+# Everything else in this harness measures inner TCP. mqvpn is a QUIC proxy, so
+# the protocol most of its traffic actually is has never been measured under
+# load -- which means a TCP-specific pathology and a general tunnel one are
+# indistinguishable in every artifact published so far. Run 34026833126 made
+# that concrete: nat_split put two identical 88 Mbps legs together and got 56,
+# with the send side draining on 100% of passes, so nothing downstream of the
+# scheduler was the constraint. Inner TCP collapsing under cross-path reorder
+# is the leading explanation and cannot be confirmed while only TCP is measured.
+#
+# The second reason: wlb vs wlb_udp_pin is defined entirely on inner UDP
+# (flow_sched.c:61 pins UDP only when udp_pin is set; TCP is pinned either
+# way). For inner TCP the two schedulers are byte-for-byte identical, so the
+# README trade-off between them has never had a measurement behind it. These
+# rows are the first that can separate them.
+#
+# On the oscillation column: what is sampled is the OUTER tunnel wire rate. The
+# inner connection RTT is not observed here and is INFERRED. See
+# collect_oscillation and ci_bench_quic.sh.
+run_quic() {
+    local class="$1" sched="${2:-$CI_BENCH_SCHEDULER}"
+    local spec="${NETSIM_CLASS[$class]:-}"
+    [ -n "$spec" ] || { echo "unknown class $class" >&2; return 1; }
+
+    echo ""
+    echo "── quic ${class} (scheduler=${sched}) ──"
+    ci_bench_stop_vpn 2>/dev/null || true
+    netsim_setup 2 >/dev/null || return 1
+    netsim_apply_path 0 "${spec%%|*}" 4242 || { netsim_teardown; return 1; }
+    netsim_apply_path 1 "${spec##*|}" 4252 || { netsim_teardown; return 1; }
+
+    if ! start_server_with_ctrl "$sched" >/dev/null; then
+        skip_row "quic_${class}" setup_failed
+        netsim_teardown
+        return 1
+    fi
+
+    local dev0 dev1 st=ok
+    dev0="$(netsim_veth_cli 0)"; dev1="$(netsim_veth_cli 1)"
+
+    # Multipath only. The solo legs are what run_pair already measures for TCP,
+    # and a QUIC row costs a 20 MiB transfer -- tripling that to restate a
+    # comparison the TCP rows already carry would buy nothing.
+    if ! ci_bench_start_client "--path $dev0 --path $dev1" >/dev/null 2>&1; then
+        st=client_start_failed
+    elif ! ci_bench_wait_tunnel "$TUNNEL_WAIT_SEC" >/dev/null 2>&1; then
+        st=tunnel_never_up
+    fi
+
+    local stats="" rss=0 gp="NA" qst="not_run"
+    if [ "$st" = ok ]; then
+        ci_bench_mark_server_log
+        sampler_start "$NETSIM_NS_SERVER" "$(netsim_veth_srv 0)"
+
+        # Globals, never $( ) -- ci_bench_quic_transfer starts a background
+        # server and records its pid, which a subshell would take with it.
+        ci_bench_quic_transfer "$TUNNEL_SERVER_IP"
+        gp="$QUIC_GOODPUT"; qst="$QUIC_STATUS"
+
+        sampler_stop
+        stats="$(collect_stats)"; rss="$(server_rss_kb)"
+        stats="${stats}$(collect_wlb_instr)$(collect_send_supply)"
+        stats="${stats}$(collect_sampler)$(collect_oscillation)$(collect_overhead)"
+    fi
+
+    ci_bench_stop_vpn
+
+    python3 -c "
+import json, os, sys
+
+class_, sched, gp, qst = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+rss, extra, st = int(sys.argv[5]), sys.argv[6], sys.argv[7]
+pin = sys.argv[8]
+
+row = {
+  'scenario': class_,
+  'mode_family': 'quic',
+  'inner_proto': 'quic_h3',
+  'scheduler': sched,
+  'arm': os.environ.get('CI_BENCH_ARM') or 'default',
+  'arm_reorder': os.environ.get('CI_BENCH_REORDER') or 'default',
+  'picoquic_pin': pin,
+  'server_rss_peak_kb': rss,
+  'status': st,
+  'quic_status': qst,
+}
+
+# NA is a sentinel, never 0: a transfer that failed and one that genuinely
+# carried nothing are different findings, and the report filters the sentinel
+# rather than averaging it in.
+row['quic_goodput_mbps'] = None if gp == 'NA' else float(gp)
+
+if extra:
+    row.update(json.loads('{' + extra + '}'))
+
+f = []
+if row.get('osc_verdict') == 'oscillating':
+    f.append('nested_cc_oscillation: outer wire rate swung %.1fx between its '
+             '10th and 90th percentile with a %ss period -- consistent with '
+             'inner and outer congestion control backing off together. The '
+             'inner RTT is INFERRED from the outer series, not measured.'
+             % (row.get('osc_peak_trough_ratio') or 0,
+                row.get('osc_autocorr_period_s')))
+elif row.get('osc_verdict') == 'unstable':
+    f.append('quic_rate_unstable: outer wire rate swung %.1fx with no '
+             'detectable period -- a stall or a trend rather than an '
+             'oscillation' % (row.get('osc_peak_trough_ratio') or 0))
+ratio = row.get('overhead_wire_app_ratio')
+if ratio is not None and ratio >= 1.5:
+    f.append('quic_encap_overhead: %.2f wire bytes per app byte' % ratio)
+if row.get('samp_sndbuf_errors'):
+    f.append('quic_sndbuf_blocked: %d socket-buffer refusals during the run'
+             % row['samp_sndbuf_errors'])
+if qst not in ('ok',):
+    f.append('quic_transfer_incomplete: %s' % qst)
+row['findings'] = f
+row['finding_count'] = len(f)
+print(json.dumps(row))" \
+        "$class" "$sched" "$gp" "$qst" "$rss" "$stats" "$st" \
+        "${CI_BENCH_QUIC_PIN:-unknown}" >> "$ROWS"
+
+    echo "   quic ${gp} Mbps [${qst}] ${st}"
+    emit_results
+    netsim_teardown
+}
+
+# ── scenario: game proxy, single path, small packets ──────────────────────
+#
+# The workload this models: an optimized single-path proxy carrying a game.
+# Euro Truck Simulator 2 is the reference -- a few 1400-byte openers, then a
+# continuous stream of 10-50 byte updates at high frequency, never more than a
+# few hundred kbit/s. Bandwidth cannot be the constraint at that rate, so
+# throughput is NOT the measurement here and no *_mbps field from these rows
+# enters the report's METRIC_FIELDS. What binds is latency and per-packet
+# handling cost.
+#
+# Scheduler: wlb_udp_pin, set at MODE scope rather than per row. Every other
+# mode passes the scheduler to the server only (all four ci_bench_start_client
+# call sites omit it), which is defensible while every measurement is a DL bulk
+# transfer -- the server schedules the payload and the client only schedules
+# returning ACKs (ci_bench_env.sh:53). Game traffic is bidirectional and small
+# in both directions, so the client's scheduler stops being irrelevant and both
+# ends have to agree.
+#
+# What this does and does not test: on ONE path, wlb_udp_pin cannot change
+# which path is chosen, because there is no choice. What it changes is which
+# code path runs -- flow_sched.c:61 pins UDP only when udp_pin is set, so this
+# exercises the pinned datagram lane and XQC_DATA_QOS_HIGH instead of unpinned
+# WRR. Read these rows as a test of that lane, not of path selection.
+#
+# The criterion is added latency against the SAME tier measured without the
+# tunnel. Both halves come from one scenario setup, so the difference is a
+# within-run quantity: run 34019491401 vs 34026833126 disagreed by 13% at the
+# median on control rows that neither run could have affected, so anything
+# compared across runs at this repeat count is not a result.
+run_game() {
+    local tier="$1" pps="$2"
+    local scenario="${tier}_${pps}pps"
+
+    echo ""
+    echo "── game ${tier} @ ${pps} pps ──"
+    ci_bench_stop_vpn 2>/dev/null || true
+    netsim_setup 1 >/dev/null || return 1
+    # Single path expressed procedurally, following run_catalog. It cannot go in
+    # NETSIM_CLASS: ${spec%%|*} and ${spec##*|} both return the whole string
+    # when there is no '|', so a single-leg entry there silently becomes a
+    # duplicated pair rather than one path.
+    netsim_apply_path 0 "eth:${tier}:public" 4242 || { netsim_teardown; return 1; }
+
+    # ETS2-shaped: 50-byte payload at a fixed packet rate. -b takes bits/sec,
+    # so pps x bytes x 8 pins the rate; iperf3's own sequence numbers give
+    # loss and reorder end to end, independent of mqvpn's reorder engine
+    # (which is off by default, so its counters would read zero for the wrong
+    # reason).
+    local pkt_len=50
+    local target_bw=$(( pps * pkt_len * 8 ))
+    local dur="${CI_BENCH_GAME_SEC:-20}"
+
+    CI_BENCH_IPERF_LEN="$pkt_len"
+    CI_BENCH_IPERF_INTERVAL=1
+
+    # ── Baseline: the same emulated tier, no tunnel ──
+    # Bare path via IP_A_SERVER_ADDR, the pattern ci_bench_raw_throughput.sh:73
+    # uses. This is what makes added_p99 a difference rather than an absolute.
+    CI_BENCH_IPERF_TARGET="$IP_A_SERVER_ADDR"
+    local base_jf base_q base_j
+    base_jf="$(ci_bench_run_iperf UDP DL "$dur" 1 "$target_bw")"
+    base_q="$(ci_bench_parse_udp_quality "$base_jf")"
+    base_j="$(ci_bench_parse_udp_jitter_p99 "$base_jf")"
+    rm -f "$base_jf"
+    CI_BENCH_IPERF_TARGET=""
+
+    # ── Through the tunnel ──
+    if ! start_server_with_ctrl "$CI_BENCH_SCHEDULER" >/dev/null; then
+        CI_BENCH_IPERF_LEN=""; CI_BENCH_IPERF_INTERVAL=""
+        skip_row "$scenario" setup_failed
+        netsim_teardown
+        return 1
+    fi
+
+    local st=ok
+    if ! ci_bench_start_client "--path $(netsim_veth_cli 0)" >/dev/null 2>&1; then
+        st=client_start_failed
+    elif ! ci_bench_wait_tunnel "$TUNNEL_WAIT_SEC" >/dev/null 2>&1; then
+        st=tunnel_never_up
+    fi
+
+    local tun_q="NA NA NA NA NA" tun_j="NA NA"
+    local stats="" rss=0
+    if [ "$st" = ok ]; then
+        ci_bench_mark_server_log
+        sampler_start "$NETSIM_NS_SERVER" "$(netsim_veth_srv 0)"
+
+        # A handful of MTU-sized openers first, the way a game sends its
+        # initial state before settling into small updates. Measured
+        # separately from the small-packet phase so the openers' bytes do not
+        # flatter the small-packet latency figure.
+        CI_BENCH_IPERF_LEN=1400
+        local open_jf; open_jf="$(ci_bench_run_iperf UDP DL 2 1 2000000)"
+        rm -f "$open_jf"
+        CI_BENCH_IPERF_LEN="$pkt_len"
+
+        local tun_jf; tun_jf="$(ci_bench_run_iperf UDP DL "$dur" 1 "$target_bw")"
+        tun_q="$(ci_bench_parse_udp_quality "$tun_jf")"
+        tun_j="$(ci_bench_parse_udp_jitter_p99 "$tun_jf")"
+        rm -f "$tun_jf"
+
+        sampler_stop
+        stats="$(collect_stats)"; rss="$(server_rss_kb)"
+        stats="${stats}$(collect_wlb_instr)$(collect_send_supply)"
+        stats="${stats}$(collect_sampler)$(collect_overhead)"
+        stats="${stats}$(collect_host_profile "$(netsim_veth_srv 0)")"
+    fi
+
+    ci_bench_stop_vpn
+    CI_BENCH_IPERF_LEN=""; CI_BENCH_IPERF_INTERVAL=""
+
+    python3 -c "
+import json, os, sys
+
+scenario, tier, pps, dur = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+base_q, base_j = sys.argv[5].split(), sys.argv[6].split()
+tun_q, tun_j = sys.argv[7].split(), sys.argv[8].split()
+rss, extra, st = int(sys.argv[9]), sys.argv[10], sys.argv[11]
+reorder_state = sys.argv[12]
+
+def num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+# quality tuple: lost_pct jitter_ms out_of_order packets mbps
+bl, bj_ms, boo, bpk, bmb = (num(x) for x in base_q)
+tl, tj_ms, too, tpk, tmb = (num(x) for x in tun_q)
+b_p99, b_max = (num(x) for x in base_j)
+t_p99, t_max = (num(x) for x in tun_j)
+
+row = {
+  'scenario': scenario,
+  'mode_family': 'game',
+  'rtt_tier_ms': int(tier.split('_')[1]),
+  'game_pps_tier': pps,
+  'pkt_bytes': 50,
+  'scheduler': os.environ.get('CI_BENCH_SCHEDULER') or 'wlb_udp_pin',
+  'arm': os.environ.get('CI_BENCH_ARM') or 'default',
+  'arm_reorder': os.environ.get('CI_BENCH_REORDER') or 'default',
+  # So a zero reorder column can never be misread as 'no reorder happened'
+  # when it really means 'the engine that counts it was switched off'.
+  'reorder_engine': reorder_state,
+  'duration_sec': dur,
+  'server_rss_peak_kb': rss,
+  'status': st,
+}
+
+row['baseline_loss_pct'] = bl
+row['tunnel_loss_pct'] = tl
+row['baseline_jitter_p99_ms'] = b_p99
+row['tunnel_jitter_p99_ms'] = t_p99
+row['baseline_out_of_order'] = boo
+row['tunnel_out_of_order'] = too
+
+# THE criterion. A within-run difference, so the cross-run drift that makes
+# absolute figures unreadable does not touch it.
+if b_p99 is not None and t_p99 is not None:
+    row['added_jitter_p99_ms'] = round(t_p99 - b_p99, 3)
+if bl is not None and tl is not None:
+    row['added_loss_pct'] = round(tl - bl, 4)
+
+# Did the tunnel carry the packet rate it was asked for? Below 1.0 means
+# packets were dropped or coalesced somewhere in the path, which on a
+# latency-bound profile matters more than any byte figure.
+if tpk is not None and dur > 0:
+    row['tunnel_pps_measured'] = round(tpk / dur, 1)
+    row['pps_fidelity'] = round((tpk / dur) / pps, 3) if pps else None
+if too is not None and tpk:
+    row['out_of_order_pct'] = round(100.0 * too / tpk, 4)
+
+if extra:
+    row.update(json.loads('{' + extra + '}'))
+
+f = []
+ap = row.get('added_jitter_p99_ms')
+al = row.get('added_loss_pct')
+fid = row.get('pps_fidelity')
+# Thresholds are stated as what they are: a proxy. iperf3 reports jitter, not
+# a latency distribution, so this is the p99 of the per-second jitter series
+# and not a per-packet RTT percentile. Named accordingly everywhere.
+if ap is not None and ap >= 5.0:
+    f.append('game_jitter_cost: tunnel added %.1f ms of p99 jitter over the '
+             'bare path at the same emulated RTT' % ap)
+if al is not None and al >= 0.5:
+    f.append('game_loss_cost: tunnel added %.2f%% loss over the bare path' % al)
+if fid is not None and fid < 0.95:
+    f.append('game_pps_shortfall: carried %.1f%% of the offered packet rate -- '
+             'a packet-handling limit, not a bandwidth one' % (100.0 * fid))
+if row.get('samp_sndbuf_errors'):
+    f.append('game_sndbuf_blocked: %d socket-buffer refusals during the run'
+             % row['samp_sndbuf_errors'])
+row['findings'] = f
+row['finding_count'] = len(f)
+print(json.dumps(row))" \
+        "$scenario" "$tier" "$pps" "$dur" "$base_q" "$base_j" \
+        "$tun_q" "$tun_j" "$rss" "$stats" "$st" \
+        "${CI_BENCH_REORDER:-off_by_default}" >> "$ROWS"
+
+    echo "   baseline_p99=$(echo "$base_j" | awk '{print $1}')ms" \
+         "tunnel_p99=$(echo "$tun_j" | awk '{print $1}')ms  [${st}]"
+    emit_results
+    netsim_teardown
+}
+
 # ── scenario: special conditions, under saturating load ───────────────────
 # All of these already have functional coverage under scripts/ci_e2e/. What
 # was missing is running them while traffic is in flight, which is where the
@@ -1285,6 +1901,77 @@ case "$MODE" in
     for s in noisy_neighbour softirq_storm cpu_capped; do
         run_tier vps_2c2g "$s" || echo "  (host $s failed, continuing)"
     done
+    ;;
+  quic)
+    # Inner QUIC rather than inner TCP. Four classes, chosen for what each can
+    # settle rather than for coverage:
+    #   homo_good       identical healthy legs -- the control. Anything this row
+    #                   shows is a property of the tunnel, not of the network.
+    #   asym_capacity   the row the WLB charge/weight fix moved (0.852 -> 1.330
+    #                   vs_best_single, run 34026833126). Does inner QUIC see
+    #                   the same gain?
+    #   hetero_extreme  one leg near dead: the reorder-vs-aggregation case.
+    #   nat_split       identical legs aggregating to 64% of one of them with
+    #                   the send queue draining every pass. The anomaly this
+    #                   whole mode exists to explain.
+    #
+    # Both schedulers on every class: wlb vs wlb_udp_pin is defined on inner
+    # UDP, so this is the first measurement in the harness that can tell them
+    # apart at all.
+    TEST_NAME="netsim_quic"
+    if ! ci_bench_quic_available; then
+        echo "::warning::picoquicdemo not found — quic mode will emit" \
+             "picoquic_missing rows. Build it with" \
+             "scripts/ci_interop/build_picoquic.sh"
+    fi
+    for c in homo_good asym_capacity hetero_extreme nat_split; do
+        for s in wlb wlb_udp_pin; do
+            run_quic "$c" "$s" || echo "  (quic $c/$s failed, continuing)"
+        done
+    done
+    ;;
+  game)
+    # Game proxy: single path, optimized transit, small packets, latency-bound.
+    #
+    # CI_BENCH_SCHEDULER rather than a per-row argument, because only the
+    # server receives the per-row scheduler (every ci_bench_start_client call
+    # omits it) and game traffic is bidirectional -- both ends have to agree.
+    TEST_NAME="netsim_game"
+    CI_BENCH_SCHEDULER=wlb_udp_pin
+    # PPS tiers, not bandwidth tiers. 500 pps of 50-byte payload is 200 kbit/s;
+    # 4000 pps is 1.6 Mbit/s, still far under any emulated rate here, so the
+    # axis stays packet rate throughout and never becomes a bandwidth test.
+    for t in game_50 game_100 game_150 game_200; do
+        for p in 500 2000; do
+            run_game "$t" "$p" || echo "  (game $t/$p failed, continuing)"
+        done
+    done
+    ;;
+  vps)
+    # The constrained box the game profile actually runs on: 1 vCPU, single
+    # VirtIO RX/TX queue, RPS disabled, IRQ and NET_RX on CPU0.
+    #
+    # What is honestly emulated and what is not: AllowedCPUs=0 plus CPUQuota
+    # reproduces the THROUGHPUT CEILING of a 1-vCPU instance. The single-queue
+    # and RPS-disabled facts need no emulation at all -- veth exposes exactly
+    # one rx and one tx queue, rps_cpus reads all zero by default, and
+    # /proc/softirqs shows NET_RX entirely on CPU0 -- so the sampler ASSERTS
+    # them (samp_net_rx_cpu0_share) rather than pretending to create them.
+    # VirtIO interrupt coalescing and hypervisor steal time cannot be
+    # reproduced from inside a guest at all and are named as such on the row.
+    TEST_NAME="netsim_vps"
+    CI_BENCH_SCHEDULER=wlb_udp_pin
+    if ! ci_bench_have_tiers; then
+        echo "::warning::transient scopes unavailable — vps rows will be" \
+             "untiered and must not be read as 1-vCPU ceilings"
+    fi
+    CI_BENCH_TIER=vps_1c1g_std
+    for t in game_100 game_200; do
+        for p in 500 2000; do
+            run_game "$t" "$p" || echo "  (vps game $t/$p failed, continuing)"
+        done
+    done
+    CI_BENCH_TIER=""
     ;;
   combo)
     TEST_NAME="netsim_combo"

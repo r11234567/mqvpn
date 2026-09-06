@@ -242,6 +242,16 @@ jobs:
               {"id": "cat_plain",   "args": "catalog bgp_plain"},
               {"id": "cat_junk",    "args": "catalog bgp_junk"},
               {"id": "cat_carrier", "args": "catalog carrier_qos"},
+              # The three modes whose inner traffic is not TCP. Every mode
+              # above measures iperf3 TCP through the tunnel, which for a QUIC
+              # proxy leaves the protocol most of its traffic actually is
+              # unmeasured -- and leaves wlb and wlb_udp_pin indistinguishable,
+              # since the two differ only on inner UDP (flow_sched.c:61).
+              # Modes run as parallel jobs, so these cost no wall clock as long
+              # as each stays under the ~31 min `classes` takes.
+              {"id": "quic",        "args": "quic"},
+              {"id": "game",        "args": "game"},
+              {"id": "vps",         "args": "vps"},
           ]
           # An arm is a named set of env overrides, so any setting worth an A/B
           # can be one. "" leaves the harness default alone. Keep these keys in
@@ -331,6 +341,14 @@ jobs:
       # to every arm; otherwise the script's own default, which is what keeps a
       # scheduled run comparable with the series.
       CI_BENCH_IPERF_STREAMS: ${{ matrix.streams || github.event.inputs.iperf_streams }}
+      # Per-second host and interface sampling. On for every mode, because the
+      # send-side and CPU counters it produces are as useful on a bulk TCP row
+      # as on a QUIC one -- and because the quic mode's oscillation metric is
+      # computed from its series and would be silently absent without it.
+      # Cost is measured and published per row (samp_cost_note), rather than
+      # assumed negligible: one long-lived reader of /proc, not a process spawn
+      # per sample.
+      CI_BENCH_SAMPLE: '1'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -397,6 +415,27 @@ jobs:
           cmake -DCMAKE_BUILD_TYPE=Release \
                 -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
           make -j$(nproc)
+
+      # picoquicdemo generates the INNER QUIC traffic for the `quic` mode. Only
+      # that mode needs it, so the build is gated -- it is a clone plus two
+      # cmake builds (picotls, then picoquicdemo) and every other mode would
+      # pay for a binary it never runs.
+      #
+      # The cache holds the whole clone, not just the binary: PICO_CERT and
+      # PICO_KEY point into third_party/picoquic/certs/, and
+      # build_picoquic.sh does not generate them -- caching the binary alone
+      # would restore a tree whose server cannot start.
+      - name: Cache picoquic
+        if: matrix.id == 'quic'
+        id: picoquic-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/picoquic
+          key: picoquic-${{ hashFiles('scripts/ci_interop/build_picoquic.sh') }}-linux-v1
+
+      - name: Build picoquic
+        if: matrix.id == 'quic' && steps.picoquic-cache.outputs.cache-hit != 'true'
+        run: bash scripts/ci_interop/build_picoquic.sh
 
       - name: Scenario ${{ matrix.id }}
         run: sudo -E bash scripts/ci_benchmarks/ci_bench_scenarios.sh ${{ matrix.args }} build/mqvpn

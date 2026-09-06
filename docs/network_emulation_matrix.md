@@ -1105,9 +1105,66 @@ before sharding further.
 - **BGP semantics.** A re-route is an abrupt delay/loss change; AS paths, flap
   damping and convergence are out of scope. The geographic routes model the
   *result* of a detour, not the protocol that chose it.
-- **Hypervisor steal.** Competing load is a proxy.
+- **Hypervisor steal.** Competing load is a proxy. `/proc/stat` does report a
+  steal figure and the sampler publishes it, but on a GitHub runner that is the
+  *runner* being descheduled by its own host, not the emulated tier — read it as
+  a confounder on the measurement, never as the tier's property.
 - **Cross-tenant noise.** Seeding netem removes *our* randomness, not the
   host's — which is why gates are on ratios and CV is published per metric.
+- **VirtIO interrupt behaviour.** The `vps` mode reproduces a 1-vCPU
+  *throughput ceiling* and asserts the single-queue / RPS-disabled / NET_RX-on-
+  CPU0 shape (all three are already the default on veth, so they are observed
+  rather than created). Interrupt coalescing is not reproduced at all.
+- **Inner-QUIC RTT.** The `quic` mode samples the **outer** tunnel. Its
+  oscillation column is the outer wire rate over time, and the inner
+  connection's own RTT and retransmit behaviour are *inferred* from an outer
+  retransmit landing beside a throughput trough — not measured. Reading it as an
+  inner-RTT measurement would be false; qlog parsing is what would make it one,
+  and was rejected because writing tens of MB per run perturbs the throughput
+  being measured on a 2-vCPU runner.
+- **Per-packet latency percentiles in the `game` mode.** iperf3 reports jitter,
+  not a latency distribution, so `added_jitter_p99_ms` is the p99 of the
+  per-second *jitter* series against the same tier measured without the tunnel.
+  It is a within-run difference and therefore robust to the cross-run drift, but
+  it is not an RTT percentile and the field name says so.
+
+### Inner traffic that is not TCP (`quic`, `game`, `vps`)
+
+Every mode above these measures `iperf3` TCP through the tunnel. For a QUIC
+proxy that left two things unmeasured:
+
+1. **The inner protocol most traffic actually is.** A TCP-specific pathology and
+   a general tunnel one were indistinguishable. Run 34026833126 made this
+   concrete: `nat_split` put two identical 88 Mbps legs together and got 56.3,
+   while the send side drained on 100% of its scheduling passes — so nothing
+   downstream of the scheduler was the constraint, and inner-TCP collapse under
+   cross-path reorder is the leading explanation but not a confirmable one.
+2. **`wlb` versus `wlb_udp_pin`.** The two differ *only* on inner UDP
+   (`flow_sched.c:61` pins UDP when `udp_pin` is set; TCP is pinned either way),
+   so for inner TCP they are byte-for-byte the same scheduler. The README
+   trade-off between them had no measurement behind it. The `quic` mode runs
+   both over four classes and is the first table in the harness where they can
+   differ.
+
+On a single path `wlb_udp_pin` cannot change *which* path is chosen — there is
+no choice. What it changes is which code path runs: the pinned datagram lane and
+`XQC_DATA_QOS_HIGH` versus unpinned WRR. The `game` rows test that lane, not
+path selection.
+
+**RTT tiers halve their label on purpose.** `netsim_apply_path` installs netem on
+four hops (access up, access down, transit up, transit down), so a path's round
+trip is 2×(access + transit). `game_200` is `delay 100ms` paired with the 0.2 ms
+`eth` access leg, which measures 200.4 ms. Writing `delay 200ms` would have
+produced a 400 ms tier under a label saying 200.
+
+**Reorder counts come from iperf3, not from mqvpn.** The reorder engine is off by
+default, so a reorder figure read from `get_reorder_stats` would be zero because
+nothing was counting — indistinguishable from a genuinely in-order stream. That
+is the same defect class as the send-supply `headroom` column, which came back
+`0.000` on all 46 rows of run 34026833126 because it restated the predicate that
+had produced the value. iperf3 stamps its own sequence numbers, so `ooo%` is
+measured end to end and independent of the engine; the row records the engine's
+state beside it regardless.
 
 ## 6. Build order
 
