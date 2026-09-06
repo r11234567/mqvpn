@@ -465,7 +465,8 @@ collect_wlb_instr() {
 import json, re, sys
 
 pat = re.compile(r'\|wlb_instr\|path:(\d+)\|weight:(\d+)\|deficit:(-?\d+)'
-                 r'\|pins:(\d+)\|sched:(\d+)\|rounds:(\d+)\|n_paths:(\d+)\|')
+                 r'\|pins:(\d+)\|sched:(\d+)\|rounds:(\d+)'
+                 r'\|spread_clamped:(\d+)\|spread_max:(-?\d+)\|n_paths:(\d+)\|')
 
 path_log, mark = sys.argv[1], int(sys.argv[2])
 
@@ -474,7 +475,7 @@ def emit(d):
                          for k, v in d.items()))
     raise SystemExit(0)
 
-W, D, P, S, R = 0, 1, 2, 3, 4
+W, D, P, S, R, SC, SMAX = 0, 1, 2, 3, 4, 5, 6
 
 # Last sample per path inside the window, plus whether any counter went
 # backwards (which only a second scheduler instance can cause).
@@ -523,6 +524,20 @@ out['wlb_deficits'] = [last[i][D] for i in ids]
 out['wlb_pins'] = pins
 out['wlb_sched'] = sched
 out['wlb_rounds'] = rounds
+out['wlb_spread_clamped'] = [last[i][SC] for i in ids]
+out['wlb_spread_max'] = max(last[i][SMAX] for i in ids)
+
+# The quantity WRR actually reads. Selection compares deficits against each
+# other, so the GAP is the signal and the absolute values are not: under the
+# old per-path floor both paths sat at -64 in 20 of 22 rows (34036912262) and
+# this gap was 0, meaning a fourfold overspend and a slight one were
+# indistinguishable to the scheduler. A gap pinned at wlb_spread_max means the
+# allowance is binding and the imbalance is larger than WRR will chase.
+defs = [last[i][D] for i in ids]
+out['wlb_deficit_gap'] = max(defs) - min(defs) if len(defs) > 1 else 0
+out['wlb_at_spread_limit'] = (
+    1 if (len(defs) > 1 and out['wlb_deficit_gap'] >= out['wlb_spread_max'])
+    else 0)
 
 tp, ts = sum(pins), sum(sched)
 # Shares, directly comparable against the 1/n a balanced scheduler would give
@@ -553,13 +568,21 @@ emit(out)
 #     queue, so the paths were never the constraint. The next place to look is
 #     then the TUN read loop and the datagram write, not the scheduler.
 #
-#   scheduler-limited -- capacity was there and went unused. Reads as
-#     `stop_headroom_left` climbing: a pass stopped with packets still queued
-#     at a moment when some active path would still have accepted one. This is
-#     the reading that would explain an aggregate below one leg alone.
+#   clamp-limited -- the congestion controllers had room and mqvpn's own
+#     so_sndbuf ceiling (8 MiB, mqvpn_conn_settings.c:128) refused the packet
+#     anyway. Reads as `stop_sndbuf_clamp` climbing. A configuration bug rather
+#     than congestion, and the leading untested explanation for an aggregate
+#     below one leg alone -- the fast leg's BDP is ~7.6 MB, so one path can
+#     very nearly exhaust a ceiling that is shared with the other.
 #
 #   network-limited -- `stop_all_blocked` dominates and backlog is deep. Honest
 #     congestion; the emulated capacity is what it is.
+#
+# This replaces a `stop_headroom_left` counter that could not fire. It asked
+# whether any path had cwnd headroom using the same predicate the scheduler had
+# just consulted, so the answer was structurally always no: 0 in all 46 rows of
+# run 34026833126 and all 22 WLB rows of 34036912262. A column that is uniform
+# across every row is presumed broken until shown otherwise, and this one was.
 #
 # Same window discipline as collect_wlb_instr: cumulative counters read from
 # the server log after the mark, because the scheduler and the connection are
@@ -575,7 +598,7 @@ collect_send_supply() {
 import json, re, sys
 
 pat = re.compile(r'\|send_supply\|passes:(\d+)\|drained:(\d+)'
-                 r'\|stop_all_blocked:(\d+)\|stop_headroom_left:(\d+)'
+                 r'\|stop_all_blocked:(\d+)\|stop_sndbuf_clamp:(\d+)'
                  r'\|stop_backlog:(\d+)\|sndq_used:(\d+)\|paths:(\d+)\|')
 
 path_log, mark = sys.argv[1], int(sys.argv[2])
@@ -606,30 +629,31 @@ except OSError:
 if last is None:
     emit({'send_supply': 'no_lines'})
 
-passes, drained, all_blk, headroom, backlog, sndq, paths = last
+passes, drained, all_blk, clamp, backlog, sndq, paths = last
 out = {'send_supply': 'ok', 'supply_samples': n}
 out['supply_passes'] = passes
 out['supply_drained'] = drained
 out['supply_stop_all_blocked'] = all_blk
-out['supply_stop_headroom_left'] = headroom
+out['supply_stop_sndbuf_clamp'] = clamp
 out['supply_sndq_used_last'] = sndq
 
 if passes:
     # The headline. Near 1.0 means the paths were never the limit.
     out['supply_drain_ratio'] = round(drained / passes, 3)
-    stops = all_blk + headroom
+    stops = all_blk + clamp
     out['supply_stop_ratio'] = round(stops / passes, 3)
-    # Of the passes that DID stop, the fraction that stopped with capacity
-    # still available. This is the number that accuses the scheduler.
-    out['supply_headroom_share'] = (round(headroom / stops, 3) if stops
-                                    else None)
+    # Of the passes that DID stop, the fraction stopped by our own sndbuf
+    # ceiling rather than by congestion. This is the number that accuses the
+    # configuration.
+    out['supply_clamp_share'] = (round(clamp / stops, 3) if stops
+                                 else None)
     # Mean depth left behind per stop, so a rare deep stall is not read the
     # same as constant shallow ones. Capped at 512 per stop in xquic.
     out['supply_backlog_per_stop'] = (round(backlog / stops, 1) if stops
                                       else None)
     out['supply_verdict'] = (
-        'supply_limited'    if out['supply_drain_ratio'] >= 0.95 else
-        'scheduler_limited' if (out['supply_headroom_share'] or 0) >= 0.5 else
+        'supply_limited' if out['supply_drain_ratio'] >= 0.95 else
+        'clamp_limited'  if (out['supply_clamp_share'] or 0) >= 0.5 else
         'network_limited')
 emit(out)
 " "$CI_BENCH_SERVER_LOG" "${CI_BENCH_SERVER_LOG_MARK:-0}"
@@ -775,13 +799,30 @@ print("," + ",".join(json.dumps(k) + ":" + json.dumps(v)
 ' "$SAMPLED_JSON" 2>/dev/null || printf '%s' ',"osc":"failed"'
 }
 
-# Wire-to-app byte ratio: what the outer tunnel costs to carry the inner flow.
+# Per-packet wire cost of carrying the inner flow.
 #
 # The specific worry with inner QUIC is its pure-ACK datagrams -- a few tens of
 # bytes of inner payload, each wrapped in an outer QUIC DATAGRAM plus UDP/IP.
-# Connection bytes_tx is APP bytes (mqvpn_server.c:3378 assigns
-# total_app_bytes), while per-path bytes_tx and pkt_sent are wire-side
-# (libmqvpn.h:328), so the ratio needs no new counters.
+#
+# There is NO wire/app ratio here any more, because the control socket exposes
+# no app-byte counter to divide by. The previous version thought it did and
+# published a ratio that was arithmetically incapable of exceeding 1.0:
+#
+#   clients[].bytes_tx is xquic's total_app_bytes (xqc_multipath.c:983), which
+#   despite the name is send+recv summed over paths, and both terms are
+#   post-encryption wire bytes (po_enc_size, xqc_send_ctl.c:704). Per-path
+#   bytes_tx/bytes_rx are the same two counters unsummed. So with S = sum of
+#   path sends and R = sum of path receives, the old expression computed
+#   (S+R)/(S+2R) -- the same numbers over themselves with the receive
+#   direction double-counted, hence 0.995-0.999 in all 20 rows of run
+#   34036912262 rather than the >1 any real encapsulation ratio must give.
+#   The name total_app_bytes was read as its contract; that was the whole bug.
+#
+# What IS honest from these fields: bytes per wire packet, and the per-
+# direction split. A true ratio needs a tun-side payload counter that does not
+# exist yet (mqvpn_server.c:2971 bumps dgram_sent but no byte total), so this
+# reports the wire side and says the denominator is missing rather than
+# inventing one.
 collect_overhead() {
     local status
     status="$(netsim_query_control get_status)"
@@ -802,22 +843,40 @@ if not clients:
     raise SystemExit(0)
 
 cl = clients[0]
-app = (cl.get("bytes_tx") or 0) + (cl.get("bytes_rx") or 0)
 paths = cl.get("paths") or []
-wire = sum((p.get("bytes_tx") or 0) + (p.get("bytes_rx") or 0) for p in paths)
-pkts = sum((p.get("pkt_sent") or 0) + (p.get("pkt_recv") or 0) for p in paths)
+tx = sum(p.get("bytes_tx") or 0 for p in paths)
+rx = sum(p.get("bytes_rx") or 0 for p in paths)
+pkt_tx = sum(p.get("pkt_sent") or 0 for p in paths)
+pkt_rx = sum(p.get("pkt_recv") or 0 for p in paths)
+wire = tx + rx
+pkts = pkt_tx + pkt_rx
 
 out["overhead"] = "ok"
-out["overhead_app_bytes"] = app
-out["overhead_wire_bytes"] = wire
-if app > 0:
-    out["overhead_wire_app_ratio"] = round(wire / app, 3)
-else:
-    # A tunnel that carried no app bytes has no ratio. Saying so beats
-    # publishing a division by zero as though it were 1.0.
-    out["overhead"] = "no_app_bytes"
+out["overhead_wire_tx_bytes"] = tx
+out["overhead_wire_rx_bytes"] = rx
+out["overhead_wire_pkts_tx"] = pkt_tx
+out["overhead_wire_pkts_rx"] = pkt_rx
+# No app-byte counter exists to divide by; naming the gap keeps a reader from
+# assuming the ratio was dropped by accident.
+out["overhead_app_bytes"] = "unavailable: no tun-side byte counter in get_status"
+
+# Bytes per wire packet, split by direction. The reverse direction is the
+# interesting one for a game workload: it is where inner ACKs live, and a
+# 50-byte inner payload paying 85-107 bytes on the wire is the figure worth
+# watching.
+if pkt_tx > 0:
+    out["overhead_bytes_per_pkt_tx"] = round(tx / pkt_tx, 1)
+if pkt_rx > 0:
+    out["overhead_bytes_per_pkt_rx"] = round(rx / pkt_rx, 1)
 if pkts > 0:
+    # Kept for series continuity with earlier runs. Slightly optimistic: the
+    # tx counter skips pure-ACK packets (xqc_send_ctl.c:711 gates on
+    # XQC_CAN_IN_FLIGHT) while the rx counter counts every datagram, so the
+    # denominator is inflated and the true per-packet cost is a little higher.
     out["overhead_bytes_per_pkt"] = round(wire / pkts, 1)
+    out["overhead_pkt_note"] = ("excludes outer UDP/IP (28B v4 per datagram); "
+                                "pkt_sent omits pure-ACK packets, pkt_recv "
+                                "does not")
 
 print("," + ",".join(json.dumps(k) + ":" + json.dumps(v)
                      for k, v in out.items()))
@@ -838,9 +897,15 @@ print("," + ",".join(json.dumps(k) + ":" + json.dumps(v)
 # than quietly omitted: VirtIO interrupt coalescing, and hypervisor steal time.
 # (/proc/stat does report a steal figure, but on a GitHub runner that is the
 # RUNNER being descheduled by its own host, not the emulated tier.)
+# Run INSIDE the server netns. /sys/class/net is namespace-scoped and the veth
+# was moved into netsim-server (ci_bench_netsim.sh:613), so reading it from the
+# root netns raised OSError on every row of run 34036912262 -- host_queues came
+# back "unreadable" and the rps_cpus keys silently vanished, which meant the
+# single-queue and RPS-disabled assertions this function exists to make had
+# never once fired. Same `ip netns exec` shape sampler_start uses.
 collect_host_profile() {
-    local dev="$1"
-    python3 -c "
+    local dev="$1" ns="${2:-$NETSIM_NS_SERVER}"
+    ip netns exec "$ns" python3 -c "
 import json, os, sys
 
 dev = sys.argv[1]
@@ -867,12 +932,25 @@ if rps is not None:
     # All-zero (allowing for the comma grouping) means RPS is off.
     out['host_rps_enabled'] = any(c not in '0,' for c in rps)
 
-out['host_nproc'] = os.cpu_count()
-out['host_tier'] = os.environ.get('CI_BENCH_TIER') or 'untiered'
+# The RUNNER's CPU count, not the tier's. This function runs outside the
+# transient scope, and os.cpu_count() ignores cpusets even inside one, so it
+# cannot report a quota ceiling however it is called -- naming it for what it
+# measures beats publishing 4 in a column a reader would take for the tier.
+# The tier's actual allowance is CI_BENCH_TIER_NCPU, recorded below.
+out['host_runner_nproc'] = os.cpu_count()
+tier = os.environ.get('CI_BENCH_TIER') or 'untiered'
+out['host_tier'] = tier
+if tier != 'untiered':
+    out['host_tier_ncpu'] = os.environ.get('CI_BENCH_TIER_NCPU_VAL') or 'unknown'
+    # A tier LABEL is not proof the scope was created. ci_bench_have_tiers
+    # degrades to untiered with only a ::warning:: to say so, so the row
+    # carries the assertion explicitly rather than implying it.
+    out['host_tier_applied'] = os.environ.get('CI_BENCH_TIER_OK') or 'unknown'
 out['host_not_emulated'] = ('virtio interrupt coalescing; hypervisor steal '
                             'time (a guest cannot reproduce either, and the '
                             'steal figure in /proc/stat is the runner being '
-                            'descheduled, not this tier)')
+                            'descheduled, not this tier); host_runner_nproc '
+                            'is the runner CPU count, not the tier ceiling')
 print(',' + ','.join(json.dumps(k) + ':' + json.dumps(v)
                      for k, v in out.items()))
 " "$dev" 2>/dev/null || printf '%s' ',"host_profile":"failed"'
@@ -1427,9 +1505,15 @@ elif row.get('osc_verdict') == 'unstable':
     f.append('quic_rate_unstable: outer wire rate swung %.1fx with no '
              'detectable period -- a stall or a trend rather than an '
              'oscillation' % (row.get('osc_peak_trough_ratio') or 0))
-ratio = row.get('overhead_wire_app_ratio')
-if ratio is not None and ratio >= 1.5:
-    f.append('quic_encap_overhead: %.2f wire bytes per app byte' % ratio)
+# No wire/app ratio to test: get_status exposes no app-byte counter, and the
+# figure that used to be here divided the wire bytes by themselves. Per-packet
+# wire cost is what the same fields can honestly support. 200 bytes on the
+# reverse direction of a small-packet workload means the ACK path is paying
+# more in headers than it carries.
+bpp_rx = row.get('overhead_bytes_per_pkt_rx')
+if bpp_rx is not None and bpp_rx >= 200:
+    f.append('quic_ack_overhead: %.0f wire bytes per reverse-direction packet '
+             '(inner ACKs are small; this is mostly encapsulation)' % bpp_rx)
 if row.get('samp_sndbuf_errors'):
     f.append('quic_sndbuf_blocked: %d socket-buffer refusals during the run'
              % row['samp_sndbuf_errors'])
@@ -1973,13 +2057,29 @@ case "$MODE" in
         echo "::warning::transient scopes unavailable — vps rows will be" \
              "untiered and must not be read as 1-vCPU ceilings"
     fi
-    CI_BENCH_TIER=vps_1c1g_std
+    # EXPORTED, not just assigned. collect_host_profile reads CI_BENCH_TIER
+    # from a python3 child's environment, so an unexported value is visible to
+    # the shell that splices in the systemd-run prefix but invisible to the
+    # code that writes the column. Every vps row in run 34036912262 came back
+    # host_tier=untiered while the scope had in fact been created -- the
+    # tier applied and the artifact denied it, which is the worse of the two
+    # failure directions.
+    export CI_BENCH_TIER=vps_1c1g_std
+    # Exported alongside it so the row can state the ceiling and whether the
+    # scope actually took, rather than leaving both to be inferred from a
+    # label. ci_bench_have_tiers ran above; reuse its answer.
+    if ci_bench_have_tiers; then
+        export CI_BENCH_TIER_OK=yes
+    else
+        export CI_BENCH_TIER_OK=no
+    fi
+    export CI_BENCH_TIER_NCPU_VAL="${CI_BENCH_TIER_NCPU[vps_1c1g_std]:-unknown}"
     for t in game_100 game_200; do
         for p in 500 2000; do
             run_game "$t" "$p" || echo "  (vps game $t/$p failed, continuing)"
         done
     done
-    CI_BENCH_TIER=""
+    unset CI_BENCH_TIER CI_BENCH_TIER_OK CI_BENCH_TIER_NCPU_VAL
     ;;
   combo)
     TEST_NAME="netsim_combo"

@@ -311,13 +311,20 @@ def emit_supply(by_key, arms):
     print(
         "`drain` is the share of scheduling passes that emptied the send queue "
         "— near 1.0 means the paths were never the constraint and the limit is "
-        "upstream of the scheduler. `headroom` is the share of the passes that "
-        "*stopped* which stopped while some active path would still have taken "
-        "the packet; that is the scheduler declining capacity. `backlog` is the "
-        "mean depth left behind per stop, capped at 512 by xquic."
+        "upstream of the scheduler. `clamp` is the share of the passes that "
+        "*stopped* which stopped because mqvpn's own 8 MiB `so_sndbuf` ceiling "
+        "refused a packet the path's congestion window would have taken — a "
+        "configuration limit, not congestion. `backlog` is the mean depth left "
+        "behind per stop, capped at 512 by xquic."
     )
     print()
-    print("| mode | scenario | sched | arm | verdict | drain | headroom | "
+    print(
+        "`clamp` replaces a `headroom` column that read 0.000 in every row of "
+        "runs 34026833126 and 34036912262: it re-asked the cwnd question the "
+        "scheduler had just answered, so it could never fire."
+    )
+    print()
+    print("| mode | scenario | sched | arm | verdict | drain | clamp | "
           "backlog | passes |")
     print("|---|---|---|---|---|---|---|---|---|")
     for mode, scenario, sched, arm, r, _s in sorted(ok):
@@ -325,7 +332,7 @@ def emit_supply(by_key, arms):
             mode, scenario, sched or "-", arm,
             r.get("supply_verdict") or "-",
             fmt(r.get("supply_drain_ratio"), "{:.3f}"),
-            fmt(r.get("supply_headroom_share"), "{:.3f}"),
+            fmt(r.get("supply_clamp_share"), "{:.3f}"),
             fmt(r.get("supply_backlog_per_stop")),
             r.get("supply_passes")))
     print()
@@ -369,12 +376,15 @@ def emit_quic(by_key, arms):
         "90th percentile AND the swing recurred at a detectable period, which "
         "is the signature of inner and outer congestion control backing off "
         "together. **The inner RTT is inferred from the outer series, not "
-        "measured** -- no qlog is parsed. `wire/app` is outer bytes per inner "
-        "byte, which is where small inner ACKs show up."
+        "measured** -- no qlog is parsed. `B/pkt tx` and `B/pkt rx` are wire "
+        "bytes per outer packet in each direction; the reverse direction is "
+        "where small inner ACKs show up. There is no wire/app ratio: "
+        "`get_status` exposes no app-byte counter, and the column that used to "
+        "be here divided the wire bytes by themselves."
     )
     print()
     print("| scenario | sched | arm | goodput | shape | ratio | period | "
-          "wire/app | B/pkt | status |")
+          "B/pkt tx | B/pkt rx | status |")
     print("|---|---|---|---|---|---|---|---|---|---|")
     for _mode, scenario, sched, arm, r in sorted(rows, key=lambda t: t[:4]):
         print("| {} | {} | `{}` | {} | {} | {} | {} | {} | {} | {} |".format(
@@ -384,8 +394,8 @@ def emit_quic(by_key, arms):
             fmt(r.get("osc_peak_trough_ratio"), "{:.2f}"),
             r.get("osc_autocorr_period_s") if r.get("osc_autocorr_period_s")
             else "-",
-            fmt(r.get("overhead_wire_app_ratio"), "{:.3f}"),
-            fmt(r.get("overhead_bytes_per_pkt")),
+            fmt(r.get("overhead_bytes_per_pkt_tx")),
+            fmt(r.get("overhead_bytes_per_pkt_rx")),
             r.get("quic_status") or "-"))
     print()
 

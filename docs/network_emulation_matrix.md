@@ -1166,6 +1166,32 @@ had produced the value. iperf3 stamps its own sequence numbers, so `ooo%` is
 measured end to end and independent of the engine; the row records the engine's
 state beside it regardless.
 
+### 5.1 Columns retired for being unable to disagree
+
+Four columns published numbers that could not have come out differently. They
+are listed here rather than deleted quietly, because each one was read as
+evidence for a round or two before it was caught, and the artifacts that carry
+them are still on the record.
+
+| Column | Ran | What it actually computed |
+|---|---|---|
+| `supply_headroom_share` | 34026833126, 34036912262 | Asked whether any path had cwnd headroom using `xqc_send_packet_cwnd_allows` — the predicate the scheduler had just consulted. Reached only when every path had said no, so it said no: `0.000` in 46/46 then 22/22 rows. Replaced by `supply_clamp_share`, which asks which ceiling bound (congestion control, or mqvpn's own 8 MiB `so_sndbuf`). |
+| `wlb_deficits` at `-64` | both | The credit cap doubled as the debt floor, so every busy path reached `-64` and stayed. WRR compares deficits against each other, so once two paths rest on the floor the difference — the whole signal — is zero. 27/39 then 20/22 rows. Replaced by a spread bound plus `wlb_deficit_gap`. |
+| `overhead_wire_app_ratio` | 34036912262 | `clients[].bytes_tx` is xquic's `total_app_bytes`, which despite the name is send+recv summed across paths, both terms post-encryption (`po_enc_size`). The ratio was `(S+R)/(S+2R)` — the wire bytes over themselves with the receive direction double-counted, hence `0.995–0.999` in 20/20 rows where any real encapsulation ratio must exceed 1. No app-byte counter exists to divide by; the per-direction per-packet cost is published instead, and the gap is named. |
+| `host_tier` on `vps` rows | 34036912262 | Read `CI_BENCH_TIER` from a python child's environment, but the mode assigned it without `export`. Every row said `untiered` while the scope had in fact been created — the tier applied and the artifact denied it. `host_nproc` compounded it: `os.cpu_count()` ignores cpusets and the collector ran outside the scope, so it reported the runner's 4. Now `host_runner_nproc`, beside `host_tier_ncpu` and `host_tier_applied`. |
+
+The `vps` mode's queue and RPS assertions never fired either: `collect_host_profile`
+read `/sys/class/net/<dev>/queues` from the root netns, but the veth had been
+moved into `netsim-server`, so the read raised and the column read
+`unreadable`. It now runs inside the namespace.
+
+**The pattern worth generalising: a column that is uniform across every row is
+presumed broken until shown otherwise.** All four were caught that way and none
+by a test. Any new derived column should therefore ship with something that
+would look different if it were wrong — a counter of its own binding, or a
+within-row comparison — rather than relying on a reader noticing that every
+value matches.
+
 ## 6. Build order
 
 0. ~~**Make the harness measure anything at all** — the service-address source
