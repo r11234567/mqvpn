@@ -383,20 +383,26 @@ def emit_quic(by_key, arms):
         "be here divided the wire bytes by themselves."
     )
     print()
-    print("| scenario | sched | arm | goodput | shape | ratio | period | "
-          "B/pkt tx | B/pkt rx | status |")
-    print("|---|---|---|---|---|---|---|---|---|---|")
+    print("| scenario | sched | arm | goodput | n | cv% | samples | shape | "
+          "ratio | period | B/pkt tx | B/pkt rx | status |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for _mode, scenario, sched, arm, r in sorted(rows, key=lambda t: t[:4]):
-        print("| {} | {} | `{}` | {} | {} | {} | {} | {} | {} | {} |".format(
-            scenario, sched or "-", arm,
-            fmt(r.get("quic_goodput_mbps")),
-            r.get("osc_verdict") or "-",
-            fmt(r.get("osc_peak_trough_ratio"), "{:.2f}"),
-            r.get("osc_autocorr_period_s") if r.get("osc_autocorr_period_s")
-            else "-",
-            fmt(r.get("overhead_bytes_per_pkt_tx")),
-            fmt(r.get("overhead_bytes_per_pkt_rx")),
-            r.get("quic_status") or "-"))
+        samples = r.get("quic_goodput_all")
+        print("| {} | {} | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} "
+              "| {} |".format(
+                  scenario, sched or "-", arm,
+                  fmt(r.get("quic_goodput_mbps")),
+                  r.get("quic_samples") if r.get("quic_samples") is not None
+                  else "-",
+                  fmt(r.get("quic_goodput_cv_pct"), "{:.0f}"),
+                  "/".join(f"{v:.0f}" for v in samples) if samples else "-",
+                  r.get("osc_verdict") or "-",
+                  fmt(r.get("osc_peak_trough_ratio"), "{:.2f}"),
+                  r.get("osc_autocorr_period_s")
+                  if r.get("osc_autocorr_period_s") else "-",
+                  fmt(r.get("overhead_bytes_per_pkt_tx")),
+                  fmt(r.get("overhead_bytes_per_pkt_rx")),
+                  r.get("quic_status") or "-"))
     print()
 
     # The comparison this mode exists for. Same scenario, two schedulers, one
@@ -406,24 +412,64 @@ def emit_quic(by_key, arms):
     for _mode, scenario, sched, arm, r in rows:
         g = r.get("quic_goodput_mbps")
         if isinstance(g, (int, float)):
-            pairs.setdefault((scenario, arm), {})[sched] = g
+            pairs.setdefault((scenario, arm), {})[sched] = r
     both = {k: v for k, v in pairs.items() if len(v) >= 2}
     if both:
         print("### `wlb` vs `wlb_udp_pin` on inner QUIC")
         print()
         print("Measured in one run, so this is a within-run comparison. This "
               "is the first table in the harness where the two schedulers can "
-              "differ at all.")
+              "differ at all: they are defined apart only on inner UDP "
+              "(`flow_sched.c:61`), and inner QUIC is UDP.")
         print()
-        print("| scenario | arm | wlb | wlb_udp_pin | udp_pin move |")
-        print("|---|---|---|---|---|")
+        print("`n` and `cv%` are per cell. A large move backed by n=1, or by "
+              "two cells whose own CV is of the same order as the move, is not "
+              "yet a result.")
+        print()
+        print("| scenario | arm | wlb | n/cv% | wlb_udp_pin | n/cv% | "
+              "udp_pin move |")
+        print("|---|---|---|---|---|---|---|")
+
+        def cell(r):
+            if r is None:
+                return "-", "-"
+            return (fmt(r.get("quic_goodput_mbps")),
+                    "{}/{}".format(
+                        r.get("quic_samples")
+                        if r.get("quic_samples") is not None else "-",
+                        fmt(r.get("quic_goodput_cv_pct"), "{:.0f}")))
+
         for (scenario, arm), v in sorted(both.items()):
-            base, pin = v.get("wlb"), v.get("wlb_udp_pin")
-            mv = pct_move(base, pin)
-            print("| {} | `{}` | {} | {} | {} |".format(
-                scenario, arm, fmt(base), fmt(pin),
+            rb, rp = v.get("wlb"), v.get("wlb_udp_pin")
+            bg = rb.get("quic_goodput_mbps") if rb else None
+            pg = rp.get("quic_goodput_mbps") if rp else None
+            bv, bn = cell(rb)
+            pv, pn = cell(rp)
+            mv = pct_move(bg, pg)
+            print("| {} | `{}` | {} | {} | {} | {} | {} |".format(
+                scenario, arm, bv, bn, pv, pn,
                 f"{mv:+.1f}%" if mv is not None else "-"))
         print()
+
+        # A row where only one scheduler produced a number is the strongest
+        # reading in this table and the one a goodput column cannot show: the
+        # other scheduler did not merely go slower, it failed to move 20 MiB
+        # inside the timeout. Naming them keeps that out of the "-" cells.
+        incomplete = []
+        for _mode, scenario, sched, arm, r in rows:
+            st = r.get("quic_status")
+            if st and st != "ok":
+                incomplete.append((scenario, sched, arm, st))
+        if incomplete:
+            print("Cells that did not complete a transfer:")
+            print()
+            for scenario, sched, arm, st in sorted(incomplete):
+                print(f"- `{scenario}` / `{sched}` / `{arm}`: {st}")
+            print()
+            print("`quic_no_goodput` means the 20 MiB transfer did not finish "
+                  "inside `CI_BENCH_QUIC_TIMEOUT` (90 s default) — a severe "
+                  "rate, not a crashed transfer.")
+            print()
 
 
 def emit_game(by_key, arms):

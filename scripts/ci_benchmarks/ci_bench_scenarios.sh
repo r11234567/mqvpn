@@ -1447,20 +1447,61 @@ run_quic() {
         st=tunnel_never_up
     fi
 
-    local stats="" rss=0 gp="NA" qst="not_run"
+    local stats="" rss=0 gp="NA" qst="not_run" gp_cv="" gp_n=0 gp_all=""
     if [ "$st" = ok ]; then
         ci_bench_mark_server_log
-        sampler_start "$NETSIM_NS_SERVER" "$(netsim_veth_srv 0)"
 
-        # Globals, never $( ) -- ci_bench_quic_transfer starts a background
-        # server and records its pid, which a subshell would take with it.
-        ci_bench_quic_transfer "$TUNNEL_SERVER_IP"
-        gp="$QUIC_GOODPUT"; qst="$QUIC_STATUS"
+        # Repeat the transfer. One measurement per cell was the shape of the
+        # first run and it is not enough to carry the finding this mode exists
+        # for: wlb vs wlb_udp_pin came out 4x-12x apart on all four scenarios,
+        # which is far outside the 13% cross-run noise floor, but a single
+        # observation of a 12x gap is still a single observation. REPEATS is
+        # the harness-wide knob (2 by default) and it never reached here --
+        # ci_bench_quic_transfer was called exactly once.
+        #
+        # The sampler covers only the FIRST transfer, deliberately. Its output
+        # feeds collect_oscillation, which reads a per-second series and looks
+        # for a period in it; spanning three transfers would put two idle gaps
+        # and two BBR startup ramps inside that series, and the autocorrelation
+        # would lock onto the transfer cadence rather than onto any nested-CC
+        # effect. A shape metric needs one continuous transfer, so it gets one.
+        local qreps="${CI_BENCH_QUIC_REPEATS:-3}" qi gsamples=()
+        for (( qi=0; qi<qreps; qi++ )); do
+            if [ "$qi" = 0 ]; then
+                sampler_start "$NETSIM_NS_SERVER" "$(netsim_veth_srv 0)"
+            fi
 
-        sampler_stop
-        stats="$(collect_stats)"; rss="$(server_rss_kb)"
-        stats="${stats}$(collect_wlb_instr)$(collect_send_supply)"
-        stats="${stats}$(collect_sampler)$(collect_oscillation)$(collect_overhead)"
+            # Globals, never $( ) -- ci_bench_quic_transfer starts a background
+            # server and records its pid, which a subshell would take with it.
+            ci_bench_quic_transfer "$TUNNEL_SERVER_IP"
+
+            if [ "$qi" = 0 ]; then
+                sampler_stop
+                # Counters and the shape metric come from the first transfer's
+                # window, matching what the sampler saw. Reading them after
+                # three transfers would describe a different interval than
+                # osc_* does, and the row would silently mix the two.
+                stats="$(collect_stats)"; rss="$(server_rss_kb)"
+                stats="${stats}$(collect_wlb_instr)$(collect_send_supply)"
+                stats="${stats}$(collect_sampler)$(collect_oscillation)"
+                stats="${stats}$(collect_overhead)"
+                qst="$QUIC_STATUS"
+            elif [ "$QUIC_STATUS" != ok ] && [ "$qst" = ok ]; then
+                # A cell that succeeded once and failed later is neither "ok"
+                # nor the failure status -- say so rather than letting whichever
+                # transfer ran last define the row.
+                qst=quic_partial_failure
+            fi
+
+            [ "$QUIC_GOODPUT" != NA ] && gsamples+=("$QUIC_GOODPUT")
+        done
+
+        gp_n="${#gsamples[@]}"
+        if [ "$gp_n" -gt 0 ]; then
+            gp="$(med "${gsamples[@]}")"
+            gp_cv="$(cv_pct "${gsamples[@]}")"
+            gp_all="$(IFS=,; echo "${gsamples[*]}")"
+        fi
     fi
 
     ci_bench_stop_vpn
@@ -1471,6 +1512,7 @@ import json, os, sys
 class_, sched, gp, qst = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 rss, extra, st = int(sys.argv[5]), sys.argv[6], sys.argv[7]
 pin = sys.argv[8]
+gp_cv, gp_n, gp_all = sys.argv[9], sys.argv[10], sys.argv[11]
 
 row = {
   'scenario': class_,
@@ -1489,6 +1531,18 @@ row = {
 # carried nothing are different findings, and the report filters the sentinel
 # rather than averaging it in.
 row['quic_goodput_mbps'] = None if gp == 'NA' else float(gp)
+
+# The median's own spread, and the count behind it. A 12x gap between two
+# schedulers means nothing without knowing whether either figure is stable, and
+# n is here explicitly because the first run of this mode reported n=1 cells in
+# a row-shape that looked identical to a repeated one.
+row['quic_samples'] = int(gp_n)
+row['quic_goodput_cv_pct'] = float(gp_cv) if gp_cv else None
+# Every sample, not just the summary. A cell whose three transfers came out
+# 70/2/68 is a different finding from one that came out 47/46/47, and the
+# median hides which happened.
+row['quic_goodput_all'] = ([float(x) for x in gp_all.split(',') if x]
+                           if gp_all else [])
 
 if extra:
     row.update(json.loads('{' + extra + '}'))
@@ -1519,13 +1573,22 @@ if row.get('samp_sndbuf_errors'):
              % row['samp_sndbuf_errors'])
 if qst not in ('ok',):
     f.append('quic_transfer_incomplete: %s' % qst)
+# A cell whose repeats disagree by more than the harness-wide noise floor is
+# reporting a bimodal regime, not a rate. Worth naming: it is the signature of
+# a transfer that sometimes completes and sometimes collapses, which is exactly
+# what nested CC would do near its tipping point.
+if (row.get('quic_goodput_cv_pct') or 0) >= 30:
+    f.append('quic_goodput_unstable: %.0f%% CV across %d transfers (%s) -- the '
+             'median is not a rate here'
+             % (row['quic_goodput_cv_pct'], row['quic_samples'],
+                row.get('quic_goodput_all')))
 row['findings'] = f
 row['finding_count'] = len(f)
 print(json.dumps(row))" \
         "$class" "$sched" "$gp" "$qst" "$rss" "$stats" "$st" \
-        "${CI_BENCH_QUIC_PIN:-unknown}" >> "$ROWS"
+        "${CI_BENCH_QUIC_PIN:-unknown}" "$gp_cv" "$gp_n" "$gp_all" >> "$ROWS"
 
-    echo "   quic ${gp} Mbps [${qst}] ${st}"
+    echo "   quic ${gp} Mbps (n=${gp_n} cv ${gp_cv:-NA}%) [${qst}] ${st}"
     emit_results
     netsim_teardown
 }
