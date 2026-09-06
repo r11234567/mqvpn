@@ -1530,17 +1530,25 @@ run_game() {
     local tun_q="NA NA NA NA NA" tun_j="NA NA"
     local stats="" rss=0
     if [ "$st" = ok ]; then
-        ci_bench_mark_server_log
-        sampler_start "$NETSIM_NS_SERVER" "$(netsim_veth_srv 0)"
-
-        # A handful of MTU-sized openers first, the way a game sends its
-        # initial state before settling into small updates. Measured
-        # separately from the small-packet phase so the openers' bytes do not
-        # flatter the small-packet latency figure.
+        # A handful of MTU-sized openers first, the way a game ships its
+        # initial state before settling into small updates -- enough to make
+        # the tunnel discover its path MTU and fill any first-packet caches,
+        # so the measured phase is not paying that cost.
+        #
+        # Deliberately BEFORE the sampler starts, and its result discarded. At
+        # 2 Mbit/s of 1400-byte packets the openers are ten times the offered
+        # rate of the phase under measurement; inside the sampled window they
+        # would dominate samp_tx_pps and put a large step at the head of the
+        # very series the oscillation metric reads, which is a trough this
+        # function created rather than one the tunnel produced. The baseline
+        # skips them too, so both halves of added_p99 see the same shape.
         CI_BENCH_IPERF_LEN=1400
         local open_jf; open_jf="$(ci_bench_run_iperf UDP DL 2 1 2000000)"
         rm -f "$open_jf"
         CI_BENCH_IPERF_LEN="$pkt_len"
+
+        ci_bench_mark_server_log
+        sampler_start "$NETSIM_NS_SERVER" "$(netsim_veth_srv 0)"
 
         local tun_jf; tun_jf="$(ci_bench_run_iperf UDP DL "$dur" 1 "$target_bw")"
         tun_q="$(ci_bench_parse_udp_quality "$tun_jf")"
