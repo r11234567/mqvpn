@@ -437,6 +437,17 @@ ci_bench_stop_vpn() {
 # Run iperf3 and return JSON file path.
 # Usage: ci_bench_run_iperf TCP DL 10 4
 #        ci_bench_run_iperf UDP UL 10 4 500M
+#
+# Optional environment knobs, all unset by default so existing callers are
+# byte-for-byte unaffected:
+#   CI_BENCH_IPERF_LEN       payload size (-l), for small-packet profiles
+#   CI_BENCH_IPERF_INTERVAL  per-second samples (-i), for shape analysis
+#   CI_BENCH_IPERF_TARGET    bind/connect address; defaults to the tunnel IP.
+#                            Set to IP_A_SERVER_ADDR to measure the BARE path
+#                            for a baseline -- the difference between the two is
+#                            what the tunnel costs, and being a within-run
+#                            difference it survives a noise floor that makes
+#                            absolute Mbps unreadable across runs.
 ci_bench_run_iperf() {
     local proto="$1"    # TCP or UDP
     local dir="$2"      # DL or UL
@@ -444,10 +455,14 @@ ci_bench_run_iperf() {
     local parallel="$4"
     local target_bw="${5:-}"
 
+    # Server bind and client connect must be the same address, or the client
+    # reaches a listener that is not there.
+    local _cb_iperf_target="${CI_BENCH_IPERF_TARGET:-$TUNNEL_SERVER_IP}"
+
     local json_file
     json_file="$(mktemp)"
 
-    # iperf3 server always in NS_SERVER (bound to tunnel IP).
+    # iperf3 server always in NS_SERVER (bound to the target address).
     # iperf3 client always in NS_CLIENT.
     # Direction controlled by -R flag:
     #   DL (server→client): -R (reverse)
@@ -465,7 +480,7 @@ ci_bench_run_iperf() {
         sleep 0.5
     done
 
-    ip netns exec "$NS_SERVER" iperf3 -s -B "$TUNNEL_SERVER_IP" -1 &>/dev/null &
+    ip netns exec "$NS_SERVER" iperf3 -s -B "$_cb_iperf_target" -1 &>/dev/null &
     local iperf_srv_pid=$!
 
     for (( i=0; i<20; i++ )); do
@@ -474,10 +489,16 @@ ci_bench_run_iperf() {
         sleep 0.5
     done
 
-    local args="-c $TUNNEL_SERVER_IP -t $duration -P $parallel --json"
+    local args="-c $_cb_iperf_target -t $duration -P $parallel --json"
     [ "$proto" = "UDP" ] && args="$args -u"
     [ -n "$target_bw" ] && args="$args -b $target_bw"
     [ "$dir" = "DL" ] && args="$args -R"
+    # Payload size, for the small-packet profiles. Left unset by every bulk
+    # caller so iperf3's own default applies and their numbers do not move.
+    [ -n "${CI_BENCH_IPERF_LEN:-}" ] && args="$args -l ${CI_BENCH_IPERF_LEN}"
+    # Per-second interval samples, so a caller that needs the shape of the
+    # transfer can read intervals[] the way ci_bench_failover.sh:180 does.
+    [ -n "${CI_BENCH_IPERF_INTERVAL:-}" ] && args="$args -i ${CI_BENCH_IPERF_INTERVAL}"
 
     # Two hang guards, both mandatory once the emulated path is allowed to be
     # genuinely broken (see tests/test_e2e_hybrid_h2.sh, which documents the
@@ -500,6 +521,104 @@ ci_bench_run_iperf() {
     wait "$iperf_srv_pid" 2>/dev/null || true
 
     echo "$json_file"
+}
+
+# Extract UDP delivery quality from iperf3 JSON.
+#
+# Echoes: "<lost_pct> <jitter_ms> <out_of_order> <packets> <mbps>", or
+# "NA NA NA NA NA" when the document carries no UDP summary -- the sentinel,
+# never zeros, because a failed run and a clean one must not read alike.
+#
+# Why iperf3 rather than the tunnel's own counters: iperf3 stamps sequence
+# numbers into the UDP payload, so out_of_order and lost_packets are measured
+# END TO END and independently of whether mqvpn's reorder engine is enabled.
+# The engine is OFF by default (config.c:707), so a reorder figure taken from
+# get_reorder_stats would read zero because the engine never ran -- which is
+# indistinguishable from a genuinely in-order stream. That is the same trap as
+# the send-supply headroom column, which came back 0.000 on all 46 rows of run
+# 34026833126 because it restated the predicate that produced it.
+#
+# The server's summary is the authoritative one for loss and reorder: only the
+# receiver can know what failed to arrive.
+ci_bench_parse_udp_quality() {
+    local json_file="$1"
+    python3 -c "
+import json
+try:
+    with open('${json_file}') as f:
+        data = json.load(f)
+except Exception:
+    print('NA NA NA NA NA')
+    raise SystemExit(0)
+
+end = data.get('end') or {}
+# -R (DL) puts the receiving side in sum_received / the server's summary; a UDP
+# run reports its delivery stats under 'sum' on the sender and
+# 'sum_received' on the receiver depending on direction and version, so try
+# each in the order that prefers a receiver's view.
+cand = []
+for key in ('sum_received', 'sum', 'sum_sent'):
+    v = end.get(key)
+    if isinstance(v, dict):
+        cand.append(v)
+srv = end.get('sum_sent_receiver') or {}
+if isinstance(srv, dict) and srv:
+    cand.insert(0, srv)
+
+pkts = lost_pct = jitter = ooo = mbps = None
+for c in cand:
+    if pkts is None and isinstance(c.get('packets'), (int, float)):
+        pkts = c['packets']
+    if lost_pct is None and isinstance(c.get('lost_percent'), (int, float)):
+        lost_pct = c['lost_percent']
+    if jitter is None and isinstance(c.get('jitter_ms'), (int, float)):
+        jitter = c['jitter_ms']
+    if ooo is None and isinstance(c.get('out_of_order'), (int, float)):
+        ooo = c['out_of_order']
+    if mbps is None and isinstance(c.get('bits_per_second'), (int, float)):
+        mbps = c['bits_per_second'] / 1e6
+
+def f(v, spec='%.3f'):
+    return 'NA' if v is None else (spec % v)
+
+print('%s %s %s %s %s' % (f(lost_pct), f(jitter),
+                          f(ooo, '%d') if ooo is not None else 'NA',
+                          f(pkts, '%d') if pkts is not None else 'NA',
+                          f(mbps, '%.3f')))
+"
+}
+
+# Extract per-second latency-proxy percentiles from an iperf3 UDP document.
+#
+# iperf3 reports jitter, not a latency distribution, so a true per-packet p99
+# is not available from it. What IS available per interval is jitter and loss,
+# and the p99 of the interval jitter series is the closest honest proxy. The
+# field is named for what it is (jitter p99, not latency p99) so no reader
+# mistakes it for an RTT percentile.
+ci_bench_parse_udp_jitter_p99() {
+    local json_file="$1"
+    python3 -c "
+import json
+try:
+    with open('${json_file}') as f:
+        data = json.load(f)
+except Exception:
+    print('NA NA')
+    raise SystemExit(0)
+
+vals = []
+for iv in data.get('intervals') or []:
+    s = iv.get('sum') or {}
+    j = s.get('jitter_ms')
+    if isinstance(j, (int, float)):
+        vals.append(j)
+if not vals:
+    print('NA NA')
+else:
+    vals.sort()
+    p99 = vals[min(len(vals) - 1, int(0.99 * (len(vals) - 1)))]
+    print('%.3f %.3f' % (p99, max(vals)))
+"
 }
 
 # Extract throughput (Mbps) from iperf3 JSON

@@ -185,6 +185,30 @@ declare -gA NETSIM_TRANSIT=(
   # sweep — against bgp_opt's 150mbit the faster tiers would all flatten out at
   # the link rate and the tier axis would read as "no difference".
   [lan]="delay 0.2ms rate 2000mbit limit 2000"
+
+  # ── Game-proxy RTT tiers ────────────────────────────────────────────────
+  # A game proxy is a different product from a bulk tunnel: the customer buys
+  # an optimized single path and the traffic is tiny high-frequency packets
+  # (Euro Truck Simulator 2: a few 1400-byte openers, then 10-50 byte updates
+  # at high rate, never more than ~300 kbit/s). Bandwidth is therefore never
+  # the constraint and throughput is not the measurement -- latency and packet
+  # handling are.
+  #
+  # THE DELAY IS HALF THE TIER NAME, AND THAT IS DELIBERATE. netsim_apply_path
+  # installs netem on four hops -- access up, access down, transit up, transit
+  # down -- so a path's round trip is 2x(access + transit). Pairing these with
+  # the `eth` access leg (0.2ms) gives 2x(0.2 + 100) = ~200 ms for game_200.
+  # Writing `delay 200ms` here would have produced a 400 ms tier under a label
+  # that said 200.
+  #
+  # Loss is 0.01%, the optimized-network figure from bgp_opt: these tiers are
+  # about the RTT axis, so quality is held good and constant across all four.
+  # Rate is generous for the same reason -- a rate ceiling would turn a latency
+  # measurement into a bandwidth one.
+  [game_50]="delay 25ms 1ms distribution normal loss 0.01% rate 100mbit limit 400"
+  [game_100]="delay 50ms 1ms distribution normal loss 0.01% rate 100mbit limit 800"
+  [game_150]="delay 75ms 1ms distribution normal loss 0.01% rate 100mbit limit 1200"
+  [game_200]="delay 100ms 1ms distribution normal loss 0.01% rate 100mbit limit 1600"
 )
 
 # Storm state for bgp_flappy / starlink, applied with `tc qdisc change` so the

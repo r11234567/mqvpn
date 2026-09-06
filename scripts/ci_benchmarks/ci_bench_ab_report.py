@@ -341,6 +341,197 @@ def emit_supply(by_key, arms):
         print()
 
 
+def emit_quic(by_key, arms):
+    """Inner-QUIC rows: goodput, rate shape, encapsulation cost.
+
+    Every other table in this report describes inner TCP. These rows are the
+    only ones that say anything about the protocol mqvpn actually proxies, and
+    the only ones where `wlb` and `wlb_udp_pin` can differ at all -- the two
+    schedulers are identical for inner TCP (flow_sched.c:61 pins TCP either
+    way), so a wlb/udp_pin comparison drawn from any other mode is comparing a
+    thing with itself.
+    """
+    rows = []
+    for (mode, scenario, sched), per_arm in by_key.items():
+        for a in arms:
+            r = per_arm.get(a)
+            if r and r.get("mode_family") == "quic":
+                rows.append((mode, scenario, sched, a, r))
+    if not rows:
+        return
+
+    print("## Inner QUIC")
+    print()
+    print(
+        "`goodput` is the inner H3 transfer rate (blank = the transfer did not "
+        "complete; see `quic_status`). `shape` is the outer wire rate over "
+        "time: `oscillating` means it swung at least 2x between its 10th and "
+        "90th percentile AND the swing recurred at a detectable period, which "
+        "is the signature of inner and outer congestion control backing off "
+        "together. **The inner RTT is inferred from the outer series, not "
+        "measured** -- no qlog is parsed. `wire/app` is outer bytes per inner "
+        "byte, which is where small inner ACKs show up."
+    )
+    print()
+    print("| scenario | sched | arm | goodput | shape | ratio | period | "
+          "wire/app | B/pkt | status |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
+    for _mode, scenario, sched, arm, r in sorted(rows, key=lambda t: t[:4]):
+        print("| {} | {} | `{}` | {} | {} | {} | {} | {} | {} | {} |".format(
+            scenario, sched or "-", arm,
+            fmt(r.get("quic_goodput_mbps")),
+            r.get("osc_verdict") or "-",
+            fmt(r.get("osc_peak_trough_ratio"), "{:.2f}"),
+            r.get("osc_autocorr_period_s") if r.get("osc_autocorr_period_s")
+            else "-",
+            fmt(r.get("overhead_wire_app_ratio"), "{:.3f}"),
+            fmt(r.get("overhead_bytes_per_pkt")),
+            r.get("quic_status") or "-"))
+    print()
+
+    # The comparison this mode exists for. Same scenario, two schedulers, one
+    # run -- so the 13% cross-run drift measured on this run's own control rows
+    # does not enter it.
+    pairs = {}
+    for _mode, scenario, sched, arm, r in rows:
+        g = r.get("quic_goodput_mbps")
+        if isinstance(g, (int, float)):
+            pairs.setdefault((scenario, arm), {})[sched] = g
+    both = {k: v for k, v in pairs.items() if len(v) >= 2}
+    if both:
+        print("### `wlb` vs `wlb_udp_pin` on inner QUIC")
+        print()
+        print("Measured in one run, so this is a within-run comparison. This "
+              "is the first table in the harness where the two schedulers can "
+              "differ at all.")
+        print()
+        print("| scenario | arm | wlb | wlb_udp_pin | udp_pin move |")
+        print("|---|---|---|---|---|")
+        for (scenario, arm), v in sorted(both.items()):
+            base, pin = v.get("wlb"), v.get("wlb_udp_pin")
+            mv = pct_move(base, pin)
+            print("| {} | `{}` | {} | {} | {} |".format(
+                scenario, arm, fmt(base), fmt(pin),
+                f"{mv:+.1f}%" if mv is not None else "-"))
+        print()
+
+
+def emit_game(by_key, arms):
+    """Game-proxy rows: latency cost and packet fidelity, not throughput.
+
+    Throughput is deliberately absent. At 500-4000 packets per second of
+    50-byte payload the offered load is 0.2-1.6 Mbit/s against emulated links
+    of 100 Mbit/s, so a bandwidth figure here would only ever restate the
+    offered rate. What binds is added latency and whether the packets arrived.
+    """
+    rows = []
+    for (mode, scenario, sched), per_arm in by_key.items():
+        for a in arms:
+            r = per_arm.get(a)
+            if r and r.get("mode_family") == "game":
+                rows.append((r.get("rtt_tier_ms") or 0,
+                             r.get("game_pps_tier") or 0, scenario, a, r))
+    if not rows:
+        return
+
+    print("## Game proxy (single path, small packets)")
+    print()
+    print(
+        "Single path, `wlb_udp_pin`, 50-byte payloads at a fixed packet rate. "
+        "`added p99` is the tunnel's p99 jitter minus the SAME emulated tier "
+        "measured without the tunnel, so it is a within-run difference and is "
+        "not affected by the cross-run drift that makes absolute figures "
+        "unreadable. Note it is a **jitter** percentile, not a per-packet RTT "
+        "percentile -- iperf3 reports jitter, not a latency distribution. "
+        "`fidelity` is packets delivered over packets offered; below 1.0 is a "
+        "packet-handling limit, never a bandwidth one at these rates."
+    )
+    print()
+    print("| RTT tier | pps | arm | base p99 | tun p99 | **added p99** | "
+          "base loss | tun loss | ooo% | fidelity | sndbuf | status |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for rtt, pps, _scenario, arm, r in sorted(rows, key=lambda t: t[:4]):
+        print("| {} ms | {} | `{}` | {} | {} | **{}** | {} | {} | {} | {} | "
+              "{} | {} |".format(
+                  rtt, pps, arm,
+                  fmt(r.get("baseline_jitter_p99_ms"), "{:.2f}"),
+                  fmt(r.get("tunnel_jitter_p99_ms"), "{:.2f}"),
+                  fmt(r.get("added_jitter_p99_ms"), "{:+.2f}"),
+                  fmt(r.get("baseline_loss_pct"), "{:.2f}"),
+                  fmt(r.get("tunnel_loss_pct"), "{:.2f}"),
+                  fmt(r.get("out_of_order_pct"), "{:.3f}"),
+                  fmt(r.get("pps_fidelity"), "{:.3f}"),
+                  r.get("samp_sndbuf_errors")
+                  if r.get("samp_sndbuf_errors") is not None else "-",
+                  r.get("status") or "-"))
+    print()
+
+    # A reorder column that reads zero is ambiguous unless the engine's state
+    # is stated beside it: mqvpn's reorder engine is off by default, so zero
+    # can mean "nothing was reordered" or "nothing was counting".
+    engines = {r.get("reorder_engine") or "unknown" for *_x, r in rows}
+    print("Reorder engine state across these rows: "
+          + ", ".join(f"`{e}`" for e in sorted(engines))
+          + ". The `ooo%` column comes from iperf3's own sequence numbers, so "
+            "it is measured end to end and does not depend on that engine.")
+    print()
+
+
+def emit_vps(by_key, arms):
+    """Constrained-host rows: CPU, softirq, and what was not emulated."""
+    rows = []
+    for (mode, scenario, sched), per_arm in by_key.items():
+        for a in arms:
+            r = per_arm.get(a)
+            if r and r.get("samp_cpu_util_pct") is not None:
+                rows.append((mode, scenario, a, r))
+    if not rows:
+        return
+
+    print("## Host load")
+    print()
+    print(
+        "Sampled once a second from `/proc/stat`, `/proc/softirqs` and the "
+        "interface counters inside the server namespace. `NET_RX cpu0` is the "
+        "share of receive softirqs that landed on CPU0 -- an assertion that "
+        "the box matched the target profile, not a measurement of anything. "
+        "`sndbuf` counts datagrams the kernel refused because the socket "
+        "buffer was full, which is a direct send-side-blocking signal."
+    )
+    print()
+    print("| mode | scenario | arm | tier | cpu% | softirq% | NET_RX/s | "
+          "NET_RX cpu0 | tx pps | rxq/txq | rps | sndbuf |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for mode, scenario, arm, r in sorted(rows, key=lambda t: t[:3]):
+        q = "{}/{}".format(r.get("host_rx_queues", "-"),
+                           r.get("host_tx_queues", "-"))
+        print("| {} | {} | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |"
+              .format(
+                  mode, scenario, arm, r.get("host_tier") or "-",
+                  fmt(r.get("samp_cpu_util_pct")),
+                  fmt(r.get("samp_softirq_pct"), "{:.2f}"),
+                  fmt(r.get("samp_net_rx_per_s")),
+                  fmt(r.get("samp_net_rx_cpu0_share"), "{:.3f}"),
+                  fmt(r.get("samp_tx_pps")),
+                  q,
+                  "on" if r.get("host_rps_enabled") else "off",
+                  r.get("samp_sndbuf_errors")
+                  if r.get("samp_sndbuf_errors") is not None else "-"))
+    print()
+
+    notes = {r.get("host_not_emulated") for *_x, r in rows
+             if r.get("host_not_emulated")}
+    for n in sorted(notes):
+        print(f"**Not emulated:** {n}")
+        print()
+
+    costs = {r.get("samp_cost_note") for *_x, r in rows if r.get("samp_cost_note")}
+    if costs:
+        print("Sampler overhead, measured rather than assumed: "
+              + "; ".join(sorted(costs)) + ".")
+        print()
+
+
 def emit_noise_floor(by_key, arms):
     """What this run can resolve, measured from the run itself.
 
@@ -448,6 +639,9 @@ def main(argv=None):
         print()
     emit_wlb(by_key, arms)
     emit_supply(by_key, arms)
+    emit_quic(by_key, arms)
+    emit_game(by_key, arms)
+    emit_vps(by_key, arms)
     return 0
 
 

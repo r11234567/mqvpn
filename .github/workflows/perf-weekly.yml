@@ -19,10 +19,27 @@ on:
       netsim_modes:
         description: >-
           Comma-separated netsim modes to narrow to (e.g. "classes,sched,tiers").
-          Leave EMPTY for the full set of 11, which is what the schedule runs and
+          Leave EMPTY for the full set of 14, which is what the schedule runs and
           what any conclusion about coverage needs.
         required: false
         default: ''
+      skip_core:
+        description: >-
+          Skip the core benchmark job (raw throughput, failover, aggregation,
+          multipath scheduler, UDP sweep, NTN, backup FEC) and run only the
+          netsim matrix. Narrowing `netsim_modes` alone does NOT make a dispatch
+          faster: the netsim modes run as parallel jobs whose longest is about
+          31 minutes, while the core job takes 57 and sets the whole dispatch's
+          wall clock on its own — run 34026833126 finished in exactly the core
+          job's 57 minutes with that day's 11 netsim modes hidden inside it.
+          Use this together with `netsim_modes` when the question is about a
+          netsim mode, which turns an hour into roughly 20 minutes. Leave it
+          OFF for anything
+          published as a series: the core numbers are what the dashboard tracks,
+          and a run missing them is not comparable with one that has them.
+        required: false
+        type: boolean
+        default: false
       arms:
         description: >-
           A/B arms, run as parallel matrix jobs in THIS one dispatch so every
@@ -70,6 +87,12 @@ concurrency:
 
 jobs:
   perf-weekly:
+    # The schedule always runs this; only a dispatch that explicitly asked to
+    # skip it does not. `github.event.inputs` is null outside workflow_dispatch,
+    # so the comparison is false on a schedule and the job runs -- which is the
+    # behaviour that matters, since the series must never silently lose its
+    # core numbers.
+    if: github.event.inputs.skip_core != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -209,7 +232,7 @@ jobs:
   # Builds the netsim matrix as modes x arms. A static matrix can be neither
   # narrowed nor doubled by an input, and both are wanted:
   #
-  #   - The full 11 modes are the default, because a conclusion about coverage
+  #   - The full 14 modes are the default, because a conclusion about coverage
   #     needs all of them. `netsim_modes` only narrows, and only on a dispatch.
   #   - `arms` runs the same modes twice in ONE dispatch, as parallel jobs. An
   #     A/B done as two dispatches is not just slower, it is weaker: these
@@ -242,6 +265,16 @@ jobs:
               {"id": "cat_plain",   "args": "catalog bgp_plain"},
               {"id": "cat_junk",    "args": "catalog bgp_junk"},
               {"id": "cat_carrier", "args": "catalog carrier_qos"},
+              # The three modes whose inner traffic is not TCP. Every mode
+              # above measures iperf3 TCP through the tunnel, which for a QUIC
+              # proxy leaves the protocol most of its traffic actually is
+              # unmeasured -- and leaves wlb and wlb_udp_pin indistinguishable,
+              # since the two differ only on inner UDP (flow_sched.c:61).
+              # Modes run as parallel jobs, so these cost no wall clock as long
+              # as each stays under the ~31 min `classes` takes.
+              {"id": "quic",        "args": "quic"},
+              {"id": "game",        "args": "game"},
+              {"id": "vps",         "args": "vps"},
           ]
           # An arm is a named set of env overrides, so any setting worth an A/B
           # can be one. "" leaves the harness default alone. Keep these keys in
@@ -331,6 +364,14 @@ jobs:
       # to every arm; otherwise the script's own default, which is what keeps a
       # scheduled run comparable with the series.
       CI_BENCH_IPERF_STREAMS: ${{ matrix.streams || github.event.inputs.iperf_streams }}
+      # Per-second host and interface sampling. On for every mode, because the
+      # send-side and CPU counters it produces are as useful on a bulk TCP row
+      # as on a QUIC one -- and because the quic mode's oscillation metric is
+      # computed from its series and would be silently absent without it.
+      # Cost is measured and published per row (samp_cost_note), rather than
+      # assumed negligible: one long-lived reader of /proc, not a process spawn
+      # per sample.
+      CI_BENCH_SAMPLE: '1'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -398,6 +439,27 @@ jobs:
                 -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
           make -j$(nproc)
 
+      # picoquicdemo generates the INNER QUIC traffic for the `quic` mode. Only
+      # that mode needs it, so the build is gated -- it is a clone plus two
+      # cmake builds (picotls, then picoquicdemo) and every other mode would
+      # pay for a binary it never runs.
+      #
+      # The cache holds the whole clone, not just the binary: PICO_CERT and
+      # PICO_KEY point into third_party/picoquic/certs/, and
+      # build_picoquic.sh does not generate them -- caching the binary alone
+      # would restore a tree whose server cannot start.
+      - name: Cache picoquic
+        if: matrix.id == 'quic'
+        id: picoquic-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/picoquic
+          key: picoquic-${{ hashFiles('scripts/ci_interop/build_picoquic.sh') }}-linux-v1
+
+      - name: Build picoquic
+        if: matrix.id == 'quic' && steps.picoquic-cache.outputs.cache-hit != 'true'
+        run: bash scripts/ci_interop/build_picoquic.sh
+
       - name: Scenario ${{ matrix.id }}
         run: sudo -E bash scripts/ci_benchmarks/ci_bench_scenarios.sh ${{ matrix.args }} build/mqvpn
 
@@ -431,6 +493,22 @@ jobs:
         with:
           pattern: netsim-*
           path: ab
+
+      # Say so in the summary itself when the core benchmarks were skipped.
+      # Otherwise a fast dispatch produces a summary that looks exactly like a
+      # full weekly minus a few tables, and the absence is easy to read as "the
+      # core numbers regressed to nothing" rather than "they were not run".
+      - name: Note a partial dispatch
+        if: github.event.inputs.skip_core == 'true'
+        run: |
+          {
+            echo "> **Partial dispatch:** \`skip_core\` was set, so the core"
+            echo "> benchmarks (raw throughput, failover, aggregation, multipath"
+            echo "> scheduler, UDP sweep, NTN, backup FEC) did NOT run. Only the"
+            echo "> netsim matrix below was measured. Do not compare this run"
+            echo "> against the published series."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Compare arms
         run: |
