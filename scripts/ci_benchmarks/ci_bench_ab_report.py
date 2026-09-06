@@ -268,6 +268,79 @@ def emit_wlb(by_key, arms):
     print()
 
 
+def emit_supply(by_key, arms):
+    """Where the send side stopped, from xquic's |send_supply| counters.
+
+    The one question the throughput columns cannot answer: when a row comes in
+    below what its legs measure alone, was the send side short of packets, or
+    was capacity available and left unused? Those have opposite remedies, and
+    every artifact before this one recorded neither.
+    """
+    rows = []
+    for (mode, scenario, sched), per_arm in by_key.items():
+        for a in arms:
+            r = per_arm.get(a)
+            if not r:
+                continue
+            state = r.get("send_supply")
+            if state is None:
+                continue
+            rows.append((mode, scenario, sched, a, r, state))
+    if not rows:
+        return
+
+    print("## Send-side supply")
+    print()
+    states = {}
+    for *_x, state in rows:
+        states[state] = states.get(state, 0) + 1
+    if set(states) - {"ok"}:
+        print("Collection status across rows: "
+              + ", ".join(f"`{k}` x{v}" for k, v in sorted(states.items())))
+        print()
+    ok = [t for t in rows if t[5] == "ok"]
+    if not ok:
+        print(
+            "No row produced counters. `no_lines` means the log carried none: "
+            "check that the embedder forwards xquic's REPORT channel and that "
+            "the build is new enough to emit `|send_supply|`."
+        )
+        print()
+        return
+
+    print(
+        "`drain` is the share of scheduling passes that emptied the send queue "
+        "— near 1.0 means the paths were never the constraint and the limit is "
+        "upstream of the scheduler. `headroom` is the share of the passes that "
+        "*stopped* which stopped while some active path would still have taken "
+        "the packet; that is the scheduler declining capacity. `backlog` is the "
+        "mean depth left behind per stop, capped at 512 by xquic."
+    )
+    print()
+    print("| mode | scenario | sched | arm | verdict | drain | headroom | "
+          "backlog | passes |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    for mode, scenario, sched, arm, r, _s in sorted(ok):
+        print("| {} | {} | {} | `{}` | {} | {} | {} | {} | {} |".format(
+            mode, scenario, sched or "-", arm,
+            r.get("supply_verdict") or "-",
+            fmt(r.get("supply_drain_ratio"), "{:.3f}"),
+            fmt(r.get("supply_headroom_share"), "{:.3f}"),
+            fmt(r.get("supply_backlog_per_stop")),
+            r.get("supply_passes")))
+    print()
+
+    verdicts = {}
+    for *_x, r, _s in ok:
+        v = r.get("supply_verdict")
+        if v:
+            verdicts[v] = verdicts.get(v, 0) + 1
+    if verdicts:
+        print("Verdicts: "
+              + ", ".join(f"`{k}` x{v}" for k, v in sorted(verdicts.items())))
+        print()
+
+
 def emit_noise_floor(by_key, arms):
     """What this run can resolve, measured from the run itself.
 
@@ -374,6 +447,7 @@ def main(argv=None):
               "the dispatch to get one.")
         print()
     emit_wlb(by_key, arms)
+    emit_supply(by_key, arms)
     return 0
 
 

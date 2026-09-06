@@ -35,10 +35,13 @@ on:
         default: ''
       wlb_instr:
         description: >-
-          Collect the WLB scheduler's per-path pin/packet/round counters
-          (CI_BENCH_WLB_INSTR). Raises both ends' log level to info; the counters
-          are once-a-second aggregates, so this does not move the throughput
-          being measured.
+          Collect xquic's scheduler and send-side counters (CI_BENCH_WLB_INSTR):
+          the WLB per-path pin/packet/round split, and |send_supply| — whether
+          each scheduling pass drained the queue (so the send side, not the
+          paths, was the limit), stopped with capacity still available on some
+          path (so the scheduler declined it), or stopped with everything
+          blocked. Raises both ends' log level to info; both are once-a-second
+          aggregates, so this does not move the throughput being measured.
         required: false
         type: boolean
         default: false

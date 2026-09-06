@@ -527,6 +527,102 @@ emit(out)
 " "$CI_BENCH_SERVER_LOG" "${CI_BENCH_SERVER_LOG_MARK:-0}"
 }
 
+# Where the send side stopped, from xquic's |send_supply| line.
+#
+# The question this exists for: asym_capacity puts a 50 Mbit leg beside a 380
+# Mbit one and the tunnel delivers 49.7 Mbps -- below the fast leg's own 234.6
+# solo figure. Static review ruled out the shared send-side resources it could
+# reach (connection flow control does not cover DATAGRAM, the per-tick send
+# budget is per-path, the packet pool is 18000 deep), which leaves two
+# possibilities that no artifact the harness collected could tell apart:
+#
+#   supply-limited -- the send side never offered enough to fill both legs.
+#     Reads as `drain_ratio` near 1: nearly every scheduling pass emptied the
+#     queue, so the paths were never the constraint. The next place to look is
+#     then the TUN read loop and the datagram write, not the scheduler.
+#
+#   scheduler-limited -- capacity was there and went unused. Reads as
+#     `stop_headroom_left` climbing: a pass stopped with packets still queued
+#     at a moment when some active path would still have accepted one. This is
+#     the reading that would explain an aggregate below one leg alone.
+#
+#   network-limited -- `stop_all_blocked` dominates and backlog is deep. Honest
+#     congestion; the emulated capacity is what it is.
+#
+# Same window discipline as collect_wlb_instr: cumulative counters read from
+# the server log after the mark, because the scheduler and the connection are
+# both per-connection and the solo phases would otherwise be folded in.
+collect_send_supply() {
+    [ "${CI_BENCH_WLB_INSTR:-0}" = "1" ] || return 0
+    [ -n "${CI_BENCH_SERVER_LOG:-}" ] && [ -r "$CI_BENCH_SERVER_LOG" ] || {
+        echo -n ',"send_supply":"no_log"'
+        return 0
+    }
+
+    python3 -c "
+import json, re, sys
+
+pat = re.compile(r'\|send_supply\|passes:(\d+)\|drained:(\d+)'
+                 r'\|stop_all_blocked:(\d+)\|stop_headroom_left:(\d+)'
+                 r'\|stop_backlog:(\d+)\|sndq_used:(\d+)\|paths:(\d+)\|')
+
+path_log, mark = sys.argv[1], int(sys.argv[2])
+
+def emit(d):
+    print(',' + ','.join(json.dumps(k) + ':' + json.dumps(v)
+                         for k, v in d.items()))
+    raise SystemExit(0)
+
+# Last line in the window wins: the counters are cumulative per connection.
+last, n = None, 0
+try:
+    with open(path_log, errors='replace') as fh:
+        fh.seek(mark)
+        for line in fh:
+            m = pat.search(line)
+            if m:
+                vals = [int(g) for g in m.groups()]
+                # A counter going backwards means a second connection, whose
+                # numbers would otherwise be added to the first's.
+                if last is not None and vals[0] < last[0]:
+                    n = 0
+                last = vals
+                n += 1
+except OSError:
+    emit({'send_supply': 'unreadable'})
+
+if last is None:
+    emit({'send_supply': 'no_lines'})
+
+passes, drained, all_blk, headroom, backlog, sndq, paths = last
+out = {'send_supply': 'ok', 'supply_samples': n}
+out['supply_passes'] = passes
+out['supply_drained'] = drained
+out['supply_stop_all_blocked'] = all_blk
+out['supply_stop_headroom_left'] = headroom
+out['supply_sndq_used_last'] = sndq
+
+if passes:
+    # The headline. Near 1.0 means the paths were never the limit.
+    out['supply_drain_ratio'] = round(drained / passes, 3)
+    stops = all_blk + headroom
+    out['supply_stop_ratio'] = round(stops / passes, 3)
+    # Of the passes that DID stop, the fraction that stopped with capacity
+    # still available. This is the number that accuses the scheduler.
+    out['supply_headroom_share'] = (round(headroom / stops, 3) if stops
+                                    else None)
+    # Mean depth left behind per stop, so a rare deep stall is not read the
+    # same as constant shallow ones. Capped at 512 per stop in xquic.
+    out['supply_backlog_per_stop'] = (round(backlog / stops, 1) if stops
+                                      else None)
+    out['supply_verdict'] = (
+        'supply_limited'    if out['supply_drain_ratio'] >= 0.95 else
+        'scheduler_limited' if (out['supply_headroom_share'] or 0) >= 0.5 else
+        'network_limited')
+emit(out)
+" "$CI_BENCH_SERVER_LOG" "${CI_BENCH_SERVER_LOG_MARK:-0}"
+}
+
 server_rss_kb() {
     [ -n "${_CB_SERVER_PID:-}" ] || { echo 0; return; }
     awk '/VmHWM/{print $2}' "/proc/${_CB_SERVER_PID}/status" 2>/dev/null || echo 0
@@ -606,7 +702,7 @@ run_pair() {
     # Must run before ci_bench_stop_vpn: the server log lives under the work
     # dir the teardown removes. The multipath pathset was measured last, so the
     # window mark points at that run -- the only one whose split matters.
-    stats="${stats}$(collect_wlb_instr)"
+    stats="${stats}$(collect_wlb_instr)$(collect_send_supply)"
     netsim_spike_stop
     ci_bench_stop_vpn
 
@@ -778,7 +874,7 @@ run_tier() {
     # uneven split has no network explanation at all -- the cleanest place to
     # read the scheduler's own counters. Before ci_bench_stop_vpn: the log lives
     # under the work dir teardown removes.
-    stats="${stats}$(collect_wlb_instr)"
+    stats="${stats}$(collect_wlb_instr)$(collect_send_supply)"
 
     if [ -n "$cap_pid" ]; then
         kill "$cap_pid" 2>/dev/null || true
