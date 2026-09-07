@@ -1157,14 +1157,40 @@ trip is 2×(access + transit). `game_200` is `delay 100ms` paired with the 0.2 m
 `eth` access leg, which measures 200.4 ms. Writing `delay 200ms` would have
 produced a 400 ms tier under a label saying 200.
 
-**Reorder counts come from iperf3, not from mqvpn.** The reorder engine is off by
-default, so a reorder figure read from `get_reorder_stats` would be zero because
-nothing was counting — indistinguishable from a genuinely in-order stream. That
-is the same defect class as the send-supply `headroom` column, which came back
-`0.000` on all 46 rows of run 34026833126 because it restated the predicate that
-had produced the value. iperf3 stamps its own sequence numbers, so `ooo%` is
-measured end to end and independent of the engine; the row records the engine's
-state beside it regardless.
+**Reorder is not currently measured at all.** The intent was to take it from
+iperf3 rather than from `get_reorder_stats`, for a good reason that still
+holds: mqvpn's reorder engine is off by default, so a figure read from its
+counters would be zero because nothing was counting — indistinguishable from a
+genuinely in-order stream, and the same defect class as the `headroom` column.
+
+But the replacement does not work either. **iperf3's JSON carries no
+`out_of_order` key**; reordering appears only in its verbose text output. The
+parser at `ci_bench_env.sh:576` looks for a field that is never emitted, so
+`ooo%` has read `null` in 12/12 game rows of every run. The plan asserted
+`end.sum.out_of_order` existed without checking the schema.
+
+The column is left in place, empty and labelled in the report, rather than
+removed — reordering is the failure mode this mode exists to measure, and a
+generator that can report it is outstanding work, not a closed question.
+
+**UDP offload is turned off for `game` and `vps`.** `UdpGso` defaults to true
+and does more than batch syscalls: the same predicate
+(`mqvpn_tx_batch_enabled()`) also sets xquic's `defer_send_flush`, so the
+sender holds a datagram back until a batch is worth sending. Run 34043133862
+measured the effect — `gso_factor` was 2.00 on every 2000 pps game row (two
+datagrams per syscall) and `samp_tx_pps` read ~958 against 2000 offered.
+
+That is precisely the thing a game row is supposed to be sensitive to: an
+inner protocol that infers loss from arrival gaps sees a coalesced batch as a
+stall. Measuring arrival timing with batching on measures the wrong thing, so
+both modes append `[Advanced] UdpGso = false / UdpGro = false` to the config
+both ends already receive.
+
+The row **verifies** this rather than trusting it. `offload_applied` compares
+the requested setting against the observed `gso_factor`, because the startup
+marker (`udp-gso: GSO enabled`) reports only the kernel capability probe and
+cannot say whether batching occurred. A `gso_factor` above 1.0 on a row that
+asked for it off means the config never reached the process.
 
 ### 5.1 Columns retired for being unable to disagree
 

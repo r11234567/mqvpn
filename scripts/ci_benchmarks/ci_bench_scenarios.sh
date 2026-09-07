@@ -89,6 +89,31 @@ if [ -n "$CI_BENCH_REORDER" ]; then
     echo "arm '${CI_BENCH_ARM}': [Reorder] Enabled = ${CI_BENCH_REORDER}"
 fi
 
+# Append an [Advanced] block to whatever config both ends are already getting,
+# creating the file if the arm did not.
+#
+# Why a mode needs this: UdpGso defaults to true, and it does not merely batch
+# syscalls -- it also sets xquic's defer_send_flush (one predicate,
+# mqvpn_tx_batch_enabled(), drives both), so the sender holds packets back
+# until a batch is worth sending. Run 34043133862 measured the consequence:
+# gso_factor was 2.00 on every 2000 pps game row, meaning two datagrams left
+# per syscall, and samp_tx_pps read ~958 against 2000 offered. A game protocol
+# that infers loss from arrival gaps sees a coalesced batch as a stall, which
+# is the failure this mode exists to measure -- so measuring it with batching
+# on measures the wrong thing.
+#
+# Appended rather than written: the reorder arm above owns the same file, and
+# clobbering it would silently disable the A/B.
+ci_bench_config_append() {
+    if [ -z "${CI_BENCH_CONFIG_FILE:-}" ]; then
+        _CB_ARM_DIR="${_CB_ARM_DIR:-$(mktemp -d)}"
+        CI_BENCH_CONFIG_FILE="${_CB_ARM_DIR}/arm.conf"
+        : >"$CI_BENCH_CONFIG_FILE"
+        export CI_BENCH_CONFIG_FILE
+    fi
+    printf '%s\n' "$@" >>"$CI_BENCH_CONFIG_FILE"
+}
+
 # Streams per sample. One stream cannot fill a high-BDP path: bgp_plain at
 # 380mbit over ~160ms RTT needs 7.6 MB of in-flight window, which a single
 # inner TCP connection does not reach inside a short sample. That is how the
@@ -335,7 +360,7 @@ collect_stats() {
     status="$(netsim_query_control get_status)"
     stats="$(netsim_query_control get_stats)"
     python3 -c "
-import json, sys
+import json, os, sys
 
 # xquic initialises ctl_minrtt to XQC_MAX_UINT32_VALUE and resets it to that on
 # a route change (xqc_send_ctl.c:129, 215, 320, 1588). xqc_multipath.c:955
@@ -411,10 +436,26 @@ for k in ('dgram_lost', 'dgram_sent', 'bytes_tx', 'bytes_rx'):
     if k in gs: out[k] = gs[k]
 # Batching factors: the readout that makes carrier_qos actionable, since a
 # packet-rate cap makes goodput scale with bytes-per-packet.
+#
+# These also VERIFY the [Advanced] setting rather than trusting it. A mode that
+# writes UdpGso=false gets 1.0 here if it worked; anything above 1.0 means the
+# config did not reach the process, which is a silent failure the startup
+# marker cannot catch (it reports the kernel capability probe, not whether
+# batching is happening).
 if gs.get('udp_tx_sends'):
     out['gso_factor'] = round(gs['udp_tx_datagrams'] / gs['udp_tx_sends'], 2)
 if gs.get('udp_rx_receives'):
     out['gro_factor'] = round(gs['udp_rx_datagrams'] / gs['udp_rx_receives'], 2)
+want_off = os.environ.get('CI_BENCH_OFFLOAD') == 'off'
+if want_off:
+    out['offload_requested'] = 'UdpGso=false UdpGro=false'
+    g = out.get('gso_factor')
+    if g is not None and g > 1.05:
+        out['offload_applied'] = 'no'
+        out['offload_note'] = ('gso_factor %.2f with UdpGso=false requested -- '
+                               'the config did not reach the process' % g)
+    elif g is not None:
+        out['offload_applied'] = 'yes'
 print(','.join(json.dumps(k) + ':' + json.dumps(v) for k, v in out.items()))
 " "$status" "$stats"
 }
@@ -2338,6 +2379,10 @@ case "$MODE" in
     # omits it) and game traffic is bidirectional -- both ends have to agree.
     TEST_NAME="netsim_game"
     CI_BENCH_SCHEDULER=wlb_udp_pin
+    # No coalescing on either side: see ci_bench_config_append. A game row is
+    # about when packets arrive, and batching changes exactly that.
+    ci_bench_config_append '[Advanced]' 'UdpGso = false' 'UdpGro = false'
+    export CI_BENCH_OFFLOAD=off
     # PPS tiers, not bandwidth tiers. 500 pps of 50-byte payload is 200 kbit/s;
     # 4000 pps is 1.6 Mbit/s, still far under any emulated rate here, so the
     # axis stays packet rate throughout and never becomes a bandwidth test.
@@ -2361,6 +2406,11 @@ case "$MODE" in
     # reproduced from inside a guest at all and are named as such on the row.
     TEST_NAME="netsim_vps"
     CI_BENCH_SCHEDULER=wlb_udp_pin
+    # Same traffic shape as the game mode, so the same offload setting -- and
+    # on a 1-vCPU box the syscall saving GSO buys is exactly the trade this
+    # mode is meant to expose, not something to quietly take.
+    ci_bench_config_append '[Advanced]' 'UdpGso = false' 'UdpGro = false'
+    export CI_BENCH_OFFLOAD=off
     if ! ci_bench_have_tiers; then
         echo "::warning::transient scopes unavailable — vps rows will be" \
              "untiered and must not be read as 1-vCPU ceilings"

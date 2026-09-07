@@ -536,6 +536,34 @@ def emit_game(by_key, arms):
     )
     print()
 
+    # Whether the offload setting actually took, rather than whether it was
+    # requested. gso_factor is the only thing that can tell the difference.
+    req = [r for *_x, r in rows if r.get("offload_requested")]
+    if req:
+        bad = [r for r in req if r.get("offload_applied") == "no"]
+        gsos = sorted({r.get("gso_factor") for r in req
+                       if r.get("gso_factor") is not None})
+        if bad:
+            print(
+                "**UDP offload was requested off and did not take.** "
+                f"{len(bad)} of {len(req)} rows still show batching "
+                "(`gso_factor` above 1.0), which means the `[Advanced]` block "
+                "never reached the process. Arrival timing on those rows is "
+                "not what the mode intended to measure."
+            )
+        else:
+            print(
+                "UDP offload off on these rows (`UdpGso=false UdpGro=false`), "
+                "confirmed by `gso_factor` "
+                + ", ".join(f"{g:.2f}" for g in gsos)
+                + " -- one datagram per syscall, so no batch is held back "
+                  "waiting to form. This matters for arrival timing: with "
+                  "batching on, a receiver sees a group of packets land "
+                  "together, and an inner protocol that infers loss from "
+                  "gaps can read that as a stall."
+            )
+        print()
+
     # A reorder column that reads zero is ambiguous unless the engine's state
     # is stated beside it: mqvpn's reorder engine is off by default, so zero
     # can mean "nothing was reordered" or "nothing was counting".

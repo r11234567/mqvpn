@@ -40,6 +40,8 @@ https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
 - [Configuration](#configuration)
   - [INI config](#ini-config)
   - [JSON config](#json-config)
+  - [TUN MTU](#tun-mtu)
+  - [`[Advanced]` — UDP offload](#advanced--udp-offload)
 - [Schedulers](#schedulers)
 - [Reorder buffer (datagram lane)](#reorder-buffer-datagram-lane)
 - [Reinjection (speculative duplication)](#reinjection-speculative-duplication)
@@ -651,6 +653,98 @@ Notes:
 sudo mqvpn --config /etc/mqvpn/server.conf
 sudo mqvpn --config /etc/mqvpn/client.conf
 ```
+
+### TUN MTU
+
+`[Interface] MTU` sets the tunnel interface's MTU. Accepts `0` (auto) or
+`1280`–`9000`; anything else is rejected at parse time rather than clamped.
+
+| | `MTU = 0` (default) | `MTU = N` |
+|---|---|---|
+| **Server** | 1382 — the outer datagram less QUIC and DATAGRAM/MASQUE headers | Sets the TUN MTU, and caps what any client may negotiate |
+| **Client** | Whatever the server negotiates, adjusted for PMTU discovery | A **cap** on the negotiated value, never a raise |
+
+The client side is a cap, not an override: asking for 9000 on a path whose
+real MTU is 1400 gets you 1400, because the negotiated value already reflects
+what the path will carry. Lowering it is the operation that always works.
+
+Three reasons to set it explicitly:
+
+- **A link that lies about its MTU.** PMTU discovery needs the ICMP
+  *Fragmentation Needed* reply to come back; a middlebox that swallows ICMP
+  turns a too-large packet into a silent black hole. Pinning the MTU below the
+  real path MTU sidesteps the discovery entirely.
+- **`[Reorder]` costs 8 bytes.** The reorder header comes out of the inner
+  MTU, and the client subtracts it *after* applying your cap — so `MTU = 1400`
+  with the reorder shim on gives a 1392-byte TUN. When IPv6 is assigned the
+  result is floored at 1280, which is the one case your setting is not what
+  runs.
+- **Jumbo frames.** A 9000-byte MTU is only useful when every hop carries it;
+  one 1500-byte hop in the middle makes it worse than the default.
+
+```ini
+[Interface]
+MTU = 1400
+```
+
+```json
+{ "tun_mtu": 1400 }
+```
+
+```bash
+sudo mqvpn --mode server --mtu 1400 ...
+```
+
+CLI beats config file; `0` from either means auto.
+
+### `[Advanced]` — UDP offload
+
+Both keys default to `true` and both are Linux-only; on other platforms the
+code path does not exist and the setting is inert.
+
+| Key | Default | What it does |
+|---|---|---|
+| `UdpGso` | `true` | Transmit batching. Hands several outer datagrams to the kernel in one `sendmsg`, which the NIC or the kernel then segments. |
+| `UdpGro` | `true` | Receive coalescing. The kernel merges several arriving datagrams into one `recvmsg`. |
+
+Both trade syscalls for latency, and both are worth turning off for
+**latency-sensitive small-packet traffic** — a game protocol, or anything where
+a packet's arrival *time* matters more than the throughput.
+
+`UdpGso = false` does two things, not one: it stops the batched send path
+*and* clears xquic's `defer_send_flush`, which is what holds packets back so a
+batch can form (both come from a single predicate,
+`mqvpn_tx_batch_enabled()`, precisely so they cannot disagree). With it on, a
+sender at a few thousand packets per second defers the first datagram until
+the batch is worth a syscall; the receiver then sees the batch arrive
+together, and an inner protocol that infers loss from arrival gaps can read
+that as a stall.
+
+Whether it is actually happening is measurable rather than guessable — the
+control API reports the achieved factors, and `1.0` means every datagram cost
+its own syscall:
+
+```bash
+echo '{"cmd":"get_stats"}' | nc 127.0.0.1 9090
+# udp_tx_datagrams / udp_tx_sends     -> transmit batching factor
+# udp_rx_datagrams / udp_rx_receives  -> receive coalescing factor
+```
+
+A factor of 2.0 on the transmit side means two datagrams left per syscall. The
+startup markers (`udp-gso: GSO enabled`) report only the kernel *capability
+probe*, so they cannot tell you whether batching is occurring — the ratio can.
+
+```ini
+[Advanced]
+UdpGso = false
+UdpGro = false
+```
+
+```json
+{ "udp_gso": false, "udp_gro": false }
+```
+
+There is no CLI flag for either; they are config-file only.
 
 ## Schedulers
 
