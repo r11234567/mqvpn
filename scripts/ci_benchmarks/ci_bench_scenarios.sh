@@ -2146,6 +2146,13 @@ row = {
   'mode_family': 'game',
   'rtt_tier_ms': int(tier.split('_')[1]),
   'game_pps_tier': pps,
+  # gamegen's own offered rate, which is NOT game_pps_tier: that names the
+  # iperf3 leg's fixed-size axis. Recorded so a row states the rate it was
+  # driven at -- run 34084331771 lost 23-49% at 17067 and the obvious next
+  # question was whether a lower rate is clean, which is unanswerable from an
+  # artifact that does not say what rate it used.
+  'gg_offered_pps': int(os.environ.get('CI_BENCH_GAME_PPS') or 17067),
+  'gg_tick_hz': float(os.environ.get('CI_BENCH_GAME_TICK_HZ') or 10),
   'pkt_bytes': 50,
   'scheduler': os.environ.get('CI_BENCH_SCHEDULER') or 'wlb_udp_pin',
   'arm': os.environ.get('CI_BENCH_ARM') or 'default',
