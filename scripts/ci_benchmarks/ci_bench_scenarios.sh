@@ -818,11 +818,37 @@ print("," + ",".join(json.dumps(k) + ":" + json.dumps(v)
 #   34036912262 rather than the >1 any real encapsulation ratio must give.
 #   The name total_app_bytes was read as its contract; that was the whole bug.
 #
-# What IS honest from these fields: bytes per wire packet, and the per-
-# direction split. A true ratio needs a tun-side payload counter that does not
-# exist yet (mqvpn_server.c:2971 bumps dgram_sent but no byte total), so this
-# reports the wire side and says the denominator is missing rather than
-# inventing one.
+# The replacement for that ratio -- per-direction bytes per packet, computed
+# here from the same four fields -- was wrong too, and in run 34043133862 it
+# said so plainly: overhead_bytes_per_pkt_rx came back as 0.2 bytes per packet
+# on the game rows. A packet cannot be under one byte.
+#
+# The cause is the same class of mistake one layer down. These four fields are
+# not two matched pairs:
+#
+#   bytes_tx/bytes_rx  <- ctl_app_bytes_send/recv, which accumulate ONLY for
+#                         STREAM|DATAGRAM frames. xqc_send_ctl.h:142 says it
+#                         outright: "only accounts for stream and datagram
+#                         packets".
+#   pkt_sent/pkt_recv  <- ctl_send_count/ctl_recv_count, where ctl_recv_count
+#                         increments once per datagram received
+#                         (xqc_send_ctl.c:1153), pure ACKs included.
+#
+# So on an ACK-dominated reverse direction the numerator counts almost nothing
+# and the denominator counts everything. The tx side looked plausible only by
+# luck: a bulk sender puts a STREAM frame in nearly every packet, so its two
+# counters happen to move together. Twice now a field name has been read as a
+# contract without checking the increment site.
+#
+# What remains here are the four raw counters, which are each individually
+# true, with their semantics stated. The per-packet cost moved to the sampler
+# (samp_wire_bytes_per_pkt_tx/_rx), which differences the veth's own
+# tx_bytes/tx_packets -- a pair the kernel maintains over the same frames, and
+# which includes the outer UDP/IP headers that actually cost capacity.
+#
+# A true wire/app ratio still needs a tun-side payload counter that does not
+# exist (mqvpn_server.c:2971 bumps dgram_sent but no byte total), so the gap
+# is named rather than filled with whatever is nearby.
 collect_overhead() {
     local status
     status="$(netsim_query_control get_status)"
@@ -848,35 +874,20 @@ tx = sum(p.get("bytes_tx") or 0 for p in paths)
 rx = sum(p.get("bytes_rx") or 0 for p in paths)
 pkt_tx = sum(p.get("pkt_sent") or 0 for p in paths)
 pkt_rx = sum(p.get("pkt_recv") or 0 for p in paths)
-wire = tx + rx
-pkts = pkt_tx + pkt_rx
 
 out["overhead"] = "ok"
-out["overhead_wire_tx_bytes"] = tx
-out["overhead_wire_rx_bytes"] = rx
+# Named for what they are, not for what they were assumed to be. These two are
+# STREAM|DATAGRAM frame bytes only, post-encryption -- not every wire byte.
+out["overhead_app_frame_tx_bytes"] = tx
+out["overhead_app_frame_rx_bytes"] = rx
+# These two count all packets on the path, ACKs included on the receive side.
 out["overhead_wire_pkts_tx"] = pkt_tx
 out["overhead_wire_pkts_rx"] = pkt_rx
-# No app-byte counter exists to divide by; naming the gap keeps a reader from
-# assuming the ratio was dropped by accident.
+out["overhead_counter_note"] = (
+    "app_frame_* are STREAM|DATAGRAM bytes (xqc_send_ctl.h:142); wire_pkts_* "
+    "count every packet. Do NOT divide one by the other -- they are not a "
+    "matched pair. Per-packet cost is samp_wire_bytes_per_pkt_tx/_rx.")
 out["overhead_app_bytes"] = "unavailable: no tun-side byte counter in get_status"
-
-# Bytes per wire packet, split by direction. The reverse direction is the
-# interesting one for a game workload: it is where inner ACKs live, and a
-# 50-byte inner payload paying 85-107 bytes on the wire is the figure worth
-# watching.
-if pkt_tx > 0:
-    out["overhead_bytes_per_pkt_tx"] = round(tx / pkt_tx, 1)
-if pkt_rx > 0:
-    out["overhead_bytes_per_pkt_rx"] = round(rx / pkt_rx, 1)
-if pkts > 0:
-    # Kept for series continuity with earlier runs. Slightly optimistic: the
-    # tx counter skips pure-ACK packets (xqc_send_ctl.c:711 gates on
-    # XQC_CAN_IN_FLIGHT) while the rx counter counts every datagram, so the
-    # denominator is inflated and the true per-packet cost is a little higher.
-    out["overhead_bytes_per_pkt"] = round(wire / pkts, 1)
-    out["overhead_pkt_note"] = ("excludes outer UDP/IP (28B v4 per datagram); "
-                                "pkt_sent omits pure-ACK packets, pkt_recv "
-                                "does not")
 
 print("," + ",".join(json.dumps(k) + ":" + json.dumps(v)
                      for k, v in out.items()))
@@ -1559,15 +1570,20 @@ elif row.get('osc_verdict') == 'unstable':
     f.append('quic_rate_unstable: outer wire rate swung %.1fx with no '
              'detectable period -- a stall or a trend rather than an '
              'oscillation' % (row.get('osc_peak_trough_ratio') or 0))
-# No wire/app ratio to test: get_status exposes no app-byte counter, and the
-# figure that used to be here divided the wire bytes by themselves. Per-packet
-# wire cost is what the same fields can honestly support. 200 bytes on the
-# reverse direction of a small-packet workload means the ACK path is paying
-# more in headers than it carries.
-bpp_rx = row.get('overhead_bytes_per_pkt_rx')
+# Reverse-direction per-packet cost, from the veth counters rather than the
+# xquic ones. The field this used to read (overhead_bytes_per_pkt_rx) divided
+# a STREAM|DATAGRAM byte counter by an all-packets counter and reported 0.2
+# bytes per packet, so the threshold below had never once been reachable.
+#
+# The new figure INCLUDES the outer UDP/IP headers (the old one claimed to
+# exclude them), so 200 bytes here means the reverse path is carrying about
+# 170 bytes of QUIC on top of a 28-byte outer header -- large for a direction
+# that should be mostly ACKs.
+bpp_rx = row.get('samp_wire_bytes_per_pkt_rx')
 if bpp_rx is not None and bpp_rx >= 200:
-    f.append('quic_ack_overhead: %.0f wire bytes per reverse-direction packet '
-             '(inner ACKs are small; this is mostly encapsulation)' % bpp_rx)
+    f.append('quic_ack_overhead: %.0f wire bytes per reverse-direction packet, '
+             'outer headers included (inner ACKs are small; this is mostly '
+             'encapsulation)' % bpp_rx)
 if row.get('samp_sndbuf_errors'):
     f.append('quic_sndbuf_blocked: %d socket-buffer refusals during the run'
              % row['samp_sndbuf_errors'])

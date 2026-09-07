@@ -376,11 +376,14 @@ def emit_quic(by_key, arms):
         "90th percentile AND the swing recurred at a detectable period, which "
         "is the signature of inner and outer congestion control backing off "
         "together. **The inner RTT is inferred from the outer series, not "
-        "measured** -- no qlog is parsed. `B/pkt tx` and `B/pkt rx` are wire "
-        "bytes per outer packet in each direction; the reverse direction is "
-        "where small inner ACKs show up. There is no wire/app ratio: "
-        "`get_status` exposes no app-byte counter, and the column that used to "
-        "be here divided the wire bytes by themselves."
+        "measured** -- no qlog is parsed. `B/pkt tx` and `B/pkt rx` are the "
+        "veth's own tx_bytes/tx_packets and rx_bytes/rx_packets, so they "
+        "include the outer UDP/IP headers and their numerator and denominator "
+        "cover the same frames. The earlier version of these two columns "
+        "divided xquic's STREAM|DATAGRAM byte counter by its all-packets "
+        "counter and reported 0.2 bytes per packet on the reverse direction, "
+        "which is impossible. There is still no wire/app ratio: `get_status` "
+        "exposes no tun-side byte counter to divide by."
     )
     print()
     print("| scenario | sched | arm | goodput | n | cv% | samples | shape | "
@@ -400,8 +403,8 @@ def emit_quic(by_key, arms):
                   fmt(r.get("osc_peak_trough_ratio"), "{:.2f}"),
                   r.get("osc_autocorr_period_s")
                   if r.get("osc_autocorr_period_s") else "-",
-                  fmt(r.get("overhead_bytes_per_pkt_tx")),
-                  fmt(r.get("overhead_bytes_per_pkt_rx")),
+                  fmt(r.get("samp_wire_bytes_per_pkt_tx")),
+                  fmt(r.get("samp_wire_bytes_per_pkt_rx")),
                   r.get("quic_status") or "-"))
     print()
 
@@ -504,11 +507,12 @@ def emit_game(by_key, arms):
     )
     print()
     print("| RTT tier | pps | arm | base p99 | tun p99 | **added p99** | "
-          "base loss | tun loss | ooo% | fidelity | sndbuf | status |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+          "base loss | tun loss | ooo% | fidelity | B/pkt tx | sndbuf | "
+          "status |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for rtt, pps, _scenario, arm, r in sorted(rows, key=lambda t: t[:4]):
         print("| {} ms | {} | `{}` | {} | {} | **{}** | {} | {} | {} | {} | "
-              "{} | {} |".format(
+              "{} | {} | {} |".format(
                   rtt, pps, arm,
                   fmt(r.get("baseline_jitter_p99_ms"), "{:.2f}"),
                   fmt(r.get("tunnel_jitter_p99_ms"), "{:.2f}"),
@@ -517,9 +521,19 @@ def emit_game(by_key, arms):
                   fmt(r.get("tunnel_loss_pct"), "{:.2f}"),
                   fmt(r.get("out_of_order_pct"), "{:.3f}"),
                   fmt(r.get("pps_fidelity"), "{:.3f}"),
+                  fmt(r.get("samp_wire_bytes_per_pkt_tx")),
                   r.get("samp_sndbuf_errors")
                   if r.get("samp_sndbuf_errors") is not None else "-",
                   r.get("status") or "-"))
+    print()
+    print(
+        "`B/pkt tx` is the outer datagram's cost on the wire, from the veth's "
+        "own tx_bytes/tx_packets -- headers included, numerator and "
+        "denominator over the same frames. It is the encapsulated cost of "
+        "carrying one small inner packet, which is the figure that matters "
+        "for a game workload. It is NOT a ratio against the inner payload: "
+        "no tun-side byte counter exists to form one."
+    )
     print()
 
     # A reorder column that reads zero is ambiguous unless the engine's state

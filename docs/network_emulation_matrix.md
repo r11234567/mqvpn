@@ -1168,7 +1168,7 @@ state beside it regardless.
 
 ### 5.1 Columns retired for being unable to disagree
 
-Four columns published numbers that could not have come out differently. They
+Six columns published numbers that could not have come out differently. They
 are listed here rather than deleted quietly, because each one was read as
 evidence for a round or two before it was caught, and the artifacts that carry
 them are still on the record.
@@ -1179,6 +1179,8 @@ them are still on the record.
 | `wlb_deficits` at `-64` | both | The credit cap doubled as the debt floor, so every busy path reached `-64` and stayed. WRR compares deficits against each other, so once two paths rest on the floor the difference — the whole signal — is zero. 27/39 then 20/22 rows. Replaced by a spread bound plus `wlb_deficit_gap`. |
 | `overhead_wire_app_ratio` | 34036912262 | `clients[].bytes_tx` is xquic's `total_app_bytes`, which despite the name is send+recv summed across paths, both terms post-encryption (`po_enc_size`). The ratio was `(S+R)/(S+2R)` — the wire bytes over themselves with the receive direction double-counted, hence `0.995–0.999` in 20/20 rows where any real encapsulation ratio must exceed 1. No app-byte counter exists to divide by; the per-direction per-packet cost is published instead, and the gap is named. |
 | `host_tier` on `vps` rows | 34036912262 | Read `CI_BENCH_TIER` from a python child's environment, but the mode assigned it without `export`. Every row said `untiered` while the scope had in fact been created — the tier applied and the artifact denied it. `host_nproc` compounded it: `os.cpu_count()` ignores cpusets and the collector ran outside the scope, so it reported the runner's 4. Now `host_runner_nproc`, beside `host_tier_ncpu` and `host_tier_applied`. |
+| `overhead_bytes_per_pkt_tx` / `_rx` | 34043133862 | The replacement for `overhead_wire_app_ratio`, wrong the same way one layer down. Numerator `bytes_tx`/`bytes_rx` ← `ctl_app_bytes_send/recv`, which accumulate only for `STREAM\|DATAGRAM` frames — the xquic header states it: *"only accounts for stream and datagram packets"* (`xqc_send_ctl.h:142`). Denominator `pkt_sent`/`pkt_recv` ← `ctl_send_count`/`ctl_recv_count`, and `ctl_recv_count` increments for **every** datagram (`xqc_send_ctl.c:1153`), pure ACKs included. On an ACK-dominated reverse direction the numerator goes to nearly zero against a full denominator: **`0.2` bytes per packet on the game rows.** A packet cannot be under one byte. The tx side read plausibly (1311 B/pkt) only by luck — a bulk sender puts a STREAM frame in nearly every packet, so its two counters happen to track. Replaced by `samp_wire_bytes_per_pkt_tx/_rx`, differenced from the veth's own `tx_bytes`/`tx_packets`, which the kernel maintains over the same frames and which include the outer UDP/IP headers. |
+| `tunnel_out_of_order`, `baseline_out_of_order` | 34043133862 | `null` in 12/12 game rows. The parser looks for an `out_of_order` key in iperf3's JSON (`ci_bench_env.sh:576`); **iperf3 does not emit one** — reordering appears only in its verbose text output. The plan asserted `end.sum.out_of_order` existed without checking the schema. Same root cause as the two rows above: a field name read as a contract. |
 
 The `vps` mode's queue and RPS assertions never fired either: `collect_host_profile`
 read `/sys/class/net/<dev>/queues` from the root netns, but the veth had been
@@ -1186,11 +1188,32 @@ moved into `netsim-server`, so the read raised and the column read
 `unreadable`. It now runs inside the namespace.
 
 **The pattern worth generalising: a column that is uniform across every row is
-presumed broken until shown otherwise.** All four were caught that way and none
+presumed broken until shown otherwise.** All six were caught that way and none
 by a test. Any new derived column should therefore ship with something that
 would look different if it were wrong — a counter of its own binding, or a
 within-row comparison — rather than relying on a reader noticing that every
 value matches.
+
+**The second pattern, which produced three of the six: a field name is not a
+contract.** `total_app_bytes` was send+recv post-encryption. `ctl_app_bytes_recv`
+counts only frame-bearing packets while `ctl_recv_count` counts all of them.
+iperf3's JSON has no `out_of_order` at all. Each was assumed from the name and
+none was checked at the increment site or against the emitted schema. **Before
+publishing a derived column, read where its numerator and its denominator are
+each written, and confirm they cover the same events.** A ratio of two counters
+maintained under different conditions is not an approximation of the right
+answer — it is an unrelated number.
+
+### 5.2 Columns that cannot disagree in *this* test bed
+
+Distinct from the above: these are correctly implemented and would move on
+different hardware, but the emulation cannot reach the regime that makes them
+non-constant. They are not bugs, and they are also not evidence.
+
+| Column | Why it cannot move here |
+|---|---|
+| `supply_stop_sndbuf_clamp` | Binds only when a path's cwnd exceeds mqvpn's 8 MiB `so_sndbuf`. The widest leg in the catalog is 100 Mbps at 139 ms RTT — a BDP of 1.74 MB, and 25 of 26 legs are under 1.4 MB. cwnd converges near BDP, so it never approaches 8 MiB and the counter reads `0` in 42/42 rows. Reaching it needs roughly 500 Mbps × 150 ms. **The sndbuf hypothesis for the aggregate-below-one-leg rows is therefore untested, not refuted.** |
+| `samp_cpu_util_pct` on tiered rows | Computed from `/proc/stat` as `busy/(busy+idle)`, which is not cpuset-aware. On a 4-vCPU runner a fully saturated single-CPU tier reads `25%` — the same value an idle-ish untiered row shows. The number is not wrong, it just means something different in each row, which makes the two incomparable. |
 
 ## 6. Build order
 

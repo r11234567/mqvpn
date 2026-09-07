@@ -216,6 +216,39 @@ if nrx_all > 0:
 # interesting -- a rate would hide that.
 out["samp_sndbuf_errors"] = last[SNDB] - first[SNDB]
 
+# Bytes per wire packet, from the counters the interface itself keeps.
+#
+# This exists because two earlier attempts to compute it from the xquic
+# per-path stats were both wrong, in the same way. get_status carries
+# path_send_bytes/path_recv_bytes (xqc_app_bytes_send/recv) and
+# path_pkt_send_count/path_pkt_recv_count (ctl_send_count/ctl_recv_count),
+# and the two are NOT a matched pair: the byte counters accumulate only for
+# STREAM|DATAGRAM frames -- the xquic header says so outright, "only accounts
+# for stream and datagram packets" (xqc_send_ctl.h:142) -- while ctl_recv_count
+# increments for every datagram received (xqc_send_ctl.c:1153). On an
+# ACK-dominated reverse direction the numerator goes to nearly zero while the
+# denominator counts every packet, which is how overhead_bytes_per_pkt_rx came
+# back as 0.2 bytes per packet in run 34043133862. A packet cannot be under
+# one byte. (The tx side read plausibly only by luck: a bulk sender puts a
+# STREAM frame in nearly every packet, so its two counters happen to track.)
+#
+# tx_bytes/tx_packets on the veth have no such mismatch -- the kernel counts
+# both for the same frames -- and they include the outer UDP/IP headers, which
+# is what actually costs capacity. They measure the OUTER tunnel datagram, so
+# they answer "what did one wire packet cost", not "what did the inner payload
+# cost"; the ratio between the two needs an inner-side counter that still does
+# not exist.
+dtxb, dtxp = last[TXB] - first[TXB], last[TXP] - first[TXP]
+drxb, drxp = last[RXB] - first[RXB], last[RXP] - first[RXP]
+if dtxp > 0:
+    out["samp_wire_bytes_per_pkt_tx"] = round(dtxb / dtxp, 1)
+if drxp > 0:
+    out["samp_wire_bytes_per_pkt_rx"] = round(drxb / drxp, 1)
+if dtxp > 0 or drxp > 0:
+    out["samp_wire_pkt_note"] = (
+        "veth tx_bytes/tx_packets: outer datagram incl. UDP+IP headers, "
+        "matched numerator and denominator")
+
 # Per-tick wire throughput, the series the oscillation metric reads. Mbit/s to
 # match every other throughput field in the artifact.
 mbps, pps = [], []
