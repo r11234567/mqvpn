@@ -1,0 +1,5 @@
+- The TUN interface's transmit queue depth and its per-wakeup read
+  batch are configurable ([Interface] TxQueueLen and TunReadBatch).
+  Bursty small-packet traffic such as a game on a fixed tick could
+  overflow the kernel's default 500-packet ring, which shows up only
+  as the interface's tx_dropped counter.
