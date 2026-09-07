@@ -28,9 +28,9 @@ env:
   # Keep in sync with ndkVersion in android/sdk-native/build.gradle.kts and
   # NDK_VERSION in android-repro.yml.
   NDK_VERSION: "28.2.13676358"
-  # SHA-256 fingerprint of the canonical mqvpn upload certificate (public).
-  # Fork: Use fork-specific certificate
-  UPLOAD_CERT_SHA256: "50:DF:DC:CA:66:1A:D4:62:BE:1A:84:6A:BE:51:C5:AD:C6:5D:83:6F:4F:52:07:B1:43:60:69:18:DD:2B:AE:98"
+  # SHA-256 fingerprint of android/app/signing/mqvpn-release.p12.
+  # The keystore is intentionally public and is not a Play upload key.
+  UPLOAD_CERT_SHA256: "20:9C:C0:27:01:6C:72:1B:6C:9E:3C:88:5C:2E:19:FD:F5:55:E2:C3:7B:26:89:57:DC:77:CD:31:F2:79:9D:79"
 
 jobs:
   build-release:
@@ -568,13 +568,6 @@ jobs:
   build-android:
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    # The upload-key secrets live in the protected `release` environment whose
-    # deployment rule admits only v* tags, so GitHub — not a check inside this
-    # file — decides whether a run can read them. That is what actually stops a
-    # modified workflow on an arbitrary branch from signing with the canonical
-    # key. Non-tag runs request no environment, receive no secrets, and fall
-    # back to the ephemeral key below.
-    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'release' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -625,96 +618,6 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6
 
-      # The stable upload key signs only official tag builds of the canonical
-      # repo. An APK carrying that signature is update-compatible and trusted
-      # by users, so it must never be producible from an arbitrary ref — a
-      # workflow_dispatch run on any branch would otherwise publish a
-      # canonical-key-signed artifact of unreviewed code. Every other run
-      # (forks, dispatch, branch experiments) uses the throwaway key below.
-      - name: Detect release keystore secret
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* && "$GITHUB_REPOSITORY" == mp0rta/mqvpn ]]; then
-            if [ -z "$KEYSTORE_B64" ]; then
-              # Never let an official tag release fall back to a throwaway key:
-              # a wrongly-signed release breaks in-place updates permanently and
-              # fails F-Droid's reproducible-build verification. Missing or
-              # wrong secrets fail this job before anything is signed; to
-              # rehearse the path, tag a pre-release (vX.Y.Z-rcN) and delete it.
-              echo "::error::ANDROID_KEYSTORE_B64 secret missing on an official tag build"
-              exit 1
-            fi
-            echo "HAVE_KEYSTORE=true" >> "$GITHUB_ENV"
-          else
-            # Assign explicitly rather than leaving it unset: earlier steps run
-            # repo scripts that could have appended HAVE_KEYSTORE=true to
-            # $GITHUB_ENV, and the last assignment wins.
-            echo "HAVE_KEYSTORE=false" >> "$GITHUB_ENV"
-            echo "Not an official tag build — signing with an ephemeral key"
-          fi
-
-      - name: Set up release keystore
-        # Official releases sign with the stable upload key from repo secrets
-        # (required for F-Droid reproducible-build verification, which grafts
-        # this signature onto F-Droid's own build). Forks and secret-less runs
-        # fall back to an ephemeral keystore so the job still succeeds.
-        if: env.HAVE_KEYSTORE == 'true'
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-        run: |
-          KEYSTORE="$RUNNER_TEMP/release.jks"
-          # $GITHUB_ENV uses NAME=value lines, so a password containing a
-          # newline would be truncated or rejected further down. Say so here
-          # rather than failing obscurely mid-build after a key rotation.
-          case "$KEYSTORE_PASSWORD" in
-            *[$'\n\r']*) echo "::error::ANDROID_KEYSTORE_PASSWORD must not contain newlines"; exit 1 ;;
-          esac
-          printf '%s' "$KEYSTORE_B64" | base64 -d > "$KEYSTORE"
-          # Preflight: refuse to sign with anything but the canonical upload
-          # key. Checks the alias holds a usable private key (certreq
-          # exercises it) and that the certificate fingerprint matches.
-          keytool -list -keystore "$KEYSTORE" -storepass "$KEYSTORE_PASSWORD" \
-              -alias mqvpn-upload 2>/dev/null | grep -q PrivateKeyEntry \
-            || { echo "::error::keystore alias mqvpn-upload missing or not a PrivateKeyEntry"; exit 1; }
-          keytool -certreq -keystore "$KEYSTORE" -storepass "$KEYSTORE_PASSWORD" \
-              -keypass "$KEYSTORE_PASSWORD" -alias mqvpn-upload -file /dev/null 2>/dev/null \
-            || { echo "::error::private key not usable with the provided password"; exit 1; }
-          FP=$(keytool -list -v -keystore "$KEYSTORE" -storepass "$KEYSTORE_PASSWORD" \
-                 -alias mqvpn-upload 2>/dev/null | sed -n 's/.*SHA256: //p' | head -1)
-          [ "$FP" = "$UPLOAD_CERT_SHA256" ] \
-            || { echo "::error::upload certificate fingerprint mismatch: got $FP"; exit 1; }
-          echo "MQVPN_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
-          echo "MQVPN_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
-          echo "MQVPN_KEY_ALIAS=mqvpn-upload" >> "$GITHUB_ENV"
-          echo "MQVPN_KEY_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
-
-      - name: Generate ephemeral release keystore
-        if: env.HAVE_KEYSTORE != 'true'
-        run: |
-          KEYSTORE="$RUNNER_TEMP/release.jks"
-          # Single password for both store and key entry. JDK 9+ defaults
-          # keytool to PKCS12, which silently ignores a distinct -keypass
-          # during -genkeypair and encrypts the key with the storePassword
-          # — a separate keyPass would later trip BadPaddingException at
-          # APK-signing time. Using one password matches PKCS12 conventions.
-          PASS=$(openssl rand -base64 24)
-          keytool -genkeypair -v \
-            -keystore "$KEYSTORE" \
-            -storepass "$PASS" \
-            -keypass "$PASS" \
-            -alias mqvpn-release \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=mqvpn sample, O=mqvpn, C=JP" >/dev/null
-          # Mask password in workflow logs; value is written only to the
-          # per-job env file ($GITHUB_ENV) which is scoped to this run.
-          echo "::add-mask::$PASS"
-          echo "MQVPN_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
-          echo "MQVPN_KEYSTORE_PASSWORD=$PASS" >> "$GITHUB_ENV"
-          echo "MQVPN_KEY_ALIAS=mqvpn-release" >> "$GITHUB_ENV"
-          echo "MQVPN_KEY_PASSWORD=$PASS" >> "$GITHUB_ENV"
-
       # Stage license texts as assets/ before APK build. Android Gradle Plugin
       # auto-includes src/main/assets/ in the produced APK. Required by
       # Apache-2.0 §4(a) since the APK statically links xquic, BoringSSL, and
@@ -725,25 +628,6 @@ jobs:
       - name: Build signed release APK
         working-directory: android
         run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
-
-      - name: Clear signing material
-        # Signing is done; drop the keystore and blank the env vars so the
-        # steps that follow — including third-party actions such as
-        # upload-artifact — never have the private key or its password in
-        # reach. Runs even on failure.
-        if: always()
-        run: |
-          # Remove the decode target unconditionally, not just the exported
-          # path: a preflight failure aborts before that variable is set and
-          # would otherwise leave the keystore on disk.
-          rm -f "$RUNNER_TEMP/release.jks"
-          if [ -n "${MQVPN_KEYSTORE_PATH:-}" ]; then rm -f "$MQVPN_KEYSTORE_PATH"; fi
-          {
-            echo "MQVPN_KEYSTORE_PATH="
-            echo "MQVPN_KEYSTORE_PASSWORD="
-            echo "MQVPN_KEY_ALIAS="
-            echo "MQVPN_KEY_PASSWORD="
-          } >> "$GITHUB_ENV"
 
       - name: Stage Android release artifact
         run: |
@@ -798,9 +682,6 @@ jobs:
           merge-multiple: true
 
       - name: Verify the published APK reproduces
-        # Fork: Skip signature verification since we use ephemeral keys
-        # Upstream: Verify F-Droid reproducibility
-        if: github.repository == 'mp0rta/mqvpn'
         run: |
           set -euo pipefail
           signed=$(ls artifacts/mqvpn_*_android.apk)

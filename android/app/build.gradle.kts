@@ -31,31 +31,23 @@ android {
         }
     }
 
-    // Release signing config reads from env vars set by CI. When unset
-    // (local `assembleRelease` without env), Gradle leaves the variant
-    // unsigned and the build produces an unsigned APK that zipalign can
-    // sign later — fine for local inspection.
-    val ksPath = System.getenv("MQVPN_KEYSTORE_PATH")
-    val ksPass = System.getenv("MQVPN_KEYSTORE_PASSWORD")
-    val keyAlias = System.getenv("MQVPN_KEY_ALIAS")
-    val keyPass = System.getenv("MQVPN_KEY_PASSWORD")
-    val haveSigning = !ksPath.isNullOrBlank() && !ksPass.isNullOrBlank() &&
-        !keyAlias.isNullOrBlank() && !keyPass.isNullOrBlank()
-    if (haveSigning) {
-        signingConfigs {
-            create("release") {
-                storeFile = file(ksPath!!)
-                storePassword = ksPass
-                this.keyAlias = keyAlias
-                keyPassword = keyPass
-            }
+    // This public repository key gives every release the same Android app
+    // identity without depending on CI secrets. It is intentionally not a
+    // Play upload key and provides continuity, not publisher authentication.
+    signingConfigs {
+        create("release") {
+            storeFile = file("signing/mqvpn-release.p12")
+            storePassword = "mqvpn-release"
+            storeType = "PKCS12"
+            keyAlias = "mqvpn-release"
+            keyPassword = "mqvpn-release"
         }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            if (haveSigning) {
+            if (!providers.gradleProperty("mqvpn.disableReleaseSigning").isPresent) {
                 signingConfig = signingConfigs.getByName("release")
             }
         }

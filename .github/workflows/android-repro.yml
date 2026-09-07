@@ -111,7 +111,7 @@ jobs:
           ANDROID_NDK="$ANDROID_HOME/ndk/${NDK_VERSION}" \
             scripts/build_android.sh --abi arm64-v8a > /dev/null
           cd android
-          ./gradlew --no-daemon -q :app:assembleRelease
+          ./gradlew --no-daemon -q :app:assembleRelease -Pmqvpn.disableReleaseSigning=true
 
       - name: Build tree B in a Debian container
         # Debian with Debian's OpenJDK, mirroring where F-Droid rebuilds us.
@@ -136,7 +136,8 @@ jobs:
               scripts/stage_apk_license_assets.sh
               ANDROID_NDK=/sdk/ndk/'"$NDK_VERSION"' \
                 scripts/build_android.sh --abi arm64-v8a > /dev/null
-              cd android && ./gradlew --no-daemon -q :app:assembleRelease'
+              cd android && ./gradlew --no-daemon -q :app:assembleRelease \
+                -Pmqvpn.disableReleaseSigning=true'
 
       - name: Compare APKs
         run: |
