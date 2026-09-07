@@ -579,11 +579,96 @@ def emit_game(by_key, arms):
             "column was specified on the assumption that "
             "`end.sum.out_of_order` existed, without checking the schema, and "
             "read `null` in every row of every run since. It is left in place, "
-            "empty and labelled, rather than quietly removed: reordering is "
-            "the failure mode this mode exists to measure, and a generator "
-            "that can report it is the outstanding work."
+            "empty and labelled, rather than quietly removed. The `reord%` "
+            "column of the stall table below is the working replacement."
         )
         print()
+
+    # Normalise to emit_stall's (mode, scenario, arm, row) shape. host_tier
+    # distinguishes the vps mode's rows from the untiered ones, which is the
+    # comparison that matters -- same workload, constrained box.
+    emit_stall([(r.get("host_tier") or "-", scenario, arm, r)
+                for _rtt, _pps, scenario, arm, r in rows])
+
+
+def emit_stall(rows):
+    """Ordered-channel stall: the metric a player actually experiences.
+
+    Loss percentage is the wrong headline for a game proxy. A tunnel can lose
+    0.3% and be unplayable if the loss lands as freezes, or lose 2% and be
+    fine if it does not. The stall window is the duration an ordered channel
+    holds packets it already has, waiting for one that is late.
+    """
+    have = [t for t in rows if t[-1].get("ggdl_status") == "ok"
+            or t[-1].get("ggul_status") == "ok"]
+    if not have:
+        return
+
+    print("### Ordered-channel stall (player-visible freeze)")
+    print()
+    print(
+        "Traffic is `gamegen.py`: bidirectional, 10 Hz ticks, 10-30 byte "
+        "random payloads, every tenth tick doubled. **`dl` is server to "
+        "client** -- the direction that feeds a player's screen. Each row is "
+        "one direction's own measurement, not a round trip; both ends share "
+        "`CLOCK_MONOTONIC`, so `owd` is a true one-way delay."
+    )
+    print()
+    print(
+        "`stall%` is the share of the run an ordered channel would have been "
+        "blocked, modelled on RakNet's live receive path "
+        "(`ReliabilityLayer.cpp:1281-1440`: per-channel min-heap, deliver only "
+        "when `orderingIndex == orderedReadIndex`, then drain \"until order "
+        "lost\"). Stalls are bounded by an assumed resend at `rto` ms, since "
+        "otherwise one permanently lost packet would score as a single "
+        "run-length freeze; `capped` counts the stalls that hit that bound and "
+        "are therefore the model's ceiling rather than a measurement."
+    )
+    print()
+    print("| tier | scenario | dir | loss% | reord% | owd p99 | **stall%** | "
+          "stalls | p50 | p99 | max | capped | gen drops |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for mode, scenario, arm, r in sorted(have, key=lambda t: t[:3]):
+        for d, label in (("ggdl", "dl"), ("ggul", "ul")):
+            if r.get("%s_status" % d) != "ok":
+                continue
+            print("| {} | {} | {} | {} | {} | {} | **{}** | {} | {} | {} | "
+                  "{} | {} | {} |".format(
+                      mode, scenario, label,
+                      fmt(r.get("%s_loss_pct" % d), "{:.3f}"),
+                      fmt(r.get("%s_reordered_pct" % d), "{:.3f}"),
+                      fmt(r.get("%s_owd_p99_ms" % d), "{:.2f}"),
+                      fmt(r.get("%s_stall_time_pct" % d), "{:.1f}"),
+                      r.get("%s_stalls" % d)
+                      if r.get("%s_stalls" % d) is not None else "-",
+                      fmt(r.get("%s_stall_p50_ms" % d), "{:.0f}"),
+                      fmt(r.get("%s_stall_p99_ms" % d), "{:.0f}"),
+                      fmt(r.get("%s_stall_max_ms" % d), "{:.0f}"),
+                      r.get("%s_stalls_rto_capped" % d)
+                      if r.get("%s_stalls_rto_capped" % d) is not None else "-",
+                      r.get("%s_rcvbuf_drops" % d)
+                      if r.get("%s_rcvbuf_drops" % d) is not None else "-"))
+    print()
+
+    # A generator that could not keep up is indistinguishable from a lossy
+    # tunnel unless this is stated, so it is stated whether or not it happened.
+    overrun = [t for t in have
+               if (t[-1].get("ggdl_rcvbuf_drops") or 0)
+               or (t[-1].get("ggul_rcvbuf_drops") or 0)]
+    if overrun:
+        print(
+            f"⚠️ **{len(overrun)} row(s) dropped packets in the receiver's own "
+            "socket buffer** (`gen drops`). On those the harness could not keep "
+            "up, so their loss and stall figures are the measurement tool, not "
+            "the tunnel."
+        )
+    else:
+        print(
+            "`gen drops` is zero on every row, so no loss above was the "
+            "harness failing to keep up. Loopback baseline for this generator "
+            "is 0 loss / 0 reorder / 0 stalls."
+        )
+    print()
 
 
 def emit_drops(rows):
@@ -749,6 +834,10 @@ def emit_vps(by_key, arms):
                   if r.get("samp_rcvbuf_errors") is not None else "-"))
     print()
 
+    # No emit_stall here: every row carrying stall data has mode_family
+    # 'game', including the vps mode's (it runs the game workload under a
+    # tier), so emit_game already tabulated all of them. Calling it again
+    # printed the identical table twice.
     emit_drops(rows)
     emit_proc(rows)
 

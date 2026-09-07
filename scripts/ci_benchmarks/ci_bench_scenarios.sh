@@ -1899,6 +1899,97 @@ print(json.dumps(row))" \
 # within-run quantity: run 34019491401 vs 34026833126 disagreed by 13% at the
 # median on control rows that neither run could have affected, so anything
 # compared across runs at this repeat count is not a result.
+# gamegen both directions at once, against one target address.
+#
+# Bidirectional because a game proxy is: the client sends input, the server
+# broadcasts entity state back, and it is the RETURN direction that carries the
+# packets a player sees. Every measurement here before this was `iperf3 UDP DL`
+# -- one direction, and the quality parsed at the receiver -- so the uplink was
+# never loaded at all while the downlink was measured on an otherwise idle
+# tunnel. That is not the shape under test.
+#
+# Sets GG_DL_* and GG_UL_* rather than echoing: two background receivers and a
+# subshell would take their pids with it.
+#
+# The client's own address inside the tunnel, read from the interface rather
+# than assumed. The harness has never needed it -- every prior measurement
+# dialled TUNNEL_SERVER_IP -- so there is no constant to reuse, and the server
+# assigns it out of the 10.0.0.0/24 pool at connect time.
+gg_client_tun_ip() {
+    ip netns exec "$NS_CLIENT" ip -4 -o addr show dev "${CI_BENCH_TUN_NAME:-mqvpn0}" \
+        2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}'
+}
+
+# $1 target address, $2 seconds, $3 pps per direction, $4 tag for temp files
+gamegen_pair() {
+    local target="$1" secs="$2" pps="$3" tag="$4"
+    local gg="${SCRIPT_DIR}/gamegen.py"
+    local dl_out="/tmp/gg_${tag}_dl.bin" ul_out="/tmp/gg_${tag}_ul.bin"
+    local hz="${CI_BENCH_GAME_TICK_HZ:-10}"
+    local len="${CI_BENCH_GAME_LEN:-10:30}"
+    local bm="${CI_BENCH_GAME_BURST_MULT:-2.0}"
+    local be="${CI_BENCH_GAME_BURST_EVERY:-10}"
+    local dlp="${GG_PORT_DL:-5301}" ulp="${GG_PORT_UL:-5302}"
+
+    GG_DL="" GG_UL="" GG_STATUS=ok
+    rm -f "$dl_out" "$ul_out"
+
+    local cli_ip; cli_ip="$(gg_client_tun_ip)"
+    if [ -z "$cli_ip" ]; then
+        # Without it there is no downlink target. Named rather than silently
+        # producing a one-directional row that looks like the old behaviour.
+        GG_STATUS=no_client_tun_ip
+        return 0
+    fi
+
+    # Downlink receiver in the client ns, uplink receiver in the server ns.
+    # Both armed before either sender starts, or the first tick is lost to a
+    # bind race and scores as loss.
+    ip netns exec "$NS_CLIENT" python3 "$gg" recv \
+        --bind "${cli_ip}:${dlp}" \
+        --out "$dl_out" --secs "$((secs + 10))" --idle 3 &>/dev/null &
+    local dl_rx=$!
+    ip netns exec "$NETSIM_NS_SERVER" python3 "$gg" recv \
+        --bind "${target}:${ulp}" \
+        --out "$ul_out" --secs "$((secs + 10))" --idle 3 &>/dev/null &
+    local ul_rx=$!
+    sleep 0.4
+
+    ip netns exec "$NETSIM_NS_SERVER" python3 "$gg" send \
+        --to "${cli_ip}:${dlp}" --secs "$secs" \
+        --tick-hz "$hz" --pps "$pps" --len "$len" \
+        --burst-mult "$bm" --burst-every "$be" &>/dev/null &
+    local dl_tx=$!
+    ip netns exec "$NS_CLIENT" python3 "$gg" send \
+        --to "${target}:${ulp}" --secs "$secs" \
+        --tick-hz "$hz" --pps "$pps" --len "$len" \
+        --burst-mult "$bm" --burst-every "$be" &>/dev/null &
+    local ul_tx=$!
+
+    wait "$dl_tx" "$ul_tx" 2>/dev/null || true
+    # The senders emit FIN; a bounded wait keeps one lost FIN from hanging the
+    # mode the way an unguarded iperf3 client once burned a 60-minute job.
+    # Both must be gone, not either -- `||` here would break as soon as the
+    # faster receiver exited and truncate the other one's capture.
+    local i alive
+    for (( i=0; i<40; i++ )); do
+        alive=0
+        kill -0 "$dl_rx" 2>/dev/null && alive=1
+        kill -0 "$ul_rx" 2>/dev/null && alive=1
+        [ "$alive" = 1 ] || break
+        sleep 0.25
+    done
+    kill "$dl_rx" "$ul_rx" 2>/dev/null || true
+    wait "$dl_rx" "$ul_rx" 2>/dev/null || true
+
+    local rto="${CI_BENCH_GAME_RTO_MS:-410}"
+    [ -s "$dl_out" ] && GG_DL="$(python3 "$gg" analyze --in "$dl_out" \
+        --rto-ms "$rto" --fragment 2>/dev/null)"
+    [ -s "$ul_out" ] && GG_UL="$(python3 "$gg" analyze --in "$ul_out" \
+        --rto-ms "$rto" --fragment 2>/dev/null)"
+    rm -f "$dl_out" "$ul_out"
+}
+
 run_game() {
     local tier="$1" pps="$2"
     local scenario="${tier}_${pps}pps"
@@ -1921,6 +2012,13 @@ run_game() {
     local pkt_len=50
     local target_bw=$(( pps * pkt_len * 8 ))
     local dur="${CI_BENCH_GAME_SEC:-20}"
+
+    # gamegen's rate is derived the way the workload is actually specified:
+    # bytes on the wire, not a packet count picked in advance. At a mean
+    # payload of 20 B plus 28 B of UDP+IP, 800 KB/s is ~17,067 pps and 1 MB/s
+    # is ~21,845. The pps tiers this function is indexed by stay as the iperf3
+    # axis; gamegen gets the byte-derived figure.
+    local gg_pps="${CI_BENCH_GAME_PPS:-17067}"
 
     CI_BENCH_IPERF_LEN="$pkt_len"
     CI_BENCH_IPERF_INTERVAL=1
@@ -1980,6 +2078,13 @@ run_game() {
         tun_j="$(ci_bench_parse_udp_jitter_p99 "$tun_jf")"
         rm -f "$tun_jf"
 
+        # Then the shape the mode is actually about: bidirectional, 10 Hz
+        # ticks, 10-30 byte payloads, every tenth tick doubled. iperf3 above
+        # stays for continuity of added_p99 and because it is one direction of
+        # fixed-size packets -- a different question, kept separate rather
+        # than reinterpreted.
+        gamegen_pair "$TUNNEL_SERVER_IP" "$dur" "$gg_pps" "${tier}_${pps}"
+
         sampler_stop
         CI_BENCH_SAMPLE_PID=""
         stats="$(collect_stats)"; rss="$(server_rss_kb)"
@@ -1993,6 +2098,23 @@ run_game() {
         # because the two were read separately.
         stats="${stats}$(collect_iface_drops "$(netsim_veth_srv 0)")"
         stats="${stats}$(collect_tun_drops)"
+
+        # Re-key each direction so the two cannot collide, and so no reader has
+        # to guess which way a stall figure points. dl = server to client, the
+        # direction a player's screen is fed from.
+        #
+        # `if` rather than `[ ] && ...`: under set -e a trailing test that
+        # comes out false is the function's exit status, and this block is the
+        # last thing before the row is written.
+        if [ -n "${GG_DL:-}" ]; then
+            stats="${stats}$(printf '%s' "$GG_DL" | sed -e 's/"gg_/"ggdl_/g')"
+        fi
+        if [ -n "${GG_UL:-}" ]; then
+            stats="${stats}$(printf '%s' "$GG_UL" | sed -e 's/"gg_/"ggul_/g')"
+        fi
+        if [ "${GG_STATUS:-unrun}" != ok ]; then
+            stats="${stats},\"gamegen\":\"${GG_STATUS:-unrun}\""
+        fi
     fi
 
     ci_bench_stop_vpn
@@ -2080,6 +2202,29 @@ if fid is not None and fid < 0.95:
 if row.get('samp_sndbuf_errors'):
     f.append('game_sndbuf_blocked: %d socket-buffer refusals during the run'
              % row['samp_sndbuf_errors'])
+
+# The stall window, both directions. This is the player-visible one: the time
+# an ordered channel spends holding packets it already has, waiting for one
+# that is late. A tunnel can score 0.3% loss and still be unplayable if that
+# loss lands as long freezes.
+for d, label in (('ggdl', 'downlink'), ('ggul', 'uplink')):
+    pctime = row.get('%s_stall_time_pct' % d)
+    if pctime is not None and pctime >= 1.0:
+        f.append('game_stall_%s: an ordered channel would be stalled %.1f%% of '
+                 'the time (%d stalls, p99 %s ms) -- this is the teleporting a '
+                 'player sees, not the %s%% packet loss'
+                 % (label, pctime, row.get('%s_stalls' % d) or 0,
+                    row.get('%s_stall_p99_ms' % d),
+                    row.get('%s_loss_pct' % d)))
+    # A generator that could not keep up looks exactly like a lossy tunnel.
+    if row.get('%s_rcvbuf_drops' % d):
+        f.append('game_gen_overrun_%s: %d packets dropped in the RECEIVER '
+                 'socket buffer -- the harness could not keep up, so loss and '
+                 'stall figures for this direction are not the tunnel'
+                 % (label, row['%s_rcvbuf_drops' % d]))
+if row.get('gamegen') and row['gamegen'] != 'ok':
+    f.append('game_gen_failed: %s' % row['gamegen'])
+
 row['findings'] = f
 row['finding_count'] = len(f)
 print(json.dumps(row))" \
