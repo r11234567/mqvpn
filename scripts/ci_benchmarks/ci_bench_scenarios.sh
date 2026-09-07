@@ -957,6 +957,24 @@ if tier != 'untiered':
     # degrades to untiered with only a ::warning:: to say so, so the row
     # carries the assertion explicitly rather than implying it.
     out['host_tier_applied'] = os.environ.get('CI_BENCH_TIER_OK') or 'unknown'
+# The competing load the box was already carrying. 'healthy' means the tier was
+# handed entirely to mqvpn, which is what made the vps rows of run 34043133862
+# indistinguishable from untiered ones -- so this belongs on the row rather
+# than being inferred from the mode name.
+state = os.environ.get('CI_BENCH_HOST_STATE') or 'healthy'
+out['host_state'] = state
+if state == 'vps_baseline':
+    out['host_baseload_cpu_pct'] = os.environ.get(
+        'CI_BENCH_BASELOAD_CPU_PCT') or '15'
+    out['host_baseload_mem_mb'] = os.environ.get(
+        'CI_BENCH_BASELOAD_MEM_MB') or '559'
+    out['host_baseload_swap_mb'] = os.environ.get(
+        'CI_BENCH_BASELOAD_SWAP_MB') or '378'
+    out['host_baseload_note'] = ('competing load shares the tier cpuset, as '
+                                 'existing services on a 1-vCPU box must; '
+                                 'the memory holder is madvised cold so the '
+                                 'kernel may swap it, which is what puts '
+                                 'page-in latency on the forwarding path')
 out['host_not_emulated'] = ('virtio interrupt coalescing; hypervisor steal '
                             'time (a guest cannot reproduce either, and the '
                             'steal figure in /proc/stat is the runner being '
@@ -967,7 +985,7 @@ print(',' + ','.join(json.dumps(k) + ':' + json.dumps(v)
 " "$dev" 2>/dev/null || printf '%s' ',"host_profile":"failed"'
 }
 
-# Peak RSS of the mqvpn server, in KB.
+# The pid of the mqvpn server process itself.
 #
 # _CB_SERVER_PID is not always the server: under a tier, ci_bench_start_server
 # splices `systemd-run --scope` ahead of the binary (ci_bench_env.sh:258), so
@@ -978,9 +996,11 @@ print(',' + ','.join(json.dumps(k) + ':' + json.dumps(v)
 # the column the vps mode leans on.
 #
 # Resolve through the cgroup when tiered: the scope holds exactly one mqvpn.
-server_rss_kb() {
+# Echoes nothing when it cannot be resolved, so a caller can tell "no server"
+# from "pid 0".
+server_pid() {
     local pid="${_CB_SERVER_PID:-}"
-    [ -n "$pid" ] || { echo 0; return; }
+    [ -n "$pid" ] || return 0
 
     if [ -n "${CI_BENCH_TIER:-}" ]; then
         local kid
@@ -996,8 +1016,202 @@ server_rss_kb() {
         fi
         [ -n "$kid" ] && pid="$kid"
     fi
+    echo "$pid"
+}
 
+# Peak RSS of the mqvpn server, in KB.
+server_rss_kb() {
+    local pid; pid="$(server_pid)"
+    [ -n "$pid" ] || { echo 0; return; }
     awk '/VmHWM/{print $2}' "/proc/${pid}/status" 2>/dev/null || echo 0
+}
+
+# What the server process itself looked like: threads, memory, and how often
+# the scheduler took the CPU away from it.
+#
+# Every field here is one a production incident turned up and this harness
+# could not see. A 1 vCPU VPS carrying a real workload showed:
+#
+#   mqvpn threads = 1        -- a single-threaded forwarder on one core stops
+#                               forwarding entirely whenever it is preempted,
+#                               and the TUN ring fills during the gap.
+#   VmRSS 524 kB / VmSwap 68 MB
+#                            -- nearly the whole process paged out. Coming back
+#                               from swap is milliseconds, which at 17k pps is
+#                               thousands of queued packets.
+#
+# nonvoluntary_ctxt_switches is the direct measure of the first: it counts the
+# times the kernel preempted the process rather than the process yielding. A
+# forwarder that is being preempted thousands of times a second is the
+# mechanism behind a TUN drop count, and no throughput number shows it.
+collect_proc_state() {
+    local pid; pid="$(server_pid)"
+    if [ -z "$pid" ] || [ ! -r "/proc/${pid}/status" ]; then
+        printf '%s' ',"proc_state":"no_server_pid"'
+        return 0
+    fi
+    python3 -c '
+import json, sys
+
+pid = sys.argv[1]
+out = {"proc_state": "ok"}
+want = {
+    "Threads": "proc_threads",
+    "VmRSS": "proc_vmrss_kb",
+    "VmHWM": "proc_vmhwm_kb",
+    "VmSwap": "proc_vmswap_kb",
+    "voluntary_ctxt_switches": "proc_ctxsw_voluntary",
+    "nonvoluntary_ctxt_switches": "proc_ctxsw_nonvoluntary",
+}
+try:
+    with open("/proc/%s/status" % pid) as fh:
+        for line in fh:
+            k, _, v = line.partition(":")
+            if k in want:
+                out[want[k]] = int(v.split()[0])
+except Exception:
+    print(",\"proc_state\":\"unreadable\"")
+    raise SystemExit(0)
+
+# Named so a reader does not have to know that a forwarder should be
+# multi-threaded to see that this one is not.
+if out.get("proc_threads") == 1:
+    out["proc_thread_note"] = ("single-threaded: any preemption stops "
+                               "forwarding until it is rescheduled")
+sw = out.get("proc_vmswap_kb")
+rss = out.get("proc_vmrss_kb")
+if sw and rss is not None and sw > rss:
+    out["proc_swap_note"] = ("more of the process is swapped out than "
+                             "resident -- page-in latency is on the "
+                             "forwarding path")
+
+print("," + ",".join(json.dumps(k) + ":" + json.dumps(v)
+                     for k, v in out.items()))
+' "$pid" 2>/dev/null || printf '%s' ',"proc_state":"failed"'
+}
+
+# Drops on the tunnel interface and on its qdisc, plus the qdisc's own
+# backlog and flow-limit counters.
+#
+# This is the counter a production incident was actually diagnosed on, and the
+# one this harness never collected: mqvpn0 TX dropped 15421/816149 = 1.9%,
+# against a qdisc that had dropped nothing. That combination localises the loss
+# precisely -- not the network, not the qdisc, but the TUN's own ring, which
+# fills while a single-threaded forwarder is off-CPU.
+#
+# The device default matters here: src/platform/linux/tun.c creates the TUN
+# with TUNSETIFF and never sets txqueuelen, so the ring is the kernel default
+# of 500 slots. At the offered rates a game workload reaches, 500 slots is a
+# few milliseconds of headroom.
+#
+# fq's flows_plimit is collected for the same reason: it caps a single flow at
+# 100 packets by default, so a tunnel that bursts -- which is exactly what an
+# encapsulated game tick does -- is dropped by its own qdisc while the link
+# sits idle. Field data showed 1450 of these.
+collect_iface_drops() {
+    local dev="$1" ns="${2:-$NETSIM_NS_SERVER}"
+    local stats qd
+    stats="$(ip netns exec "$ns" cat \
+        "/sys/class/net/${dev}/statistics/tx_dropped" \
+        "/sys/class/net/${dev}/statistics/rx_dropped" \
+        "/sys/class/net/${dev}/statistics/tx_packets" \
+        "/sys/class/net/${dev}/statistics/rx_packets" 2>/dev/null \
+        | tr '\n' ' ')"
+    qd="$(ip netns exec "$ns" tc -s -j qdisc show dev "$dev" 2>/dev/null)"
+    local qlen
+    qlen="$(ip netns exec "$ns" cat "/sys/class/net/${dev}/tx_queue_len" \
+            2>/dev/null)"
+
+    python3 -c '
+import json, sys
+
+nums, qjson, qlen, dev = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+out = {}
+parts = nums.split()
+if len(parts) != 4:
+    print(",\"iface_drops\":\"unreadable\"")
+    raise SystemExit(0)
+try:
+    txd, rxd, txp, rxp = (int(x) for x in parts)
+except ValueError:
+    print(",\"iface_drops\":\"unreadable\"")
+    raise SystemExit(0)
+
+out["iface_drops"] = "ok"
+out["iface_dev"] = dev
+out["iface_tx_dropped"] = txd
+out["iface_rx_dropped"] = rxd
+# Shares, because an absolute drop count means nothing without the offered
+# count beside it -- 15421 drops is 1.9% or 0.02% depending on the denominator.
+if txp + txd > 0:
+    out["iface_tx_drop_pct"] = round(100.0 * txd / (txp + txd), 3)
+if rxp + rxd > 0:
+    out["iface_rx_drop_pct"] = round(100.0 * rxd / (rxp + rxd), 3)
+try:
+    out["iface_txqueuelen"] = int(qlen)
+except (TypeError, ValueError):
+    pass
+
+# qdisc drops, separately from the device ring. The pair is what localises a
+# loss: ring drops with a clean qdisc means the reader was too slow, while
+# qdisc drops mean the shaper refused it.
+try:
+    qs = json.loads(qjson) if qjson else []
+except Exception:
+    qs = []
+if qs:
+    q = qs[0]
+    out["qdisc_kind"] = q.get("kind")
+    for src, dst in (("drops", "qdisc_drops"), ("overlimits", "qdisc_overlimits"),
+                     ("requeues", "qdisc_requeues"), ("backlog", "qdisc_backlog"),
+                     ("qlen", "qdisc_qlen")):
+        if q.get(src) is not None:
+            out[dst] = q[src]
+    # fq only. flows_plimit is the per-flow 100-packet cap: a tunnel is one
+    # flow to fq, so an encapsulated burst hits it while the link is idle.
+    for k in ("flows_plimit", "throttled", "pkts_too_long"):
+        if q.get(k) is not None:
+            out["qdisc_" + k] = q[k]
+
+print("," + ",".join(json.dumps(k) + ":" + json.dumps(v)
+                     for k, v in out.items()))
+' "$stats" "${qd:-}" "${qlen:-}" "$dev" 2>/dev/null \
+        || printf '%s' ',"iface_drops":"failed"'
+}
+
+# The same counters for the tunnel interface, on both ends.
+#
+# This is the one that matters most and the one the harness never had. The veth
+# is the emulated network; mqvpn0 is where mqvpn itself hands packets to the
+# kernel, and it is where a forwarder that fell behind loses them. On a real
+# 1 vCPU box the split was unambiguous -- mqvpn0 TX dropped 1.9%, its qdisc
+# dropped nothing -- and neither number was collectable here.
+#
+# Both directions are read because they fail for different reasons: the
+# server's TUN TX is the downlink a game broadcasts, the client's TUN TX is
+# the uplink. Prefixed rather than merged so a row can say which end.
+collect_tun_drops() {
+    local dev="${CI_BENCH_TUN_NAME:-mqvpn0}"
+    local out="" side ns
+    for side in srv cli; do
+        if [ "$side" = srv ]; then ns="$NETSIM_NS_SERVER"; else ns="$NS_CLIENT"; fi
+        # Absent until the tunnel is up, and absent is not an error: the
+        # baseline leg runs before any TUN exists.
+        ip netns exec "$ns" test -d "/sys/class/net/${dev}" 2>/dev/null \
+            || continue
+        local frag
+        frag="$(collect_iface_drops "$dev" "$ns")"
+        # Re-key so the two ends do not collide, and so a reader never has to
+        # guess which interface a drop count belongs to. Both prefixes are
+        # rewritten: leaving qdisc_* alone would let the client's qdisc
+        # silently overwrite the server's in the merged row.
+        frag="$(printf '%s' "$frag" | sed \
+            -e "s/\"iface_/\"tun_${side}_/g" \
+            -e "s/\"qdisc_/\"tun_${side}_qdisc_/g")"
+        out="${out}${frag}"
+    done
+    [ -n "$out" ] || out=',"tun_drops":"no_tun_device"'
+    printf '%s' "$out"
 }
 
 start_server_with_ctrl() {
@@ -1479,6 +1693,10 @@ run_quic() {
         local qreps="${CI_BENCH_QUIC_REPEATS:-3}" qi gsamples=()
         for (( qi=0; qi<qreps; qi++ )); do
             if [ "$qi" = 0 ]; then
+                # Resolved here rather than inside the sampler: under a tier
+                # the pid must be walked down through systemd-run, which
+                # server_pid already knows how to do.
+                CI_BENCH_SAMPLE_PID="$(server_pid)"
                 sampler_start "$NETSIM_NS_SERVER" "$(netsim_veth_srv 0)"
             fi
 
@@ -1495,7 +1713,9 @@ run_quic() {
                 stats="$(collect_stats)"; rss="$(server_rss_kb)"
                 stats="${stats}$(collect_wlb_instr)$(collect_send_supply)"
                 stats="${stats}$(collect_sampler)$(collect_oscillation)"
-                stats="${stats}$(collect_overhead)"
+                stats="${stats}$(collect_overhead)$(collect_proc_state)"
+                stats="${stats}$(collect_iface_drops "$(netsim_veth_srv 0)")"
+                CI_BENCH_SAMPLE_PID=""
                 qst="$QUIC_STATUS"
             elif [ "$QUIC_STATUS" != ok ] && [ "$qst" = ok ]; then
                 # A cell that succeeded once and failed later is neither "ok"
@@ -1711,6 +1931,7 @@ run_game() {
         CI_BENCH_IPERF_LEN="$pkt_len"
 
         ci_bench_mark_server_log
+        CI_BENCH_SAMPLE_PID="$(server_pid)"
         sampler_start "$NETSIM_NS_SERVER" "$(netsim_veth_srv 0)"
 
         local tun_jf; tun_jf="$(ci_bench_run_iperf UDP DL "$dur" 1 "$target_bw")"
@@ -1719,10 +1940,18 @@ run_game() {
         rm -f "$tun_jf"
 
         sampler_stop
+        CI_BENCH_SAMPLE_PID=""
         stats="$(collect_stats)"; rss="$(server_rss_kb)"
         stats="${stats}$(collect_wlb_instr)$(collect_send_supply)"
         stats="${stats}$(collect_sampler)$(collect_overhead)"
         stats="${stats}$(collect_host_profile "$(netsim_veth_srv 0)")"
+        stats="${stats}$(collect_proc_state)"
+        # Both interfaces: the veth is where the emulated network starts, the
+        # TUN is where a single-threaded forwarder that fell behind drops
+        # packets. Field data localised a 1.9% loss to the TUN ring precisely
+        # because the two were read separately.
+        stats="${stats}$(collect_iface_drops "$(netsim_veth_srv 0)")"
+        stats="${stats}$(collect_tun_drops)"
     fi
 
     ci_bench_stop_vpn
@@ -2153,12 +2382,28 @@ case "$MODE" in
         export CI_BENCH_TIER_OK=no
     fi
     export CI_BENCH_TIER_NCPU_VAL="${CI_BENCH_TIER_NCPU[vps_1c1g_std]:-unknown}"
+    # The box is not empty before mqvpn starts. Every vps row so far handed the
+    # whole tier to the server, and the four rows of run 34043133862 came back
+    # indistinguishable from the untiered game rows -- 25.0% vs 24.8% CPU,
+    # pps_fidelity 1.000 on both -- because 800 kbit/s of game traffic cannot
+    # trouble an otherwise idle core. The tier was applied and measured
+    # nothing.
+    #
+    # Field data from a production 1 vCPU / 1 GB instance: ~15% CPU already
+    # consumed, 559 MB of 929 MB resident, 378 MB of swap in use, and mqvpn
+    # itself sitting at VmRSS 524 kB against VmSwap 68 MB. That last pair is
+    # the state worth reproducing -- a forwarder that has to fault its own
+    # pages back in before it can forward.
+    export CI_BENCH_HOST_STATE="${CI_BENCH_VPS_HOST_STATE:-vps_baseline}"
+    ci_bench_host_start "$CI_BENCH_HOST_STATE" vps_1c1g_std
     for t in game_100 game_200; do
         for p in 500 2000; do
             run_game "$t" "$p" || echo "  (vps game $t/$p failed, continuing)"
         done
     done
-    unset CI_BENCH_TIER CI_BENCH_TIER_OK CI_BENCH_TIER_NCPU_VAL
+    ci_bench_host_stop
+    unset CI_BENCH_TIER CI_BENCH_TIER_OK CI_BENCH_TIER_NCPU_VAL \
+          CI_BENCH_HOST_STATE
     ;;
   combo)
     TEST_NAME="netsim_combo"

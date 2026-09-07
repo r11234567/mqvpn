@@ -65,8 +65,14 @@ sampler_start() {
     # sampler: a gap in the series is not a failed measurement.
     local stat_dir="/sys/class/net/${dev}/statistics"
 
+    # /proc is not namespaced the way /sys/class/net is, so the server's status
+    # file is readable from inside the netns by pid. Empty when there is no
+    # server yet (the baseline leg runs before one starts), which leaves the
+    # process columns at zero rather than failing the tick.
+    local srv_pid="${CI_BENCH_SAMPLE_PID:-}"
+
     ip netns exec "$ns" bash -c '
-        csv="$1"; stat_dir="$2"; interval="$3"
+        csv="$1"; stat_dir="$2"; interval="$3"; srv_pid="$4"
         while :; do
             now="$(date +%s.%N)"
             # /proc/stat line 1: cpu user nice system idle iowait irq softirq steal
@@ -75,13 +81,17 @@ sampler_start() {
             # /proc/net/snmp carries a header row and a value row per protocol.
             # After `set -- $rest`: 1=InDatagrams 2=NoPorts 3=InErrors
             # 4=OutDatagrams 5=RcvbufErrors 6=SndbufErrors
-            udp_in=0; udp_out=0; sndbuf=0
+            #
+            # RcvbufErrors was parsed and thrown away for three runs. Field
+            # data put 441 of them on a box that was dropping packets, so it
+            # is the receive-side counterpart of SndbufErrors and is now kept.
+            udp_in=0; udp_out=0; sndbuf=0; rcvbuf=0
             while read -r label rest; do
                 [ "$label" = "Udp:" ] || continue
                 set -- $rest
                 # Header row has words where numbers go.
                 case "$1" in ""|*[!0-9]*) continue ;; esac
-                udp_in="$1"; udp_out="$4"; sndbuf="$6"
+                udp_in="$1"; udp_out="$4"; rcvbuf="$5"; sndbuf="$6"
             done < /proc/net/snmp
 
             # NET_RX per CPU. The VPS profile under test puts every queue and
@@ -102,13 +112,40 @@ sampler_start() {
             [ -r "$stat_dir/tx_bytes" ]   && read -r txb < "$stat_dir/tx_bytes"
             [ -r "$stat_dir/rx_bytes" ]   && read -r rxb < "$stat_dir/rx_bytes"
 
-            printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
+            # Drops on the measured interface, per tick. The end-to-end delta
+            # is collected separately, but the series is what shows whether
+            # the loss was steady or arrived in bursts -- field data had 1.9%
+            # overall that was in fact six short bursts, and a single
+            # percentage cannot tell those apart.
+            txd=0; rxd=0
+            [ -r "$stat_dir/tx_dropped" ] && read -r txd < "$stat_dir/tx_dropped"
+            [ -r "$stat_dir/rx_dropped" ] && read -r rxd < "$stat_dir/rx_dropped"
+
+            # Preemption of the forwarding process, and how much of it is
+            # swapped out. Both are only meaningful as a series: a single
+            # end-of-run VmSwap says the process was paged out, while the
+            # series says whether it was paged out DURING the measurement.
+            nvcs=0; vmswap=0; vmrss=0; nthr=0
+            if [ -n "$srv_pid" ] && [ -r "/proc/$srv_pid/status" ]; then
+                while read -r k v _; do
+                    case "$k" in
+                        nonvoluntary_ctxt_switches:) nvcs="$v" ;;
+                        VmSwap:) vmswap="$v" ;;
+                        VmRSS:)  vmrss="$v" ;;
+                        Threads:) nthr="$v" ;;
+                    esac
+                done < "/proc/$srv_pid/status"
+            fi
+
+            printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
                 "$now" "$u" "$n" "$s" "$idl" "$iow" "$irq" "$sirq" "$steal" \
                 "$udp_in" "$udp_out" "$sndbuf" "$netrx0" "$netrx" \
-                "$txp" "$rxp" "$txb" "$rxb" >> "$csv"
+                "$txp" "$rxp" "$txb" "$rxb" \
+                "$rcvbuf" "$txd" "$rxd" "$nvcs" "$vmswap" "$vmrss" "$nthr" \
+                >> "$csv"
             sleep "$interval"
         done
-    ' _ "$_CB_SAMP_CSV" "$stat_dir" "$interval" &>/dev/null &
+    ' _ "$_CB_SAMP_CSV" "$stat_dir" "$interval" "$srv_pid" &>/dev/null &
     _CB_SAMP_PID=$!
 }
 
@@ -155,13 +192,15 @@ csv_path, samp_cpu, interval = sys.argv[1], sys.argv[2], float(sys.argv[3])
 
 # Column order written by the tick loop above.
 (T, U, N, S, IDL, IOW, IRQ, SIRQ, STEAL,
- UIN, UOUT, SNDB, NRX0, NRX, TXP, RXP, TXB, RXB) = range(18)
+ UIN, UOUT, SNDB, NRX0, NRX, TXP, RXP, TXB, RXB,
+ RCVB, TXD, RXD, NVCS, VMSWAP, VMRSS, NTHR) = range(25)
+NCOL = 25
 
 rows = []
 with open(csv_path) as fh:
     for line in fh:
         p = line.strip().split(",")
-        if len(p) != 18:
+        if len(p) != NCOL:
             continue
         try:
             rows.append([float(p[0])] + [int(x) for x in p[1:]])
@@ -215,6 +254,43 @@ if nrx_all > 0:
 # full. A direct send-side-blocking signal, and absolute because one is already
 # interesting -- a rate would hide that.
 out["samp_sndbuf_errors"] = last[SNDB] - first[SNDB]
+# RcvbufErrors: the receive counterpart. Parsed since the sampler was written
+# and discarded until now; a production box that was dropping packets showed
+# 441 of these, so it is the socket-level evidence that the reader could not
+# keep up with the wire.
+out["samp_rcvbuf_errors"] = last[RCVB] - first[RCVB]
+
+# Interface drops during the measurement, and their shape.
+#
+# The absolute delta answers "did the box drop anything"; the series answers
+# "was it steady or bursty", which a single percentage cannot. Field data on a
+# real VPS showed 1.9% TX dropped that turned out to be six short bursts --
+# the difference between a capacity problem and a scheduling one.
+dtxd, drxd = last[TXD] - first[TXD], last[RXD] - first[RXD]
+out["samp_tx_dropped"] = dtxd
+out["samp_rx_dropped"] = drxd
+dtxp_all = (last[TXP] - first[TXP]) + dtxd
+if dtxp_all > 0:
+    out["samp_tx_drop_pct"] = round(100.0 * dtxd / dtxp_all, 3)
+
+# Preemption of the forwarding process. A single-threaded forwarder on one
+# core stops forwarding entirely while it is off-CPU, and the TUN ring fills
+# during the gap -- which is the mechanism behind a drop count, invisible in
+# any throughput figure.
+dnv = last[NVCS] - first[NVCS]
+if last[NVCS] or first[NVCS]:
+    out["samp_nonvol_ctxsw"] = dnv
+    if span > 0:
+        out["samp_nonvol_ctxsw_per_s"] = round(dnv / span, 1)
+if last[NTHR]:
+    out["samp_proc_threads"] = last[NTHR]
+# Swap footprint at the end of the measurement, with the peak over it. A
+# process paged out mid-measurement pays page-in latency on the forwarding
+# path; the peak is what says it happened during, not before.
+if last[VMSWAP] or last[VMRSS]:
+    out["samp_vmswap_kb"] = last[VMSWAP]
+    out["samp_vmrss_kb"] = last[VMRSS]
+    out["samp_vmswap_peak_kb"] = max(r[VMSWAP] for r in rows)
 
 # Bytes per wire packet, from the counters the interface itself keeps.
 #
@@ -251,17 +327,38 @@ if dtxp > 0 or drxp > 0:
 
 # Per-tick wire throughput, the series the oscillation metric reads. Mbit/s to
 # match every other throughput field in the artifact.
-mbps, pps = [], []
+mbps, pps, drops, sirqs = [], [], [], []
 for a, b in zip(rows, rows[1:]):
     dt = b[T] - a[T]
     if dt <= 0:
         continue
     mbps.append(round((b[TXB] - a[TXB]) * 8.0 / 1e6 / dt, 2))
     pps.append(round((b[TXP] - a[TXP]) / dt, 1))
+    drops.append((b[TXD] - a[TXD]) + (b[RXD] - a[RXD]))
+    # Softirq share per tick. The end-to-end average hides a spike, and a
+    # spike is the thing a packet-handling-bound box does under a burst.
+    tick_busy = sum(b[i] - a[i] for i in (U, N, S, IRQ, SIRQ, STEAL))
+    tick_idle = sum(b[i] - a[i] for i in (IDL, IOW))
+    tick_tot = tick_busy + tick_idle
+    sirqs.append(round(100.0 * (b[SIRQ] - a[SIRQ]) / tick_tot, 2)
+                 if tick_tot > 0 else 0.0)
 if mbps:
     out["samp_tx_mbps_series"] = mbps
 if pps:
     out["samp_tx_pps_series"] = pps
+if any(drops):
+    # Only emitted when something was dropped: an all-zero series on every
+    # clean row would be noise, and its absence is unambiguous beside
+    # samp_tx_dropped, which is always present.
+    out["samp_drop_series"] = drops
+    nz = [i for i, d in enumerate(drops) if d]
+    # Bursts, not a rate: consecutive ticks with drops are one event.
+    bursts = 1 + sum(1 for x, y in zip(nz, nz[1:]) if y - x > 1)
+    out["samp_drop_bursts"] = bursts
+    out["samp_drop_worst_tick"] = max(drops)
+if sirqs:
+    out["samp_softirq_series"] = sirqs
+    out["samp_softirq_peak_pct"] = max(sirqs)
 
 if samp_cpu != "unknown":
     try:

@@ -52,7 +52,7 @@ CI_BENCH_TIER_UNIT="mqvpn-bench-tier"
 # throttle landing on a live server.
 CI_BENCH_CAPPED_QUOTA="${CI_BENCH_CAPPED_QUOTA:-20%}"
 
-CI_BENCH_HOST_STATES="healthy noisy_neighbour softirq_storm cpu_capped"
+CI_BENCH_HOST_STATES="healthy noisy_neighbour softirq_storm cpu_capped vps_baseline"
 
 _CB_HOST_PIDS=""
 _CB_NOISE_NS_A="ci-bench-noise-a"
@@ -133,6 +133,20 @@ ci_bench_host_free_cpus() {
     echo "${owned}-$((total - 1))"
 }
 
+# The CPU list the tier itself owns, parsed out of AllowedCPUs. The inverse of
+# the above, for load that belongs ON the server's cores rather than beside
+# them. Falls back to CPU 0, which is where an untiered run lands anyway.
+ci_bench_host_tier_cpus() {
+    local tier="${1:-}" props="" kv
+    # An empty subscript is an error under bash's associative arrays, not a
+    # miss, so the untiered case is answered before the lookup.
+    [ -n "$tier" ] && props="${CI_BENCH_TIER_PROPS[$tier]:-}"
+    for kv in $props; do
+        case "$kv" in AllowedCPUs=*) echo "${kv#AllowedCPUs=}"; return 0 ;; esac
+    done
+    echo 0
+}
+
 # Burn CPU on $1 (a taskset cpu-list). stress-ng if available, otherwise shell
 # spinners — the load only has to be real, not calibrated, and adding a package
 # dependency for a busy loop is not worth a broken job when the mirror is slow.
@@ -148,6 +162,103 @@ _cb_host_burn() {
         taskset -c "$cpus" sh -c 'while :; do :; done' &>/dev/null &
         _CB_HOST_PIDS="$_CB_HOST_PIDS $!"
     done
+}
+
+# The load a real VPS is already carrying before mqvpn starts.
+#
+# Every tiered row so far handed the whole tier to mqvpn, which assumes a box
+# bought to run nothing else. The observed baseline on a production 1 vCPU /
+# 1 GB instance was materially different, and the difference is the whole
+# reason the field numbers and the benchmark numbers disagree:
+#
+#   CPU     ~15% already consumed by existing services
+#   Memory  559 MB of 929 MB already resident
+#   Swap    378 MB of 1.5 GB already in use
+#
+# The memory figure is what matters most. mqvpn on that box had VmRSS 524 kB
+# against VmSwap 68 MB -- almost the entire process paged out -- and a
+# forwarder that must fault pages back in before it can forward is a forwarder
+# that drops. That state is unreachable on a runner with free memory, so it has
+# to be arranged.
+#
+# CPU_PCT is approximated by duty-cycling rather than by a cgroup quota: the
+# competing load must sit OUTSIDE mqvpn's own tier scope (a quota on the scope
+# would throttle mqvpn instead of competing with it), and a plain spinner on
+# the same cpuset would take far more than 15%.
+# Exported, not merely assigned: collect_host_profile reads these from a
+# python3 child's environment, and an unexported value is invisible there. That
+# exact omission made every vps row of run 34036912262 claim host_tier=untiered
+# while the scope had in fact been created.
+export CI_BENCH_BASELOAD_CPU_PCT="${CI_BENCH_BASELOAD_CPU_PCT:-15}"
+export CI_BENCH_BASELOAD_MEM_MB="${CI_BENCH_BASELOAD_MEM_MB:-559}"
+export CI_BENCH_BASELOAD_SWAP_MB="${CI_BENCH_BASELOAD_SWAP_MB:-378}"
+
+_cb_host_vps_baseline() {
+    local cpus="$1"
+    local pct="$CI_BENCH_BASELOAD_CPU_PCT"
+
+    # Duty-cycled busy loop: ~pct% of one core, on the same cpuset the tier
+    # owns, because a neighbour on a different core is not competition for a
+    # 1-vCPU box.
+    #
+    # In python rather than shell: a shell duty cycle needs a `date` spawn per
+    # iteration to know when to stop burning, and at a 10 ms period those
+    # spawns cost more than the load being emulated. A 10 ms period is short
+    # enough that the forwarder meets the contention many times per second
+    # rather than in one long block.
+    taskset -c "$cpus" python3 -c '
+import sys, time
+duty = float(sys.argv[1]) / 100.0
+period = 0.01
+on, off = period * duty, period * (1.0 - duty)
+while True:
+    end = time.monotonic() + on
+    while time.monotonic() < end:
+        pass
+    if off > 0:
+        time.sleep(off)
+' "$pct" &>/dev/null &
+    _CB_HOST_PIDS="$_CB_HOST_PIDS $!"
+
+    # Resident memory, then swap. Two separate allocations because they are two
+    # separate facts: the first squeezes the page cache and mqvpn's own
+    # working set, the second forces the box to actually be swapping rather
+    # than merely full.
+    #
+    # Held by a process that touches its pages once and then sleeps, so the
+    # kernel is free to choose IT as the swap victim -- which is the realistic
+    # shape, an idle service paged out while an active one runs.
+    _cb_host_hold_mem "$CI_BENCH_BASELOAD_MEM_MB" resident
+    _cb_host_hold_mem "$CI_BENCH_BASELOAD_SWAP_MB" swap
+}
+
+# Allocate and touch <mb> MiB, then hold it. mode=swap additionally madvises
+# the region cold so the kernel prefers it as a swap victim.
+_cb_host_hold_mem() {
+    local mb="$1" mode="${2:-resident}"
+    [ "${mb:-0}" -gt 0 ] 2>/dev/null || return 0
+    python3 -c '
+import mmap, sys, time
+mb, mode = int(sys.argv[1]), sys.argv[2]
+try:
+    buf = mmap.mmap(-1, mb << 20)
+except (OSError, ValueError):
+    raise SystemExit(0)
+# Touch every page so the pages are really committed, not just reserved.
+for off in range(0, mb << 20, 4096):
+    buf[off] = 1
+if mode == "swap":
+    try:
+        # MADV_COLD (20) where available: marks the pages as reclaim
+        # candidates without freeing them, so they migrate to swap under
+        # pressure rather than being dropped.
+        buf.madvise(20)
+    except (AttributeError, OSError):
+        pass
+while True:
+    time.sleep(3600)
+' "$mb" "$mode" &>/dev/null &
+    _CB_HOST_PIDS="$_CB_HOST_PIDS $!"
 }
 
 # A small-packet flood over a veth pair that has nothing to do with the tunnel,
@@ -197,6 +308,12 @@ ci_bench_host_start() {
             ;;
         softirq_storm)
             _cb_host_softirq_storm
+            ;;
+        vps_baseline)
+            # Deliberately INSIDE the tier's cpuset, unlike noisy_neighbour:
+            # this is the box's own existing services, which on a 1-vCPU
+            # instance necessarily share the one core mqvpn runs on.
+            _cb_host_vps_baseline "$(ci_bench_host_tier_cpus "$tier")"
             ;;
         cpu_capped)
             # Applied mid-measurement by the caller, not here: the point is a

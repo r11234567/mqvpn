@@ -541,10 +541,131 @@ def emit_game(by_key, arms):
     # can mean "nothing was reordered" or "nothing was counting".
     engines = {r.get("reorder_engine") or "unknown" for *_x, r in rows}
     print("Reorder engine state across these rows: "
-          + ", ".join(f"`{e}`" for e in sorted(engines))
-          + ". The `ooo%` column comes from iperf3's own sequence numbers, so "
-            "it is measured end to end and does not depend on that engine.")
+          + ", ".join(f"`{e}`" for e in sorted(engines)) + ".")
     print()
+    if all(r.get("out_of_order_pct") is None for *_x, r in rows):
+        print(
+            "**`ooo%` is empty because nothing measured it.** The parser looks "
+            "for an `out_of_order` key in iperf3's JSON; iperf3 does not emit "
+            "one -- reordering appears only in its verbose text output. The "
+            "column was specified on the assumption that "
+            "`end.sum.out_of_order` existed, without checking the schema, and "
+            "read `null` in every row of every run since. It is left in place, "
+            "empty and labelled, rather than quietly removed: reordering is "
+            "the failure mode this mode exists to measure, and a generator "
+            "that can report it is the outstanding work."
+        )
+        print()
+
+
+def emit_drops(rows):
+    """Where packets were lost, by interface.
+
+    The table exists to separate three losses that a single end-to-end
+    percentage cannot: the emulated network dropped it, the qdisc refused it,
+    or the tunnel device's own ring overflowed while the forwarder was off-CPU.
+    A production incident was diagnosed on exactly that split -- mqvpn0 TX
+    dropped 1.9% against a qdisc that had dropped nothing -- and the harness
+    could not previously see any of it.
+    """
+    # Any drop-related field is enough to render the row. Gating on one
+    # specific key would silently drop rows whose tunnel never came up (no
+    # tun_* at all) or whose sampler was off, and an empty table is more
+    # honest than a missing one.
+    keys = ("tun_srv_tx_dropped", "tun_srv_tx_drop_pct", "iface_tx_dropped",
+            "iface_tx_drop_pct", "tun_cli_tx_drop_pct", "samp_tx_dropped")
+    have = [t for t in rows
+            if any(t[-1].get(k) is not None for k in keys)]
+    if not have:
+        return
+
+    print("### Where packets were dropped")
+    print()
+    print(
+        "`veth` is the emulated network's own interface; `TUN srv`/`TUN cli` "
+        "are mqvpn's tunnel devices at each end. A drop on the TUN with a "
+        "clean qdisc means the ring filled -- the forwarder was not reading "
+        "fast enough -- rather than anything the network did. `bursts` counts "
+        "runs of consecutive one-second ticks that carried a drop, so a steady "
+        "loss and a few short stalls do not read alike."
+    )
+    print()
+    print("| mode | scenario | arm | veth tx drop% | TUN srv tx drop% | "
+          "TUN srv qdisc drops | TUN srv qlen | TUN cli tx drop% | "
+          "bursts | worst tick |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
+    for mode, scenario, arm, r in sorted(have, key=lambda t: t[:3]):
+        print("| {} | {} | `{}` | {} | {} | {} | {} | {} | {} | {} |".format(
+            mode, scenario, arm,
+            fmt(r.get("iface_tx_drop_pct"), "{:.3f}"),
+            fmt(r.get("tun_srv_tx_drop_pct"), "{:.3f}"),
+            r.get("tun_srv_qdisc_drops")
+            if r.get("tun_srv_qdisc_drops") is not None else "-",
+            r.get("tun_srv_txqueuelen")
+            if r.get("tun_srv_txqueuelen") is not None else "-",
+            fmt(r.get("tun_cli_tx_drop_pct"), "{:.3f}"),
+            r.get("samp_drop_bursts")
+            if r.get("samp_drop_bursts") is not None else "-",
+            r.get("samp_drop_worst_tick")
+            if r.get("samp_drop_worst_tick") is not None else "-"))
+    print()
+
+    qlens = {t[-1].get("tun_srv_txqueuelen") for t in have
+             if t[-1].get("tun_srv_txqueuelen") is not None}
+    if qlens:
+        print(
+            "TUN `txqueuelen` is "
+            + ", ".join(str(q) for q in sorted(qlens))
+            + ". mqvpn never sets it (`src/platform/linux/tun.c` calls "
+              "`TUNSETIFF` and stops), so this is the kernel default. It is "
+              "the depth of the ring a drop count above lands in."
+        )
+        print()
+
+
+def emit_proc(rows):
+    """The forwarding process itself: threads, preemption, and swap."""
+    have = [t for t in rows if t[-1].get("proc_state") == "ok"
+            or t[-1].get("samp_proc_threads") is not None]
+    if not have:
+        return
+
+    print("### The forwarding process")
+    print()
+    print(
+        "`nonvol ctxsw/s` counts the times per second the kernel took the CPU "
+        "away from mqvpn rather than mqvpn yielding it. On a single-threaded "
+        "forwarder pinned to one core, each of those is an interval during "
+        "which nothing is forwarded and the TUN ring fills -- which is the "
+        "mechanism behind the drop table above, and is invisible in any "
+        "throughput figure. `swap` is the process's own paged-out footprint: "
+        "a forwarder that must fault pages back in before it can forward pays "
+        "that latency on the packet path."
+    )
+    print()
+    print("| mode | scenario | arm | threads | nonvol ctxsw/s | RSS MB | "
+          "swap MB | swap peak MB |")
+    print("|---|---|---|---|---|---|---|---|")
+
+    def mb(kb):
+        return "-" if kb is None else "{:.1f}".format(kb / 1024.0)
+
+    for mode, scenario, arm, r in sorted(have, key=lambda t: t[:3]):
+        print("| {} | {} | `{}` | {} | {} | {} | {} | {} |".format(
+            mode, scenario, arm,
+            r.get("proc_threads") or r.get("samp_proc_threads") or "-",
+            fmt(r.get("samp_nonvol_ctxsw_per_s")),
+            mb(r.get("proc_vmrss_kb")),
+            mb(r.get("proc_vmswap_kb")),
+            mb(r.get("samp_vmswap_peak_kb"))))
+    print()
+
+    notes = {t[-1].get("proc_swap_note") for t in have
+             if t[-1].get("proc_swap_note")}
+    for n in sorted(notes):
+        print(f"- {n}")
+    if notes:
+        print()
 
 
 def emit_vps(by_key, arms):
@@ -565,29 +686,43 @@ def emit_vps(by_key, arms):
         "interface counters inside the server namespace. `NET_RX cpu0` is the "
         "share of receive softirqs that landed on CPU0 -- an assertion that "
         "the box matched the target profile, not a measurement of anything. "
-        "`sndbuf` counts datagrams the kernel refused because the socket "
-        "buffer was full, which is a direct send-side-blocking signal."
+        "`sndbuf`/`rcvbuf` count datagrams the kernel refused because the "
+        "socket buffer was full, in each direction."
     )
     print()
-    print("| mode | scenario | arm | tier | cpu% | softirq% | NET_RX/s | "
-          "NET_RX cpu0 | tx pps | rxq/txq | rps | sndbuf |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print(
+        "**`cpu%` is not comparable between a tiered and an untiered row.** It "
+        "comes from `/proc/stat`, which is not cpuset-aware, so a fully "
+        "saturated single-CPU tier on a 4-vCPU runner reads `25%` -- the same "
+        "figure an idle-ish untiered row shows. `softirq peak%` is the worst "
+        "single tick rather than the average, because a packet-handling limit "
+        "shows up as a spike that a 20-second mean erases."
+    )
+    print()
+    print("| mode | scenario | arm | tier | load | cpu% | softirq% | "
+          "softirq peak% | NET_RX cpu0 | tx pps | rxq/txq | sndbuf | rcvbuf |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for mode, scenario, arm, r in sorted(rows, key=lambda t: t[:3]):
         q = "{}/{}".format(r.get("host_rx_queues", "-"),
                            r.get("host_tx_queues", "-"))
-        print("| {} | {} | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |"
-              .format(
+        print("| {} | {} | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} "
+              "| {} |".format(
                   mode, scenario, arm, r.get("host_tier") or "-",
+                  r.get("host_state") or "-",
                   fmt(r.get("samp_cpu_util_pct")),
                   fmt(r.get("samp_softirq_pct"), "{:.2f}"),
-                  fmt(r.get("samp_net_rx_per_s")),
+                  fmt(r.get("samp_softirq_peak_pct"), "{:.2f}"),
                   fmt(r.get("samp_net_rx_cpu0_share"), "{:.3f}"),
                   fmt(r.get("samp_tx_pps")),
                   q,
-                  "on" if r.get("host_rps_enabled") else "off",
                   r.get("samp_sndbuf_errors")
-                  if r.get("samp_sndbuf_errors") is not None else "-"))
+                  if r.get("samp_sndbuf_errors") is not None else "-",
+                  r.get("samp_rcvbuf_errors")
+                  if r.get("samp_rcvbuf_errors") is not None else "-"))
     print()
+
+    emit_drops(rows)
+    emit_proc(rows)
 
     notes = {r.get("host_not_emulated") for *_x, r in rows
              if r.get("host_not_emulated")}
