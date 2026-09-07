@@ -429,8 +429,7 @@ mqvpn_config_load_json(mqvpn_config_t *cfg, const char *json_text)
 
     v = json_find_key(json_text, "tx_queue_len");
     if (v) {
-        if (json_read_int_strict(v, &iv) != 0
-            || (iv != 0 && (iv < 100 || iv > 65536))) {
+        if (json_read_int_strict(v, &iv) != 0 || (iv != 0 && (iv < 100 || iv > 65536))) {
             return MQVPN_ERR_INVALID_ARG;
         }
         cfg->tun_txqueuelen = iv;
@@ -438,8 +437,7 @@ mqvpn_config_load_json(mqvpn_config_t *cfg, const char *json_text)
 
     v = json_find_key(json_text, "tun_read_batch");
     if (v) {
-        if (json_read_int_strict(v, &iv) != 0
-            || (iv != 0 && (iv < 1 || iv > 4096))) {
+        if (json_read_int_strict(v, &iv) != 0 || (iv != 0 && (iv < 1 || iv > 4096))) {
             return MQVPN_ERR_INVALID_ARG;
         }
         cfg->tun_read_batch = iv;

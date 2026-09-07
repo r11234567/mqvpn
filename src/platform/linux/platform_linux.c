@@ -34,8 +34,8 @@
  * 27 wakeups to clear, during which the 500-slot ring overflows -- measured
  * 23-49% tx_dropped in run 34084331771, against a qdisc that dropped none. */
 #define TUN_READ_BATCH_DEFAULT 64
-#define TUN_BUF_SIZE        65536
-#define SOCK_BUF_SIZE       65536
+#define TUN_BUF_SIZE           65536
+#define SOCK_BUF_SIZE          65536
 /* Teardown RX-offload telemetry line (client and server cleanup labels).
  * ONE format definition, same drift hazard and consumers as
  * MQVPN_UDP_TX_LINE_FMT in mqvpn_internal.h. */
@@ -393,8 +393,7 @@ on_tun_read(evutil_socket_t fd, short what, void *arg)
     (void)what;
     platform_ctx_t *p = (platform_ctx_t *)arg;
     uint8_t buf[TUN_BUF_SIZE];
-    int batch = p->tun_read_batch > 0 ? p->tun_read_batch
-                                      : TUN_READ_BATCH_DEFAULT;
+    int batch = p->tun_read_batch > 0 ? p->tun_read_batch : TUN_READ_BATCH_DEFAULT;
 
     for (int i = 0; i < batch; i++) {
         int n = mqvpn_tun_read(&p->tun, buf, sizeof(buf));
@@ -986,8 +985,7 @@ svr_on_tun_read(evutil_socket_t fd, short what, void *arg)
     (void)what;
     server_platform_ctx_t *sp = (server_platform_ctx_t *)arg;
     uint8_t buf[TUN_BUF_SIZE];
-    int batch = sp->tun_read_batch > 0 ? sp->tun_read_batch
-                                       : TUN_READ_BATCH_DEFAULT;
+    int batch = sp->tun_read_batch > 0 ? sp->tun_read_batch : TUN_READ_BATCH_DEFAULT;
 
     for (int i = 0; i < batch; i++) {
         int n = mqvpn_tun_read(&sp->tun, buf, sizeof(buf));

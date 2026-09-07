@@ -31,14 +31,14 @@ typedef struct mqvpn_client_cfg_s {
     int reconnect_interval;     /* base reconnect interval in seconds (default 5) */
     int kill_switch;            /* 1=block traffic outside tunnel (default 0) */
     int manage_routes; /* 1=manage host routes (default 1), 0=skip routing setup */
-    uint64_t init_max_path_id;         /* draft-21 §4.6 TP cap, 0=use xquic default 8 */
-    int tun_mtu;                       /* 0=auto (MSS-derived), >0=cap (floor 1280) */
-    int tun_txqueuelen;                /* 0=kernel default (500), >0=TUN tx ring depth */
-    int tun_read_batch;                /* 0=built-in default (64), >0=TUN reads per wakeup */
-    int cc;                            /* mqvpn_cc_t: congestion control algorithm */
-    int reinjection;                   /* mqvpn_reinjection_t; 0=off (default) */
-    int reinj_srtt_factor_pct;         /* deadline mode; percent, e.g. 110 = 1.10x srtt */
-    int reinj_hard_deadline_ms;        /* deadline mode */
+    uint64_t init_max_path_id;  /* draft-21 §4.6 TP cap, 0=use xquic default 8 */
+    int tun_mtu;                /* 0=auto (MSS-derived), >0=cap (floor 1280) */
+    int tun_txqueuelen;         /* 0=kernel default (500), >0=TUN tx ring depth */
+    int tun_read_batch;         /* 0=built-in default (64), >0=TUN reads per wakeup */
+    int cc;                     /* mqvpn_cc_t: congestion control algorithm */
+    int reinjection;            /* mqvpn_reinjection_t; 0=off (default) */
+    int reinj_srtt_factor_pct;  /* deadline mode; percent, e.g. 110 = 1.10x srtt */
+    int reinj_hard_deadline_ms; /* deadline mode */
     int reinj_deadline_lower_bound_ms; /* deadline mode */
     mqvpn_reorder_config_t
         reorder;                  /* INI [Reorder]/[ReorderRule] (mode OFF by default) */

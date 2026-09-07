@@ -150,7 +150,7 @@ int
 mqvpn_tun_set_txqueuelen(mqvpn_tun_t *tun, int qlen)
 {
     if (qlen <= 0) {
-        return 0;               /* 0 means "leave the kernel default alone" */
+        return 0; /* 0 means "leave the kernel default alone" */
     }
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
