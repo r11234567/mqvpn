@@ -129,6 +129,15 @@ struct mqvpn_config_s {
     int tun_mtu; /* 0 = auto (client: negotiated; server: 1382), >0 = client cap / server
                     TUN MTU */
 
+    /* 0 = leave the kernel default (500 packets), >0 = TUN transmit ring
+     * depth. A 10 Hz game tick delivers its whole burst in a few ms, and
+     * anything past the ring is dropped with tx_dropped and no other trace. */
+    int tun_txqueuelen;
+
+    /* 0 = built-in default (64). Packets drained from the TUN per event-loop
+     * wakeup: the ring above is only as useful as the rate it is emptied. */
+    int tun_read_batch;
+
     /* Flow-aware reorder shim config (§16). Seeded with
      * mqvpn_reorder_config_default() in mqvpn_config_new(); the library
      * consumer reads cfg->reorder. */

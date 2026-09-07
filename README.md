@@ -41,6 +41,7 @@ https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
   - [INI config](#ini-config)
   - [JSON config](#json-config)
   - [TUN MTU](#tun-mtu)
+  - [TUN queue depth and drain batch](#tun-queue-depth-and-drain-batch)
   - [`[Advanced]` — UDP offload](#advanced--udp-offload)
 - [Schedulers](#schedulers)
 - [Reorder buffer (datagram lane)](#reorder-buffer-datagram-lane)
@@ -696,6 +697,73 @@ sudo mqvpn --mode server --mtu 1400 ...
 ```
 
 CLI beats config file; `0` from either means auto.
+
+### TUN queue depth and drain batch
+
+Two knobs for **bursty small-packet traffic** — a game server broadcasting on a
+tick, VoIP, telemetry. Both are `[Interface]`, both Linux-only, and both
+default to leaving current behaviour untouched.
+
+| Key | Default | Range | What it is |
+|---|---|---|---|
+| `TxQueueLen` | `0` = kernel default (**500**) | 100–65536 | Depth of the TUN's transmit ring, in packets |
+| `TunReadBatch` | `0` = built-in default (**64**) | 1–4096 | Packets drained from the TUN per event-loop wakeup |
+
+**Why they matter.** A game server on a 10 Hz tick delivers a whole tick's
+worth of packets in a few milliseconds. Anything arriving past the ring's depth
+is dropped, and the only trace it leaves is the interface's `tx_dropped`
+counter — the qdisc shows nothing, the network shows nothing, and throughput
+looks fine because there is barely any. Measured in the netsim harness
+(run `34084331771`): **1707 packets per tick lost 23–49%** at the TUN with a
+qdisc that dropped zero. At 2000 pps the same tunnel lost 0.016%.
+
+The two work together, and raising one alone is usually not enough: the ring
+buys time, and the batch is the rate the ring is emptied at. At the default 64,
+clearing a 1707-packet tick takes 27 wakeups.
+
+**Sizing.** Start from your peak burst — packets per tick, including whatever
+spike multiple you expect:
+
+```
+TxQueueLen   ≈ 2 × (peak packets in one tick)
+TunReadBatch ≈ peak packets in one tick
+```
+
+At 200 KB/s of 20-byte payloads (~4,270 pps) on a 10 Hz tick that is ~427
+packets per tick, doubling to ~853 on a spike — already over the 500 default.
+`TxQueueLen = 2048` and `TunReadBatch = 512` covers it with room.
+
+`TunReadBatch` is bounded at 4096 on purpose: the drain runs inside one
+event-loop callback, so an unbounded batch starves every other descriptor in
+that loop — including the UDP socket the drained packets have to leave through.
+
+**Server side is the one that matters** for a game proxy: the downlink
+broadcast is what a player sees. Set it on the client too if the uplink is also
+bursty.
+
+```ini
+# /etc/mqvpn/server.conf
+[Interface]
+TxQueueLen = 2048
+TunReadBatch = 512
+```
+
+```json
+{ "tx_queue_len": 2048, "tun_read_batch": 512 }
+```
+
+There is no CLI flag for either; they are config-file only. Out-of-range values
+are rejected when the config is parsed rather than clamped, so a typo fails
+loudly instead of silently becoming a different depth. On macOS and Windows
+both are accepted and ignored — `txqueuelen` is a Linux netdev concept.
+
+**Check whether it helped**: `tx_dropped` on the tunnel interface should be the
+number that moves.
+
+```bash
+ip -s link show mqvpn0        # TX errors/dropped column
+tc -s qdisc show dev mqvpn0   # if THIS shows drops, the ring was not the problem
+```
 
 ### `[Advanced]` — UDP offload
 

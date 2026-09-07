@@ -65,13 +65,14 @@ on:
       game_pps:
         description: >-
           Packets per second per direction for the game/vps modes
-          (CI_BENCH_GAME_PPS). Empty keeps the harness default of 17067, which
-          is 800 KB/s at a 20-byte mean payload plus 28 bytes of UDP+IP. Run
-          34084331771 lost 23-49% at that rate with the TUN's own tx_dropped
-          carrying all of it and its qdisc carrying none, while the iperf3 leg
-          of the same rows was clean at 2000 pps -- so lowering this is how you
-          separate "the tunnel is broken" from "a 1707-packet tick does not fit
-          a 500-slot ring".
+          (CI_BENCH_GAME_PPS). Empty keeps the harness default of 4267, which
+          is 200 KB/s at a 20-byte mean payload plus 28 bytes of UDP+IP -- a
+          realistic single game client. Set it to 17067 (800 KB/s, roughly 4x
+          that) to drive past the knee: run 34084331771 lost 23-49% there with
+          the TUN's own tx_dropped carrying all of it and its qdisc carrying
+          none, while run 34086132803 at 2000 lost 0.016% on the same code.
+          Both rates are worth keeping -- one shows the shipped behaviour, the
+          other shows where it breaks.
         required: false
         default: ''
       iperf_streams:

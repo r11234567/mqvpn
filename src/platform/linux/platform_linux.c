@@ -27,6 +27,13 @@
 
 #define STATUS_INTERVAL_SEC 30
 #define BULK_READ_COUNT     64
+/* Default packets drained from the TUN per event-loop wakeup. Separate from
+ * BULK_READ_COUNT, which also bounds the UDP socket drain: those are two
+ * different queues with two different overflow behaviours, and only this one
+ * meets a game tick's burst. At 64 a 10 Hz tick carrying 1707 packets needs
+ * 27 wakeups to clear, during which the 500-slot ring overflows -- measured
+ * 23-49% tx_dropped in run 34084331771, against a qdisc that dropped none. */
+#define TUN_READ_BATCH_DEFAULT 64
 #define TUN_BUF_SIZE        65536
 #define SOCK_BUF_SIZE       65536
 /* Teardown RX-offload telemetry line (client and server cleanup labels).
@@ -110,6 +117,9 @@ cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
 
     if (mqvpn_tun_set_addr(&p->tun, local_ip, peer_ip, 32) < 0) goto fail;
     if (mqvpn_tun_set_mtu(&p->tun, info->mtu) < 0) goto fail;
+    /* Not fatal: a default-depth ring still forwards, and failing the
+     * tunnel over a queue-depth hint would be the worse trade. */
+    mqvpn_tun_set_txqueuelen(&p->tun, p->tun_txqueuelen);
     if (mqvpn_tun_up(&p->tun) < 0) goto fail;
 
     /* Set IPv6 address if available */
@@ -383,8 +393,10 @@ on_tun_read(evutil_socket_t fd, short what, void *arg)
     (void)what;
     platform_ctx_t *p = (platform_ctx_t *)arg;
     uint8_t buf[TUN_BUF_SIZE];
+    int batch = p->tun_read_batch > 0 ? p->tun_read_batch
+                                      : TUN_READ_BATCH_DEFAULT;
 
-    for (int i = 0; i < BULK_READ_COUNT; i++) {
+    for (int i = 0; i < batch; i++) {
         int n = mqvpn_tun_read(&p->tun, buf, sizeof(buf));
         if (n <= 0) break;
 
@@ -544,6 +556,8 @@ linux_platform_run_client(const mqvpn_client_cfg_t *cfg)
     ctx.killswitch_enabled = cfg->kill_switch;
     ctx.manage_routes = cfg->manage_routes;
     ctx.udp_gro = cfg->udp_gro;
+    ctx.tun_txqueuelen = cfg->tun_txqueuelen;
+    ctx.tun_read_batch = cfg->tun_read_batch;
 
     /* Pre-set TUN name (save to tun_name_cfg too — survives TUN destroy/recreate) */
     if (cfg->tun_name) {
@@ -600,6 +614,8 @@ linux_platform_run_client(const mqvpn_client_cfg_t *cfg)
                                                  cfg->reinj_deadline_lower_bound_ms);
     mqvpn_config_set_init_max_path_id(lib_cfg, cfg->init_max_path_id);
     mqvpn_config_set_tun_mtu(lib_cfg, cfg->tun_mtu);
+    mqvpn_config_set_tun_txqueuelen(lib_cfg, cfg->tun_txqueuelen);
+    mqvpn_config_set_tun_read_batch(lib_cfg, cfg->tun_read_batch);
     mqvpn_config_apply_reorder(lib_cfg,
                                &cfg->reorder); /* INI [Reorder]/[ReorderRule] bridge */
     mqvpn_config_apply_hybrid(lib_cfg, &cfg->hybrid); /* INI [Hybrid] bridge */
@@ -860,6 +876,11 @@ typedef struct server_platform_ctx_s {
      * the core's own fd cap can never drift apart. */
     egress_fd_slot_t *egress_fds;
     int n_egress_fds;
+
+    /* [Interface] TxQueueLen — 0 leaves the kernel default. */
+    int tun_txqueuelen;
+    /* [Interface] TunReadBatch — 0 uses the built-in default. */
+    int tun_read_batch;
 } server_platform_ctx_t;
 
 static void svr_on_tick(evutil_socket_t fd, short what, void *arg);
@@ -925,6 +946,7 @@ svr_cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
 
     if (mqvpn_tun_set_addr(&sp->tun, srv_ip, base_ip, info->assigned_prefix) < 0) return;
     if (mqvpn_tun_set_mtu(&sp->tun, info->mtu) < 0) return;
+    mqvpn_tun_set_txqueuelen(&sp->tun, sp->tun_txqueuelen);
     if (mqvpn_tun_up(&sp->tun) < 0) return;
 
     /* IPv6 if available */
@@ -964,8 +986,10 @@ svr_on_tun_read(evutil_socket_t fd, short what, void *arg)
     (void)what;
     server_platform_ctx_t *sp = (server_platform_ctx_t *)arg;
     uint8_t buf[TUN_BUF_SIZE];
+    int batch = sp->tun_read_batch > 0 ? sp->tun_read_batch
+                                       : TUN_READ_BATCH_DEFAULT;
 
-    for (int i = 0; i < BULK_READ_COUNT; i++) {
+    for (int i = 0; i < batch; i++) {
         int n = mqvpn_tun_read(&sp->tun, buf, sizeof(buf));
         if (n <= 0) break;
 
@@ -1206,6 +1230,8 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
     memset(&sp, 0, sizeof(sp));
     sp.tun.fd = -1;
     sp.udp_fd = -1;
+    sp.tun_txqueuelen = cfg->tun_txqueuelen;
+    sp.tun_read_batch = cfg->tun_read_batch;
 
     if (cfg->tun_name) snprintf(sp.tun.name, sizeof(sp.tun.name), "%s", cfg->tun_name);
 
@@ -1243,6 +1269,8 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
                                                  cfg->reinj_deadline_lower_bound_ms);
     mqvpn_config_set_init_max_path_id(lib_cfg, cfg->init_max_path_id);
     mqvpn_config_set_tun_mtu(lib_cfg, cfg->tun_mtu);
+    mqvpn_config_set_tun_txqueuelen(lib_cfg, cfg->tun_txqueuelen);
+    mqvpn_config_set_tun_read_batch(lib_cfg, cfg->tun_read_batch);
     mqvpn_config_apply_reorder(lib_cfg,
                                &cfg->reorder); /* INI [Reorder]/[ReorderRule] bridge */
     mqvpn_config_apply_hybrid(lib_cfg, &cfg->hybrid); /* INI [Hybrid] bridge */

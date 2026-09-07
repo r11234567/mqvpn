@@ -427,6 +427,24 @@ mqvpn_config_load_json(mqvpn_config_t *cfg, const char *json_text)
         cfg->tun_mtu = iv;
     }
 
+    v = json_find_key(json_text, "tx_queue_len");
+    if (v) {
+        if (json_read_int_strict(v, &iv) != 0
+            || (iv != 0 && (iv < 100 || iv > 65536))) {
+            return MQVPN_ERR_INVALID_ARG;
+        }
+        cfg->tun_txqueuelen = iv;
+    }
+
+    v = json_find_key(json_text, "tun_read_batch");
+    if (v) {
+        if (json_read_int_strict(v, &iv) != 0
+            || (iv != 0 && (iv < 1 || iv > 4096))) {
+            return MQVPN_ERR_INVALID_ARG;
+        }
+        cfg->tun_read_batch = iv;
+    }
+
     /* "paths" sets the multipath flag; individual interface names are not stored
      * in the opaque config — callers must configure interface binding separately
      * via the platform layer. */
@@ -636,6 +654,24 @@ mqvpn_config_set_tun_mtu(mqvpn_config_t *cfg, int mtu)
     if (!cfg) return MQVPN_ERR_INVALID_ARG;
     if (mtu != 0 && (mtu < 1280 || mtu > 9000)) return MQVPN_ERR_INVALID_ARG;
     cfg->tun_mtu = mtu;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_tun_txqueuelen(mqvpn_config_t *cfg, int qlen)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    if (qlen != 0 && (qlen < 100 || qlen > 65536)) return MQVPN_ERR_INVALID_ARG;
+    cfg->tun_txqueuelen = qlen;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_tun_read_batch(mqvpn_config_t *cfg, int n)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    if (n != 0 && (n < 1 || n > 4096)) return MQVPN_ERR_INVALID_ARG;
+    cfg->tun_read_batch = n;
     return MQVPN_OK;
 }
 

@@ -468,6 +468,24 @@ cfgk_int_mtu(int v)
     return v == 0 || (v >= 1280 && v <= 9000);
 }
 
+/* 0 keeps the kernel default. The ceiling is generous rather than tuned:
+ * the ring costs one pointer per slot, and a deep ring on a slow link only
+ * adds latency the sender was going to pay anyway. */
+static int
+cfgk_int_txqueuelen(int v)
+{
+    return v == 0 || (v >= 100 && v <= 65536);
+}
+
+/* Bounded above because this runs inside one event-loop callback: an
+ * unbounded batch would starve every other fd, including the UDP socket the
+ * drained packets have to leave through. */
+static int
+cfgk_int_tun_read_batch(int v)
+{
+    return v == 0 || (v >= 1 && v <= 4096);
+}
+
 static int
 cfgk_int_reinj_factor_pct(int v)
 {
@@ -573,6 +591,10 @@ static const cfg_key_desc_t cfg_keys[] = {
     CFG_INT(SEC_INTERFACE, "ReconnectInterval", "reconnect_interval", reconnect_interval,
             cfgk_int_positive),
     CFG_INT(SEC_INTERFACE, "MTU", "mtu", tun_mtu, cfgk_int_mtu),
+    CFG_INT(SEC_INTERFACE, "TxQueueLen", "tx_queue_len", tun_txqueuelen,
+            cfgk_int_txqueuelen),
+    CFG_INT(SEC_INTERFACE, "TunReadBatch", "tun_read_batch", tun_read_batch,
+            cfgk_int_tun_read_batch),
     /* [Server] */
     CFG_STR(SEC_SERVER, "Address", "server_addr", server_addr),
     CFG_STR(SEC_SERVER, "ServerName", "tls_server_name", tls_server_name),

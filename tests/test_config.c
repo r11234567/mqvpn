@@ -976,6 +976,43 @@ test_mtu_above_ceiling_ignored(void)
 }
 
 static void
+test_txqueuelen_default(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    ASSERT_EQ_INT(cfg.tun_txqueuelen, 0, "default tun_txqueuelen is 0 (kernel)");
+    ASSERT_EQ_INT(cfg.tun_read_batch, 0, "default tun_read_batch is 0 (built-in)");
+}
+
+static void
+test_txqueuelen_parse(void)
+{
+    const char *ini = "[Interface]\nTxQueueLen = 4096\nTunReadBatch = 512\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.tun_txqueuelen, 4096, "TxQueueLen 4096 parsed");
+    ASSERT_EQ_INT(cfg.tun_read_batch, 512, "TunReadBatch 512 parsed");
+}
+
+static void
+test_txqueuelen_out_of_range_ignored(void)
+{
+    /* Rejected at parse time rather than clamped, so a typo cannot silently
+     * become a different queue depth than the operator wrote. */
+    const char *ini = "[Interface]\nTxQueueLen = 99\nTunReadBatch = 4097\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.tun_txqueuelen, 0, "TxQueueLen < 100 ignored -> stays 0");
+    ASSERT_EQ_INT(cfg.tun_read_batch, 0, "TunReadBatch > 4096 ignored -> stays 0");
+}
+
+static void
 test_mtu_invalid_string_ignored(void)
 {
     const char *ini = "[Interface]\nMTU = abc\n";
@@ -2306,6 +2343,9 @@ main(void)
     test_mtu_config_parse();
     test_mtu_below_floor_ignored();
     test_mtu_above_ceiling_ignored();
+    test_txqueuelen_default();
+    test_txqueuelen_parse();
+    test_txqueuelen_out_of_range_ignored();
     test_mtu_invalid_string_ignored();
     test_mtu_json_parse();
 

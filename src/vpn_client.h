@@ -33,6 +33,8 @@ typedef struct mqvpn_client_cfg_s {
     int manage_routes; /* 1=manage host routes (default 1), 0=skip routing setup */
     uint64_t init_max_path_id;         /* draft-21 §4.6 TP cap, 0=use xquic default 8 */
     int tun_mtu;                       /* 0=auto (MSS-derived), >0=cap (floor 1280) */
+    int tun_txqueuelen;                /* 0=kernel default (500), >0=TUN tx ring depth */
+    int tun_read_batch;                /* 0=built-in default (64), >0=TUN reads per wakeup */
     int cc;                            /* mqvpn_cc_t: congestion control algorithm */
     int reinjection;                   /* mqvpn_reinjection_t; 0=off (default) */
     int reinj_srtt_factor_pct;         /* deadline mode; percent, e.g. 110 = 1.10x srtt */

@@ -2013,12 +2013,16 @@ run_game() {
     local target_bw=$(( pps * pkt_len * 8 ))
     local dur="${CI_BENCH_GAME_SEC:-20}"
 
-    # gamegen's rate is derived the way the workload is actually specified:
-    # bytes on the wire, not a packet count picked in advance. At a mean
-    # payload of 20 B plus 28 B of UDP+IP, 800 KB/s is ~17,067 pps and 1 MB/s
-    # is ~21,845. The pps tiers this function is indexed by stay as the iperf3
-    # axis; gamegen gets the byte-derived figure.
-    local gg_pps="${CI_BENCH_GAME_PPS:-17067}"
+    # gamegen's rate is derived from bytes on the wire, not a packet count
+    # picked in advance: at a 20 B mean payload plus 28 B of UDP+IP, 100 KB/s
+    # is ~2,133 pps and 200 KB/s is ~4,267.
+    #
+    # The default is the realistic figure. 17,067 (which is 800 KB/s, roughly
+    # 4x a real single client) stays available and is worth keeping, because
+    # it is the rate that exposed the TUN ring: run 34084331771 lost 23-49% at
+    # the TUN with a clean qdisc, and run 34086132803 lost 0.016% at 2000 on
+    # the same code. Two rates, one of them deliberately past the knee.
+    local gg_pps="${CI_BENCH_GAME_PPS:-4267}"
 
     CI_BENCH_IPERF_LEN="$pkt_len"
     CI_BENCH_IPERF_INTERVAL=1

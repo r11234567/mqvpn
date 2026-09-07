@@ -524,6 +524,17 @@ MQVPN_API int mqvpn_config_set_init_max_path_id(mqvpn_config_t *cfg, uint64_t v)
 /* TUN MTU cap: 0 = auto (MSS-derived), 1280..9000 = upper bound. */
 MQVPN_API int mqvpn_config_set_tun_mtu(mqvpn_config_t *cfg, int mtu);
 
+/* TUN transmit ring depth in packets. 0 keeps the kernel default (500),
+ * otherwise 100..65536. Shallow rings drop bursty small-packet traffic with
+ * tx_dropped and no other trace; Linux only, accepted and ignored elsewhere. */
+MQVPN_API int mqvpn_config_set_tun_txqueuelen(mqvpn_config_t *cfg, int qlen);
+
+/* Packets drained from the TUN per event-loop wakeup. 0 keeps the built-in
+ * default (64), otherwise 1..4096. Bounded above because an unbounded batch
+ * starves every other fd in the same loop, including the socket the drained
+ * packets leave through. */
+MQVPN_API int mqvpn_config_set_tun_read_batch(mqvpn_config_t *cfg, int n);
+
 /* ─── Flow-aware reorder shim config (§16.1) ───
  *
  * These mirror the reorder design spec's builder surface. Values are validated

@@ -60,6 +60,12 @@ typedef struct {
     int routing_configured;
     int routing6_configured;
     int manage_routes; /* 1=run setup_routes/cleanup_routes (default 1) */
+    /* [Interface] TxQueueLen — 0 leaves the kernel default. Kept here for
+     * the same reason as manage_routes: the TUN is destroyed and recreated
+     * on reconnect, so the setting has to outlive the device. */
+    int tun_txqueuelen;
+    /* [Interface] TunReadBatch — 0 uses the built-in default. */
+    int tun_read_batch;
 #if defined(__linux__)
     /* [Advanced] UdpGro — effective RX GRO mode. Config-derived state kept
      * here (pattern: manage_routes above) so the netlink re-add path can
