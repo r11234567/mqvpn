@@ -556,6 +556,12 @@ win_platform_run_client(const mqvpn_client_cfg_t *cfg)
     ctx.killswitch_enabled = cfg->kill_switch;
     ctx.manage_routes = cfg->manage_routes;
 
+    if (ctx.manage_routes && !ctx.killswitch_enabled) {
+        LOG_WRN("Windows route management does not capture applications bound to a "
+                "physical interface; enable KillSwitch to prevent interface-bound "
+                "traffic leaks");
+    }
+
     if (cfg->n_paths == 0) {
         LOG_ERR("--path is required on Windows: specify at least one adapter "
                 "FriendlyName (e.g. --path \"Ethernet\"). "

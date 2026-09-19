@@ -20,6 +20,7 @@
 #  include "platform_internal_win.h"
 #  include "log.h"
 
+#  include <stdlib.h>
 #  include <stdio.h>
 #  include <string.h>
 
@@ -121,16 +122,46 @@ wfp_add_iface_permit(platform_win_ctx_t *p)
     return 0;
 }
 
-/* PERMIT UDP to VPN server (IPv4 or IPv6, based on server_addr family) */
+static int
+wfp_current_app_id(FWP_BYTE_BLOB **out)
+{
+    /* GetModuleFileNameW has no size-query mode. Allocate its documented
+     * extended-length ceiling off-stack so unusual install paths are either
+     * represented exactly or rejected, never silently truncated. */
+    const DWORD cap = 32768;
+    wchar_t *path = (wchar_t *)calloc(cap, sizeof(*path));
+    if (!path) return -1;
+
+    DWORD len = GetModuleFileNameW(NULL, path, cap);
+    if (len == 0 || len >= cap) {
+        LOG_ERR("GetModuleFileNameW: error %lu", GetLastError());
+        free(path);
+        return -1;
+    }
+
+    DWORD err = FwpmGetAppIdFromFileName0(path, out);
+    free(path);
+    if (err != ERROR_SUCCESS) {
+        LOG_ERR("FwpmGetAppIdFromFileName0: error %lu", err);
+        return -1;
+    }
+    return 0;
+}
+
+/* PERMIT this mqvpn process's UDP transport to the exact VPN server. */
 static int
 wfp_add_server_permit(platform_win_ctx_t *p)
 {
+    FWP_BYTE_BLOB *app_id = NULL;
+    if (wfp_current_app_id(&app_id) < 0) return -1;
+
+    int rc = 0;
     if (p->server_addr.ss_family == AF_INET) {
         FWPM_FILTER0 f;
         wfp_filter_base(&f, &FWPM_LAYER_ALE_AUTH_CONNECT_V4, &p->wfp_sublayer_key,
                         L"mqvpn: permit server UDP v4", 13, FWP_ACTION_PERMIT);
 
-        FWPM_FILTER_CONDITION0 conds[2];
+        FWPM_FILTER_CONDITION0 conds[4];
 
         conds[0].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
         conds[0].matchType = FWP_MATCH_EQUAL;
@@ -143,17 +174,26 @@ wfp_add_server_permit(platform_win_ctx_t *p)
         conds[1].conditionValue.type = FWP_UINT16;
         conds[1].conditionValue.uint16 = (UINT16)p->server_port;
 
-        f.filterCondition = conds;
-        f.numFilterConditions = 2;
-        return add_filter(p, &f);
-    }
+        conds[2].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+        conds[2].matchType = FWP_MATCH_EQUAL;
+        conds[2].conditionValue.type = FWP_UINT8;
+        conds[2].conditionValue.uint8 = IPPROTO_UDP;
 
-    if (p->server_addr.ss_family == AF_INET6) {
+        conds[3].fieldKey = FWPM_CONDITION_ALE_APP_ID;
+        conds[3].matchType = FWP_MATCH_EQUAL;
+        conds[3].conditionValue.type = FWP_BYTE_BLOB_TYPE;
+        conds[3].conditionValue.byteBlob = app_id;
+
+        f.filterCondition = conds;
+        f.numFilterConditions = 4;
+        rc = add_filter(p, &f);
+
+    } else if (p->server_addr.ss_family == AF_INET6) {
         FWPM_FILTER0 f;
         wfp_filter_base(&f, &FWPM_LAYER_ALE_AUTH_CONNECT_V6, &p->wfp_sublayer_key,
                         L"mqvpn: permit server UDP v6", 13, FWP_ACTION_PERMIT);
 
-        FWPM_FILTER_CONDITION0 conds[2];
+        FWPM_FILTER_CONDITION0 conds[4];
 
         conds[0].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
         conds[0].matchType = FWP_MATCH_EQUAL;
@@ -166,12 +206,28 @@ wfp_add_server_permit(platform_win_ctx_t *p)
         conds[1].conditionValue.type = FWP_UINT16;
         conds[1].conditionValue.uint16 = (UINT16)p->server_port;
 
+        conds[2].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+        conds[2].matchType = FWP_MATCH_EQUAL;
+        conds[2].conditionValue.type = FWP_UINT8;
+        conds[2].conditionValue.uint8 = IPPROTO_UDP;
+
+        conds[3].fieldKey = FWPM_CONDITION_ALE_APP_ID;
+        conds[3].matchType = FWP_MATCH_EQUAL;
+        conds[3].conditionValue.type = FWP_BYTE_BLOB_TYPE;
+        conds[3].conditionValue.byteBlob = app_id;
+
         f.filterCondition = conds;
-        f.numFilterConditions = 2;
-        return add_filter(p, &f);
+        f.numFilterConditions = 4;
+        rc = add_filter(p, &f);
+
+    } else {
+        LOG_ERR("killswitch: unsupported VPN server address family %d",
+                (int)p->server_addr.ss_family);
+        rc = -1;
     }
 
-    return 0; /* unknown family — skip */
+    FwpmFreeMemory0((void **)&app_id);
+    return rc;
 }
 
 /* BLOCK all other outbound (IPv4 + IPv6) */

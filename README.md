@@ -86,6 +86,7 @@ implemented and tested. Do not infer fork status from an old commit alone.
 | Hybrid TCP-lane uplink backpressure | **Fork-only, requires pinned xquic API** | `src/hybrid/tcp_lane_uplink.c` stops granting lwIP receive credit when either xquic returns EAGAIN/partial or its connection-wide retained send queue reaches 256 KiB. Credit resumes only after the local retry queue is empty and xquic drains to 64 KiB. The xquic boundary wrappers live in `src/mqvpn_client.c`; full-accept, pre-send-high-water, and repeated-EAGAIN regressions are pinned in `tests/test_tcp_lane.c`; memory accounting is in `docs/hybrid_h2_memory_budget.md`. |
 | ~~Unbounded Hybrid server egress read per reactor grant~~ | ~~Fork-only~~ **Synchronized from upstream ([mp0rta/mqvpn#349](https://github.com/mp0rta/mqvpn/pull/349); fixes [#348](https://github.com/mp0rta/mqvpn/issues/348))** | `src/hybrid/tcp_egress.c` limits each readable dispatch to a 64 KiB, whole-chunk budget so one busy TCP flow yields to its peers without disarming the level-triggered read event. `tests/test_tcp_egress.c` pins the exact first-dispatch budget and verifies that a later dispatch drains the remainder without manual re-arming. This is server-side reactor fairness; it complements rather than replaces the client-side xquic/lwIP backpressure above. |
 | Windows WFP cleanup lifecycle ([upstream #331](https://github.com/mp0rta/mqvpn/issues/331)) | **Fork-only** | `src/platform/windows/firewall.c` uses a dynamic WFP session for crash cleanup and, on normal exit or reconnect, deletes every tracked filter before its referenced sublayer. Cleanup failures are returned instead of logging a false success; reconnect then stops rather than stacking another ruleset. `tests/test_windows_firewall.c` pins deletion order, idempotent not-found handling, best-effort continuation, and retained retry state after an engine-close failure. |
+| Windows interface-bound leak protection ([upstream #330](https://github.com/mp0rta/mqvpn/issues/330)) | **Fork-only** | Windows split-default routes cannot redirect applications that select a physical interface with `IP_UNICAST_IF`/`IPV6_UNICAST_IF`. The existing explicit `KillSwitch` is therefore the protection boundary: its unconditional ALE block also covers interface-bound sockets, while the transport exception is restricted to the current mqvpn executable, UDP, and the configured server endpoint. Windows logs a warning when routes are managed without this protection. Policy-shape tests live in `tests/test_windows_firewall.c`; the operator contract is documented in `docs/windows_build.md`. |
 | Android native logs | **Fork-only, retained** | JNI Logcat output, `onNativeLog`, and the app log view are intentionally retained across upstream syncs; see `docs/logging.md`. |
 | Hybrid TCP lane, reorder buffering, multipath recovery, route/killswitch hardening | **Fork-only** | Indexed by their public config sections below and covered by the corresponding `tests/test_*`, `scripts/ci_e2e/*`, and platform routing tests. |
 | ~~xquic var-buffer underflow and submatrix overflow patch files~~ | ~~Local patch stack~~ **Synchronized into the pinned xquic fork** | Replaced by xquic commit `2ae918c`; the obsolete duplicate patch hunks must not be restored. |
@@ -590,6 +591,7 @@ Key = mPyVpoQWcp/5gr404xvS19aRC03o0XS2mrb2tZJ1Ii4=
 
 [Interface]
 DNS = 1.1.1.1, 8.8.8.8
+# KillSwitch = true              # Windows: also blocks interface-bound bypasses
 # MTU = 1280                   # TUN MTU (1280–9000, default: auto = ~1382)
 
 [Multipath]
@@ -658,6 +660,7 @@ Notes:
 - `auth_key` remains supported as a single legacy/global key.
 - `mode` is optional if it can be inferred (`listen` implies server).
 - `manage_routes` defaults to `true`; set it to `false` on router/embedded integrations where an external orchestrator owns the host routing table and mqvpn should only bring up the TUN.
+- On Windows, route management alone cannot capture programs that bind directly to a physical interface. Set `KillSwitch = true` (or `"kill_switch": true`) when traffic must not bypass mqvpn; the WFP policy permits only loopback, the Wintun interface, and this mqvpn process's UDP connection to the configured server.
 - **[mqvpn-prometheus-exporter](https://github.com/mp0rta/mqvpn-prometheus-exporter) requires per-user keys.** Using mqvpn-prometheus-exporter, you can correct and visualize mqvpn metrics. If you use it, sharing a single `auth_key` across
   multiple clients works for the VPN data plane, but the control API
   surfaces those sessions as `user="(global)"` and the Prometheus exporter

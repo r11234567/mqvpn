@@ -110,6 +110,28 @@ mqvpn.exe --mode client --server 203.0.113.1:443 --auth-key <key> ^
   --path "Ethernet" --path "Ethernet 3" --scheduler wlb
 ```
 
+## Preventing interface-bound leaks
+
+`ManageRoutes = true` installs split-default routes, but Windows applications
+can deliberately bypass those routes by selecting a physical adapter with
+`IP_UNICAST_IF` or `IPV6_UNICAST_IF`. Tailscale is one example. Route metrics
+cannot prevent this because the socket's interface choice is explicit.
+
+Enable the WFP kill switch when all non-tunnel traffic must be contained:
+
+```ini
+[Interface]
+ManageRoutes = true
+KillSwitch = true
+```
+
+The Windows policy permits loopback, traffic on mqvpn's Wintun interface, and
+only the current `mqvpn.exe` process's UDP traffic to the configured server
+address and port. Its remaining ALE connect rules are unconditional blocks, so
+binding a socket to Wi-Fi or Ethernet does not bypass them. The policy uses a
+dynamic WFP session and explicitly deletes filters before their sublayer on
+normal exit or reconnect.
+
 ## Console output encoding
 
 Log messages contain ASCII only, deliberately, and
