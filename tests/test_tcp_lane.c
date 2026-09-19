@@ -360,6 +360,10 @@ static int g_h3_fin_sent;     /* a fin=1 call returned >= 0 */
 static size_t g_h3_fin_len;   /* len of the last fin=1 call */
 static uint8_t g_h3_capture[512 * 1024];
 static size_t g_h3_capture_len;
+static uint64_t g_h3_send_queue_bytes;
+static int g_h3_queue_grows_with_send;
+static int g_h3_write_notify_calls;
+static int g_h3_write_notify_enabled;
 
 /* Ordered call log — lets tests pin ORDERING (e.g. "the FIN call happens
  * strictly after every data call", not just "both eventually happened"). */
@@ -389,6 +393,9 @@ cli_tcp_lane_h3_send(void *h3_request, const uint8_t *buf, size_t len, int fin)
         size_t n = ((size_t)ret <= room) ? (size_t)ret : room;
         memcpy(g_h3_capture + g_h3_capture_len, buf, n);
         g_h3_capture_len += n;
+        if (g_h3_queue_grows_with_send) {
+            g_h3_send_queue_bytes += (uint64_t)ret;
+        }
     }
     if (fin) {
         g_h3_fin_attempts++;
@@ -404,6 +411,22 @@ cli_tcp_lane_h3_send(void *h3_request, const uint8_t *buf, size_t len, int fin)
         g_h3_log_len++;
     }
     return ret;
+}
+
+uint64_t
+cli_tcp_lane_h3_send_queue_bytes(void *h3_request)
+{
+    (void)h3_request;
+    return g_h3_send_queue_bytes;
+}
+
+int
+cli_tcp_lane_h3_set_write_notify(void *h3_request, int enabled)
+{
+    (void)h3_request;
+    g_h3_write_notify_calls++;
+    g_h3_write_notify_enabled = enabled ? 1 : 0;
+    return 0;
 }
 
 static void
@@ -454,6 +477,10 @@ relay_reset(void)
     g_h3_fin_len = 0;
     g_h3_capture_len = 0;
     g_h3_log_len = 0;
+    g_h3_send_queue_bytes = 0;
+    g_h3_queue_grows_with_send = 0;
+    g_h3_write_notify_calls = 0;
+    g_h3_write_notify_enabled = 0;
     g_recved_calls = 0;
     g_recved_total = 0;
     g_expected_len = 0;
@@ -1508,6 +1535,84 @@ test_relay_full_accept(void)
 }
 
 static void
+test_relay_xquic_queue_blocks_before_send(void)
+{
+    relay_reset();
+    mqvpn_hybrid_config_t cfg;
+    mqvpn_hybrid_config_default(&cfg);
+    mqvpn_tcp_lane_t *lane = mqvpn_tcp_lane_new(&cfg, 0x1112ULL, NULL, fake_clock, NULL);
+    struct tcp_pcb pcb;
+    int fake_req, fake_stream;
+    mqvpn_tcp_flow_t *f = setup_flow(lane, &pcb, 5101, &fake_req, &fake_stream, 1);
+    ASSERT_TRUE(f != NULL, "flow established");
+
+    g_h3_send_queue_bytes = MQVPN_TCP_LANE_BP_HIGH_WATER;
+    struct pbuf *p = mk_pbuf(1000);
+    mqvpn_tcp_lane_on_lwip_recv(f, &pcb, p, ERR_OK);
+
+    ASSERT_EQ_INT(g_h3_send_calls, 0, "high xquic queue stops body submission");
+    ASSERT_EQ_INT(f->uplink_queued_bytes, 1000, "entire pbuf remains in local queue");
+    ASSERT_EQ_INT(g_recved_calls, 0, "lwIP credit withheld while xquic queue is high");
+    ASSERT_EQ_INT(g_h3_write_notify_enabled, 1, "write notifications retained for drain");
+
+    mqvpn_tcp_lane_on_h3_writable(lane, &fake_stream);
+    ASSERT_EQ_INT(g_h3_send_calls, 0,
+                  "high queue writable callback does not overfill xquic");
+    ASSERT_EQ_INT(g_recved_calls, 0, "high queue callback does not reopen lwIP window");
+
+    g_h3_send_queue_bytes = MQVPN_TCP_LANE_BP_LOW_WATER;
+    mqvpn_tcp_lane_on_h3_writable(lane, &fake_stream);
+    ASSERT_EQ_INT(g_h3_send_calls, 1, "low-water callback flushes local queue");
+    ASSERT_EQ_INT(g_h3_capture_len, 1000, "queued pbuf relayed exactly once");
+    ASSERT_EQ_INT(g_recved_total, 1000, "lwIP credit restored after both queues drain");
+    ASSERT_EQ_INT(g_h3_write_notify_enabled, 0, "explicit write notifications released");
+
+    f->pcb = NULL;
+    mqvpn_tcp_lane_free(lane);
+}
+
+static void
+test_relay_full_accept_withholds_on_xquic_queue(void)
+{
+    relay_reset();
+    mqvpn_hybrid_config_t cfg;
+    mqvpn_hybrid_config_default(&cfg);
+    mqvpn_tcp_lane_t *lane = mqvpn_tcp_lane_new(&cfg, 0x1113ULL, NULL, fake_clock, NULL);
+    struct tcp_pcb pcb;
+    int fake_req, fake_stream;
+    mqvpn_tcp_flow_t *f = setup_flow(lane, &pcb, 5102, &fake_req, &fake_stream, 1);
+    ASSERT_TRUE(f != NULL, "flow established");
+
+    g_h3_send_queue_bytes = MQVPN_TCP_LANE_BP_HIGH_WATER - 500;
+    g_h3_queue_grows_with_send = 1;
+    struct pbuf *p = mk_pbuf(1000);
+    mqvpn_tcp_lane_on_lwip_recv(f, &pcb, p, ERR_OK);
+
+    ASSERT_EQ_INT(g_h3_send_calls, 1, "body fully accepted by xquic");
+    ASSERT_EQ_INT(g_h3_capture_len, 1000, "accepted bytes relayed exactly once");
+    ASSERT_TRUE(f->uplink_q_head == NULL, "no mqvpn-local backlog after full accept");
+    ASSERT_EQ_INT(g_recved_calls, 0,
+                  "full xquic accept is not mistaken for downstream progress");
+    ASSERT_EQ_INT(f->uplink_withheld_recved, 1000,
+                  "accepted delivery remains charged to the lwIP window");
+    ASSERT_EQ_INT(g_h3_write_notify_enabled, 1, "queue-drain callback retained");
+
+    g_h3_queue_grows_with_send = 0;
+    g_h3_send_queue_bytes = MQVPN_TCP_LANE_BP_LOW_WATER + 1;
+    mqvpn_tcp_lane_on_h3_writable(lane, &fake_stream);
+    ASSERT_EQ_INT(g_recved_calls, 0, "above-low-water callback keeps credit withheld");
+
+    g_h3_send_queue_bytes = MQVPN_TCP_LANE_BP_LOW_WATER;
+    mqvpn_tcp_lane_on_h3_writable(lane, &fake_stream);
+    ASSERT_EQ_INT(g_recved_total, 1000, "credit restored at xquic low water");
+    ASSERT_EQ_INT(f->uplink_withheld, 0, "withhold latch cleared after drain");
+    ASSERT_EQ_INT(g_h3_write_notify_enabled, 0, "queue-drain callback released");
+
+    f->pcb = NULL;
+    mqvpn_tcp_lane_free(lane);
+}
+
+static void
 test_relay_eagain_then_writable_flush(void)
 {
     relay_reset();
@@ -1519,6 +1624,7 @@ test_relay_eagain_then_writable_flush(void)
     mqvpn_tcp_flow_t *f = setup_flow(lane, &pcb, 5200, &fake_req, &fake_stream, 1);
     ASSERT_TRUE(f != NULL, "flow established");
 
+    h3_script_push(MQVPN_TCP_LANE_H3_SEND_AGAIN);
     h3_script_push(MQVPN_TCP_LANE_H3_SEND_AGAIN);
     struct pbuf *p = mk_pbuf(1000);
     mqvpn_tcp_lane_on_lwip_recv(f, &pcb, p, ERR_OK);
@@ -1532,11 +1638,19 @@ test_relay_eagain_then_writable_flush(void)
     ASSERT_EQ_INT(f->uplink_withheld_recved, 1000,
                   "deferred-recved total tracks the pbuf");
 
-    /* Writable notify; script now exhausted -> default full accept. */
+    /* A repeated EAGAIN on a backlog smaller than LOW_WATER must not reopen
+     * the lwIP window merely because the local byte count is small. */
     ASSERT_EQ_INT(mqvpn_tcp_lane_on_h3_writable(lane, &fake_stream), 0,
                   "on_h3_writable returns 0");
+    ASSERT_EQ_INT(g_h3_send_calls, 2, "first writable retry still gets EAGAIN");
+    ASSERT_EQ_INT(g_recved_calls, 0, "small EAGAIN backlog remains withheld");
+    ASSERT_EQ_INT(f->uplink_withheld, 1, "withhold latch survives repeated EAGAIN");
 
-    ASSERT_EQ_INT(g_h3_send_calls, 2, "retry attempt sent");
+    /* Script now exhausted -> default full accept. */
+    ASSERT_EQ_INT(mqvpn_tcp_lane_on_h3_writable(lane, &fake_stream), 0,
+                  "second on_h3_writable returns 0");
+
+    ASSERT_EQ_INT(g_h3_send_calls, 3, "second retry attempt sent");
     ASSERT_EQ_INT(g_h3_capture_len, 1000, "all bytes now relayed");
     ASSERT_TRUE(memcmp(g_h3_capture, g_expected, 1000) == 0,
                 "exact byte sequence, no dup");
@@ -1744,12 +1858,9 @@ test_relay_repeated_eagain_writable(void)
     mqvpn_tcp_flow_t *f = setup_flow(lane, &pcb, 5700, &fake_req, &fake_stream, 1);
     ASSERT_TRUE(f != NULL, "flow established");
 
-    /* Backlog must clear LOW_WATER (64 KiB) or the very first writable
-     * notify's low-water check (queued_bytes < LOW_WATER, no separate
-     * "did we make progress" gate — see tcp_lane_uplink_flush) would
-     * legitimately resume recved before anything actually drained. 3 * 30000
-     * = 90000 > LOW_WATER, so the repeated-EAGAIN backpressure stays
-     * observable across every notify below. */
+    /* Use several nodes so repeated EAGAIN also proves FIFO head/offset
+     * stability; resumption now additionally requires the local queue to be
+     * completely empty, independent of its byte count. */
     for (int i = 0; i < 5; i++) {
         h3_script_push(MQVPN_TCP_LANE_H3_SEND_AGAIN);
     }
@@ -3716,6 +3827,8 @@ main(void)
     test_marker_cap();
     test_accept_key_correspondence();
     test_relay_full_accept();
+    test_relay_xquic_queue_blocks_before_send();
+    test_relay_full_accept_withholds_on_xquic_queue();
     test_relay_eagain_then_writable_flush();
     test_relay_partial_accept();
     test_relay_pending_stream_buffering();
