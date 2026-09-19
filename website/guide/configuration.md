@@ -148,7 +148,7 @@ sudo mqvpn --config /etc/mqvpn/server.json
 | `TunName` | TUN device name | `mqvpn0` |
 | `DNS` | DNS servers (comma-separated) | — |
 | `LogLevel` | Log level (`debug`, `info`, `warn`, `error`) | `info` |
-| `KillSwitch` | Block traffic outside the VPN tunnel (client only) | `false` |
+| `KillSwitch` | Block traffic outside the VPN tunnel (client only). On Windows this also blocks applications that bind directly to a physical interface; `ManageRoutes` alone cannot redirect those sockets. | `false` |
 | `Reconnect` | Enable automatic reconnection (client only) | `true` |
 | `ReconnectInterval` | Seconds between reconnection attempts | `5` |
 | `ManageRoutes` | Manage the host routing table (VPN routes and server pin route). Set to `false` (or pass `--no-manage-routes`) to handle routing yourself | `true` |

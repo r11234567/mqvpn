@@ -10,7 +10,9 @@
  *   - Traffic to the VPN server (UDP on original interface)
  *   - Traffic on the TUN (Wintun) interface
  *
- * All filters are added under a single sublayer so cleanup is atomic.
+ * All filters are added under a single dynamic WFP session and sublayer.
+ * Closing the engine is the crash-safety backstop; normal cleanup still
+ * deletes filters explicitly before deleting their referenced sublayer.
  */
 
 #ifdef _WIN32
@@ -18,6 +20,7 @@
 #  include "platform_internal_win.h"
 #  include "log.h"
 
+#  include <stdlib.h>
 #  include <stdio.h>
 #  include <string.h>
 
@@ -119,16 +122,46 @@ wfp_add_iface_permit(platform_win_ctx_t *p)
     return 0;
 }
 
-/* PERMIT UDP to VPN server (IPv4 or IPv6, based on server_addr family) */
+static int
+wfp_current_app_id(FWP_BYTE_BLOB **out)
+{
+    /* GetModuleFileNameW has no size-query mode. Allocate its documented
+     * extended-length ceiling off-stack so unusual install paths are either
+     * represented exactly or rejected, never silently truncated. */
+    const DWORD cap = 32768;
+    wchar_t *path = (wchar_t *)calloc(cap, sizeof(*path));
+    if (!path) return -1;
+
+    DWORD len = GetModuleFileNameW(NULL, path, cap);
+    if (len == 0 || len >= cap) {
+        LOG_ERR("GetModuleFileNameW: error %lu", GetLastError());
+        free(path);
+        return -1;
+    }
+
+    DWORD err = FwpmGetAppIdFromFileName0(path, out);
+    free(path);
+    if (err != ERROR_SUCCESS) {
+        LOG_ERR("FwpmGetAppIdFromFileName0: error %lu", err);
+        return -1;
+    }
+    return 0;
+}
+
+/* PERMIT this mqvpn process's UDP transport to the exact VPN server. */
 static int
 wfp_add_server_permit(platform_win_ctx_t *p)
 {
+    FWP_BYTE_BLOB *app_id = NULL;
+    if (wfp_current_app_id(&app_id) < 0) return -1;
+
+    int rc = 0;
     if (p->server_addr.ss_family == AF_INET) {
         FWPM_FILTER0 f;
         wfp_filter_base(&f, &FWPM_LAYER_ALE_AUTH_CONNECT_V4, &p->wfp_sublayer_key,
                         L"mqvpn: permit server UDP v4", 13, FWP_ACTION_PERMIT);
 
-        FWPM_FILTER_CONDITION0 conds[2];
+        FWPM_FILTER_CONDITION0 conds[4];
 
         conds[0].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
         conds[0].matchType = FWP_MATCH_EQUAL;
@@ -141,17 +174,26 @@ wfp_add_server_permit(platform_win_ctx_t *p)
         conds[1].conditionValue.type = FWP_UINT16;
         conds[1].conditionValue.uint16 = (UINT16)p->server_port;
 
-        f.filterCondition = conds;
-        f.numFilterConditions = 2;
-        return add_filter(p, &f);
-    }
+        conds[2].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+        conds[2].matchType = FWP_MATCH_EQUAL;
+        conds[2].conditionValue.type = FWP_UINT8;
+        conds[2].conditionValue.uint8 = IPPROTO_UDP;
 
-    if (p->server_addr.ss_family == AF_INET6) {
+        conds[3].fieldKey = FWPM_CONDITION_ALE_APP_ID;
+        conds[3].matchType = FWP_MATCH_EQUAL;
+        conds[3].conditionValue.type = FWP_BYTE_BLOB_TYPE;
+        conds[3].conditionValue.byteBlob = app_id;
+
+        f.filterCondition = conds;
+        f.numFilterConditions = 4;
+        rc = add_filter(p, &f);
+
+    } else if (p->server_addr.ss_family == AF_INET6) {
         FWPM_FILTER0 f;
         wfp_filter_base(&f, &FWPM_LAYER_ALE_AUTH_CONNECT_V6, &p->wfp_sublayer_key,
                         L"mqvpn: permit server UDP v6", 13, FWP_ACTION_PERMIT);
 
-        FWPM_FILTER_CONDITION0 conds[2];
+        FWPM_FILTER_CONDITION0 conds[4];
 
         conds[0].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
         conds[0].matchType = FWP_MATCH_EQUAL;
@@ -164,12 +206,28 @@ wfp_add_server_permit(platform_win_ctx_t *p)
         conds[1].conditionValue.type = FWP_UINT16;
         conds[1].conditionValue.uint16 = (UINT16)p->server_port;
 
+        conds[2].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+        conds[2].matchType = FWP_MATCH_EQUAL;
+        conds[2].conditionValue.type = FWP_UINT8;
+        conds[2].conditionValue.uint8 = IPPROTO_UDP;
+
+        conds[3].fieldKey = FWPM_CONDITION_ALE_APP_ID;
+        conds[3].matchType = FWP_MATCH_EQUAL;
+        conds[3].conditionValue.type = FWP_BYTE_BLOB_TYPE;
+        conds[3].conditionValue.byteBlob = app_id;
+
         f.filterCondition = conds;
-        f.numFilterConditions = 2;
-        return add_filter(p, &f);
+        f.numFilterConditions = 4;
+        rc = add_filter(p, &f);
+
+    } else {
+        LOG_ERR("killswitch: unsupported VPN server address family %d",
+                (int)p->server_addr.ss_family);
+        rc = -1;
     }
 
-    return 0; /* unknown family — skip */
+    FwpmFreeMemory0((void **)&app_id);
+    return rc;
 }
 
 /* BLOCK all other outbound (IPv4 + IPv6) */
@@ -197,6 +255,14 @@ wfp_add_block_all(platform_win_ctx_t *p)
 
 /* ── Public API ── */
 
+static void
+wfp_init_dynamic_session(FWPM_SESSION0 *session)
+{
+    memset(session, 0, sizeof(*session));
+    session->displayData.name = L"mqvpn dynamic WFP session";
+    session->flags = FWPM_SESSION_FLAG_DYNAMIC;
+}
+
 int
 win_setup_killswitch(platform_win_ctx_t *p)
 {
@@ -204,8 +270,12 @@ win_setup_killswitch(platform_win_ctx_t *p)
 
     DWORD err;
 
-    /* Open WFP engine */
-    err = FwpmEngineOpen0(NULL, RPC_C_AUTHN_DEFAULT, NULL, NULL, &p->wfp_engine);
+    /* A dynamic session makes every object created through this engine
+     * lifetime-bound to the handle. If mqvpn crashes or normal cleanup is
+     * interrupted, BFE removes the filters when the handle closes. */
+    FWPM_SESSION0 session;
+    wfp_init_dynamic_session(&session);
+    err = FwpmEngineOpen0(NULL, RPC_C_AUTHN_DEFAULT, NULL, &session, &p->wfp_engine);
     if (err != ERROR_SUCCESS) {
         LOG_ERR("FwpmEngineOpen0: error %lu", err);
         return -1;
@@ -264,21 +334,52 @@ win_setup_killswitch(platform_win_ctx_t *p)
     return 0;
 }
 
-void
+int
 win_cleanup_killswitch(platform_win_ctx_t *p)
 {
-    if (!p->killswitch_active || !p->wfp_engine) return;
+    if (!p->wfp_engine) {
+        p->killswitch_active = 0;
+        p->n_wfp_filters = 0;
+        return 0;
+    }
 
-    /* Deleting the sublayer cascades and removes all filters in it */
+    int failed = 0;
+
+    /* WFP refuses to delete a sublayer while filters still reference it.
+     * Delete in reverse creation order, attempting every ID even after one
+     * failure so cleanup makes as much progress as possible. */
+    for (int i = p->n_wfp_filters - 1; i >= 0; i--) {
+        DWORD err = FwpmFilterDeleteById0(p->wfp_engine, p->wfp_filter_ids[i]);
+        if (err != ERROR_SUCCESS && err != FWP_E_FILTER_NOT_FOUND) {
+            LOG_ERR("FwpmFilterDeleteById0(filter=%llu): error %lu",
+                    (unsigned long long)p->wfp_filter_ids[i], err);
+            failed = 1;
+        }
+    }
+
     DWORD err = FwpmSubLayerDeleteByKey0(p->wfp_engine, &p->wfp_sublayer_key);
-    if (err != ERROR_SUCCESS && err != FWP_E_SUBLAYER_NOT_FOUND)
-        LOG_WRN("FwpmSubLayerDeleteByKey0: error %lu", err);
+    if (err != ERROR_SUCCESS && err != FWP_E_SUBLAYER_NOT_FOUND) {
+        LOG_ERR("FwpmSubLayerDeleteByKey0: error %lu", err);
+        failed = 1;
+    }
 
-    FwpmEngineClose0(p->wfp_engine);
+    err = FwpmEngineClose0(p->wfp_engine);
+    if (err != ERROR_SUCCESS) {
+        /* Keep the handle and bookkeeping so a later cleanup can retry. */
+        LOG_ERR("FwpmEngineClose0: error %lu", err);
+        return -1;
+    }
+
     p->wfp_engine = NULL;
     p->killswitch_active = 0;
     p->n_wfp_filters = 0;
+    if (failed) {
+        LOG_ERR("kill switch cleanup reported WFP errors; dynamic session closed");
+        return -1;
+    }
+
     LOG_INF("kill switch deactivated");
+    return 0;
 }
 
 #endif /* _WIN32 */

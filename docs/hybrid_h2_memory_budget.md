@@ -46,8 +46,8 @@ Sections 1–4 below describe the **desktop/router** profile unless stated other
 | `TCP_LANE_RAW_MARKER_CAP` | tcp_lane.c | 4096 | sticky-RAW marker cap, compile-time (`#ifndef`-overridable for tests) |
 | `TCP_LANE_CLOSING_CAP` | tcp_lane.c | 4096 | post-close routing-marker cap, same shape as the RAW cap |
 | hash bucket array | tcp_lane.c `pick_buckets` | 8192 buckets × 8 B pointer = 64 KiB | sized from `tcp_max_flows + TCP_LANE_RAW_MARKER_CAP` (256 + 4096 → next pow2). Unchanged at the 4096 ceiling: 4096 + 4096 lands on the same 8192 buckets, so raising the flow cap costs nothing here |
-| `MQVPN_TCP_LANE_BP_HIGH_WATER` | tcp_lane.h | 262,144 B (256 KiB) | see §2 — not the per-flow hard bound |
-| `MQVPN_TCP_LANE_BP_LOW_WATER` | tcp_lane.h | 65,536 B (64 KiB) | resume threshold, prevents withhold/resume flapping |
+| `MQVPN_TCP_LANE_BP_HIGH_WATER` | tcp_lane.h | 262,144 B (256 KiB) | see §2 — pauses a flow when either its local retry path is blocked or xquic's shared connection queue reaches this estimate; not a per-flow hard bound |
+| `MQVPN_TCP_LANE_BP_LOW_WATER` | tcp_lane.h | 65,536 B (64 KiB) | resume threshold: the local retry queue must be empty and xquic's shared connection queue must be at or below this value |
 
 ### 1a. PBUF_POOL status
 
@@ -75,11 +75,15 @@ placeholder or 0 to reclaim the remaining ~0.55 MiB.
 ## 2. What bounds per-flow memory
 
 The uplink backpressure watermarks (`MQVPN_TCP_LANE_BP_HIGH_WATER` / `_LOW_WATER`) are
-hysteresis thresholds on the relay-owned retry stash, not a hard per-flow memory cap.
-Bytes lwIP has already delivered to the TCP-lane receive callback were sequenced and
-ACKed on the wire; they cannot be dropped and must be queued whenever xquic will not yet
-accept them. Withholding `tcp_recved()` only stops the receive window from re-opening —
-the peer may still fill whatever window was already advertised.
+hysteresis thresholds, not a hard per-flow memory cap. The high-water check covers both
+the relay-owned retry stash and xquic's connection-wide estimate of retained packets,
+including packets already sent but not yet acknowledged. This distinction matters:
+`xqc_h3_request_send_body()` accepting a complete write means the bytes entered xquic,
+not that congestion control or pacing delivered them. Bytes lwIP has already delivered
+to the TCP-lane receive callback were sequenced and ACKed on the wire; they cannot be
+dropped and must be queued whenever xquic will not yet accept them. Withholding
+`tcp_recved()` only stops the receive window from re-opening — the peer may still fill
+whatever window was already advertised.
 
 The worst-case per-flow queue is therefore larger than `TCP_WND` (512 KiB). In the
 `PENDING_STREAM` case (the H3 CONNECT-TCP stream is not yet open and uplink bytes are
@@ -98,7 +102,9 @@ Config knobs, by when they take effect:
   is `min(configured, profile ceiling)` — raising it past the ceiling is silent-free but
   ineffective.
 - **BP high/low water (compile-time, `tcp_lane.h`)** — internal constants, not exposed as
-  config. Bound only the relay-stash portion of the uplink queue.
+  config. Bound when the lane grants more lwIP receive credit: the local retry queue must
+  be empty and xquic's shared connection queue must drain to low water before credit is
+  restored. The xquic term is connection-wide and is not multiplied by the flow count.
 - **`lwipopts.h` window sizing (compile-time)** — `TCP_WND` + `TCP_SND_BUF`, the dominant
   per-flow cost and the only one requiring a rebuild to change.
 

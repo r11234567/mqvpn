@@ -1045,8 +1045,10 @@ jobs:
       - name: Smoke-run binary
         run: build/Release/mqvpn.exe --version
 
-      - name: Run Windows certificate verifier test
-        run: ctest --test-dir build -C Release --output-on-failure -R test_platform_cert_verify
+      - name: Run Windows platform tests
+        run: >-
+          ctest --test-dir build -C Release --output-on-failure
+          -R 'test_(platform_cert_verify|windows_firewall)'
 
   android:
     runs-on: ubuntu-latest

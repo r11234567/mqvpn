@@ -1699,6 +1699,21 @@ cli_tcp_lane_h3_send(void *h3_request, const uint8_t *buf, size_t len, int fin)
     return ret;
 }
 
+uint64_t
+cli_tcp_lane_h3_send_queue_bytes(void *h3_request)
+{
+    return xqc_h3_request_get_send_queue_bytes((xqc_h3_request_t *)h3_request);
+}
+
+int
+cli_tcp_lane_h3_set_write_notify(void *h3_request, int enabled)
+{
+    return xqc_h3_request_set_write_notify((xqc_h3_request_t *)h3_request,
+                                           enabled ? 1 : 0) == XQC_OK
+               ? 0
+               : -1;
+}
+
 /* H2/Task 11: downlink body recv for the TCP lane. Cross-TU like
  * cli_tcp_lane_h3_send above — same one-way boundary, same normalization
  * duty, opposite direction. xqc_h3_request_recv_body (third_party/xquic

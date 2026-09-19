@@ -225,7 +225,7 @@ cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
     return;
 
 fail:
-    win_cleanup_killswitch(p);
+    (void)win_cleanup_killswitch(p);
     if (p->manage_routes) win_cleanup_routes(p);
     win_cleanup_dns(p);
     if (p->tun.adapter) mqvpn_tun_win_destroy(&p->tun);
@@ -271,7 +271,15 @@ cb_state_changed(mqvpn_client_state_t old_state, mqvpn_client_state_t new_state,
          * reappears, per the field comment in platform_internal_win.h. */
         if (p->ev_recover) event_del(p->ev_recover);
         memset(p->path_recover_failures, 0, sizeof(p->path_recover_failures));
-        win_cleanup_killswitch(p);
+        if (win_cleanup_killswitch(p) < 0) {
+            /* Continuing into a fresh tunnel after an unverified WFP cleanup
+             * can stack filters and strand the host offline. Fail closed and
+             * let process teardown retry the retained engine handle. */
+            LOG_ERR("kill switch cleanup failed during reconnect; stopping client");
+            p->fatal_error = 1;
+            p->shutting_down = 1;
+            event_base_loopbreak(p->eb);
+        }
         if (p->manage_routes) win_cleanup_routes(p);
         win_cleanup_dns(p);
         if (p->tun_up) {
@@ -548,6 +556,12 @@ win_platform_run_client(const mqvpn_client_cfg_t *cfg)
     ctx.killswitch_enabled = cfg->kill_switch;
     ctx.manage_routes = cfg->manage_routes;
 
+    if (ctx.manage_routes && !ctx.killswitch_enabled) {
+        LOG_WRN("Windows route management does not capture applications bound to a "
+                "physical interface; enable KillSwitch to prevent interface-bound "
+                "traffic leaks");
+    }
+
     if (cfg->n_paths == 0) {
         LOG_ERR("--path is required on Windows: specify at least one adapter "
                 "FriendlyName (e.g. --path \"Ethernet\"). "
@@ -730,7 +744,7 @@ cleanup:
     mqvpn_client_destroy(ctx.client);
     ctx.client = NULL;
 
-    win_cleanup_killswitch(&ctx);
+    if (win_cleanup_killswitch(&ctx) < 0) rc = 1;
     if (ctx.manage_routes) win_cleanup_routes(&ctx);
     win_cleanup_dns(&ctx);
 
