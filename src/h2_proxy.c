@@ -854,13 +854,13 @@ static int
 stream_flush_response(h2_proxy_stream_t *stream)
 {
     if (!stream || stream->closed || stream->response_fin_sent) return 0;
-    if (xqc_h3_request_get_send_queue_bytes(stream->h3_request) >=
-        H2_QUIC_QUEUE_HIGH_WATER) {
-        stream_set_response_blocked(stream, 1);
-        return 0;
-    }
     size_t body_available = stream->response_body_len - stream->response_body_off;
 
+    /* Forward the bounded header block before applying body backpressure. A
+     * single backend read can contain 103 plus final headers; leaving the 103
+     * pending would make on_begin_headers reject the final block as re-entry.
+     * The parser caps each block and recv() caps the uninterruptible input at
+     * 16 KiB, so this does not reopen unbounded backend-to-QUIC buffering. */
     if (stream->response_headers_pending && !stream->response_headers_are_trailers) {
         xqc_http_headers_t headers = {
             .headers = stream->response_headers,
@@ -877,6 +877,12 @@ stream_flush_response(h2_proxy_stream_t *stream)
         if (!stream->response_headers_informational) stream->response_started = 1;
         if (fin) stream->response_fin_sent = 1;
         response_headers_clear(stream);
+    }
+
+    if (xqc_h3_request_get_send_queue_bytes(stream->h3_request) >=
+        H2_QUIC_QUEUE_HIGH_WATER) {
+        stream_set_response_blocked(stream, 1);
+        return 0;
     }
 
     body_available = stream->response_body_len - stream->response_body_off;

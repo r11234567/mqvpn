@@ -766,7 +766,7 @@ jobs:
             --target mqvpn_lib mqvpn_shared mqvpn_darwin_platform \
                      mqvpn test_route_parse_darwin test_dns_backup_darwin \
                      test_dns_state_darwin test_routing_seq_darwin test_killswitch_rules_darwin \
-                     test_tcp_lane test_config test_conn_settings \
+                     test_tcp_lane test_config test_conn_settings test_platform_cert_verify \
             -j "$(sysctl -n hw.ncpu)"
 
       - name: Verify artifacts
@@ -1044,6 +1044,9 @@ jobs:
       # exits 0 without needing wintun or admin rights.
       - name: Smoke-run binary
         run: build/Release/mqvpn.exe --version
+
+      - name: Run Windows certificate verifier test
+        run: ctest --test-dir build -C Release --output-on-failure -R test_platform_cert_verify
 
   android:
     runs-on: ubuntu-latest

@@ -89,8 +89,8 @@ object PlatformTrust {
     private fun authTypeOf(leaf: X509Certificate): String =
         leaf.publicKey?.algorithm?.takeIf { it.isNotBlank() } ?: "GENERIC"
 
-    private fun matchesHostname(certificate: X509Certificate, hostname: String): Boolean {
-        val unbracketed = hostname.removePrefix("[").removeSuffix("]")
+    internal fun matchesHostname(certificate: X509Certificate, hostname: String): Boolean {
+        val unbracketed = hostname.removePrefix("[").removeSuffix("]").removeSuffix(".")
         val address = parseIpLiteral(unbracketed)
         val names = certificate.subjectAlternativeNames ?: return false
         if (address != null) {

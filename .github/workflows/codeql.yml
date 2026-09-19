@@ -95,7 +95,7 @@ jobs:
       # then traces only the mqvpn build below; xquic is vendored code and
       # its findings belong upstream, not in this repository's alert set.
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4.37.3
+        uses: github/codeql-action/init@v4.38.0
         with:
           languages: c-cpp
           queries: security-and-quality

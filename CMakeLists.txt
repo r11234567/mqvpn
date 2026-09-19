@@ -575,6 +575,19 @@ if(MSVC)
     target_compile_definitions(mqvpn_lib PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+option(BUILD_TESTING "Build unit tests" ON)
+if(BUILD_TESTING)
+    enable_testing()
+    add_executable(test_platform_cert_verify tests/test_platform_cert_verify.c
+                   src/platform/windows/cert_verify_windows.c)
+    target_compile_definitions(test_platform_cert_verify PRIVATE
+        TEST_CERT_DER_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.der")
+    target_include_directories(test_platform_cert_verify PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/platform/windows)
+    target_link_libraries(test_platform_cert_verify PRIVATE crypt32)
+    add_test(NAME test_platform_cert_verify COMMAND test_platform_cert_verify)
+endif()
+
 elseif(APPLE)
 
 # ---------- mqvpn CLI binary (Darwin) ----------
@@ -765,6 +778,16 @@ if(BUILD_TESTING)
     set_target_properties(test_conn_settings PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_conn_settings COMMAND test_conn_settings)
+
+    add_executable(test_platform_cert_verify tests/test_platform_cert_verify.c
+                   src/platform/darwin/cert_verify_apple.c)
+    target_compile_definitions(test_platform_cert_verify PRIVATE
+        TEST_CERT_DER_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.der")
+    target_include_directories(test_platform_cert_verify PRIVATE
+        ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/platform/darwin)
+    target_link_libraries(test_platform_cert_verify PRIVATE
+                          "-framework Security" "-framework CoreFoundation")
+    add_test(NAME test_platform_cert_verify COMMAND test_platform_cert_verify)
 
 endif()
 
