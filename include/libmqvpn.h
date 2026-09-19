@@ -718,6 +718,8 @@ MQVPN_API int mqvpn_config_set_quic_fallback_proxy_protocol(mqvpn_config_t *cfg,
 
 /* ─── Client API ─── */
 
+/* user_ctx is borrowed and must remain valid until mqvpn_client_destroy()
+ * returns. It is passed unchanged to callbacks. */
 MQVPN_API mqvpn_client_t *mqvpn_client_new(const mqvpn_config_t *cfg,
                                            const mqvpn_client_callbacks_t *cbs,
                                            void *user_ctx);
@@ -887,6 +889,8 @@ MQVPN_API int mqvpn_client_set_server_addr(mqvpn_client_t *client,
 
 /* ─── Server API ─── */
 
+/* user_ctx is borrowed and must remain valid until mqvpn_server_destroy()
+ * returns. It is passed unchanged to callbacks. */
 MQVPN_API mqvpn_server_t *mqvpn_server_new(const mqvpn_config_t *cfg,
                                            const mqvpn_server_callbacks_t *cbs,
                                            void *user_ctx);

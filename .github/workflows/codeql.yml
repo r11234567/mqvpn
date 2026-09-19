@@ -91,21 +91,26 @@ jobs:
                 -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
           make -j$(nproc)
 
-      # Initialize after the third-party dependency has been built. CodeQL
-      # then traces only the mqvpn build below; xquic is vendored code and
-      # its findings belong upstream, not in this repository's alert set.
+      # Configure the production build and pre-build vendored lwIP before
+      # CodeQL starts tracing. xquic and lwIP findings belong upstream, while
+      # tests are covered by CI/sanitizers and must not create duplicate
+      # findings when they include production .c files as test seams.
+      - name: Configure mqvpn production build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_TESTING=OFF \
+                -DXQUIC_BUILD_DIR="${GITHUB_WORKSPACE}/third_party/xquic/build"
+          cmake --build build --target lwip_core --parallel "$(nproc)"
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4.38.0
         with:
           languages: c-cpp
           queries: security-and-quality
+          config-file: ./.github/codeql/codeql-config.yml
 
       - name: Build mqvpn (CodeQL traced)
-        run: |
-          mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release \
-                -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
-          make -j$(nproc)
+        run: cmake --build build --parallel "$(nproc)"
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v4.38.0

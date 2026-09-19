@@ -2341,9 +2341,9 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
                           ? cbs->struct_size
                           : sizeof(*cbs);
     memcpy(&s->cbs, cbs, cbs_size);
+    // codeql[cpp/stack-address-escape] user_ctx must outlive s by public API contract
     s->user_ctx = user_ctx;
     s->log_level = cfg->log_level;
-    /* caller guarantees lifetime exceeds this object */ // lgtm[cpp/stack-address-escape]
     s->udp_fd = -1;
     s->max_clients = cfg->max_clients > 0 ? cfg->max_clients : 64;
     mqvpn_ptb_bucket_init(&s->ptb_bucket);

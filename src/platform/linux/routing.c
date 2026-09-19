@@ -114,11 +114,11 @@ discover_route(const char *server_ip, sa_family_t af, char *gateway, size_t gw_l
     for (char *tok = strtok_r(out, " \t\r\n", &saveptr); tok;
          tok = strtok_r(NULL, " \t\r\n", &saveptr)) {
         if (strcmp(tok, "via") == 0) {
-            tok = strtok_r(NULL, " \t\r\n", &saveptr);
-            if (tok) snprintf(gateway, gw_len, "%s", tok);
+            char *value = strtok_r(NULL, " \t\r\n", &saveptr);
+            if (value) snprintf(gateway, gw_len, "%s", value);
         } else if (strcmp(tok, "dev") == 0) {
-            tok = strtok_r(NULL, " \t\r\n", &saveptr);
-            if (tok) snprintf(iface, if_len, "%s", tok);
+            char *value = strtok_r(NULL, " \t\r\n", &saveptr);
+            if (value) snprintf(iface, if_len, "%s", value);
         }
     }
     return iface[0] ? 0 : -1;

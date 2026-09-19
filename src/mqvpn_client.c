@@ -939,7 +939,8 @@ client_init_handle(mqvpn_client_t *c, const mqvpn_config_t *cfg,
                           ? cbs->struct_size
                           : sizeof(*cbs);
     memcpy(&c->cbs, cbs, cbs_size);
-    c->user_ctx = user_ctx; // lgtm[cpp/stack-address-escape]
+    // codeql[cpp/stack-address-escape] user_ctx must outlive c by public API contract
+    c->user_ctx = user_ctx;
     c->log_level = cfg->log_level;
     c->state = MQVPN_STATE_IDLE;
     c->next_path_handle = 1;

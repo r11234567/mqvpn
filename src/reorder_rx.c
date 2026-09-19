@@ -177,7 +177,8 @@ ring_insert(struct ring *r, uint64_t seq, void *pkt, uint16_t len, uint64_t expe
     struct slot *s = &r->slots[RING_IDX(r, seq)];
     s->seq = seq;
     s->len = len;
-    s->pkt = pkt; // lgtm[cpp/stack-address-escape]
+    // codeql[cpp/stack-address-escape] caller transfers its heap copy into the ring
+    s->pkt = pkt;
     s->enqueue_us = enqueue_us;
     r->count++;
     r->bytes += len;
@@ -1056,8 +1057,9 @@ mqvpn_reorder_rx_new(const mqvpn_reorder_config_t *cfg, uint64_t hash_seed,
      * all flow through here), so per-flow resolution below can rely on it. */
     mqvpn_reorder_config_finalize(&rx->cfg);
     rx->hash_seed = hash_seed;
-    rx->deliver = deliver;         // lgtm[cpp/stack-address-escape]
-    rx->deliver_ctx = deliver_ctx; // lgtm[cpp/stack-address-escape]
+    rx->deliver = deliver;
+    // codeql[cpp/stack-address-escape] callback context must outlive rx by API contract
+    rx->deliver_ctx = deliver_ctx;
     rx->n_buckets = MQVPN_RX_BUCKETS;
     rx->buckets = (mqvpn_reorder_flow_t **)calloc(rx->n_buckets, sizeof(*rx->buckets));
     if (!rx->buckets) {

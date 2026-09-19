@@ -59,11 +59,15 @@ static inline const char *
 json_object_end(const char *obj)
 {
     if (!obj || *obj != '{') return NULL;
-    int depth = 0, in_str = 0;
+    int depth = 0, in_str = 0, escaped = 0;
     for (const char *p = obj; *p; p++) {
         if (in_str) {
-            if (*p == '\\' && p[1]) {
-                p++;
+            if (escaped) {
+                escaped = 0;
+                continue;
+            }
+            if (*p == '\\') {
+                escaped = 1;
                 continue;
             }
             if (*p == '"') in_str = 0;

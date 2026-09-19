@@ -356,19 +356,20 @@ get_dns_servers(const char *service, char *out, size_t outlen)
     char *saveptr = NULL;
     for (char *line = strtok_r(cap, "\r\n", &saveptr); line;
          line = strtok_r(NULL, "\r\n", &saveptr)) {
-        while (*line == ' ' || *line == '\t')
-            line++;
-        if (line[0] == '\0') continue;
+        char *trimmed = line;
+        while (*trimmed == ' ' || *trimmed == '\t')
+            trimmed++;
+        if (trimmed[0] == '\0') continue;
 
         unsigned char scratch[sizeof(struct in6_addr)];
-        if (inet_pton(AF_INET, line, scratch) != 1 &&
-            inet_pton(AF_INET6, line, scratch) != 1) {
+        if (inet_pton(AF_INET, trimmed, scratch) != 1 &&
+            inet_pton(AF_INET6, trimmed, scratch) != 1) {
             all_ip = 0;
             break;
         }
         have_any = 1;
 
-        size_t llen = strlen(line);
+        size_t llen = strlen(trimmed);
         size_t need = used + (used > 0 ? 1 : 0) + llen;
         if (need >= sizeof(joined)) {
             /* Joining would overflow: a truncated snapshot would silently
@@ -382,7 +383,7 @@ get_dns_servers(const char *service, char *out, size_t outlen)
             return -1;
         }
         if (used > 0) joined[used++] = ' ';
-        memcpy(joined + used, line, llen);
+        memcpy(joined + used, trimmed, llen);
         used += llen;
         joined[used] = '\0';
     }

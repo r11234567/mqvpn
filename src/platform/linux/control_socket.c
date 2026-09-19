@@ -532,12 +532,17 @@ ctrl_on_read(evutil_socket_t fd, short what, void *arg)
                 p++;
             if (*p == '{') {
                 int depth = 0, in_str = 0;
+                int escaped = 0;
                 int complete = 0;
                 for (size_t i = (size_t)(p - conn->req); i < conn->req_len; i++) {
                     char c = conn->req[i];
                     if (in_str) {
+                        if (escaped) {
+                            escaped = 0;
+                            continue;
+                        }
                         if (c == '\\') {
-                            i++;
+                            escaped = 1;
                             continue;
                         }
                         if (c == '"') in_str = 0;
@@ -661,8 +666,10 @@ ctrl_socket_create(struct event_base *eb, const char *addr, int port,
     cs->eb = eb;
     cs->server = server;
     /* Borrowed, not copied — the platform ctx outlives this socket. */
-    cs->gro_receives = gro_receives;   // lgtm[cpp/stack-address-escape]
-    cs->gro_datagrams = gro_datagrams; // lgtm[cpp/stack-address-escape]
+    // codeql[cpp/stack-address-escape] lifetime is part of ctrl_socket_create's API
+    cs->gro_receives = gro_receives;
+    // codeql[cpp/stack-address-escape] lifetime is part of ctrl_socket_create's API
+    cs->gro_datagrams = gro_datagrams;
 
     /* Determine address family */
     struct sockaddr_in sin4;
