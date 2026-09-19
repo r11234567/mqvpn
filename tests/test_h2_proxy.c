@@ -20,6 +20,8 @@ typedef struct {
     void *fd_ctx;
     int registered;
     int unregistered;
+    int want_read;
+    int want_write;
 } test_ctx_t;
 
 typedef struct {
@@ -29,6 +31,10 @@ typedef struct {
     size_t body_len;
     int fin;
     int closed;
+    uint64_t send_queue_bytes;
+    int write_notify;
+    int priority_set;
+    uint8_t urgency;
 } mock_h3_t;
 
 static mock_h3_t mock_h3;
@@ -75,6 +81,40 @@ xqc_h3_request_close(xqc_h3_request_t *request)
 {
     (void)request;
     mock_h3.closed++;
+    return XQC_OK;
+}
+
+uint64_t
+xqc_h3_request_get_send_queue_bytes(xqc_h3_request_t *request)
+{
+    (void)request;
+    return mock_h3.send_queue_bytes;
+}
+
+xqc_int_t
+xqc_h3_request_set_write_notify(xqc_h3_request_t *request, uint8_t enabled)
+{
+    (void)request;
+    mock_h3.write_notify = enabled != 0;
+    return XQC_OK;
+}
+
+xqc_int_t
+xqc_parse_http_priority(xqc_h3_priority_t *priority, const uint8_t *value,
+                        size_t value_len)
+{
+    if (value_len != 3 || memcmp(value, "u=0", 3) != 0) return -XQC_EPARAM;
+    memset(priority, 0, sizeof(*priority));
+    priority->urgency = 0;
+    return XQC_OK;
+}
+
+xqc_int_t
+xqc_h3_request_set_priority(xqc_h3_request_t *request, xqc_h3_priority_t *priority)
+{
+    (void)request;
+    mock_h3.priority_set++;
+    mock_h3.urgency = priority->urgency;
     return XQC_OK;
 }
 
@@ -139,11 +179,11 @@ test_log(int level, const char *message, void *user_ctx)
 static void
 test_register_fd(int fd, int want_read, int want_write, void *fd_ctx, void *user_ctx)
 {
-    (void)want_read;
-    (void)want_write;
     test_ctx_t *ctx = user_ctx;
     ctx->fd = fd;
     ctx->fd_ctx = fd_ctx;
+    ctx->want_read = want_read;
+    ctx->want_write = want_write;
     ctx->registered++;
 }
 
@@ -242,6 +282,8 @@ test_h3_headers_submit_h2_request(void)
          .value = {.iov_base = (void *)"/health", .iov_len = 7}},
         {.name = {.iov_base = (void *)"connection", .iov_len = 10},
          .value = {.iov_base = (void *)"close", .iov_len = 5}},
+        {.name = {.iov_base = (void *)"priority", .iov_len = 8},
+         .value = {.iov_base = (void *)"u=0", .iov_len = 3}},
     };
     xqc_http_headers_t headers = {
         .headers = fields,
@@ -252,6 +294,7 @@ test_h3_headers_submit_h2_request(void)
     h2_proxy_stream_t *stream =
         h2_proxy_handle_request(proxy, fake_request, &headers, 0, NULL, NULL, 0);
     assert(stream != NULL);
+    assert(mock_h3.priority_set == 1 && mock_h3.urgency == 0);
     assert(h2_proxy_on_h3_body(stream, (const uint8_t *)"ping", 4, 1) == 0);
     assert(ctx.fd >= 0 && ctx.fd_ctx != NULL && ctx.registered > 0);
     assert(h2_proxy_owns_fd(proxy, ctx.fd, ctx.fd_ctx) == 1);
@@ -307,7 +350,15 @@ test_h3_headers_submit_h2_request(void)
                                    sizeof(response_headers) / sizeof(response_headers[0]),
                                    &provider) == 0);
     assert(nghttp2_session_send(server_session) == 0);
+    mock_h3.send_queue_bytes = 256u * 1024u;
     h2_proxy_on_backend_ready(proxy, ctx.fd, ctx.fd_ctx, 1, 0);
+    assert(ctx.want_read == 0);
+    assert(mock_h3.write_notify == 1);
+    assert(mock_h3.body_len == 0);
+    mock_h3.send_queue_bytes = 128u * 1024u;
+    assert(h2_proxy_on_h3_writable(stream) == 0);
+    assert(ctx.want_read == 1);
+    assert(mock_h3.write_notify == 0);
     assert(mock_h3.headers == 2);
     assert(mock_h3.status_200 == 1);
     assert(mock_h3.body_len == 2 && memcmp(mock_h3.body, "ok", 2) == 0);

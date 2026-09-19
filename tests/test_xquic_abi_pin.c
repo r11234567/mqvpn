@@ -29,6 +29,7 @@
  */
 
 #include "mqvpn_internal.h"              /* MQVPN_XQC_PATH_STATE_* */
+#include <xquic/xqc_http3.h>             /* H3 proxy backpressure API */
 #include "src/transport/xqc_multipath.h" /* xqc_path_state_t (private)  */
 
 #define PIN_PATH_STATE(mirror, real)                                                 \
@@ -41,8 +42,29 @@ PIN_PATH_STATE(MQVPN_XQC_PATH_STATE_ACTIVE, XQC_PATH_STATE_ACTIVE);
 PIN_PATH_STATE(MQVPN_XQC_PATH_STATE_CLOSING, XQC_PATH_STATE_CLOSING);
 PIN_PATH_STATE(MQVPN_XQC_PATH_STATE_CLOSED, XQC_PATH_STATE_CLOSED);
 
+/* ── mqvpn public-ABI freeze pins (kindred purpose, different source) ──
+ * Constants baked into public struct LAYOUT: changing one silently breaks
+ * callers built against the older header (the library writes these arrays
+ * bounded by its own compiled-in value — see the ABI-FROZEN comments in
+ * libmqvpn.h). This assert turns the comment into enforcement: a bump
+ * cannot compile without touching this pin, forcing the SemVer/layout
+ * conversation the comment asks for. */
+_Static_assert(MQVPN_MAX_PATHS == 8,
+               "MQVPN_MAX_PATHS is ABI-frozen (embedded in mqvpn_client_info_t "
+               "layout) -- see libmqvpn.h before changing this pin");
+
+/* The H3-to-h2c proxy relies on these public symbols from the pinned xquic
+ * fork. Keeping typed references here makes an accidental submodule rollback
+ * fail at compile time instead of silently restoring the unbounded reader. */
+static uint64_t (*const pin_h3_send_queue_bytes)(xqc_h3_request_t *) =
+    xqc_h3_request_get_send_queue_bytes;
+static xqc_int_t (*const pin_h3_write_notify)(xqc_h3_request_t *,
+                                              uint8_t) = xqc_h3_request_set_write_notify;
+
 int
 main(void)
 {
+    (void)pin_h3_send_queue_bytes;
+    (void)pin_h3_write_notify;
     return 0;
 }

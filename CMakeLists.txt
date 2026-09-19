@@ -261,7 +261,6 @@ set(BORINGSSL_INCLUDE_DIR
 
 # ---------- libmqvpn source files (shared between static and shared targets) ----------
 set(MQVPN_LIB_SOURCES
-    src/cert_verify.c
     src/mqvpn_config.c
     src/mqvpn_client.c
     src/udp_offload.c
@@ -278,6 +277,14 @@ set(MQVPN_LIB_SOURCES
     src/reorder_rx.c
     src/hybrid/classifier.c
 )
+
+# Native client trust stores are exposed through the public verifier callback.
+# Keep the platform implementation out of the portable core on other targets.
+if(WIN32)
+    list(APPEND MQVPN_LIB_SOURCES src/platform/windows/cert_verify_windows.c)
+elseif(APPLE)
+    list(APPEND MQVPN_LIB_SOURCES src/platform/darwin/cert_verify_apple.c)
+endif()
 
 # SNI inspection and fallback use the POSIX server reactor; Windows builds are
 # client-only and must not pull this server-side translation unit in.
@@ -476,6 +483,9 @@ if(ANDROID_CROSS_COMPILE)
     target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB})
 elseif(WIN32)
     target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} ws2_32 crypt32)
+elseif(APPLE)
+    target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} pthread
+                          "-framework Security" "-framework CoreFoundation")
 else()
     target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} pthread)
 endif()
@@ -505,6 +515,7 @@ set(WINTUN_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/third_party/wintun)
 # ---------- mqvpn CLI binary (Windows) ----------
 add_executable(mqvpn
     src/main.c
+    src/platform/client_config_bridge.c
     src/platform/windows/platform_windows.c
     src/platform/windows/tun_wintun.c
     src/platform/windows/routing.c
@@ -564,6 +575,19 @@ if(MSVC)
     target_compile_definitions(mqvpn_lib PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+option(BUILD_TESTING "Build unit tests" ON)
+if(BUILD_TESTING)
+    enable_testing()
+    add_executable(test_platform_cert_verify tests/test_platform_cert_verify.c
+                   src/platform/windows/cert_verify_windows.c)
+    target_compile_definitions(test_platform_cert_verify PRIVATE
+        TEST_CERT_DER_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.der")
+    target_include_directories(test_platform_cert_verify PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/platform/windows)
+    target_link_libraries(test_platform_cert_verify PRIVATE crypt32)
+    add_test(NAME test_platform_cert_verify COMMAND test_platform_cert_verify)
+endif()
+
 elseif(APPLE)
 
 # ---------- mqvpn CLI binary (Darwin) ----------
@@ -575,8 +599,10 @@ elseif(APPLE)
 # tun.c/dns.c and fail to compile on Darwin).
 add_executable(mqvpn
     src/main.c
+    src/platform/client_config_bridge.c
     src/platform/darwin/platform_darwin.c
     src/platform/darwin/route_mon.c
+    src/platform/posix/netmon_common.c
     src/platform/darwin/tun_utun.c
     src/platform/darwin/routing.c
     src/platform/darwin/dns.c
@@ -606,14 +632,18 @@ target_link_libraries(mqvpn
     dl
     m
     c++ # C++ runtime for BoringSSL; macOS SDKs ship libc++, not libstdc++
+    "-framework Security"
+    "-framework CoreFoundation"
 )
 
 # Compile gate for CI: builds the Darwin platform TUs as a standalone
 # OBJECT target, independent of the full CLI link above. See
 # .github/workflows/ci.yml darwin job.
 add_library(mqvpn_darwin_platform OBJECT
+    src/platform/client_config_bridge.c
     src/platform/darwin/platform_darwin.c
     src/platform/darwin/route_mon.c
+    src/platform/posix/netmon_common.c
     src/platform/darwin/tun_utun.c
     src/platform/darwin/routing.c
     src/platform/darwin/dns.c
@@ -650,7 +680,8 @@ target_include_directories(mqvpn_shared
 # Shared lib links shared xquic, same as Linux (static .a is unusable there
 # for -fPIC reasons; kept symmetric here even though clang on Darwin emits
 # PIC by default).
-target_link_libraries(mqvpn_shared xquic ${SSL_LIB} ${CRYPTO_LIB} pthread c++)
+target_link_libraries(mqvpn_shared xquic ${SSL_LIB} ${CRYPTO_LIB} pthread c++
+                      "-framework Security" "-framework CoreFoundation")
 
 # Keep in sync with the Linux twin (the mqvpn_shared lane block in the
 # Linux branch below).
@@ -748,16 +779,16 @@ if(BUILD_TESTING)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_conn_settings COMMAND test_conn_settings)
 
-    # test_cert_verify — twin of the Linux definition below. macOS clients run
-    # the same verify_posix path, so the identity rules (SAN-only, IP literals
-    # against iPAddress SANs) are worth pinning on both.
-    add_executable(test_cert_verify tests/test_cert_verify.c src/cert_verify.c)
-    target_link_libraries(test_cert_verify ${SSL_LIB} ${CRYPTO_LIB} c++)
-    target_include_directories(test_cert_verify PRIVATE
-        ${CMAKE_SOURCE_DIR}/src ${BORINGSSL_INCLUDE_DIR})
-    set_target_properties(test_cert_verify PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
-    add_test(NAME test_cert_verify COMMAND test_cert_verify)
+    add_executable(test_platform_cert_verify tests/test_platform_cert_verify.c
+                   src/platform/darwin/cert_verify_apple.c)
+    target_compile_definitions(test_platform_cert_verify PRIVATE
+        TEST_CERT_DER_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.der")
+    target_include_directories(test_platform_cert_verify PRIVATE
+        ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/platform/darwin)
+    target_link_libraries(test_platform_cert_verify PRIVATE
+                          "-framework Security" "-framework CoreFoundation")
+    add_test(NAME test_platform_cert_verify COMMAND test_platform_cert_verify)
+
 endif()
 
 else() # NOT WIN32, NOT APPLE — Linux
@@ -805,8 +836,10 @@ endif()
 # Links libmqvpn for the library API; keeps platform-specific files separate.
 add_executable(mqvpn
     src/main.c
+    src/platform/client_config_bridge.c
     src/platform/linux/platform_linux.c
     src/platform/linux/netlink_mon.c
+    src/platform/posix/netmon_common.c
     src/platform/linux/route_check.c
     src/platform/linux/control_socket.c
     src/platform/posix/status.c
@@ -855,6 +888,34 @@ if(MQVPN_ENABLE_H2_PROXY)
     endif()
 endif()
 
+# libFuzzer target: control-API request parsing crash-safety (see
+# fuzz/fuzz_control_dispatch.c for scope). Lives here — not in the
+# fuzz_tcp_lane block above — because control_socket.c is Linux-only and
+# needs libevent, both guaranteed in this branch. The TU #include's
+# control_socket.c to reach the file-local dispatch(); mqvpn_lib resolves
+# the NULL-guarded mqvpn_server_* calls (log.c is inside mqvpn_lib — do
+# not add it here). Only the fuzz TU is instrumented — that covers the
+# dispatch + argument-extraction surface (json_mini.h is header-inline, so
+# it compiles into the TU); library-side validation of extracted strings
+# short-circuits at the server=NULL guard and is out of scope (see the TU).
+if(MQVPN_ENABLE_FUZZING)
+    add_executable(fuzz_control_dispatch fuzz/fuzz_control_dispatch.c)
+    target_compile_options(fuzz_control_dispatch PRIVATE -fsanitize=fuzzer,address)
+    target_link_options(fuzz_control_dispatch PRIVATE -fsanitize=fuzzer,address)
+    target_link_libraries(fuzz_control_dispatch PRIVATE
+        mqvpn_lib ${XQUIC_LIB} ${EVENT_LIB} ${SSL_LIB} ${CRYPTO_LIB}
+        pthread dl m stdc++)
+    target_include_directories(fuzz_control_dispatch PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/platform/linux
+        ${CMAKE_SOURCE_DIR}/src/platform/posix
+        ${CMAKE_SOURCE_DIR}/include
+        ${EVENT_INCLUDE_DIR}
+        ${XQUIC_INCLUDE_DIR})
+    set_target_properties(fuzz_control_dispatch PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+endif()
+
 # ---------- Tests ----------
 option(BUILD_TESTING "Build unit tests" ON)
 if(BUILD_TESTING)
@@ -887,24 +948,16 @@ if(BUILD_TESTING)
     # mqvpn_config.c is linked (separate TU) for the composed-builder bridge test.
     add_executable(test_reorder_rx tests/test_reorder_rx.c src/mqvpn_config.c src/log.c)
     add_executable(test_reorder_config tests/test_reorder_config.c src/mqvpn_config.c src/config.c src/log.c)
+    # Parity test for the shared CLI→library config bridge: pins every field
+    # forwarded by mqvpn_platform_apply_client_config so a new knob cannot be
+    # bridged on one platform and dropped on another (see the bridge TU).
+    add_executable(test_config_bridge tests/test_config_bridge.c src/platform/client_config_bridge.c src/mqvpn_config.c src/log.c)
     add_executable(test_classifier tests/test_classifier.c src/hybrid/classifier.c)
     add_executable(test_icmp tests/test_icmp.c src/icmp.c)
     # test_reorder_gate exercises src/reorder_gate.h (shared STAMP/RAW/DROP_MTU
     # gate + PTB token bucket, extracted from mqvpn_client.c/mqvpn_server.c) —
     # links reorder_tx.c (for the peek it wraps) + icmp.c (for the PTB send).
     add_executable(test_reorder_gate tests/test_reorder_gate.c src/reorder_tx.c src/icmp.c src/log.c)
-
-    # Certificate verifier test — mints its own certificates, so it needs
-    # BoringSSL for both the subject under test and the fixtures. Keep in sync
-    # with the Darwin twin above: macOS is a supported client and reaches the
-    # same verify_posix path.
-    add_executable(test_cert_verify tests/test_cert_verify.c src/cert_verify.c)
-    target_link_libraries(test_cert_verify ${SSL_LIB} ${CRYPTO_LIB} stdc++)
-    target_include_directories(test_cert_verify PRIVATE ${BORINGSSL_INCLUDE_DIR})
-    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(test_cert_verify PRIVATE -Wall -Wextra -Werror)
-    endif()
-
     # SNI router test (Linux/POSIX server path only)
     if(NOT WIN32)
         add_executable(test_sni_router tests/test_sni_router.c src/sni_router.c src/log.c)
@@ -933,7 +986,7 @@ if(BUILD_TESTING)
             target_compile_options(test_h2_proxy PRIVATE -Wall -Wextra -Werror)
         endif()
     endif()
-    set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_classifier test_icmp test_reorder_gate test_cert_verify)
+    set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_config_bridge test_classifier test_icmp test_reorder_gate)
     if(NOT WIN32)
         list(APPEND MQVPN_UNIT_TESTS test_sni_router)
     endif()
@@ -1036,6 +1089,28 @@ if(BUILD_TESTING)
         add_test(NAME ${t} COMMAND ${t})
     endforeach()
 
+    # Linux platform-twin PATH-stub state machine tests: same fake_cmd.h
+    # harness and scenario shape as the Darwin trio above, pointed at the
+    # Linux twins (linux/routing.c drives `ip`, linux/killswitch.c drives
+    # iptables/ip6tables — all via fork+execvp, so the PATH-stub idiom
+    # ports unchanged). Until now these files were exercised only by the
+    # sudo+netns e2e suite.
+    add_executable(test_routing_linux
+        tests/test_routing_linux.c src/platform/linux/routing.c
+        src/platform/posix/dns_common.c src/log.c)
+    add_executable(test_killswitch_rules_linux
+        tests/test_killswitch_rules_linux.c src/platform/linux/killswitch.c
+        src/platform/posix/dns_common.c src/log.c)
+    foreach(t test_routing_linux test_killswitch_rules_linux)
+        target_include_directories(${t} PRIVATE
+            ${EVENT_INCLUDE_DIR}   # platform_internal.h includes <event2/event.h>
+            ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/platform/posix
+            ${CMAKE_SOURCE_DIR}/src/platform/linux)
+        set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+        add_test(NAME ${t} COMMAND ${t})
+    endforeach()
+
     # Control-API command dispatch test. dispatch() is static, so the test
     # #include's control_socket.c directly (test_reorder_rx idiom) and mocks the
     # mqvpn_server_* API — no mqvpn_server.c / xquic linked. libevent is required
@@ -1079,6 +1154,17 @@ if(BUILD_TESTING)
     target_compile_definitions(test_server PRIVATE
         TEST_CERT_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.crt"
         TEST_KEY_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.key"
+        # DER form of test.crt for the presented-chain assertion. Derived:
+        # regenerate with `openssl x509 -in test.crt -outform DER -out test.der`
+        # whenever test.crt changes (a stale copy fails the memcmp loudly).
+        TEST_CERT_DER_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.der"
+        # Two-tier chain (leaf <- intermediate <- uncommitted root), generated
+        # by tests/certs/gen_chain.sh: pins the leaf-first presented-chain
+        # contract and the unknown-issuer path.
+        TEST_CHAIN_CERT_FILE="${CMAKE_SOURCE_DIR}/tests/certs/chain-fullchain.crt"
+        TEST_CHAIN_KEY_FILE="${CMAKE_SOURCE_DIR}/tests/certs/chain-leaf.key"
+        TEST_CHAIN_LEAF_DER_FILE="${CMAKE_SOURCE_DIR}/tests/certs/chain-leaf.der"
+        TEST_CHAIN_INTERMEDIATE_DER_FILE="${CMAKE_SOURCE_DIR}/tests/certs/chain-intermediate.der"
     )
     set_target_properties(test_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_server COMMAND test_server)

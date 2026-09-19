@@ -3,15 +3,19 @@
 
 package com.mqvpn.sdk.native_
 
+import android.net.http.X509TrustManagerExtensions
 import java.io.ByteArrayInputStream
+import java.net.IDN
+import java.net.InetAddress
 import java.security.KeyStore
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
+import java.util.Locale
 import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
 
 /**
- * Chain-of-trust check backed by Android's own CA store.
+ * Server-certificate check backed by Android's CA store.
  *
  * BoringSSL's `X509_STORE_set_default_paths` finds nothing on Android: the CA
  * store sits at none of the paths it compiles in, it moved into an updatable
@@ -20,30 +24,35 @@ import javax.net.ssl.X509TrustManager
  * handshake failed, and the client reconnected forever. Asking the platform is
  * the only check that stays correct across releases.
  *
- * Identity — hostname or IP — is deliberately *not* checked here.
- * `src/cert_verify.c` does that for every platform, before calling this, so
- * all of them agree on which names a certificate may speak for.
- *
  * Called from native code: `mqvpn_jni.c` resolves [checkServerTrusted] by name
- * in `JNI_OnLoad` and installs it through `mqvpn_set_cert_trust_check`. The
- * class name, method name and signature are part of that contract — see
- * `consumer-rules.pro` for the matching keep rule.
+ * in `JNI_OnLoad`; each native config installs it through
+ * `mqvpn_config_set_cert_verifier`. The class name, method name and signature
+ * are part of that contract — see `consumer-rules.pro`.
  */
 object PlatformTrust {
 
     /**
      * @param chain DER-encoded certificates as delivered by the TLS stack,
      *   leaf first, peer-supplied intermediates after it.
-     * @return `null` when the chain ends in a trust anchor Android accepts, or
-     *   a short reason for the log when it does not.
+     * @param hostname effective TLS server name, or the configured address.
+     * @return `null` only when Android accepts the chain and the leaf SAN
+     *   matches [hostname], otherwise a short reason for the native log.
      */
     @JvmStatic
-    fun checkServerTrusted(chain: Array<ByteArray>): String? {
+    fun checkServerTrusted(chain: Array<ByteArray>, hostname: String): String? {
         if (chain.isEmpty()) return "empty certificate chain"
+        if (hostname.isBlank()) return "empty certificate hostname"
         return try {
             val certs = decode(chain)
             val manager = systemTrustManager ?: return "no system X509 trust manager"
-            manager.checkServerTrusted(certs, authTypeOf(certs[0]))
+            X509TrustManagerExtensions(manager).checkServerTrusted(
+                certs,
+                authTypeOf(certs[0]),
+                hostname,
+            )
+            if (!matchesHostname(certs[0], hostname)) {
+                return "certificate subjectAltName does not match $hostname"
+            }
             null
         } catch (t: Throwable) {
             // Catch everything. This return value is the only channel back to
@@ -79,4 +88,65 @@ object PlatformTrust {
      */
     private fun authTypeOf(leaf: X509Certificate): String =
         leaf.publicKey?.algorithm?.takeIf { it.isNotBlank() } ?: "GENERIC"
+
+    internal fun matchesHostname(certificate: X509Certificate, hostname: String): Boolean {
+        val unbracketed = hostname.removePrefix("[").removeSuffix("]").removeSuffix(".")
+        val address = parseIpLiteral(unbracketed)
+        val names = certificate.subjectAlternativeNames ?: return false
+        if (address != null) {
+            return names.any { entry ->
+                entry.size >= 2 && entry[0] == 7 && parseSanAddress(entry[1])
+                    ?.contentEquals(address) == true
+            }
+        }
+
+        val host = normalizeDnsName(unbracketed) ?: return false
+        return names.any { entry ->
+            entry.size >= 2 && entry[0] == 2 &&
+                (entry[1] as? String)?.let { matchesDnsName(host, it) } == true
+        }
+    }
+
+    private fun matchesDnsName(host: String, certificateName: String): Boolean {
+        val raw = certificateName.removeSuffix(".")
+        if (raw.startsWith("*.") && raw.indexOf('*', 1) == -1) {
+            val suffix = normalizeDnsName(raw.substring(2)) ?: return false
+            return host.endsWith(".$suffix") && host.count { it == '.' } == suffix.count { it == '.' } + 1
+        }
+        val name = normalizeDnsName(raw) ?: return false
+        return '*' !in name && host == name
+    }
+
+    private fun normalizeDnsName(name: String): String? = try {
+        IDN.toASCII(name, IDN.USE_STD3_ASCII_RULES).lowercase(Locale.US)
+            .takeIf { it.isNotEmpty() }
+    } catch (_: IllegalArgumentException) {
+        null
+    }
+
+    private fun parseSanAddress(value: Any?): ByteArray? = when (value) {
+        is ByteArray -> value.takeIf { it.size == 4 || it.size == 16 }
+        is String -> parseIpLiteral(value)
+        else -> null
+    }
+
+    private fun parseIpLiteral(value: String): ByteArray? {
+        if (':' in value) {
+            return try {
+                InetAddress.getByName(value).address.takeIf { it.size == 16 }
+            } catch (_: Exception) {
+                null
+            }
+        }
+        val parts = value.split('.')
+        if (parts.size != 4) return null
+        val bytes = ByteArray(4)
+        for (i in parts.indices) {
+            if (parts[i].isEmpty() || parts[i].any { !it.isDigit() }) return null
+            val octet = parts[i].toIntOrNull() ?: return null
+            if (octet !in 0..255) return null
+            bytes[i] = octet.toByte()
+        }
+        return bytes
+    }
 }
