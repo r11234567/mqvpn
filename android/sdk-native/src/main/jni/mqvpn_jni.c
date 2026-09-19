@@ -28,7 +28,6 @@
 #include <netinet/in.h>
 #include <android/log.h>
 
-#include "cert_verify.h"
 #include "libmqvpn.h"
 #include "mqvpn_internal.h"
 #include "reorder.h"
@@ -116,18 +115,12 @@ detach_if_needed(jni_ctx_t *ctx, int did_attach)
     vm_detach_if_needed(ctx->jvm, did_attach);
 }
 
-/* ─── Certificate trust (Android CA store via PlatformTrust) ─── */
-
-static void
-trust_error(char *error, size_t error_len, const char *message)
-{
-    if (error != NULL && error_len > 0) snprintf(error, error_len, "%s", message);
-}
+/* ─── Certificate verification (Android trust store + hostname) ─── */
 
 /* Marshal the DER chain into a Java byte[][]. Returns NULL on failure with any
  * pending exception cleared; the caller owns the returned local ref. */
 static jobjectArray
-build_der_chain(JNIEnv *env, const unsigned char *certs[], const size_t cert_len[],
+build_der_chain(JNIEnv *env, const uint8_t *const certs[], const size_t cert_len[],
                 size_t certs_len)
 {
     jclass byte_array_cls = (*env)->FindClass(env, "[B");
@@ -161,56 +154,57 @@ fail:
 }
 
 /*
- * Hand the DER chain to PlatformTrust.checkServerTrusted and translate its
- * answer (null = trusted, anything else = a reason) into the cert_verify.h
- * contract. Identity was already checked in cert_verify.c, so this is trust
- * only.
+ * Hand the DER chain and effective TLS hostname to PlatformTrust. The Java
+ * side owns both Android CA-store validation and endpoint identity; returning
+ * success here bypasses BoringSSL's unavailable-on-Android default paths.
  */
 static int
-jni_cert_trust(const unsigned char *certs[], const size_t cert_len[], size_t certs_len,
-               char *error, size_t error_len, void *ctx)
+jni_cert_verify(const uint8_t *const certs[], const size_t cert_len[], size_t certs_len,
+                const char *hostname, void *ctx)
 {
     (void)ctx;
 
-    if (s_trust_cls == NULL || s_mid_check_server_trusted == NULL || certs_len == 0) {
-        trust_error(error, error_len, "platform trust check unavailable");
+    if (s_trust_cls == NULL || s_mid_check_server_trusted == NULL || certs_len == 0 ||
+        hostname == NULL || hostname[0] == '\0')
         return -1;
-    }
 
     int did_attach;
     JNIEnv *env = vm_get_env(g_jvm, &did_attach);
-    if (env == NULL) {
-        trust_error(error, error_len, "platform trust check: no JNI env");
-        return -1;
-    }
+    if (env == NULL) return -1;
 
     int result = -1;
     jobjectArray chain = build_der_chain(env, certs, cert_len, certs_len);
     if (chain == NULL) {
-        trust_error(error, error_len, "platform trust check: marshalling failed");
+        vm_detach_if_needed(g_jvm, did_attach);
+        return -1;
+    }
+
+    jstring host = (*env)->NewStringUTF(env, hostname);
+    if (host == NULL) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, chain);
         vm_detach_if_needed(g_jvm, did_attach);
         return -1;
     }
 
     jstring reason = (jstring)(*env)->CallStaticObjectMethod(
-        env, s_trust_cls, s_mid_check_server_trusted, chain);
+        env, s_trust_cls, s_mid_check_server_trusted, chain, host);
     if ((*env)->ExceptionCheck(env)) {
         (*env)->ExceptionClear(env);
-        trust_error(error, error_len, "platform trust check threw");
     } else if (reason == NULL) {
         result = 0; /* trusted */
     } else {
         const char *text = (*env)->GetStringUTFChars(env, reason, NULL);
         if (text != NULL) {
-            trust_error(error, error_len, text);
+            LOGE("certificate verification failed for %s: %s", hostname, text);
             (*env)->ReleaseStringUTFChars(env, reason, text);
         } else {
             if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-            trust_error(error, error_len, "platform rejected the certificate chain");
         }
     }
 
     if (reason != NULL) (*env)->DeleteLocalRef(env, reason);
+    (*env)->DeleteLocalRef(env, host);
     (*env)->DeleteLocalRef(env, chain);
     vm_detach_if_needed(g_jvm, did_attach);
     return result;
@@ -233,8 +227,9 @@ JNI_OnLoad(JavaVM *vm, void *reserved)
     if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) == JNI_OK) {
         jclass cls = (*env)->FindClass(env, "com/mqvpn/sdk/native_/PlatformTrust");
         if (cls != NULL) {
-            jmethodID mid = (*env)->GetStaticMethodID(env, cls, "checkServerTrusted",
-                                                     "([[B)Ljava/lang/String;");
+            jmethodID mid =
+                (*env)->GetStaticMethodID(env, cls, "checkServerTrusted",
+                                          "([[BLjava/lang/String;)Ljava/lang/String;");
             if (mid != NULL) {
                 s_trust_cls = (*env)->NewGlobalRef(env, cls);
                 s_mid_check_server_trusted = mid;
@@ -244,9 +239,7 @@ JNI_OnLoad(JavaVM *vm, void *reserved)
         if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
     }
 
-    if (s_trust_cls != NULL && s_mid_check_server_trusted != NULL) {
-        mqvpn_set_cert_trust_check(jni_cert_trust, NULL);
-    } else {
+    if (s_trust_cls == NULL || s_mid_check_server_trusted == NULL) {
         /*
          * Leave the built-in verifier in place, which on Android trusts
          * nothing, so this fails closed rather than open. Say so at ERROR: the
@@ -446,6 +439,8 @@ JNI_FN(configNew)(JNIEnv *env, jobject thiz)
     (void)env;
     (void)thiz;
     mqvpn_config_t *cfg = mqvpn_config_new();
+    if (cfg != NULL && s_trust_cls != NULL && s_mid_check_server_trusted != NULL)
+        mqvpn_config_set_cert_verifier(cfg, jni_cert_verify, NULL);
     return (jlong)(intptr_t)cfg;
 }
 

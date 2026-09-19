@@ -7,6 +7,9 @@ benchmarks/*
 # H2a micro-benchmark rig (harness + driver) is tracked
 !benchmarks/tcp_lane_microbench/
 
+fuzz/corpus/tcp_lane/*
+!fuzz/corpus/tcp_lane/*.bin
+
 # local-only picoquic build for reorder sweep / interop (not vendored as a submodule).
 # picotls is picoquic's sibling TLS dependency, cloned + built next to it.
 /third_party/picoquic/
@@ -65,3 +68,8 @@ docs/report/2026-07-04-hybrid-h2b-throughput.md
 # Python bytecode, e.g. from scripts/ci_benchmarks/ci_bench_ab_report.py
 __pycache__/
 *.pyc
+
+# libFuzzer writes minimized findings into the corpus dir it is given —
+# keep curated *.bin seeds tracked, ignore SHA-named fuzzer output.
+fuzz/corpus/control_dispatch/*
+!fuzz/corpus/control_dispatch/*.bin

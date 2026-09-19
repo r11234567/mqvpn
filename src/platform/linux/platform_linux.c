@@ -19,7 +19,6 @@
 #include "log.h"
 #include "mqvpn_internal.h" /* mqvpn_config_apply_reorder (INI reorder bridge) */
 #include "netlink_mon.h"
-#include "server_socket_policy.h"
 #include "udp_offload.h" /* mqvpn_udp_gro_enable / recv_segmented / gro_seg_len */
 
 #include <stdio.h>
@@ -27,15 +26,8 @@
 
 #define STATUS_INTERVAL_SEC 30
 #define BULK_READ_COUNT     64
-/* Default packets drained from the TUN per event-loop wakeup. Separate from
- * BULK_READ_COUNT, which also bounds the UDP socket drain: those are two
- * different queues with two different overflow behaviours, and only this one
- * meets a game tick's burst. At 64 a 10 Hz tick carrying 1707 packets needs
- * 27 wakeups to clear, during which the 500-slot ring overflows -- measured
- * 23-49% tx_dropped in run 34084331771, against a qdisc that dropped none. */
-#define TUN_READ_BATCH_DEFAULT 64
-#define TUN_BUF_SIZE           65536
-#define SOCK_BUF_SIZE          65536
+#define TUN_BUF_SIZE        65536
+#define SOCK_BUF_SIZE       65536
 /* Teardown RX-offload telemetry line (client and server cleanup labels).
  * ONE format definition, same drift hazard and consumers as
  * MQVPN_UDP_TX_LINE_FMT in mqvpn_internal.h. */
@@ -117,9 +109,6 @@ cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
 
     if (mqvpn_tun_set_addr(&p->tun, local_ip, peer_ip, 32) < 0) goto fail;
     if (mqvpn_tun_set_mtu(&p->tun, info->mtu) < 0) goto fail;
-    /* Not fatal: a default-depth ring still forwards, and failing the
-     * tunnel over a queue-depth hint would be the worse trade. */
-    mqvpn_tun_set_txqueuelen(&p->tun, p->tun_txqueuelen);
     if (mqvpn_tun_up(&p->tun) < 0) goto fail;
 
     /* Set IPv6 address if available */
@@ -184,7 +173,7 @@ cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
     }
 
     /* Start periodic dropped-path re-add timer. Carrier-up netlink events
-     * fire only once and `try_readd_removed_path()` can fail synchronously
+     * fire only once and `netmon_try_readd_removed_path()` can fail synchronously
      * (e.g. xqc_conn_create_path returning -XQC_EMP_NO_AVAIL_PATH_ID before
      * the server has distributed enough CIDs). Without this timer the slot
      * would sit in CLOSED_DROPPED indefinitely — no further netlink event
@@ -272,9 +261,8 @@ cb_path_event(mqvpn_path_handle_t path, mqvpn_path_status_t status, void *user_c
 {
     (void)user_ctx;
     /* PR5: path lifecycle state is owned entirely by libmqvpn. Platform
-     * no longer mirrors recoverable / removed state — try_reactivate_by_ifname
+     * no longer mirrors recoverable / removed state — netmon_try_reactivate_by_ifname
      * queries lib state directly via mqvpn_client_get_paths(). */
-    if (!mqvpn_log_path_status_changed((int64_t)path, (int)status)) return;
     const char *sn = mqvpn_path_status_string(status);
     LOG_INF("path %lld -> %s", (long long)path, sn);
 }
@@ -393,9 +381,8 @@ on_tun_read(evutil_socket_t fd, short what, void *arg)
     (void)what;
     platform_ctx_t *p = (platform_ctx_t *)arg;
     uint8_t buf[TUN_BUF_SIZE];
-    int batch = p->tun_read_batch > 0 ? p->tun_read_batch : TUN_READ_BATCH_DEFAULT;
 
-    for (int i = 0; i < batch; i++) {
+    for (int i = 0; i < BULK_READ_COUNT; i++) {
         int n = mqvpn_tun_read(&p->tun, buf, sizeof(buf));
         if (n <= 0) break;
 
@@ -555,8 +542,6 @@ linux_platform_run_client(const mqvpn_client_cfg_t *cfg)
     ctx.killswitch_enabled = cfg->kill_switch;
     ctx.manage_routes = cfg->manage_routes;
     ctx.udp_gro = cfg->udp_gro;
-    ctx.tun_txqueuelen = cfg->tun_txqueuelen;
-    ctx.tun_read_batch = cfg->tun_read_batch;
 
     /* Pre-set TUN name (save to tun_name_cfg too — survives TUN destroy/recreate) */
     if (cfg->tun_name) {
@@ -586,41 +571,9 @@ linux_platform_run_client(const mqvpn_client_cfg_t *cfg)
         return 1;
     }
 
-    mqvpn_config_set_server(lib_cfg, cfg->server_addr, cfg->server_port);
-    if (cfg->tls_server_name)
-        mqvpn_config_set_tls_server_name(lib_cfg, cfg->tls_server_name);
-    if (cfg->auth_key) mqvpn_config_set_auth_key(lib_cfg, cfg->auth_key);
-    mqvpn_config_set_insecure(lib_cfg, cfg->insecure);
-    mqvpn_config_set_multipath(lib_cfg, cfg->n_paths > 1 ? 1 : 0);
-    mqvpn_config_set_reconnect(lib_cfg, cfg->reconnect,
-                               cfg->reconnect_interval > 0 ? cfg->reconnect_interval : 5);
-    mqvpn_config_set_killswitch_hint(lib_cfg, cfg->kill_switch);
-
-    mqvpn_config_set_log_level(lib_cfg, (mqvpn_log_level_t)cfg->log_level);
-
-    mqvpn_scheduler_t lib_sched;
-    switch (cfg->scheduler) {
-    case 1: lib_sched = MQVPN_SCHED_WLB; break;
-    case 2: lib_sched = MQVPN_SCHED_BACKUP_FEC; break;
-    case 3: lib_sched = MQVPN_SCHED_WLB_UDP_PIN; break;
-    default: lib_sched = MQVPN_SCHED_MINRTT; break;
-    }
-    mqvpn_config_set_scheduler(lib_cfg, lib_sched);
-    mqvpn_config_set_cc(lib_cfg, (mqvpn_cc_t)cfg->cc);
-    mqvpn_config_set_reinjection(lib_cfg, (mqvpn_reinjection_t)cfg->reinjection);
-    mqvpn_config_set_reinjection_deadline_params(lib_cfg, cfg->reinj_srtt_factor_pct,
-                                                 cfg->reinj_hard_deadline_ms,
-                                                 cfg->reinj_deadline_lower_bound_ms);
-    mqvpn_config_set_init_max_path_id(lib_cfg, cfg->init_max_path_id);
-    mqvpn_config_set_tun_mtu(lib_cfg, cfg->tun_mtu);
-    mqvpn_config_set_tun_txqueuelen(lib_cfg, cfg->tun_txqueuelen);
-    mqvpn_config_set_tun_read_batch(lib_cfg, cfg->tun_read_batch);
-    mqvpn_config_apply_reorder(lib_cfg,
-                               &cfg->reorder); /* INI [Reorder]/[ReorderRule] bridge */
-    mqvpn_config_apply_hybrid(lib_cfg, &cfg->hybrid); /* INI [Hybrid] bridge */
-    if (cfg->recv_rate_limit)
-        mqvpn_config_set_recv_rate_limit(lib_cfg, cfg->recv_rate_limit);
-    /* Unconditional: 0 is a meaningful explicit-disable, not "unset". */
+    mqvpn_platform_apply_client_config(lib_cfg, cfg);
+    /* Linux-only knob, deliberately outside the shared bridge (vpn_client.h).
+     * Unconditional: 0 is a meaningful explicit-disable, not "unset". */
     mqvpn_config_set_udp_gso(lib_cfg, cfg->udp_gso);
 
     /* Create callbacks */
@@ -860,8 +813,6 @@ typedef struct server_platform_ctx_s {
     int shutting_down;
     ctrl_socket_t *ctrl;
 
-    /* Shared egress fd registry for hybrid TCP, SNI fallback, and H2 upstream
-     * sockets. It is sized once from the core's frozen admission budget. */
     /* Receive-side offload telemetry — same meaning as platform_ctx_t's pair,
      * written by svr_on_socket_read and read once at teardown. No udp_gro flag
      * here: the listen socket is created exactly once, so the sockopt hook
@@ -875,11 +826,6 @@ typedef struct server_platform_ctx_s {
      * the core's own fd cap can never drift apart. */
     egress_fd_slot_t *egress_fds;
     int n_egress_fds;
-
-    /* [Interface] TxQueueLen — 0 leaves the kernel default. */
-    int tun_txqueuelen;
-    /* [Interface] TunReadBatch — 0 uses the built-in default. */
-    int tun_read_batch;
 } server_platform_ctx_t;
 
 static void svr_on_tick(evutil_socket_t fd, short what, void *arg);
@@ -945,7 +891,6 @@ svr_cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
 
     if (mqvpn_tun_set_addr(&sp->tun, srv_ip, base_ip, info->assigned_prefix) < 0) return;
     if (mqvpn_tun_set_mtu(&sp->tun, info->mtu) < 0) return;
-    mqvpn_tun_set_txqueuelen(&sp->tun, sp->tun_txqueuelen);
     if (mqvpn_tun_up(&sp->tun) < 0) return;
 
     /* IPv6 if available */
@@ -985,9 +930,8 @@ svr_on_tun_read(evutil_socket_t fd, short what, void *arg)
     (void)what;
     server_platform_ctx_t *sp = (server_platform_ctx_t *)arg;
     uint8_t buf[TUN_BUF_SIZE];
-    int batch = sp->tun_read_batch > 0 ? sp->tun_read_batch : TUN_READ_BATCH_DEFAULT;
 
-    for (int i = 0; i < batch; i++) {
+    for (int i = 0; i < BULK_READ_COUNT; i++) {
         int n = mqvpn_tun_read(&sp->tun, buf, sizeof(buf));
         if (n <= 0) break;
 
@@ -1025,9 +969,9 @@ svr_on_socket_read(evutil_socket_t fd, short what, void *arg)
     svr_schedule_next_tick(sp);
 }
 
-/* ─── Shared egress fd registry ───
+/* ─── Egress fd registry (hybrid TCP lane, D1) ───
  *
- * The core modules own every egress fd's socket()/
+ * The core (src/hybrid/tcp_egress.c) owns every egress fd's socket()/
  * connect()/send()/recv()/close() syscalls directly; these callbacks only
  * (un)register the platform's interest in an already-open fd. Linear scan
  * is fine — register/unregister fire on state-change, not per-packet. */
@@ -1183,6 +1127,8 @@ svr_create_udp_socket(const char *addr, int port, struct sockaddr_storage *out_a
 
     memset(out_addr, 0, sizeof(*out_addr));
     if (af == AF_INET6) {
+        int v6only = 1;
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
         struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)out_addr;
         sin6->sin6_family = AF_INET6;
         sin6->sin6_port = htons((uint16_t)port);
@@ -1190,12 +1136,6 @@ svr_create_udp_socket(const char *addr, int port, struct sockaddr_storage *out_a
             sin6->sin6_addr = addr6;
         else
             sin6->sin6_addr = in6addr_any;
-        int v6only = mqvpn_linux_server_ipv6_v6only(&sin6->sin6_addr);
-        if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) != 0) {
-            LOG_ERR("setsockopt(IPV6_V6ONLY=%d): %s", v6only, strerror(errno));
-            close(fd);
-            return -1;
-        }
         *out_addrlen = sizeof(struct sockaddr_in6);
     } else {
         struct sockaddr_in *sin = (struct sockaddr_in *)out_addr;
@@ -1228,8 +1168,6 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
     memset(&sp, 0, sizeof(sp));
     sp.tun.fd = -1;
     sp.udp_fd = -1;
-    sp.tun_txqueuelen = cfg->tun_txqueuelen;
-    sp.tun_read_batch = cfg->tun_read_batch;
 
     if (cfg->tun_name) snprintf(sp.tun.name, sizeof(sp.tun.name), "%s", cfg->tun_name);
 
@@ -1267,31 +1205,9 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
                                                  cfg->reinj_deadline_lower_bound_ms);
     mqvpn_config_set_init_max_path_id(lib_cfg, cfg->init_max_path_id);
     mqvpn_config_set_tun_mtu(lib_cfg, cfg->tun_mtu);
-    mqvpn_config_set_tun_txqueuelen(lib_cfg, cfg->tun_txqueuelen);
-    mqvpn_config_set_tun_read_batch(lib_cfg, cfg->tun_read_batch);
     mqvpn_config_apply_reorder(lib_cfg,
                                &cfg->reorder); /* INI [Reorder]/[ReorderRule] bridge */
     mqvpn_config_apply_hybrid(lib_cfg, &cfg->hybrid); /* INI [Hybrid] bridge */
-    if (mqvpn_config_set_proxy(lib_cfg, cfg->proxy_enabled, cfg->proxy_sni,
-                               cfg->proxy_quic_fallback, cfg->proxy_h2_backend,
-                               cfg->proxy_h2_backend_tls, cfg->proxy_max_connections,
-                               cfg->proxy_idle_timeout_sec) != MQVPN_OK) {
-        LOG_ERR("invalid [Proxy] configuration");
-        mqvpn_config_free(lib_cfg);
-        return 1;
-    }
-    if (mqvpn_config_set_proxy_protocol(lib_cfg, cfg->proxy_h2_backend_proxy_protocol) !=
-        MQVPN_OK) {
-        LOG_ERR("invalid [Proxy] Http2BackendProxyProtocol setting");
-        mqvpn_config_free(lib_cfg);
-        return 1;
-    }
-    if (mqvpn_config_set_quic_fallback_proxy_protocol(
-            lib_cfg, cfg->proxy_quic_fallback_proxy_protocol) != MQVPN_OK) {
-        LOG_ERR("invalid [Proxy] QuicFallbackProxyProtocol setting");
-        mqvpn_config_free(lib_cfg);
-        return 1;
-    }
     /* Unconditional: 0 is a meaningful explicit-disable, not "unset". */
     mqvpn_config_set_udp_gso(lib_cfg, cfg->udp_gso);
 
@@ -1314,8 +1230,8 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
         return 1;
     }
 
-    /* Shared egress fd registry, sized from the same frozen budget enforced
-     * by the core's feature admission limits. */
+    /* Egress fd registry (hybrid TCP lane, D1). Sized from the same budget
+     * tcp_egress.c will itself enforce, so the two caps cannot drift. */
     sp.n_egress_fds = mqvpn_server_egress_fd_budget(sp.server);
     if (sp.n_egress_fds > 0) {
         sp.egress_fds = calloc((size_t)sp.n_egress_fds, sizeof(*sp.egress_fds));

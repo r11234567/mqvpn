@@ -48,7 +48,6 @@
 #include <xquic/xqc_http3.h>
 
 #include "flow_sched.h"
-#include "cert_verify.h"
 #include "hybrid/classifier.h"
 #ifdef MQVPN_HYBRID_TCP_LANE_ENABLED
 #  include "hybrid/lwip_glue.h"
@@ -212,6 +211,8 @@ struct mqvpn_client_s {
     uint8_t server_prefix;
     int mtu;
     uint8_t assigned_ip6[16];
+    /* wire value, write-only mirror of conn->assigned_prefix6 (no reader); the TUN
+     * width is derived at the tunnel_info builder via mqvpn_tunnel_prefix6_effective */
     uint8_t assigned_prefix6;
     int has_v6;
     int tun_active;
@@ -269,6 +270,20 @@ struct mqvpn_client_s {
     int reconnect_attempts;
     uint64_t reconnect_scheduled_us;
     int shutting_down;
+    /* Re-entrancy fence for the UNSAFE window of a connect transaction:
+     * the pre-start slot reset + the connection bootstrap
+     * (cli_start_connection), which fire path_event synchronously while
+     * slots/conn ownership are mid-mutation. A callback calling
+     * mqvpn_client_connect()/mqvpn_client_disconnect() there would
+     * double-start, double-arm the retry backoff, or drive a
+     * CLOSED->CONNECTING resurrection; while set, both entry points
+     * return MQVPN_ERR_INVALID_ARG. Deliberately CLEARED before the
+     * post-outcome callbacks (reconnect_scheduled on failure,
+     * state_changed(CONNECTING) on success): those observe committed
+     * state, and cancelling from them — e.g. disconnect() inside
+     * reconnect_scheduled after a retry limit — must keep working.
+     * Single writer (tick thread). */
+    int in_connect;
 
     /* Log correlation + filtering */
     uint32_t conn_id; /* monotonic, bumped on each connect */
@@ -338,9 +353,7 @@ now_us(void)
 /* Injectable clock: use config clock_fn if set, else default now_us().
  * PR4 — non-static + visibility hidden so path_state_machine.c can call it
  * without exporting from libmqvpn.so. MSVC ignores visibility(). */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 uint64_t
 client_now_us(const mqvpn_client_t *c)
 {
@@ -401,16 +414,14 @@ now_ms_mono(void)
 }
 
 #if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden"))) void
-client_log(mqvpn_client_t *c, mqvpn_log_level_t level, const char *fmt, ...)
+MQVPN_INTERNAL void client_log(mqvpn_client_t *c, mqvpn_log_level_t level,
+                               const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 #endif
 
 /* PR4 — non-static + visibility hidden so path_state_machine.c can call it
  * without exporting from libmqvpn.so. MSVC ignores visibility(). */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 void
 client_log(mqvpn_client_t *c, mqvpn_log_level_t level, const char *fmt, ...)
 {
@@ -427,9 +438,7 @@ client_log(mqvpn_client_t *c, mqvpn_log_level_t level, const char *fmt, ...)
 
 /* PR4 - Fire public path_event callback from FSM body.
  * MSVC ignores visibility(). */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 void
 path_fsm_fire_path_event(mqvpn_client_t *c, const path_entry_t *p)
 {
@@ -445,9 +454,7 @@ path_fsm_fire_path_event(mqvpn_client_t *c, const path_entry_t *p)
  * No-op if engine or conn is missing (e.g. during reconnect, or for
  * pre-handshake transitions); path-status will be re-asserted by the
  * caller when the conn is re-established and the lifecycle moves again. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 void
 client_notify_xqc_path_state(mqvpn_client_t *c, const path_entry_t *p, int app_status)
 {
@@ -596,9 +603,7 @@ first_active_idx(const mqvpn_client_t *c)
  * driving xquic.  Marked `hidden` so it does not show up in
  * libmqvpn.so's dynamic symbol table — not part of the public ABI,
  * and intentionally absent from libmqvpn.h. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_first_active_fd(const mqvpn_client_t *c)
 {
@@ -666,9 +671,7 @@ client_next_primary_idx(const mqvpn_client_t *c, int from_idx)
  * lock in the issue #46 + OMR-backport composite fallback semantics
  * without driving xquic.  Hidden from libmqvpn.so's dynamic export
  * table (not part of public ABI). */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_set_primary_path_idx(mqvpn_client_t *c, int idx)
 {
@@ -677,9 +680,7 @@ mqvpn_client_test_set_primary_path_idx(mqvpn_client_t *c, int idx)
     return 0;
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_get_fd_for_path(mqvpn_client_t *c, uint64_t xqc_path_id)
 {
@@ -687,9 +688,7 @@ mqvpn_client_test_get_fd_for_path(mqvpn_client_t *c, uint64_t xqc_path_id)
     return get_fd_for_path(c, xqc_path_id);
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_next_primary_idx(const mqvpn_client_t *c, int from_idx)
 {
@@ -697,9 +696,7 @@ mqvpn_client_test_next_primary_idx(const mqvpn_client_t *c, int from_idx)
     return client_next_primary_idx(c, from_idx);
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_classify_status(int status)
 {
@@ -711,9 +708,7 @@ mqvpn_client_test_classify_status(int status)
  * mqvpn_client_test_conn_free (cli_conn_destroy handles the all-NULL conn).
  * Hidden from libmqvpn.so's dynamic export table (not part of the public
  * ABI). */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_conn_alloc(mqvpn_client_t *c)
 {
@@ -725,9 +720,7 @@ mqvpn_client_test_conn_alloc(mqvpn_client_t *c)
     return 0;
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_conn_free(mqvpn_client_t *c)
 {
@@ -736,9 +729,7 @@ mqvpn_client_test_conn_free(mqvpn_client_t *c)
     return 0;
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_conn_tunnel_notified(const mqvpn_client_t *c)
 {
@@ -748,9 +739,7 @@ mqvpn_client_test_conn_tunnel_notified(const mqvpn_client_t *c)
 
 /* Test-only: drive the real pre-establishment failure-signal path
  * (cli_signal_connect_fail) on the attached test conn. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_signal_connect_fail(mqvpn_client_t *c, int reason, int status)
 {
@@ -761,9 +750,7 @@ mqvpn_client_test_signal_connect_fail(mqvpn_client_t *c, int reason, int status)
 
 /* Test-only: drive the real cb_h3_conn_close platform-notify gate
  * (cli_notify_conn_closed) on the attached test conn. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_notify_conn_closed(mqvpn_client_t *c)
 {
@@ -772,9 +759,7 @@ mqvpn_client_test_notify_conn_closed(mqvpn_client_t *c)
     return 0;
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_conn_tunnel_ok(const mqvpn_client_t *c)
 {
@@ -782,9 +767,7 @@ mqvpn_client_test_conn_tunnel_ok(const mqvpn_client_t *c)
     return c->conn->tunnel_ok;
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_set_shutting_down(mqvpn_client_t *c, int v)
 {
@@ -797,9 +780,7 @@ mqvpn_client_test_set_shutting_down(mqvpn_client_t *c, int v)
  * (cli_connect_ip_scan_headers) on the attached test conn with a fabricated
  * header section of n (name, value) pairs. The xqc_http_headers_t is built
  * here so tests don't need xquic types. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_scan_headers(mqvpn_client_t *c, const char **names, const char **values,
                                int n)
@@ -823,9 +804,7 @@ mqvpn_client_test_scan_headers(mqvpn_client_t *c, const char **names, const char
     return 0;
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_conn_peer_reorder(const mqvpn_client_t *c)
 {
@@ -835,9 +814,7 @@ mqvpn_client_test_conn_peer_reorder(const mqvpn_client_t *c)
 
 /* Test-only: drive the real CONNECT-IP final-close handling
  * (cli_connect_ip_on_request_close) on the attached test conn. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_request_close_connect_ip(mqvpn_client_t *c)
 {
@@ -846,9 +823,7 @@ mqvpn_client_test_request_close_connect_ip(mqvpn_client_t *c)
     return 0;
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 uint64_t
 mqvpn_client_test_get_handshake_started_us(const mqvpn_client_t *c)
 {
@@ -856,9 +831,7 @@ mqvpn_client_test_get_handshake_started_us(const mqvpn_client_t *c)
     return c->handshake_started_us;
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_set_handshake_started_us(mqvpn_client_t *c, uint64_t us)
 {
@@ -867,9 +840,7 @@ mqvpn_client_test_set_handshake_started_us(mqvpn_client_t *c, uint64_t us)
     return 0;
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_handshake_stalled(const mqvpn_client_t *c, uint64_t now_us)
 {
@@ -877,9 +848,7 @@ mqvpn_client_test_handshake_stalled(const mqvpn_client_t *c, uint64_t now_us)
     return client_handshake_stalled(c, now_us) ? 1 : 0;
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_force_state(mqvpn_client_t *c, mqvpn_client_state_t s)
 {
@@ -895,9 +864,7 @@ mqvpn_client_test_force_state(mqvpn_client_t *c, mqvpn_client_state_t s)
  * transition table); these are NOT path_entry_t lifecycle fields, so no
  * LINT-ALLOW is required. Hidden from libmqvpn.so's dynamic export table
  * (not part of the public ABI). */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_force_established(mqvpn_client_t *c)
 {
@@ -907,14 +874,42 @@ mqvpn_client_test_force_established(mqvpn_client_t *c)
     return 0;
 }
 
+/* Test-only: kill the live connection through xquic's REAL local-close
+ * machinery WITHOUT the disconnect bookkeeping (shutting_down stays 0 and
+ * the state is not forced to CLOSED). The close notify then runs the same
+ * path as a peer/transport-initiated death — cli_conn_destroy plus the
+ * reconnect arming when enabled — leaving the path slots exactly as a
+ * genuine drop leaves them (stale). Exists because the QUIC idle timeout is
+ * a fixed 120 s (mqvpn_conn_settings.c), far beyond unit-test budgets.
+ * Hidden from libmqvpn.so's dynamic export table (not part of the public
+ * ABI). */
+MQVPN_INTERNAL
+int
+mqvpn_client_test_kill_conn(mqvpn_client_t *c)
+{
+    if (!c || !c->conn || !c->engine) return -1;
+    xqc_conn_close(c->engine, &c->conn->cid);
+    xqc_engine_main_logic(c->engine);
+    return 0;
+}
+
+/* Test-only: read the armed reconnect deadline (0 = disarmed). Lets tests
+ * pin the disarm-on-manual-connect / re-arm-on-failure contract without
+ * exposing the field publicly. Hidden from libmqvpn.so's dynamic export
+ * table (not part of the public ABI). */
+MQVPN_INTERNAL
+uint64_t
+mqvpn_client_test_get_reconnect_scheduled_us(const mqvpn_client_t *c)
+{
+    return c ? c->reconnect_scheduled_us : 0;
+}
+
 /* P1 test-only: seed c->next_wake_us — the xquic-requested wake that
  * mqvpn_client_get_interest starts `ms` from (normally set by
  * cb_set_event_timer). Lets a pure-function test observe whether the
  * Recovery timer block clamps or leaves the wake untouched. Hidden from
  * libmqvpn.so's dynamic export table (not part of the public ABI). */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_set_next_wake_us(mqvpn_client_t *c, uint64_t us)
 {
@@ -1292,28 +1287,57 @@ cb_write_mmsg_ex(uint64_t path_id, const struct iovec *msg_iov, unsigned int vle
 
 /* ─── TLS callbacks ─── */
 
+/* The name the server certificate must match: the configured TLS server
+ * name, or the server host when unset. Shared by the connect path (SNI) and
+ * the verifier callback so both sides agree on one name. */
+static const char *
+cli_effective_sni(const mqvpn_config_t *cfg)
+{
+    return cfg->tls_server_name[0] ? cfg->tls_server_name : cfg->server_host;
+}
+
+/* xquic hands us the chain the server presented (leaf first, DER). Reached
+ * on every handshake when a verifier is configured (APP_VERIFY): the verifier
+ * is the sole judge, and its rejection is the one TLS failure the platform
+ * hears about immediately, as MQVPN_ERR_TLS. Without a verifier, xquic's
+ * legacy path routes only an unknown issuer (X509 error 20) here; every
+ * other library-side rejection (self-signed, expired, hostname mismatch) is
+ * refused inside the library and never reaches this callback. Both are one
+ * class of failure — the library verifying — so both surface the same way:
+ * this site only logs and refuses, and the platform sees the plain
+ * connection close (MQVPN_ERR_CLOSED) after the drain, exactly like the
+ * rejections that never get here. Reporting error 20 alone as MQVPN_ERR_TLS
+ * would make the public reason depend on which X509 error the library hit.
+ * insecure never gets here: verify_mode is NONE and xquic installs no
+ * callback. An empty chain is rejected by the ssl library before this point.
+ * conn_user_data is always the cli_conn_t passed to xqc_h3_connect. */
 static int
 cb_cert_verify(const unsigned char *certs[], const size_t cert_len[], size_t certs_len,
                void *conn_user_data)
 {
     cli_conn_t *conn = (cli_conn_t *)conn_user_data;
     if (conn == NULL || conn->client == NULL) return -1;
-    if (conn->client->config.insecure) return 0;
+    mqvpn_client_t *c = conn->client;
+    const mqvpn_config_t *cfg = &c->config;
 
-    char error[256] = {0};
-    const char *hostname = conn->client->config.tls_server_name;
-    if (hostname == NULL || hostname[0] == '\0') {
-        hostname = conn->client->config.server_host;
+    if (cfg->cert_verify_fn) {
+        if (cfg->cert_verify_fn(certs, cert_len, certs_len, cli_effective_sni(cfg),
+                                cfg->cert_verify_ctx) == 0)
+            return 0;
+
+        LOG_E(c, "TLS certificate verification failed");
+        /* Tell the platform now, once, instead of after the 3-PTO drain that
+         * follows the handshake alert; the conn-close notify that comes later
+         * is gated by tunnel_notified. Runs inside xqc_engine_main_logic: the
+         * platform handler must not re-enter libmqvpn (documented on
+         * mqvpn_tunnel_closed_fn). */
+        cli_signal_connect_fail(conn, MQVPN_ERR_TLS, 0);
+        return -1;
     }
-    if (mqvpn_verify_cert_chain(certs, cert_len, certs_len, hostname, error,
-                                sizeof(error)) == 0) {
-        return 0;
-    }
-    /* Name the identity that was checked. It is either ServerName or the
-     * --server host, and which one it came from decides whether a mismatch is
-     * a misconfiguration or a real rejection. */
-    LOG_E(conn->client, "TLS certificate verification failed for '%s': %s", hostname,
-          error[0] ? error : "unknown error");
+
+    /* Library-side verification (no verifier): refuse and let the connection
+     * close report it, like every other library-side rejection. */
+    LOG_E(c, "TLS certificate verification failed");
     return -1;
 }
 
@@ -1379,12 +1403,14 @@ cli_classify_status(int status)
     }
 }
 
-/* Fire tunnel_closed exactly once for a CONNECT-IP request that failed BEFORE
- * establishment (observed non-200 status, or the tunnel stream closing before
- * 200). Notifies only — it does not abort the request in-core (cross-platform
- * full-stop and non-iOS reconnect-suppression are a documented follow-up);
- * iOS's onTunnelClosed turns this into a startTunnel throw, and the process
- * teardown that follows stops any reconnect on the iOS target. */
+/* Fire tunnel_closed(reason) exactly once per conn for a pre-establishment
+ * failure: a non-200 CONNECT-IP status, the tunnel stream closing before 200,
+ * or (TLS) the platform verifier rejecting the server certificate from inside
+ * the handshake. Notifies only — it does not abort the request in-core
+ * (cross-platform full-stop and non-iOS reconnect-suppression are a
+ * documented follow-up); iOS's onTunnelClosed turns this into a startTunnel
+ * throw, and the process teardown that follows stops any reconnect on the iOS
+ * target. */
 static void
 cli_signal_connect_fail(cli_conn_t *conn, mqvpn_error_t reason, int status_for_log)
 {
@@ -1392,8 +1418,13 @@ cli_signal_connect_fail(cli_conn_t *conn, mqvpn_error_t reason, int status_for_l
     if (conn->tunnel_notified) return; /* once (calloc-zeroed at conn start) */
     assert(!conn->tunnel_ok);          /* every caller gates on !tunnel_ok / non-200 */
     conn->tunnel_notified = 1;
-    LOG_W(c, "CONNECT-IP request failed (status=%d) -> tunnel_closed(%d)", status_for_log,
-          (int)reason);
+    /* "CONNECT-IP request failed" is an e2e marker (tests/test_e2e_wrong_psk.sh)
+     * and must keep printing once for the CONNECT-IP witnesses. A TLS
+     * rejection never sent a request, so it stays silent here — the verifier
+     * site already logged "TLS certificate verification failed". */
+    if (reason != MQVPN_ERR_TLS)
+        LOG_W(c, "CONNECT-IP request failed (status=%d) -> tunnel_closed(%d)",
+              status_for_log, (int)reason);
     if (c->cbs.tunnel_closed) c->cbs.tunnel_closed(reason, c->user_ctx);
 }
 
@@ -2020,9 +2051,9 @@ cli_connect_ip_on_body(cli_stream_t *stream, xqc_h3_request_t *h3_request)
         /* Hybrid: learn the tunnel subnet for the classifier's TCP-lane
          * exclusion. The full rationale (server ACL denies the tunnel
          * subnet unconditionally → lane could only RST; RAW keeps intra-VPN
-         * TCP working) and the /24 widening rule (with its wider-pool
-         * limitation) live on mqvpn_tunnel_subnet_learn and
-         * client_tunnel_subnet in classifier.h. Deliberately OUTSIDE the
+         * TCP working) and the v4 /24 and v6 /112 widening rules (with their pool-width
+         * limitations) live on mqvpn_tunnel_subnet_learn / mqvpn_tunnel_prefix6_effective
+         * and client_tunnel_subnet in classifier.h. Deliberately OUTSIDE the
          * MQVPN_HYBRID_TCP_LANE_ENABLED block: lane-less builds still
          * classify for counters and must report the same verdicts.
          * client_tunnel_subnet[0] is v4 (always learned here); [1] is the v6
@@ -2120,7 +2151,8 @@ cli_connect_ip_on_body(cli_stream_t *stream, xqc_h3_request_t *h3_request)
         info.mtu = tun_mtu;
         if (conn->addr6_assigned) {
             memcpy(info.assigned_ip6, conn->assigned_ip6, 16);
-            info.assigned_prefix6 = conn->assigned_prefix6;
+            info.assigned_prefix6 =
+                (uint8_t)mqvpn_tunnel_prefix6_effective(conn->assigned_prefix6);
             info.has_v6 = 1;
         }
 
@@ -2537,9 +2569,7 @@ cb_ready_to_create_path(const xqc_cid_t *cid, void *conn_user_data)
  * part of public ABI). The event chosen depends on current state — fresh
  * PENDING slots take ACTIVATE_REQUESTED, retry-armed slots (CREATE_WAIT /
  * DEGRADED) take RETRY_TIMER. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_apply_path_activation_failure(mqvpn_client_t *c, mqvpn_path_handle_t handle,
                                            uint64_t now_us)
@@ -2556,9 +2586,7 @@ mqvpn_client_apply_path_activation_failure(mqvpn_client_t *c, mqvpn_path_handle_
 
 /* Test-only wrapper: drives the permanent path-create failure path via
  * path_on_event(). Hidden from libmqvpn.so's dynamic export table. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_apply_path_create_permanent_failure(mqvpn_client_t *c,
                                                       mqvpn_path_handle_t handle)
@@ -2581,9 +2609,7 @@ mqvpn_client_test_apply_path_create_permanent_failure(mqvpn_client_t *c,
  * §7.1 visibility=hidden test wrapper: seed VALIDATING-shape invariants
  * directly so tests can pin transitions without spinning up xquic. Each
  * direct write carries a LINT-ALLOW trailer for check_lifecycle_field_writes.sh. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_force_validating(mqvpn_client_t *c, mqvpn_path_handle_t handle,
                                    uint64_t xqc_path_id)
@@ -2616,9 +2642,7 @@ mqvpn_client_test_force_validating(mqvpn_client_t *c, mqvpn_path_handle_t handle
  * xquic_path_live). Does NOT run path_invariant_check: it deliberately writes
  * a non-lifecycle-consistent shape to isolate the get_interest read path.
  * Hidden from libmqvpn.so's dynamic export table (not part of the public ABI). */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_set_path_stable_us(mqvpn_client_t *c, mqvpn_path_handle_t handle,
                                      uint64_t stable_since_us, int xquic_live)
@@ -2635,9 +2659,7 @@ mqvpn_client_test_set_path_stable_us(mqvpn_client_t *c, mqvpn_path_handle_t hand
  * path_on_event(XQUIC_REMOVED). Used by test_api to pin the
  * VALIDATING -> CREATE_WAIT dispatch without spinning up a live xquic
  * engine. Hidden from libmqvpn.so's dynamic export table. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_force_validating_then_remove(mqvpn_client_t *c,
                                                mqvpn_path_handle_t handle,
@@ -2656,9 +2678,7 @@ static int path_xquic_abandon_due(const path_entry_t *p);
 /* Test-only: expose the shared abandon-emission predicate by handle so tests
  * can pin that a live primary (xqc_path_id 0) is abandoned on removal.
  * Hidden from libmqvpn.so's dynamic export table. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_abandon_due(mqvpn_client_t *c, mqvpn_path_handle_t handle)
 {
@@ -2674,9 +2694,7 @@ mqvpn_client_test_abandon_due(mqvpn_client_t *c, mqvpn_path_handle_t handle)
  * Returns the lifecycle name (static string, never NULL on success), writes
  * recreate_retries to *out_retries. Returns NULL on bad input. Hidden from
  * libmqvpn.so's dynamic export table. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 const char *
 mqvpn_client_test_get_path_state_name(mqvpn_client_t *c, mqvpn_path_handle_t handle,
                                       int *out_retries)
@@ -2777,6 +2795,20 @@ mqvpn_check_scheduler_preconditions(mqvpn_scheduler_t scheduler, int n_paths)
 static int
 cli_start_connection(mqvpn_client_t *c)
 {
+    /* Invariant: starting requires no live connection. Every legitimate
+     * entry satisfies it — initial connect from IDLE never created one,
+     * and both reconnect entries (tick_reconnect, manual connect from
+     * RECONNECTING) run only after cb_h3_conn_close destroyed and NULLed
+     * c->conn. The reachable violation is a re-entrant lifecycle call: the
+     * pre-start slot reset fires path_event synchronously (documented
+     * contract), and an observer calling mqvpn_client_connect() from there
+     * would otherwise start a SECOND connection whose c->conn overwrite
+     * makes a later close notify free the wrong connection. Refuse instead. */
+    if (c->conn) {
+        LOG_W(c, "connection start refused: a connection already exists");
+        return -1;
+    }
+
     c->conn_id++;
     cli_conn_t *conn = calloc(1, sizeof(*conn));
     if (!conn) return -1;
@@ -2837,13 +2869,22 @@ cli_start_connection(mqvpn_client_t *c)
         }
     }
 
+    /* One owner of the certificate decision, readable from the config alone:
+     * insecure → none (xquic never calls cb_cert_verify); verifier → the
+     * platform, on every handshake (APP_VERIFY); otherwise the library's root
+     * store + hostname check. insecure must stay first: it takes precedence
+     * over a verifier (mqvpn_client_new warned about that). */
     xqc_conn_ssl_config_t ssl_cfg;
     memset(&ssl_cfg, 0, sizeof(ssl_cfg));
-    ssl_cfg.cert_verify_flag = c->config.insecure ? XQC_TLS_CERT_FLAG_ALLOW_SELF_SIGNED
-                                                  : XQC_TLS_CERT_FLAG_NEED_VERIFY;
+    if (c->config.insecure)
+        ssl_cfg.cert_verify_flag = XQC_TLS_CERT_FLAG_ALLOW_SELF_SIGNED;
+    else if (c->config.cert_verify_fn)
+        ssl_cfg.cert_verify_flag =
+            XQC_TLS_CERT_FLAG_NEED_VERIFY | XQC_TLS_CERT_FLAG_APP_VERIFY;
+    else
+        ssl_cfg.cert_verify_flag = XQC_TLS_CERT_FLAG_NEED_VERIFY;
 
-    const char *sni =
-        c->config.tls_server_name[0] ? c->config.tls_server_name : c->config.server_host;
+    const char *sni = cli_effective_sni(&c->config);
 
     const xqc_cid_t *cid =
         xqc_h3_connect(c->engine, &cs, NULL, 0, sni, 0, &ssl_cfg,
@@ -3047,6 +3088,13 @@ mqvpn_client_new(const mqvpn_config_t *cfg, const mqvpn_client_callbacks_t *cbs,
 
     client_init_handle(c, cfg, cbs, user_ctx);
 
+    /* insecure=1 means xquic never consults cert_verify_cb (verify_mode NONE),
+     * so a configured verifier is silently dead. Config is final here, so
+     * warn once at creation rather than on every (re)connect. */
+    if (c->config.insecure && c->config.cert_verify_fn)
+        LOG_W(c, "insecure=1 overrides the configured certificate verifier: "
+                 "the server certificate will not be checked");
+
 #ifdef MQVPN_HYBRID_TCP_LANE_ENABLED
     /* Load-time visibility for the lane's pcb-pool clamp: the value is
      * silently reduced at lane creation (by design — see tcp_lane.c), and
@@ -3132,8 +3180,36 @@ mqvpn_client_connect(mqvpn_client_t *c)
     if (!c) return MQVPN_ERR_INVALID_ARG;
     ASSERT_TICK_THREAD(c);
 
+    /* Re-entrancy fence: the reset/bootstrap below fire callbacks
+     * synchronously; a callback re-entering connect() mid-transaction must
+     * be refused (see the in_connect field comment). */
+    if (c->in_connect) {
+        LOG_W(c, "connect() re-entered from a client callback; rejected");
+        return MQVPN_ERR_INVALID_ARG;
+    }
+
     if (!mqvpn_state_transition_valid(c->state, MQVPN_STATE_CONNECTING))
         return MQVPN_ERR_INVALID_ARG;
+
+    c->in_connect = 1;
+
+    /* Manual re-establishment from RECONNECTING (the transition table's only
+     * other entry into CONNECTING): run the same pre-start reset the internal
+     * retry path (tick_reconnect) runs. The dead connection's slots still
+     * carry xquic-side bindings — xquic never fires path_removed_notify on
+     * conn destroy — plus stale ACTIVE/DEGRADED states and multipath_ready=1.
+     * Starting on them force-writes a DEGRADED primary to VALIDATING (Debug
+     * invariant abort) and leaves stale-ACTIVE secondaries permanently
+     * un-activatable (activate_pending_paths is PENDING-only: silent
+     * multipath loss). Also disarm the pending retry so tick_reconnect cannot
+     * start a second connection on top of this one; on start failure below
+     * the timer is re-armed, so a failed manual attempt cannot strand a
+     * RECONNECTING client with automatic retry disabled. */
+    int from_reconnecting = (c->state == MQVPN_STATE_RECONNECTING);
+    if (from_reconnecting) {
+        c->reconnect_scheduled_us = 0;
+        client_reset_paths_for_reconnect(c);
+    }
 
     /* Warn if the scheduler choice has unmet path-count preconditions.
      * This is a snapshot at connect time — adding a second path later via
@@ -3160,7 +3236,31 @@ mqvpn_client_connect(mqvpn_client_t *c)
     }
 #endif
 
-    if (cli_start_connection(c) < 0) return MQVPN_ERR_ENGINE;
+    int start_rc = cli_start_connection(c);
+    /* The unsafe window — slot reset + connection bootstrap — ends here.
+     * Callbacks fired below (reconnect_scheduled on failure, state_changed
+     * on success) observe committed, consistent state, so lifecycle calls
+     * from them are legitimate again: in particular an embedder cancelling
+     * the retry via disconnect() from reconnect_scheduled must keep
+     * working (it did before this fence existed). */
+    c->in_connect = 0;
+
+    if (start_rc < 0) {
+        /* Restore the automatic retry disarmed above — otherwise a failed
+         * manual attempt leaves a RECONNECTING client with a zero timer and
+         * tick_reconnect never fires again (permanent reconnect loss).
+         * Mirrors tick_reconnect's own failure handling. The state re-check
+         * skips the re-arm when a re-entrant connect() already moved the
+         * client to CONNECTING (a connection IS underway then). */
+        if (from_reconnecting && c->state == MQVPN_STATE_RECONNECTING) {
+            int delay = client_arm_reconnect_timer(c);
+            LOG_I(c, "manual reconnect failed, retrying in %ds (attempt %d)", delay,
+                  c->reconnect_attempts);
+            if (c->cbs.reconnect_scheduled)
+                c->cbs.reconnect_scheduled(delay, c->user_ctx);
+        }
+        return MQVPN_ERR_ENGINE;
+    }
 
     client_set_state(c, MQVPN_STATE_CONNECTING);
     /* Platform drives the engine via tick() — no main_logic here */
@@ -3172,6 +3272,15 @@ mqvpn_client_disconnect(mqvpn_client_t *c)
 {
     if (!c) return MQVPN_ERR_INVALID_ARG;
     ASSERT_TICK_THREAD(c);
+
+    /* Re-entrancy fence: disconnecting from inside a callback fired by an
+     * in-progress connect transaction would tear down mid-reset state
+     * (CLOSED->CONNECTING resurrection in release, transition assert in
+     * debug). Refused; disconnect after the connect call returns. */
+    if (c->in_connect) {
+        LOG_W(c, "disconnect() re-entered from a client callback; rejected");
+        return MQVPN_ERR_INVALID_ARG;
+    }
 
     if (c->state == MQVPN_STATE_CLOSED || c->state == MQVPN_STATE_IDLE) return MQVPN_OK;
 
@@ -3487,9 +3596,7 @@ mqvpn_client_reactivate_path(mqvpn_client_t *c, mqvpn_path_handle_t handle)
  * multipath_ready guard and the live activation call so tests can pin
  * the gate without a real engine/conn. Hidden from libmqvpn.so's
  * dynamic export table. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
+MQVPN_INTERNAL
 int
 mqvpn_client_test_reactivate_slot_eligible(mqvpn_client_t *c, mqvpn_path_handle_t handle)
 {
@@ -4003,10 +4110,20 @@ tick_reconnect(mqvpn_client_t *c)
     c->reconnect_scheduled_us = 0;
     LOG_I(c, "attempting reconnection (attempt %d)...", c->reconnect_attempts);
 
+    /* Same re-entrancy fence as mqvpn_client_connect(): the reset below
+     * fires callbacks synchronously, and a callback calling
+     * connect()/disconnect() mid-transaction must be refused. */
+    c->in_connect = 1;
+
     /* Reset path state for a fresh connection attempt. */
     client_reset_paths_for_reconnect(c);
 
-    if (cli_start_connection(c) < 0) {
+    int start_rc = cli_start_connection(c);
+    /* Unsafe window over (see mqvpn_client_connect): callbacks below run
+     * against committed state and may call lifecycle APIs again. */
+    c->in_connect = 0;
+
+    if (start_rc < 0) {
         int delay = client_arm_reconnect_timer(c);
         LOG_I(c, "reconnect failed, retrying in %ds (attempt %d)", delay,
               c->reconnect_attempts);

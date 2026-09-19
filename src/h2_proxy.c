@@ -24,6 +24,9 @@
 #define H2_DEFAULT_MAX_BUFFER      (1024u * 1024u)
 #define H2_MAX_RESPONSE_HEADERS    256u
 #define H2_MAX_HEADER_BYTES        (32u * 1024u)
+#define H2_QUIC_QUEUE_HIGH_WATER   (256u * 1024u)
+#define H2_QUIC_QUEUE_LOW_WATER    (128u * 1024u)
+#define H2_QUIC_SEND_CHUNK         (16u * 1024u)
 
 /* Proxy Protocol v2 constants */
 #define PROXY_PROTOCOL_V2_SIG       "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A"
@@ -65,6 +68,9 @@ struct h2_proxy_stream_s {
     int response_headers_informational;
     int response_status_seen;
     int response_started;
+    int response_blocked;
+    int backend_stream_closed;
+    size_t response_unconsumed;
     int closed;
     struct h2_proxy_stream_s *next;
 };
@@ -75,6 +81,7 @@ struct h2_backend_conn_s {
     nghttp2_session *session;
     uint64_t last_active;
     uint32_t stream_count;
+    uint32_t blocked_stream_count;
     int connected;
     int proxy_protocol_sent;
     uint8_t proxy_protocol_buf[128];
@@ -94,6 +101,7 @@ struct h2_proxy_s {
 
 static void backend_destroy(h2_backend_conn_t *conn);
 static int stream_flush_response(h2_proxy_stream_t *stream);
+static void stream_set_response_blocked(h2_proxy_stream_t *stream, int blocked);
 static int is_hop_by_hop(const uint8_t *name, size_t len, const uint8_t *value,
                          size_t value_len);
 static void proxy_log(h2_proxy_t *proxy, int level, const char *fmt, ...);
@@ -375,6 +383,7 @@ static void
 stream_detach_backend(h2_proxy_stream_t *stream)
 {
     if (!stream->backend_conn) return;
+    stream_set_response_blocked(stream, 0);
     if (stream->backend_conn->stream_count > 0) stream->backend_conn->stream_count--;
     stream->backend_conn = NULL;
     stream->backend_stream_id = -1;
@@ -401,7 +410,13 @@ stream_destroy(h2_proxy_stream_t *stream)
     if (!stream || stream->closed) return;
     stream->closed = 1;
     h2_proxy_t *proxy = stream->proxy;
-    if (stream->backend_conn && stream->backend_stream_id >= 0)
+    if (stream->backend_conn && stream->response_unconsumed > 0) {
+        (void)nghttp2_session_consume_connection(stream->backend_conn->session,
+                                                 stream->response_unconsumed);
+        stream->response_unconsumed = 0;
+    }
+    if (stream->backend_conn && stream->backend_stream_id >= 0 &&
+        !stream->backend_stream_closed)
         (void)nghttp2_session_set_stream_user_data(stream->backend_conn->session,
                                                    stream->backend_stream_id, NULL);
     h2_proxy_stream_t **link = &proxy->streams;
@@ -430,8 +445,40 @@ backend_update_interest(h2_backend_conn_t *conn)
     int want_write = !conn->connected ||
                      (conn->proxy_protocol_len > conn->proxy_protocol_off) ||
                      nghttp2_session_want_write(conn->session);
-    proxy->callbacks.register_fd(conn->fd, 1, want_write, conn,
-                                 proxy->callbacks.user_ctx);
+    proxy->callbacks.register_fd(conn->fd, conn->blocked_stream_count == 0, want_write,
+                                 conn, proxy->callbacks.user_ctx);
+}
+
+static void
+stream_set_response_blocked(h2_proxy_stream_t *stream, int blocked)
+{
+    if (!stream || !stream->backend_conn || stream->response_blocked == blocked) return;
+    h2_backend_conn_t *conn = stream->backend_conn;
+    stream->response_blocked = blocked;
+    if (blocked) {
+        conn->blocked_stream_count++;
+        (void)xqc_h3_request_set_write_notify(stream->h3_request, 1);
+    } else {
+        if (conn->blocked_stream_count > 0) conn->blocked_stream_count--;
+        (void)xqc_h3_request_set_write_notify(stream->h3_request, 0);
+    }
+    backend_update_interest(conn);
+}
+
+static int
+stream_consume_response(h2_proxy_stream_t *stream, size_t amount)
+{
+    if (amount == 0) return 0;
+    if (!stream->backend_conn || amount > stream->response_unconsumed) return -1;
+    int rc;
+    if (stream->backend_stream_closed)
+        rc = nghttp2_session_consume_connection(stream->backend_conn->session, amount);
+    else
+        rc = nghttp2_session_consume_stream(stream->backend_conn->session,
+                                            stream->backend_stream_id, amount);
+    if (rc != 0) return -1;
+    stream->response_unconsumed -= amount;
+    return 0;
 }
 
 static ssize_t
@@ -532,6 +579,7 @@ on_data_chunk_recv_callback(nghttp2_session *session, uint8_t flags, int32_t str
                       &stream->response_body_off, data, len,
                       stream->proxy->config.max_buffered_body) != 0)
         return NGHTTP2_ERR_CALLBACK_FAILURE;
+    stream->response_unconsumed += len;
     return stream_flush_response(stream) == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
 }
 
@@ -565,9 +613,23 @@ on_stream_close_callback(nghttp2_session *session, int32_t stream_id, uint32_t e
     (void)user_data;
     h2_proxy_stream_t *stream = stream_from_id(session, stream_id);
     if (!stream) return 0;
-    if (error_code != NGHTTP2_NO_ERROR && !stream->response_fin_sent)
-        xqc_h3_request_close(stream->h3_request);
-    stream_detach_backend(stream);
+    if (error_code != NGHTTP2_NO_ERROR) {
+        if (!stream->response_fin_sent) xqc_h3_request_close(stream->h3_request);
+        if (stream->response_unconsumed > 0) {
+            (void)nghttp2_session_consume_connection(session,
+                                                     stream->response_unconsumed);
+            stream->response_unconsumed = 0;
+        }
+        free(stream->response_body);
+        stream->response_body = NULL;
+        stream->response_body_off = stream->response_body_len = 0;
+        stream->backend_stream_closed = 1;
+        stream_detach_backend(stream);
+        return 0;
+    }
+    stream->backend_stream_closed = 1;
+    if (stream->response_unconsumed == 0 && stream->response_fin_sent)
+        stream_detach_backend(stream);
     return 0;
 }
 
@@ -603,7 +665,14 @@ backend_create(h2_proxy_t *proxy)
         callbacks, on_data_chunk_recv_callback);
     nghttp2_session_callbacks_set_on_stream_close_callback(callbacks,
                                                            on_stream_close_callback);
-    int session_rc = nghttp2_session_client_new(&conn->session, callbacks, conn);
+    nghttp2_option *option = NULL;
+    if (nghttp2_option_new(&option) != 0) {
+        nghttp2_session_callbacks_del(callbacks);
+        goto fail;
+    }
+    nghttp2_option_set_no_auto_window_update(option, 1);
+    int session_rc = nghttp2_session_client_new2(&conn->session, callbacks, conn, option);
+    nghttp2_option_del(option);
     nghttp2_session_callbacks_del(callbacks);
     if (session_rc != 0) goto fail;
 
@@ -664,7 +733,20 @@ backend_destroy(h2_backend_conn_t *conn)
 
     for (h2_proxy_stream_t *stream = proxy->streams; stream; stream = stream->next) {
         if (stream->backend_conn != conn) continue;
-        send_bad_gateway(stream);
+        if (stream->response_blocked) {
+            stream->response_blocked = 0;
+            (void)xqc_h3_request_set_write_notify(stream->h3_request, 0);
+        }
+        stream->response_unconsumed = 0;
+        free(stream->response_body);
+        stream->response_body = NULL;
+        stream->response_body_off = stream->response_body_len = 0;
+        response_headers_clear(stream);
+        if (stream->response_started && !stream->response_fin_sent)
+            xqc_h3_request_close(stream->h3_request);
+        else
+            send_bad_gateway(stream);
+        stream->backend_stream_closed = 1;
         stream->backend_conn = NULL;
         stream->backend_stream_id = -1;
     }
@@ -750,10 +832,33 @@ submit_request(h2_proxy_stream_t *stream, const xqc_http_headers_t *headers, int
     return 0;
 }
 
+static void
+apply_request_priority(h2_proxy_stream_t *stream, const xqc_http_headers_t *headers)
+{
+    for (size_t i = 0; i < headers->count; i++) {
+        const xqc_http_header_t *header = &headers->headers[i];
+        if (!header->name.iov_base || !header->value.iov_base ||
+            header->name.iov_len != sizeof("priority") - 1 ||
+            memcmp(header->name.iov_base, "priority", sizeof("priority") - 1) != 0)
+            continue;
+
+        xqc_h3_priority_t priority;
+        if (xqc_parse_http_priority(&priority, header->value.iov_base,
+                                    header->value.iov_len) == XQC_OK)
+            (void)xqc_h3_request_set_priority(stream->h3_request, &priority);
+        return;
+    }
+}
+
 static int
 stream_flush_response(h2_proxy_stream_t *stream)
 {
     if (!stream || stream->closed || stream->response_fin_sent) return 0;
+    if (xqc_h3_request_get_send_queue_bytes(stream->h3_request) >=
+        H2_QUIC_QUEUE_HIGH_WATER) {
+        stream_set_response_blocked(stream, 1);
+        return 0;
+    }
     size_t body_available = stream->response_body_len - stream->response_body_off;
 
     if (stream->response_headers_pending && !stream->response_headers_are_trailers) {
@@ -764,7 +869,10 @@ stream_flush_response(h2_proxy_stream_t *stream)
         };
         int fin = stream->response_eof && body_available == 0;
         ssize_t sent = xqc_h3_request_send_headers(stream->h3_request, &headers, fin);
-        if (sent == -XQC_EAGAIN) return 0;
+        if (sent == -XQC_EAGAIN) {
+            stream_set_response_blocked(stream, 1);
+            return 0;
+        }
         if (sent < 0) return -1;
         if (!stream->response_headers_informational) stream->response_started = 1;
         if (fin) stream->response_fin_sent = 1;
@@ -773,15 +881,26 @@ stream_flush_response(h2_proxy_stream_t *stream)
 
     body_available = stream->response_body_len - stream->response_body_off;
     while (body_available > 0) {
+        if (xqc_h3_request_get_send_queue_bytes(stream->h3_request) >=
+            H2_QUIC_QUEUE_HIGH_WATER) {
+            stream_set_response_blocked(stream, 1);
+            return 0;
+        }
+        size_t chunk = body_available;
+        if (chunk > H2_QUIC_SEND_CHUNK) chunk = H2_QUIC_SEND_CHUNK;
         int fin = stream->response_eof && !stream->response_headers_pending;
         ssize_t sent = xqc_h3_request_send_body(
-            stream->h3_request, stream->response_body + stream->response_body_off,
-            body_available, fin);
-        if (sent == -XQC_EAGAIN) return 0;
+            stream->h3_request, stream->response_body + stream->response_body_off, chunk,
+            fin && chunk == body_available);
+        if (sent == -XQC_EAGAIN) {
+            stream_set_response_blocked(stream, 1);
+            return 0;
+        }
         if (sent < 0) return -1;
         if (sent == 0) break;
         stream->response_body_off += (size_t)sent;
         body_available -= (size_t)sent;
+        if (stream_consume_response(stream, (size_t)sent) != 0) return -1;
         if (fin && body_available == 0) stream->response_fin_sent = 1;
     }
     if (stream->response_body_off == stream->response_body_len) {
@@ -799,7 +918,10 @@ stream_flush_response(h2_proxy_stream_t *stream)
         };
         ssize_t sent = xqc_h3_request_send_headers(stream->h3_request, &headers,
                                                    stream->response_eof);
-        if (sent == -XQC_EAGAIN) return 0;
+        if (sent == -XQC_EAGAIN) {
+            stream_set_response_blocked(stream, 1);
+            return 0;
+        }
         if (sent < 0) return -1;
         if (stream->response_eof) stream->response_fin_sent = 1;
         response_headers_clear(stream);
@@ -808,10 +930,16 @@ stream_flush_response(h2_proxy_stream_t *stream)
     if (stream->response_eof && !stream->response_fin_sent &&
         !stream->response_headers_pending && stream->response_body_len == 0) {
         ssize_t sent = xqc_h3_request_finish(stream->h3_request);
-        if (sent == -XQC_EAGAIN) return 0;
+        if (sent == -XQC_EAGAIN) {
+            stream_set_response_blocked(stream, 1);
+            return 0;
+        }
         if (sent < 0) return -1;
         stream->response_fin_sent = 1;
     }
+    if (stream->backend_stream_closed && stream->response_unconsumed == 0 &&
+        stream->response_fin_sent)
+        stream_detach_backend(stream);
     return 0;
 }
 
@@ -860,6 +988,8 @@ h2_proxy_handle_request(h2_proxy_t *proxy, xqc_h3_request_t *h3_request,
     h2_proxy_stream_t *stream = stream_create(proxy, h3_request, h3_stream_user_data);
     if (!stream) return NULL;
 
+    apply_request_priority(stream, headers);
+
     /* Store client address for Proxy Protocol */
     if (client_addr && client_addrlen <= sizeof(stream->client_addr)) {
         memcpy(&stream->client_addr, client_addr, client_addrlen);
@@ -906,6 +1036,13 @@ h2_proxy_on_h3_body(h2_proxy_stream_t *stream, const uint8_t *data, size_t len, 
 int
 h2_proxy_on_h3_writable(h2_proxy_stream_t *stream)
 {
+    if (!stream || stream->closed) return -1;
+    if (stream->response_blocked) {
+        if (xqc_h3_request_get_send_queue_bytes(stream->h3_request) >
+            H2_QUIC_QUEUE_LOW_WATER)
+            return 0;
+        stream_set_response_blocked(stream, 0);
+    }
     return stream_flush_response(stream);
 }
 
@@ -913,7 +1050,8 @@ void
 h2_proxy_on_h3_close(h2_proxy_stream_t *stream)
 {
     if (!stream || stream->closed) return;
-    if (stream->backend_conn && stream->backend_stream_id >= 0) {
+    if (stream->backend_conn && stream->backend_stream_id >= 0 &&
+        !stream->backend_stream_closed) {
         h2_backend_conn_t *conn = stream->backend_conn;
         (void)nghttp2_session_set_stream_user_data(conn->session,
                                                    stream->backend_stream_id, NULL);
@@ -979,6 +1117,7 @@ h2_proxy_on_backend_ready(h2_proxy_t *proxy, int fd, void *fd_ctx, int readable,
                 backend_fail(conn);
                 return;
             }
+            if (conn->blocked_stream_count > 0) break;
         }
     }
     if (conn->connected && (writable || readable) &&

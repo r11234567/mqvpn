@@ -10,10 +10,12 @@
         width="400">
     </picture>
   </h1>
+
   <p><b>All your connections. One stronger connection.</b></p>
+
   <p>
     <a href="https://docs.mqvpn.org/">Documentation</a> |
-    <a href="https://discord.gg/rjEqtBNtF">Discord community</a>
+    <a href="https://discord.gg/5rsqnZfBqu">Discord community</a>
   </p>
 </div>
 
@@ -70,39 +72,47 @@ https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
 ## Differences from upstream
 
 This repository is a fork of [mp0rta/mqvpn](https://github.com/mp0rta/mqvpn).
-Relative to upstream it adds a real client-side certificate check, SNI-based
-shared-port routing on the server, and post-quantum key exchange — plus the
-transport fixes those changes turned out to need before the end-to-end suite
-would pass. The transport fixes live in the pinned
-[xquic fork](https://github.com/r11234567/xquic), not in this tree.
+The table below is the merge index: it records what is still fork-only, what
+has been replaced by a stronger upstream design, and where each behavior is
+implemented and tested. Do not infer fork status from an old commit alone.
+
+| Area | Status | Implementation and verification |
+|---|---|---|
+| Client TLS ownership | **Upstream design + platform adapters** | Core uses upstream's config-scoped `mqvpn_config_set_cert_verifier()` and xquic `APP_VERIFY`; Windows uses CryptoAPI, Apple uses `SecTrust`, Android uses `X509TrustManager`, and Linux uses BoringSSL's configured default paths. See `src/platform/*/cert_verify_*`, `PlatformTrust.kt`, and `docs/client-certificate-verification.md`. |
+| ~~Global `cert_verify.c` fallback and Android `mqvpn_set_cert_trust_check()`~~ | ~~Fork-only~~ **Synchronized with upstream; removed** | The old process-global hook and “library failure, then platform fallback” path were deleted. Verification now has one owner per handshake. |
+| ~~mqvpn-side replacement of all BoringSSL chain/hostname checks~~ | ~~Fork-only~~ **Synchronized with upstream; removed** | Linux delegates to xquic/BoringSSL. Platforms whose trust stores are not filesystem bundles explicitly install an application verifier. |
+| Shared UDP-port routing | **Fork-only** | QUIC v1/v2 Initial SNI inspection, raw QUIC fallback, and H3-to-h2c translation live in `src/sni_router.c` and `src/h2_proxy.c`; protocol tests are `tests/test_sni_router.c` and `tests/test_h2_proxy.c`. |
+| H3-to-h2c backpressure and Priority | **Fork-only, requires pinned xquic API** | 256/128 KiB connection queue watermarks pause/resume h2c reads, nghttp2 credit follows bytes accepted by xquic, and RFC 9218 `Priority` maps to the H3 stream. xquic supplies queue-byte/write-notify APIs and an urgent packet queue. |
+| Android native logs | **Fork-only, retained** | JNI Logcat output, `onNativeLog`, and the app log view are intentionally retained across upstream syncs; see `docs/logging.md`. |
+| Hybrid TCP lane, reorder buffering, multipath recovery, route/killswitch hardening | **Fork-only** | Indexed by their public config sections below and covered by the corresponding `tests/test_*`, `scripts/ci_e2e/*`, and platform routing tests. |
+| ~~xquic var-buffer underflow and submatrix overflow patch files~~ | ~~Local patch stack~~ **Synchronized into the pinned xquic fork** | Replaced by xquic commit `2ae918c`; the obsolete duplicate patch hunks must not be restored. |
+| ~~xquic active_connection_id_limit backport~~ | ~~`patches/xquic/0001-*`~~ **Synchronized upstream; local patch removed** | The new xquic pin already contains the exact RFC 9000 peer-CID accounting fix, confirmed by reverse-applying the former patch. |
+| xquic parser/allocation CodeQL hardening | **Local patch retained** | `patches/xquic/0002-*` still applies cleanly and covers null checks, bounds checks, and failure cleanup not present in the pin. |
+| xquic STREAM multipath scheduling | **Local patch retained** | `patches/xquic/0003-*` keeps stream packets on WLB's unpinned per-packet path so the hybrid TCP lane can aggregate links. |
+| xquic Retry sizing, PMTU, receive-buffer, WLB and TLS hardening | **Pinned xquic fork** | The detailed commit-to-fix map remains in [End-to-end fixes carried in the pinned xquic](#end-to-end-fixes-carried-in-the-pinned-xquic). |
+| Rolling binaries from `main` | **Fork-only** | `.github/workflows/release.yml` updates the `snapshot` prerelease only after Linux, macOS, Windows, and Android builds succeed; tagged releases remain immutable. |
 
 ### Client certificate verification against the OS trust store
 
-Upstream hands the decision to xquic/BoringSSL and collapses it into one flag:
-`cb_cert_verify` returns success when `--insecure` is set and failure otherwise,
-building no chain and checking no hostname of its own. This fork verifies the
-chain itself in `src/cert_verify.c`, against the platform's own trust store:
+The core now follows upstream's verifier ownership model. With no callback,
+xquic/BoringSSL verifies the chain and hostname. With a callback, `APP_VERIFY`
+makes that callback the sole decision maker; there is no retry or fallback after
+a failed library check. `--insecure` is the only bypass.
 
-- **Windows** — `CertGetCertificateChain` and
-  `CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL)` against the native
-  certificate store (linked via `crypt32`).
-- **Android** — the framework's own `X509TrustManager`, reached through
-  `mqvpn_set_cert_trust_check`. Nothing else works there: Android's CA store is
-  at none of the paths BoringSSL compiles in, it moved into an updatable APEX in
-  Android 14, and user-installed CAs are only reachable through the framework.
-- **Other POSIX** — the default CA paths of the bundled OpenSSL-compatible X.509
-  implementation. Packagers must make those paths resolvable on the target.
+- **Linux** installs no callback and uses BoringSSL's default CA file/directory
+  (`SSL_CERT_FILE` and `SSL_CERT_DIR` can override them).
+- **Windows** installs a config-scoped CryptoAPI verifier using
+  `CertGetCertificateChain` and `CERT_CHAIN_POLICY_SSL`.
+- **macOS and iOS** install a config-scoped `SecTrust` verifier with an SSL
+  policy bound to the effective server name.
+- **Android** installs a config-scoped JNI verifier. The framework validates
+  the chain using `X509TrustManager`; the leaf must also match a DNS or IP SAN.
 
-Every path checks expiry, chaining to a trusted root, and that the certificate
-identity matches the hostname, and every one reports *why* a handshake was
-refused rather than failing opaquely. Verification is on by default, and
-`--insecure` is an explicit opt-out that logs a warning for as long as it is
-active.
-
-The identity check is shared rather than per-platform, so all of them agree on
-which names a certificate may speak for. An IP literal is matched against the
-certificate's `iPAddress` SANs, and a DNS name against its `dNSName` SANs; the
-deprecated commonName is never accepted as an identity.
+All callback paths receive the same effective name used for SNI: `ServerName`
+when configured, otherwise the host part of `Address`. The old process-global
+Android hook and shared `src/cert_verify.c` implementation are deliberately
+gone because they allowed verification ownership to vary depending on which
+BoringSSL error happened first.
 
 ```ini
 # /etc/mqvpn/client.conf
@@ -379,12 +389,15 @@ the first place.
 ### End-to-end fixes carried in the pinned xquic
 
 `third_party/xquic` is pinned at
-[`4de3bb8`](https://github.com/r11234567/xquic/commit/4de3bb8). Enabling the
+[`6969d22`](https://github.com/r11234567/xquic/commit/6969d223058187a961a2d0657d99109841470688).
+Enabling the
 features above exposed transport bugs that the e2e suite caught and that had to
 be fixed in xquic rather than here:
 
 | xquic commit | What it fixes |
 |---|---|
+| [6969d22](https://github.com/r11234567/xquic/commit/6969d223058187a961a2d0657d99109841470688) | **H3 proxy backpressure and RFC 9218 urgency.** Adds a public connection send-queue byte estimate and retained write notification so mqvpn can pause h2c reads at 256 KiB and resume at 128 KiB. Urgency 0/1 packets use a congestion-controlled urgent queue ahead of bulk application data. Retry, 0-RTT rejection, packet drop, stream close and connection destruction clean up or migrate that queue. The bounded `Priority` parser no longer reads past non-NUL-terminated header slices. |
+| [11ceb3a](https://github.com/r11234567/xquic/commit/11ceb3a4f8fe9e189dc8213d3d8758fb5967191f) | **Alibaba protocol/security sync plus mqvpn-main TLS fixes.** Pulls the useful upstream transport, HTTP/3, parser, allocation and test hardening into this fork while retaining its multipath fixes. It also provides the config-scoped `APP_VERIFY` ownership used here: platform callbacks receive the presented DER chain and are the sole verifier, while clients without a callback use BoringSSL's chain and hostname verification with default trust paths. |
 | [4de3bb8](https://github.com/r11234567/xquic/commit/4de3bb8) | **WLB pinned flows by deficit, which is downstream of its own traffic.** Measured on two identical unshaped legs: pins 2:13, 12:3, 8:43, and weights 2.4x-10.4x apart. Deficit derives from the LATE weight, the weight from cwnd, and cwnd from the traffic the scheduler already put there, so pinning to it closed a loop. Pins now go to the path furthest below its weight-entitled share of flows. Does not change throughput -- see [the scheduler numbers](#what-the-scheduler-numbers-still-do-not-explain). |
 | [e1abe04](https://github.com/r11234567/xquic/commit/e1abe04) · [77ede10](https://github.com/r11234567/xquic/commit/77ede10) · [54f98ef](https://github.com/r11234567/xquic/commit/54f98ef) | **The WLB counters emitted nothing**, so the first instrumented netsim run came back with `wlb_instr: no_lines` on all 22 rows. They were logged at xquic INFO, and mqvpn deliberately maps its own INFO to xquic WARN to keep per-packet traffic out of the log, so xquic's own filter dropped the line before the callback. Moved to the REPORT statistics channel, which passes any level — and `77ede10` then had to give the unit-test fixture logs a callback sink, since REPORT is level 0 and so passes their filter too, where `xqc_log_implement()` dereferenced their NULL `log_callbacks`. And `54f98ef` fixed the last reason they stayed empty: `%lld` is not a specifier xquic's own `xqc_vsprintf` knows, so the line rendered `deficit:19ld|` and the parser matched nothing. Do not bisect onto `e1abe04` or `77ede10` alone. |
 | [bcb7381](https://github.com/r11234567/xquic/commit/bcb7381) | **A converged PMTU search never reopened**, so a path MTU that *grew* mid-connection was never found and a long-lived connection kept the size it first settled on. Convergence now rearms the probing timer as RFC 8899 §5.3's PMTU_RAISE_TIMER (600 s). The reopen raises only the search's ceiling, not the size in use, so it costs probe packets and no throughput. Also fixes an error-code collision: `XQC_EAEAD_LIMIT` shared the value 623 with `XQC_ESTREAM_NFOUND`, so an AEAD-integrity-limit close and a stream-not-found were indistinguishable to a caller comparing codes. |
@@ -458,7 +471,7 @@ curl -fsSL https://github.com/mp0rta/mqvpn/releases/latest/download/install.sh \
     | sudo bash -s -- --start
 ```
 
-> **Note:** The self-signed certificate requires `--insecure` on the client. For production, replace with a trusted certificate (e.g. Let's Encrypt) and omit `--insecure`.
+> **Note:** The self-signed certificate requires `--insecure` on the client. For production, replace with a trusted certificate (e.g. Let's Encrypt) and omit `--insecure`. Point `--cert` (or `Cert` / `cert_file` in a config file) at the full chain file (for Let's Encrypt, `fullchain.pem`): clients do not fetch missing intermediates.
 
 Options can be combined:
 
@@ -1303,7 +1316,7 @@ mqvpn is designed to comply with the following RFCs as much as possible.
 
 ## Community
 
-Welcome to join the [mqvpn community on Discord](https://discord.gg/rjEqtBNtF) to ask questions, discuss use cases, share feedback, and contribute to the project.
+Welcome to join the [mqvpn community on Discord](https://discord.gg/5rsqnZfBqu) to ask questions, discuss use cases, share feedback, and contribute to the project.
 
 ## Disclaimer
 

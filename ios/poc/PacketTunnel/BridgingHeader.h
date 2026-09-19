@@ -5,6 +5,7 @@
 #define MQVPN_POC_BRIDGING_H
 #include <libmqvpn.h>
 #include "mqvpn_clock_shim.h"
+#include "platform/darwin/cert_verify_apple.h"
 
 // Internal reorder stats API. reorder.h supplies mqvpn_reorder_stats_t + the
 // percentile helpers; mqvpn_client_get_reorder_stats is internal but linkable

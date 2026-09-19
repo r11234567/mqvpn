@@ -62,6 +62,11 @@ jobs:
                 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
           make -j$(nproc) ssl crypto
 
+      # Deliberately not gated on the cache miss: a cache restored from before
+      # the CMAKE_BUILD_TYPE fix is exactly what this is meant to catch.
+      - name: Verify BoringSSL is an optimized build
+        run: bash scripts/ci_check_bssl_optimized.sh third_party/xquic/third_party/boringssl/build
+
       - name: Cache xquic (Release)
         id: xquic-cache
         uses: actions/cache@v6
@@ -103,6 +108,6 @@ jobs:
           make -j$(nproc)
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v4.37.3
+        uses: github/codeql-action/analyze@v4.38.0
         with:
           category: "/language:c-cpp"

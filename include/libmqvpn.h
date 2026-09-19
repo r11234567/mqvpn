@@ -47,7 +47,17 @@ extern "C" {
 
 /* ─── Capacity constants ─── */
 
-#define MQVPN_MAX_USERS            64
+#define MQVPN_MAX_USERS 64
+/* ABI-FROZEN — do not bump. MQVPN_MAX_PATHS is baked into the layout of
+ * public structs (mqvpn_client_info_t embeds paths[MQVPN_MAX_PATHS] by
+ * value), and the library fills that array bounded by ITS OWN compiled-in
+ * value: a caller built against an older header linked to a newer .so
+ * with a larger value would take an out-of-bounds write past its
+ * caller-provided storage (stack or heap).
+ * If more path headroom is ever needed, add a caller-bounded paginated
+ * API instead (mqvpn_client_get_paths already takes max_paths and is the
+ * model to follow). Enforced: tests/test_xquic_abi_pin.c pins this value
+ * at compile time, so a bump cannot build without meeting this comment. */
 #define MQVPN_MAX_PATHS            8
 #define MQVPN_INIT_MAX_PATH_ID_MAX UINT64_C(0xffffffff)
 
@@ -203,7 +213,7 @@ MQVPN_API const char *mqvpn_path_status_string(mqvpn_path_status_t status);
  * sync transient failure. Platform recovery (RTM_NEWLINK after a
  * carrier-loss drop_path) needs this distinction to avoid rolling back
  * a successful activation and burning xqc path_id budget — see
- * platform_linux::try_readd_removed_path().
+ * netmon_try_readd_removed_path() (src/platform/posix/netmon_common.c).
  */
 typedef enum {
     MQVPN_ADD_PATH_OK = 0,
@@ -259,6 +269,12 @@ typedef struct {
     uint8_t server_prefix;
     int mtu;
     uint8_t assigned_ip6[16]; /* IPv6 tunnel IP (all-zero = none) */
+    /* Prefix to configure on the TUN for assigned_ip6. Client: derived locally
+     * (a well-formed wire prefix is widened to at most /112 so the tunnel
+     * subnet stays on-link; a malformed prefix > 128 passes through unchanged)
+     * — not the wire ADDRESS_ASSIGN prefix, which is this client's own /128.
+     * Server: the pool prefix, both for its own TUN (tunnel_config_ready) and
+     * in on_client_connected. */
     uint8_t assigned_prefix6;
     int has_v6; /* 1 = IPv6 assigned */
 } mqvpn_tunnel_info_t;
@@ -379,6 +395,9 @@ typedef void (*mqvpn_send_packet_fn)(mqvpn_path_handle_t path, const uint8_t *pk
                                      size_t len, const struct sockaddr *peer,
                                      socklen_t peer_len, void *user_ctx);
 
+/* May be invoked synchronously from inside the TLS handshake (certificate
+ * rejected by the platform verifier) on the thread that drives tick(); the
+ * handler must not re-enter libmqvpn. */
 typedef void (*mqvpn_tunnel_closed_fn)(mqvpn_error_t reason, void *user_ctx);
 
 typedef void (*mqvpn_ready_for_tun_fn)(void *user_ctx);
@@ -643,6 +662,35 @@ typedef uint64_t (*mqvpn_clock_fn)(void *ctx);
 MQVPN_API int mqvpn_config_set_clock(mqvpn_config_t *cfg, mqvpn_clock_fn clock_fn,
                                      void *clock_ctx);
 
+/* Client only. Platform certificate verifier. 0 = trusted, nonzero = reject.
+ * certs[0] is the leaf; every entry is DER, in the order the server
+ * presented them. hostname is the name the chain must match: the TLS server
+ * name, or the server host when none is set; hostname may be an IP literal
+ * when the server is configured by address. Called synchronously on every
+ * full TLS handshake, on the thread that drives tick(); it must not re-enter
+ * libmqvpn. A resumed TLS 1.3 session would reuse the original decision
+ * without calling it again (the client does not feed session tickets back
+ * today, so every handshake is a full one). When set, the verifier is the
+ * sole judge of chain and hostname — the library's root store is not
+ * consulted. When unset, the library verifies against its default root
+ * paths (by default /etc/ssl/cert.pem and /etc/ssl/certs from the
+ * build-time OPENSSLDIR, overridable with SSL_CERT_FILE / SSL_CERT_DIR; on
+ * macOS that is the system-provided bundle, not the Keychain). Platforms
+ * without an OS bundle at those paths (Windows, Android) must install a
+ * verifier or set SSL_CERT_FILE; without one, every CA-signed chain is
+ * rejected there. A library-side rejection (unknown issuer, self-signed,
+ * expired, hostname mismatch) surfaces as the plain connection close,
+ * tunnel_closed(MQVPN_ERR_CLOSED); only a verifier's rejection is reported
+ * as MQVPN_ERR_TLS. insecure=1
+ * takes precedence over a verifier (a WARN is logged at client creation).
+ * Passing fn=NULL restores library-side verification (ctx is ignored). ctx
+ * must stay valid until the client is destroyed (the config is copied at
+ * client creation). */
+typedef int (*mqvpn_cert_verify_fn)(const uint8_t *const certs[], const size_t cert_len[],
+                                    size_t n_certs, const char *hostname, void *ctx);
+MQVPN_API int mqvpn_config_set_cert_verifier(mqvpn_config_t *cfg, mqvpn_cert_verify_fn fn,
+                                             void *ctx);
+
 /* Server-only config */
 MQVPN_API int mqvpn_config_set_listen(mqvpn_config_t *cfg, const char *addr, int port);
 MQVPN_API int mqvpn_config_set_subnet(mqvpn_config_t *cfg, const char *cidr);
@@ -683,6 +731,17 @@ MQVPN_API mqvpn_client_t *mqvpn_client_new(const mqvpn_config_t *cfg,
  * handle afterwards. */
 MQVPN_API void mqvpn_client_destroy(mqvpn_client_t *client);
 
+/* Start (or, from RECONNECTING, immediately restart) the connection.
+ * Calling from RECONNECTING runs the same pre-start path reset as the
+ * internal retry and replaces the pending automatic attempt; on failure the
+ * automatic retry is re-armed. RE-ENTRANCY: the call fires callbacks
+ * synchronously (path_event during the pre-start reset;
+ * reconnect_scheduled on a failed start; state_changed on success).
+ * connect()/disconnect() called from a callback while the reset/bootstrap
+ * section is still in progress return MQVPN_ERR_INVALID_ARG; callbacks
+ * fired after the outcome is committed (reconnect_scheduled,
+ * state_changed) may call them normally — e.g. cancelling further retries
+ * via disconnect() from reconnect_scheduled is supported. */
 MQVPN_API int mqvpn_client_connect(mqvpn_client_t *client);
 MQVPN_API int mqvpn_client_disconnect(mqvpn_client_t *client);
 

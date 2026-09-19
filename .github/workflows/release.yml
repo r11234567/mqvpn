@@ -2,8 +2,13 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
   workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 # Actions in this workflow — and in android-repro.yml, which it calls — are
 # pinned to commit SHAs with the version in a trailing comment; ci.yml
@@ -382,16 +387,41 @@ jobs:
           cd third_party/xquic/third_party/boringssl
           mkdir build
           cd build
-          # OPENSSL_NO_ASM=1 on ARM64: works around BoringSSL CMake bug at
-          # the pinned commit that mis-routes ASM source selection on
-          # Windows ARM64 (pulls in x86_64-apple obj → LNK1181). Trade-off:
-          # ARM64 falls back to C crypto, measurably slower than amd64 for
-          # AES-GCM / SHA. Revisit when bumping the BoringSSL submodule pin.
+          # OPENSSL_NO_ASM=1 on ARM64: BoringSSL ships its AArch64 assembly
+          # as .S files that only clang-cl can assemble; with the Visual
+          # Studio generator + cl.exe the ASM source selection breaks (pulled
+          # in an x86_64-apple obj → LNK1181), so ARM64 runs constant-time C
+          # crypto, roughly 10x slower per byte than the asm path. Accepted:
+          # Windows ARM64 has no known users. Fixing it means building
+          # BoringSSL with Ninja + clang-cl for this arch, not a pin bump.
+          # scripts/ci_check_bssl_optimized.sh would fail on this archive
+          # and is deliberately not wired for Windows.
+          # CMAKE_BUILD_TYPE is ignored by the multi-config generator for
+          # build selection (that is --config below) but BoringSSL's own
+          # CMakeLists still reads it: left empty, its `NOT ... MATCHES "rel"`
+          # guard compiles BORINGSSL_DISPATCH_TEST instrumentation into an
+          # otherwise /O2 build. Same fix as the Linux jobs.
           cmake -G "Visual Studio 17 2022" -A ${{ matrix.arch == 'amd64' && 'x64' || 'ARM64' }} `
             -DBUILD_SHARED_LIBS=0 `
+            -DCMAKE_BUILD_TYPE=Release `
             ${{ matrix.arch == 'arm64' && '-DOPENSSL_NO_ASM=1' || '' }} ..
           cmake --build . --target ssl --config Release
           cmake --build . --target crypto --config Release
+
+      # amd64 only: arm64 is NO_ASM by decision (see above) and would fail
+      # the assembly check. The runner image ships LLVM and MinGW binutils;
+      # either reads the COFF archive, and we fail loudly if neither is on
+      # PATH rather than skip the gate.
+      - name: Verify BoringSSL is an optimized build (Windows amd64)
+        if: matrix.os == 'windows' && matrix.arch == 'amd64'
+        shell: bash
+        run: |
+          NM="$(command -v llvm-nm || command -v nm || true)"
+          if [ -z "$NM" ]; then
+            echo "ERROR: neither llvm-nm nor nm on PATH — cannot verify BoringSSL" >&2
+            exit 1
+          fi
+          NM="$NM" bash scripts/ci_check_bssl_optimized.sh third_party/xquic/third_party/boringssl/build
 
       - name: Build xquic (Windows)
         if: matrix.os == 'windows'
@@ -602,6 +632,15 @@ jobs:
         run: |
           scripts/build_android.sh --abi arm64-v8a --ndk "${{ steps.ndk.outputs.ndk_path }}"
 
+      # The NDK toolchain supplies -O3 for Release and BoringSSL enables its
+      # AArch64 assembly by default; neither is spelled out in
+      # build_android.sh, so check the archive rather than trust the defaults.
+      # llvm-nm from the NDK reads the aarch64 archive regardless of host nm.
+      - name: Verify BoringSSL (arm64-v8a) is an optimized build
+        run: |
+          NM="${{ steps.ndk.outputs.ndk_path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+            bash scripts/ci_check_bssl_optimized.sh build-android/arm64-v8a/boringssl
+
       - name: Verify prebuilt libraries
         run: |
           for lib in libmqvpn.a libxquic.a libssl.a libcrypto.a liblwip_core.a; do
@@ -610,13 +649,13 @@ jobs:
           done
 
       - name: Set up JDK 21
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: 21
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6
 
       # Stage license texts as assets/ before APK build. Android Gradle Plugin
       # auto-includes src/main/assets/ in the produced APK. Required by
@@ -638,8 +677,8 @@ jobs:
       - name: Verify license assets in APK
         run: |
           set -e
-          apk=$(ls mqvpn_*_android.apk)
           expected=5
+          apk=$(ls mqvpn_*_android.apk)
           found=$(unzip -l "$apk" \
                   | grep -cE 'assets/(LICENSE|NOTICE|third-party/(xquic|boringssl|lwip)\.txt)$' \
                   || true)
@@ -648,7 +687,6 @@ jobs:
             unzip -l "$apk" | grep -E 'assets/' || echo "  (none found)"
             exit 1
           fi
-
       - name: Upload Android artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -727,7 +765,7 @@ jobs:
         # Signs Sigstore provenance (SLSA) for every released binary artifact.
         # Users verify with:
         #   gh attestation verify <file> --owner mp0rta
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: |
             artifacts/mqvpn_*.tar.gz
@@ -765,3 +803,61 @@ jobs:
             scripts/install.sh \
             LICENSE \
             NOTICE
+
+  publish-snapshot:
+    if: github.ref == 'refs/heads/main'
+    needs: [build-release, build-android]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          shopt -s nullglob
+          files=(mqvpn_*.tar.gz mqvpn_*.deb mqvpn_*.zip mqvpn_*_android.apk)
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no snapshot artifacts"; exit 1; }
+          sha256sum "${files[@]}" > SHA256SUMS
+
+      - name: Publish rolling snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          [ "$latest" = "$GITHUB_SHA" ] || {
+            echo "main advanced to $latest; refusing to publish stale snapshot $GITHUB_SHA"
+            exit 0
+          }
+
+          short_sha=${GITHUB_SHA:0:12}
+          if gh release view snapshot >/dev/null 2>&1; then
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/git/refs/tags/snapshot" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+            gh release edit snapshot \
+              --title "mqvpn snapshot ($short_sha)" \
+              --notes "Automated prerelease from main at $GITHUB_SHA. Assets are replaced after every successful main build." \
+              --prerelease
+          else
+            gh release create snapshot \
+              --target "$GITHUB_SHA" \
+              --title "mqvpn snapshot ($short_sha)" \
+              --notes "Automated prerelease from main at $GITHUB_SHA. Assets are replaced after every successful main build." \
+              --prerelease
+          fi
+
+          shopt -s nullglob
+          assets=(artifacts/mqvpn_*.tar.gz artifacts/mqvpn_*.deb \
+                  artifacts/mqvpn_*.zip artifacts/mqvpn_*_android.apk \
+                  artifacts/SHA256SUMS scripts/install.sh LICENSE NOTICE)
+          gh release upload snapshot --clobber "${assets[@]}"

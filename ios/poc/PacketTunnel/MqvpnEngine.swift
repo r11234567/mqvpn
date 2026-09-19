@@ -94,6 +94,9 @@ final class MqvpnEngine: NSObject {
         if !server.serverName.isEmpty {
             mqvpn_config_set_tls_server_name(cfg, server.serverName)
         }
+        if !server.insecure {
+            mqvpn_apple_configure_cert_verifier(cfg)
+        }
         mqvpn_config_set_clock(cfg, mqvpn_ios_clock_us, nil)
         if !server.authKey.isEmpty { mqvpn_config_set_auth_key(cfg, server.authKey) }
         if server.insecure { mqvpn_config_set_insecure(cfg, 1) }
