@@ -108,7 +108,7 @@ void win_cleanup_routes(platform_win_ctx_t *p);
 
 /* firewall.c */
 int win_setup_killswitch(platform_win_ctx_t *p);
-void win_cleanup_killswitch(platform_win_ctx_t *p);
+int win_cleanup_killswitch(platform_win_ctx_t *p);
 
 /* dns.c */
 int win_setup_dns(platform_win_ctx_t *p);

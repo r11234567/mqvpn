@@ -586,6 +586,28 @@ if(BUILD_TESTING)
         ${CMAKE_SOURCE_DIR}/src/platform/windows)
     target_link_libraries(test_platform_cert_verify PRIVATE crypt32)
     add_test(NAME test_platform_cert_verify COMMAND test_platform_cert_verify)
+
+    # Includes firewall.c directly so the cleanup-only WFP entry points can
+    # be replaced with deterministic fakes while the remaining setup symbols
+    # continue to compile and link against the Windows SDK.
+    add_executable(test_windows_firewall tests/test_windows_firewall.c src/log.c)
+    target_include_directories(test_windows_firewall PRIVATE
+        ${EVENT_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/platform/windows
+        ${WINTUN_INCLUDE_DIR})
+    target_link_libraries(test_windows_firewall PRIVATE
+        ws2_32 iphlpapi fwpuclnt ole32)
+    if(Libevent_FOUND)
+        target_link_libraries(test_windows_firewall PRIVATE libevent::core)
+    endif()
+    if(MSVC)
+        target_compile_options(test_windows_firewall PRIVATE /WX /utf-8)
+        target_compile_definitions(test_windows_firewall PRIVATE
+            _CRT_SECURE_NO_WARNINGS)
+    endif()
+    add_test(NAME test_windows_firewall COMMAND test_windows_firewall)
 endif()
 
 elseif(APPLE)

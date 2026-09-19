@@ -10,7 +10,9 @@
  *   - Traffic to the VPN server (UDP on original interface)
  *   - Traffic on the TUN (Wintun) interface
  *
- * All filters are added under a single sublayer so cleanup is atomic.
+ * All filters are added under a single dynamic WFP session and sublayer.
+ * Closing the engine is the crash-safety backstop; normal cleanup still
+ * deletes filters explicitly before deleting their referenced sublayer.
  */
 
 #ifdef _WIN32
@@ -197,6 +199,14 @@ wfp_add_block_all(platform_win_ctx_t *p)
 
 /* ── Public API ── */
 
+static void
+wfp_init_dynamic_session(FWPM_SESSION0 *session)
+{
+    memset(session, 0, sizeof(*session));
+    session->displayData.name = L"mqvpn dynamic WFP session";
+    session->flags = FWPM_SESSION_FLAG_DYNAMIC;
+}
+
 int
 win_setup_killswitch(platform_win_ctx_t *p)
 {
@@ -204,8 +214,12 @@ win_setup_killswitch(platform_win_ctx_t *p)
 
     DWORD err;
 
-    /* Open WFP engine */
-    err = FwpmEngineOpen0(NULL, RPC_C_AUTHN_DEFAULT, NULL, NULL, &p->wfp_engine);
+    /* A dynamic session makes every object created through this engine
+     * lifetime-bound to the handle. If mqvpn crashes or normal cleanup is
+     * interrupted, BFE removes the filters when the handle closes. */
+    FWPM_SESSION0 session;
+    wfp_init_dynamic_session(&session);
+    err = FwpmEngineOpen0(NULL, RPC_C_AUTHN_DEFAULT, NULL, &session, &p->wfp_engine);
     if (err != ERROR_SUCCESS) {
         LOG_ERR("FwpmEngineOpen0: error %lu", err);
         return -1;
@@ -264,21 +278,52 @@ win_setup_killswitch(platform_win_ctx_t *p)
     return 0;
 }
 
-void
+int
 win_cleanup_killswitch(platform_win_ctx_t *p)
 {
-    if (!p->killswitch_active || !p->wfp_engine) return;
+    if (!p->wfp_engine) {
+        p->killswitch_active = 0;
+        p->n_wfp_filters = 0;
+        return 0;
+    }
 
-    /* Deleting the sublayer cascades and removes all filters in it */
+    int failed = 0;
+
+    /* WFP refuses to delete a sublayer while filters still reference it.
+     * Delete in reverse creation order, attempting every ID even after one
+     * failure so cleanup makes as much progress as possible. */
+    for (int i = p->n_wfp_filters - 1; i >= 0; i--) {
+        DWORD err = FwpmFilterDeleteById0(p->wfp_engine, p->wfp_filter_ids[i]);
+        if (err != ERROR_SUCCESS && err != FWP_E_FILTER_NOT_FOUND) {
+            LOG_ERR("FwpmFilterDeleteById0(filter=%llu): error %lu",
+                    (unsigned long long)p->wfp_filter_ids[i], err);
+            failed = 1;
+        }
+    }
+
     DWORD err = FwpmSubLayerDeleteByKey0(p->wfp_engine, &p->wfp_sublayer_key);
-    if (err != ERROR_SUCCESS && err != FWP_E_SUBLAYER_NOT_FOUND)
-        LOG_WRN("FwpmSubLayerDeleteByKey0: error %lu", err);
+    if (err != ERROR_SUCCESS && err != FWP_E_SUBLAYER_NOT_FOUND) {
+        LOG_ERR("FwpmSubLayerDeleteByKey0: error %lu", err);
+        failed = 1;
+    }
 
-    FwpmEngineClose0(p->wfp_engine);
+    err = FwpmEngineClose0(p->wfp_engine);
+    if (err != ERROR_SUCCESS) {
+        /* Keep the handle and bookkeeping so a later cleanup can retry. */
+        LOG_ERR("FwpmEngineClose0: error %lu", err);
+        return -1;
+    }
+
     p->wfp_engine = NULL;
     p->killswitch_active = 0;
     p->n_wfp_filters = 0;
+    if (failed) {
+        LOG_ERR("kill switch cleanup reported WFP errors; dynamic session closed");
+        return -1;
+    }
+
     LOG_INF("kill switch deactivated");
+    return 0;
 }
 
 #endif /* _WIN32 */
