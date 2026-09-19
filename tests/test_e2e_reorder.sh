@@ -78,12 +78,12 @@ bench_check_test_deps nc jq
 #   [ReorderRule] Port  <P>      -> handle_kv SEC_REORDER_RULE arm
 #   [ReorderRule] Profile quic_bulk -> parse_reorder_profile
 #
-# MaxWaitMs = 60 is chosen ABOVE the 40ms path-B spread (netem below) on purpose:
+# MaxWaitMs = 60 is chosen well above the 20ms path-B spread (netem below):
 # the late packet from the slow path then arrives WITHIN the reorder wait window,
 # so the buffered gap actually FILLS (gap_filled_count>0) instead of timing out.
 # This lets Phase B prove the engine genuinely re-orders packets, not merely that
-# it activates. (With the default 30ms wait < 40ms spread, every period would
-# time out — the §24 H5 "wait < RTT spread" regime where the shim only adds cost.)
+# it activates. The extra margin keeps that assertion stable under sanitizer
+# scheduling, pacing, and timer overhead.
 cat >"$INI_ON" <<EOF
 [Reorder]
 Enabled = on
@@ -103,10 +103,10 @@ EOF
 # ── Topology: 2 paths, RTT spread on path 1 so striping reorders inner pkts ──
 bench_setup_netns_n "$N_PATHS"
 bench_add_server_host_routes "$N_PATHS"
-# Path A (slot 0): low latency. Path B (slot 1): +40ms one-way delay. The RTT
+# Path A (slot 0): low latency. Path B (slot 1): +20ms one-way delay. The RTT
 # asymmetry across the two striped paths is what produces out-of-order arrival
 # at the receiver, which is exactly what the reorder buffer must absorb.
-bench_apply_netem "delay 1ms" "delay 40ms"
+bench_apply_netem "delay 1ms" "delay 20ms"
 
 # Helper: run one full server+client lifecycle with a given INI + log files.
 # $1 = INI path, $2 = server log, $3 = client log
@@ -224,7 +224,7 @@ fi
 
 # ── Prove the reorder ENGINE actually fired in-tunnel (not just that the
 #    capability was negotiated). The inner UDP flow is striped across the
-#    1ms vs 40ms paths, so packets MUST arrive out of order at the server's
+#    1ms vs 20ms paths, so packets MUST arrive out of order at the server's
 #    RX engine; every reorder period it arms increments gap_count. A non-zero
 #    gap_count is therefore the load-bearing evidence that the engine observed
 #    and acted on real in-tunnel reordering.
@@ -250,7 +250,7 @@ echo "INFO: reorder stats — gap_filled=$gap_filled gap_timeout=$gap_timeout de
 
 # The "engine fired" (gap_count>0) check is a HARD assertion only under the
 # high-rate iperf3 workload, which reliably produces concurrent in-flight
-# packets across the 1ms vs 40ms paths. The ping fallback (-c 10 -i 0.2) is
+# packets across the 1ms vs 20ms paths. The ping fallback (-c 10 -i 0.2) is
 # too low-rate/serialized to guarantee a reorder period, so there it is
 # informational only (don't fail a host that merely lacks iperf3).
 if [ "$WORKLOAD_KIND" = "iperf3" ]; then
@@ -262,14 +262,14 @@ if [ "$WORKLOAD_KIND" = "iperf3" ]; then
         fail=1
     fi
     # Stronger evidence: the engine did not just activate, it actually RE-ORDERED.
-    # MaxWaitMs=60 > the 40ms path-B spread, so the late packet arrives inside the
+    # MaxWaitMs=60 > the 20ms path-B spread, so the late packet arrives inside the
     # wait window and the buffered gap fills. gap_filled>0 proves real in-tunnel
     # order correction (the feature delivering value), not merely detection.
     if [ "${gap_filled:-0}" -gt 0 ]; then
         echo "PASS: reorder engine corrected ordering in-tunnel (gap_filled=$gap_filled)"
     else
         echo "FAIL: no gaps filled (gap_filled=$gap_filled) despite MaxWaitMs(60) >"
-        echo "      path-B spread(40ms) — late packets should arrive within the wait."
+        echo "      path-B spread(20ms) — late packets should arrive within the wait."
         echo "      raw=$reorder_stats"
         fail=1
     fi
@@ -278,12 +278,9 @@ else
     echo "      to guarantee reordering. gap_count=$gap_count gap_filled=$gap_filled (info)."
 fi
 
-# Non-fatal breakdown for the human reading the run. Whether a gap closes by
-# the missing seq arriving (gap_filled) vs the wait expiring (gap_timeout)
-# depends on the 40ms path-B one-way delay vs the 30ms default max_wait_ms —
-# either outcome still counts toward gap_count, which is why the hard assertion
-# is on gap_count, not gap_filled. Narrow path B below max_wait (e.g. 20ms) if
-# you want to bias toward gap_filled.
+# Non-fatal breakdown for the human reading the run. Some timeouts are possible
+# under load, but the 20ms path spread is deliberately well inside MaxWaitMs=60
+# so the iperf3 workload must produce at least one filled gap above.
 echo "INFO: reorder breakdown — gap_filled=$gap_filled gap_timeout=$gap_timeout delivered=$delivered"
 
 # ACK demotion is intentionally NOT asserted here. iperf3 -u is a one-directional
