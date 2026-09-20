@@ -1993,11 +1993,10 @@ cb_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t flag,
 #ifdef MQVPN_H2_PROXY_ENABLED
         if (s->h2_proxy) {
             stream->role = SVR_STREAM_ROLE_H2_PROXY;
-            stream->h2_proxy_stream =
-                h2_proxy_handle_request(s->h2_proxy, h3_request, headers, fin, stream,
-                                        stream->conn,
-                                        (const struct sockaddr *)&stream->conn->peer_addr,
-                                        stream->conn->peer_addrlen);
+            stream->h2_proxy_stream = h2_proxy_handle_request(
+                s->h2_proxy, h3_request, headers, fin, stream, stream->conn,
+                (const struct sockaddr *)&stream->conn->peer_addr,
+                stream->conn->peer_addrlen);
             return 0;
         }
 #endif

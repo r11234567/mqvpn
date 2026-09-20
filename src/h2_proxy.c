@@ -513,9 +513,8 @@ stream_set_response_blocked(h2_proxy_stream_t *stream, int blocked)
 {
     if (!stream || stream->response_blocked == blocked) return;
     stream->response_blocked = blocked;
-    int notify = blocked ||
-                 (stream->send_pressure && stream->send_pressure->paused &&
-                  stream->send_pressure->notifier == stream);
+    int notify = blocked || (stream->send_pressure && stream->send_pressure->paused &&
+                             stream->send_pressure->notifier == stream);
     (void)xqc_h3_request_set_write_notify(stream->h3_request, notify != 0);
 }
 

@@ -298,9 +298,8 @@ test_h3_headers_submit_h2_request(void)
         .capacity = sizeof(fields) / sizeof(fields[0]),
     };
     xqc_h3_request_t *fake_request = (xqc_h3_request_t *)(uintptr_t)1;
-    h2_proxy_stream_t *stream =
-        h2_proxy_handle_request(proxy, fake_request, &headers, 0, NULL,
-                                (void *)(uintptr_t)10, NULL, 0);
+    h2_proxy_stream_t *stream = h2_proxy_handle_request(
+        proxy, fake_request, &headers, 0, NULL, (void *)(uintptr_t)10, NULL, 0);
     assert(stream != NULL);
     assert(mock_h3.priority_set == 1 && mock_h3.urgency == 0);
     assert(h2_proxy_on_h3_body(stream, (const uint8_t *)"ping", 4, 1) == 0);
@@ -428,9 +427,8 @@ test_h3_close_detaches_nghttp2_user_data(void)
         .capacity = sizeof(fields) / sizeof(fields[0]),
     };
     xqc_h3_request_t *fake_request = (xqc_h3_request_t *)(uintptr_t)2;
-    h2_proxy_stream_t *stream =
-        h2_proxy_handle_request(proxy, fake_request, &headers, 1, NULL,
-                                (void *)(uintptr_t)20, NULL, 0);
+    h2_proxy_stream_t *stream = h2_proxy_handle_request(
+        proxy, fake_request, &headers, 1, NULL, (void *)(uintptr_t)20, NULL, 0);
     assert(stream != NULL);
 
     int backend_fd = accept(listener, NULL, NULL);
