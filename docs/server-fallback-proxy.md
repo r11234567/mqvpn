@@ -225,6 +225,15 @@ Backend sockets are nonblocking and reused. One H2 connection supports up to
 Request and response buffers are bounded; a stream is closed if it exceeds a
 limit rather than consuming unbounded memory.
 
+Response backpressure is scoped to the downstream QUIC connection, because
+xquic's retained-send-byte estimate covers that connection rather than one H3
+stream. Crossing 256 KiB pauses response bodies for that QUIC connection until
+the estimate falls to 128 KiB. It does not disable reads on the shared h2c
+socket: nghttp2 connection credit is returned after bytes enter the bounded
+per-stream buffer, while stream credit is returned only after xquic accepts the
+bytes. The server tick probes paused connections and retries them, so progress
+does not depend on receiving a stream write-notification callback.
+
 ## Resource limits
 
 | Resource | Limit |

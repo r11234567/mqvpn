@@ -48,10 +48,12 @@ h2_proxy_t *h2_proxy_create(const h2_proxy_config_t *config,
                             const h2_proxy_callbacks_t *callbacks);
 void h2_proxy_destroy(h2_proxy_t *proxy);
 
+/* h3_conn_key identifies the downstream QUIC connection shared by requests;
+ * it is compared by identity only and must remain stable for their lifetime. */
 h2_proxy_stream_t *h2_proxy_handle_request(h2_proxy_t *proxy,
                                            xqc_h3_request_t *h3_request,
                                            const xqc_http_headers_t *headers, int fin,
-                                           void *h3_stream_user_data,
+                                           void *h3_stream_user_data, void *h3_conn_key,
                                            const struct sockaddr *client_addr,
                                            socklen_t client_addrlen);
 int h2_proxy_on_h3_body(h2_proxy_stream_t *stream, const uint8_t *data, size_t len,
@@ -62,6 +64,8 @@ void h2_proxy_on_h3_close(h2_proxy_stream_t *stream);
 int h2_proxy_owns_fd(const h2_proxy_t *proxy, int fd, const void *fd_ctx);
 void h2_proxy_on_backend_ready(h2_proxy_t *proxy, int fd, void *fd_ctx, int readable,
                                int writable);
+/* Retry response streams parked by xquic EAGAIN, then evict idle backends.
+ * Correctness must not depend on xquic delivering a stream write callback. */
 void h2_proxy_tick(h2_proxy_t *proxy, uint64_t now_sec);
 void h2_proxy_get_stats(const h2_proxy_t *proxy, h2_proxy_stats_t *stats);
 

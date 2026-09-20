@@ -32,6 +32,8 @@ typedef struct {
     int fin;
     int closed;
     uint64_t send_queue_bytes;
+    int body_eagain_count;
+    int body_send_calls;
     int write_notify;
     int priority_set;
     uint8_t urgency;
@@ -61,6 +63,11 @@ xqc_h3_request_send_body(xqc_h3_request_t *request, unsigned char *data, size_t 
                          uint8_t fin)
 {
     (void)request;
+    mock_h3.body_send_calls++;
+    if (mock_h3.body_eagain_count > 0) {
+        mock_h3.body_eagain_count--;
+        return -XQC_EAGAIN;
+    }
     assert(data_size <= sizeof(mock_h3.body) - mock_h3.body_len);
     memcpy(mock_h3.body + mock_h3.body_len, data, data_size);
     mock_h3.body_len += data_size;
@@ -292,7 +299,8 @@ test_h3_headers_submit_h2_request(void)
     };
     xqc_h3_request_t *fake_request = (xqc_h3_request_t *)(uintptr_t)1;
     h2_proxy_stream_t *stream =
-        h2_proxy_handle_request(proxy, fake_request, &headers, 0, NULL, NULL, 0);
+        h2_proxy_handle_request(proxy, fake_request, &headers, 0, NULL,
+                                (void *)(uintptr_t)10, NULL, 0);
     assert(stream != NULL);
     assert(mock_h3.priority_set == 1 && mock_h3.urgency == 0);
     assert(h2_proxy_on_h3_body(stream, (const uint8_t *)"ping", 4, 1) == 0);
@@ -350,16 +358,30 @@ test_h3_headers_submit_h2_request(void)
                                    sizeof(response_headers) / sizeof(response_headers[0]),
                                    &provider) == 0);
     assert(nghttp2_session_send(server_session) == 0);
+    /* Queue bytes are connection-wide, so a busy sibling stream may pause this
+     * QUIC connection but must not disable the multiplexed h2c fd. Recovery
+     * below deliberately arrives via tick only, without simulating xquic's
+     * optional write notification. */
     mock_h3.send_queue_bytes = 256u * 1024u;
+    mock_h3.body_eagain_count = 1;
     h2_proxy_on_backend_ready(proxy, ctx.fd, ctx.fd_ctx, 1, 0);
-    assert(ctx.want_read == 0);
+    assert(ctx.want_read == 1);
     assert(mock_h3.write_notify == 1);
+    assert(mock_h3.headers == 2);
     assert(mock_h3.body_len == 0);
+    assert(mock_h3.body_send_calls == 0);
+
     mock_h3.send_queue_bytes = 128u * 1024u;
-    assert(h2_proxy_on_h3_writable(stream) == 0);
+    h2_proxy_tick(proxy, 0);
+    assert(ctx.want_read == 1);
+    assert(mock_h3.write_notify == 1);
+    assert(mock_h3.body_send_calls == 1);
+    assert(mock_h3.body_len == 0);
+
+    h2_proxy_tick(proxy, 0);
     assert(ctx.want_read == 1);
     assert(mock_h3.write_notify == 0);
-    assert(mock_h3.headers == 2);
+    assert(mock_h3.body_send_calls == 2);
     assert(mock_h3.status_200 == 1);
     assert(mock_h3.body_len == 2 && memcmp(mock_h3.body, "ok", 2) == 0);
     assert(mock_h3.fin == 1);
@@ -407,7 +429,8 @@ test_h3_close_detaches_nghttp2_user_data(void)
     };
     xqc_h3_request_t *fake_request = (xqc_h3_request_t *)(uintptr_t)2;
     h2_proxy_stream_t *stream =
-        h2_proxy_handle_request(proxy, fake_request, &headers, 1, NULL, NULL, 0);
+        h2_proxy_handle_request(proxy, fake_request, &headers, 1, NULL,
+                                (void *)(uintptr_t)20, NULL, 0);
     assert(stream != NULL);
 
     int backend_fd = accept(listener, NULL, NULL);

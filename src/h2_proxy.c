@@ -37,11 +37,13 @@
 #define PROXY_PROTOCOL_V2_AF_INET6  0x21
 
 typedef struct h2_backend_conn_s h2_backend_conn_t;
+typedef struct h3_send_pressure_s h3_send_pressure_t;
 
 struct h2_proxy_stream_s {
     h2_proxy_t *proxy;
     xqc_h3_request_t *h3_request;
     void *h3_user_data;
+    h3_send_pressure_t *send_pressure;
     h2_backend_conn_t *backend_conn;
     int32_t backend_stream_id;
 
@@ -81,7 +83,6 @@ struct h2_backend_conn_s {
     nghttp2_session *session;
     uint64_t last_active;
     uint32_t stream_count;
-    uint32_t blocked_stream_count;
     int connected;
     int proxy_protocol_sent;
     uint8_t proxy_protocol_buf[128];
@@ -90,18 +91,31 @@ struct h2_backend_conn_s {
     struct h2_backend_conn_s *next;
 };
 
+/* One gate per downstream QUIC connection. The queue-byte API reports this
+ * scope (not an individual stream), so the ownership must match it. */
+struct h3_send_pressure_s {
+    void *conn_key;
+    h2_proxy_stream_t *notifier;
+    uint32_t stream_count;
+    int paused;
+    struct h3_send_pressure_s *next;
+};
+
 struct h2_proxy_s {
     h2_proxy_config_t config;
     h2_proxy_callbacks_t callbacks;
     h2_backend_conn_t *connections;
     size_t connection_count;
     h2_proxy_stream_t *streams;
+    h3_send_pressure_t *send_pressures;
     h2_proxy_stats_t stats;
 };
 
 static void backend_destroy(h2_backend_conn_t *conn);
 static int stream_flush_response(h2_proxy_stream_t *stream);
 static void stream_set_response_blocked(h2_proxy_stream_t *stream, int blocked);
+static void send_pressure_pause(h2_proxy_stream_t *stream);
+static void send_pressure_maybe_resume(h3_send_pressure_t *pressure);
 static int is_hop_by_hop(const uint8_t *name, size_t len, const uint8_t *value,
                          size_t value_len);
 static void proxy_log(h2_proxy_t *proxy, int level, const char *fmt, ...);
@@ -390,13 +404,30 @@ stream_detach_backend(h2_proxy_stream_t *stream)
 }
 
 static h2_proxy_stream_t *
-stream_create(h2_proxy_t *proxy, xqc_h3_request_t *request, void *h3_user_data)
+stream_create(h2_proxy_t *proxy, xqc_h3_request_t *request, void *h3_user_data,
+              void *h3_conn_key)
 {
     h2_proxy_stream_t *stream = calloc(1, sizeof(*stream));
     if (!stream) return NULL;
     stream->proxy = proxy;
     stream->h3_request = request;
     stream->h3_user_data = h3_user_data;
+    if (!h3_conn_key) h3_conn_key = request;
+    h3_send_pressure_t *pressure = proxy->send_pressures;
+    while (pressure && pressure->conn_key != h3_conn_key)
+        pressure = pressure->next;
+    if (!pressure) {
+        pressure = calloc(1, sizeof(*pressure));
+        if (!pressure) {
+            free(stream);
+            return NULL;
+        }
+        pressure->conn_key = h3_conn_key;
+        pressure->next = proxy->send_pressures;
+        proxy->send_pressures = pressure;
+    }
+    pressure->stream_count++;
+    stream->send_pressure = pressure;
     stream->backend_stream_id = -1;
     stream->next = proxy->streams;
     proxy->streams = stream;
@@ -411,8 +442,8 @@ stream_destroy(h2_proxy_stream_t *stream)
     stream->closed = 1;
     h2_proxy_t *proxy = stream->proxy;
     if (stream->backend_conn && stream->response_unconsumed > 0) {
-        (void)nghttp2_session_consume_connection(stream->backend_conn->session,
-                                                 stream->response_unconsumed);
+        /* Connection credit was returned in on_data_chunk_recv_callback.
+         * Stream credit is irrelevant once this stream is being removed. */
         stream->response_unconsumed = 0;
     }
     if (stream->backend_conn && stream->backend_stream_id >= 0 &&
@@ -424,6 +455,30 @@ stream_destroy(h2_proxy_stream_t *stream)
         link = &(*link)->next;
     if (*link) *link = stream->next;
     stream_detach_backend(stream);
+    h3_send_pressure_t *pressure = stream->send_pressure;
+    if (pressure) {
+        if (pressure->notifier == stream) {
+            pressure->notifier = NULL;
+            (void)xqc_h3_request_set_write_notify(stream->h3_request, 0);
+        }
+        if (pressure->stream_count > 0) pressure->stream_count--;
+        if (pressure->stream_count == 0) {
+            h3_send_pressure_t **pressure_link = &proxy->send_pressures;
+            while (*pressure_link && *pressure_link != pressure)
+                pressure_link = &(*pressure_link)->next;
+            if (*pressure_link) *pressure_link = pressure->next;
+            free(pressure);
+        } else if (pressure->paused && !pressure->notifier) {
+            for (h2_proxy_stream_t *candidate = proxy->streams; candidate;
+                 candidate = candidate->next) {
+                if (candidate->send_pressure == pressure && !candidate->closed) {
+                    pressure->notifier = candidate;
+                    (void)xqc_h3_request_set_write_notify(candidate->h3_request, 1);
+                    break;
+                }
+            }
+        }
+    }
     response_headers_clear(stream);
     free(stream->request_body);
     free(stream->response_body);
@@ -445,24 +500,47 @@ backend_update_interest(h2_backend_conn_t *conn)
     int want_write = !conn->connected ||
                      (conn->proxy_protocol_len > conn->proxy_protocol_off) ||
                      nghttp2_session_want_write(conn->session);
-    proxy->callbacks.register_fd(conn->fd, conn->blocked_stream_count == 0, want_write,
-                                 conn, proxy->callbacks.user_ctx);
+    /* The backend connection multiplexes independent H2/H3 streams. A single
+     * H3 stream returning EAGAIN must not disarm reads for all of them. The
+     * no-auto-window-update session below withholds credit only for bytes that
+     * xquic has not accepted, so nghttp2 supplies the per-stream backpressure. */
+    proxy->callbacks.register_fd(conn->fd, 1, want_write, conn,
+                                 proxy->callbacks.user_ctx);
 }
 
 static void
 stream_set_response_blocked(h2_proxy_stream_t *stream, int blocked)
 {
-    if (!stream || !stream->backend_conn || stream->response_blocked == blocked) return;
-    h2_backend_conn_t *conn = stream->backend_conn;
+    if (!stream || stream->response_blocked == blocked) return;
     stream->response_blocked = blocked;
-    if (blocked) {
-        conn->blocked_stream_count++;
-        (void)xqc_h3_request_set_write_notify(stream->h3_request, 1);
-    } else {
-        if (conn->blocked_stream_count > 0) conn->blocked_stream_count--;
-        (void)xqc_h3_request_set_write_notify(stream->h3_request, 0);
-    }
-    backend_update_interest(conn);
+    int notify = blocked ||
+                 (stream->send_pressure && stream->send_pressure->paused &&
+                  stream->send_pressure->notifier == stream);
+    (void)xqc_h3_request_set_write_notify(stream->h3_request, notify != 0);
+}
+
+static void
+send_pressure_pause(h2_proxy_stream_t *stream)
+{
+    h3_send_pressure_t *pressure = stream->send_pressure;
+    if (!pressure || pressure->paused) return;
+    pressure->paused = 1;
+    pressure->notifier = stream;
+    (void)xqc_h3_request_set_write_notify(stream->h3_request, 1);
+}
+
+static void
+send_pressure_maybe_resume(h3_send_pressure_t *pressure)
+{
+    if (!pressure || !pressure->paused || !pressure->notifier) return;
+    if (xqc_h3_request_get_send_queue_bytes(pressure->notifier->h3_request) >
+        H2_QUIC_QUEUE_LOW_WATER)
+        return;
+    h2_proxy_stream_t *notifier = pressure->notifier;
+    pressure->paused = 0;
+    pressure->notifier = NULL;
+    (void)xqc_h3_request_set_write_notify(notifier->h3_request,
+                                          notifier->response_blocked != 0);
 }
 
 static int
@@ -470,13 +548,13 @@ stream_consume_response(h2_proxy_stream_t *stream, size_t amount)
 {
     if (amount == 0) return 0;
     if (!stream->backend_conn || amount > stream->response_unconsumed) return -1;
-    int rc;
-    if (stream->backend_stream_closed)
-        rc = nghttp2_session_consume_connection(stream->backend_conn->session, amount);
-    else
-        rc = nghttp2_session_consume_stream(stream->backend_conn->session,
-                                            stream->backend_stream_id, amount);
-    if (rc != 0) return -1;
+    /* Connection credit is returned as soon as the DATA callback copies the
+     * bytes into this bounded per-stream buffer. Stream credit stays withheld
+     * until xquic accepts those bytes, isolating backpressure to this stream. */
+    if (!stream->backend_stream_closed &&
+        nghttp2_session_consume_stream(stream->backend_conn->session,
+                                       stream->backend_stream_id, amount) != 0)
+        return -1;
     stream->response_unconsumed -= amount;
     return 0;
 }
@@ -579,6 +657,10 @@ on_data_chunk_recv_callback(nghttp2_session *session, uint8_t flags, int32_t str
                       &stream->response_body_off, data, len,
                       stream->proxy->config.max_buffered_body) != 0)
         return NGHTTP2_ERR_CALLBACK_FAILURE;
+    /* Keep the shared h2c connection moving for unrelated streams. Per-stream
+     * credit is deliberately deferred to stream_consume_response(). */
+    if (nghttp2_session_consume_connection(session, len) != 0)
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
     stream->response_unconsumed += len;
     return stream_flush_response(stream) == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
 }
@@ -616,8 +698,7 @@ on_stream_close_callback(nghttp2_session *session, int32_t stream_id, uint32_t e
     if (error_code != NGHTTP2_NO_ERROR) {
         if (!stream->response_fin_sent) xqc_h3_request_close(stream->h3_request);
         if (stream->response_unconsumed > 0) {
-            (void)nghttp2_session_consume_connection(session,
-                                                     stream->response_unconsumed);
+            /* Connection credit was already returned at DATA receipt. */
             stream->response_unconsumed = 0;
         }
         free(stream->response_body);
@@ -879,17 +960,12 @@ stream_flush_response(h2_proxy_stream_t *stream)
         response_headers_clear(stream);
     }
 
-    if (xqc_h3_request_get_send_queue_bytes(stream->h3_request) >=
-        H2_QUIC_QUEUE_HIGH_WATER) {
-        stream_set_response_blocked(stream, 1);
-        return 0;
-    }
-
     body_available = stream->response_body_len - stream->response_body_off;
     while (body_available > 0) {
+        if (stream->send_pressure && stream->send_pressure->paused) return 0;
         if (xqc_h3_request_get_send_queue_bytes(stream->h3_request) >=
             H2_QUIC_QUEUE_HIGH_WATER) {
-            stream_set_response_blocked(stream, 1);
+            send_pressure_pause(stream);
             return 0;
         }
         size_t chunk = body_available;
@@ -903,7 +979,10 @@ stream_flush_response(h2_proxy_stream_t *stream)
             return 0;
         }
         if (sent < 0) return -1;
-        if (sent == 0) break;
+        if (sent == 0) {
+            stream_set_response_blocked(stream, 1);
+            return 0;
+        }
         stream->response_body_off += (size_t)sent;
         body_available -= (size_t)sent;
         if (stream_consume_response(stream, (size_t)sent) != 0) return -1;
@@ -987,11 +1066,12 @@ h2_proxy_destroy(h2_proxy_t *proxy)
 h2_proxy_stream_t *
 h2_proxy_handle_request(h2_proxy_t *proxy, xqc_h3_request_t *h3_request,
                         const xqc_http_headers_t *headers, int fin,
-                        void *h3_stream_user_data, const struct sockaddr *client_addr,
-                        socklen_t client_addrlen)
+                        void *h3_stream_user_data, void *h3_conn_key,
+                        const struct sockaddr *client_addr, socklen_t client_addrlen)
 {
     if (!proxy || !h3_request || !headers) return NULL;
-    h2_proxy_stream_t *stream = stream_create(proxy, h3_request, h3_stream_user_data);
+    h2_proxy_stream_t *stream =
+        stream_create(proxy, h3_request, h3_stream_user_data, h3_conn_key);
     if (!stream) return NULL;
 
     apply_request_priority(stream, headers);
@@ -1043,12 +1123,9 @@ int
 h2_proxy_on_h3_writable(h2_proxy_stream_t *stream)
 {
     if (!stream || stream->closed) return -1;
-    if (stream->response_blocked) {
-        if (xqc_h3_request_get_send_queue_bytes(stream->h3_request) >
-            H2_QUIC_QUEUE_LOW_WATER)
-            return 0;
-        stream_set_response_blocked(stream, 0);
-    }
+    send_pressure_maybe_resume(stream->send_pressure);
+    if (stream->send_pressure && stream->send_pressure->paused) return 0;
+    if (stream->response_blocked) stream_set_response_blocked(stream, 0);
     return stream_flush_response(stream);
 }
 
@@ -1123,7 +1200,6 @@ h2_proxy_on_backend_ready(h2_proxy_t *proxy, int fd, void *fd_ctx, int readable,
                 backend_fail(conn);
                 return;
             }
-            if (conn->blocked_stream_count > 0) break;
         }
     }
     if (conn->connected && (writable || readable) &&
@@ -1138,6 +1214,17 @@ void
 h2_proxy_tick(h2_proxy_t *proxy, uint64_t now_sec)
 {
     if (!proxy) return;
+    /* Write notification is a latency optimization, not the recovery owner.
+     * xquic can suppress it while connection DATA_BLOCKED is set. Probe every
+     * paused QUIC connection, then retry its streams after the low-water edge. */
+    for (h3_send_pressure_t *pressure = proxy->send_pressures; pressure;
+         pressure = pressure->next)
+        send_pressure_maybe_resume(pressure);
+    for (h2_proxy_stream_t *stream = proxy->streams; stream; stream = stream->next) {
+        if ((!stream->send_pressure || !stream->send_pressure->paused) &&
+            h2_proxy_on_h3_writable(stream) != 0)
+            (void)xqc_h3_request_close(stream->h3_request);
+    }
     uint64_t cutoff = now_sec > proxy->config.conn_timeout_sec
                           ? now_sec - proxy->config.conn_timeout_sec
                           : 0;
