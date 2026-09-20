@@ -3457,6 +3457,13 @@ mqvpn_server_get_interest(const mqvpn_server_t *s, mqvpn_interest_t *out)
 
     int ms = (int)(s->next_wake_us / 1000);
     out->next_timer_ms = ms > 0 ? ms : 1;
+#ifdef MQVPN_H2_PROXY_ENABLED
+    /* H3 response recovery cannot rely exclusively on xquic's write callback
+     * or next timer: a connection-wide queue may cross low water without a
+     * stream notification. Keep the fair response round independently live. */
+    if (h2_proxy_needs_tick(s->h2_proxy) && out->next_timer_ms > 10)
+        out->next_timer_ms = 10;
+#endif
 #ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
     /* next_wake_us above comes solely from xquic's event timer, which knows
      * nothing about the egress deadlines (connect timeout -> 504, ACTIVE

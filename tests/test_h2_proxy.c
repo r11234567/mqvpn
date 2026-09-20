@@ -27,11 +27,12 @@ typedef struct {
 typedef struct {
     int headers;
     int status_200;
-    uint8_t body[32];
+    uint8_t body[64 * 1024];
     size_t body_len;
     int fin;
     int closed;
     uint64_t send_queue_bytes;
+    uint64_t raise_queue_bytes_on_send;
     int body_eagain_count;
     int body_send_calls;
     int write_notify;
@@ -39,22 +40,42 @@ typedef struct {
     uint8_t urgency;
 } mock_h3_t;
 
-static mock_h3_t mock_h3;
+#define MOCK_H3_REQUESTS 4
+static mock_h3_t mock_h3_requests[MOCK_H3_REQUESTS];
+#define mock_h3 mock_h3_requests[0]
+static uintptr_t mock_body_send_order[32];
+static size_t mock_body_send_order_len;
+
+static mock_h3_t *
+mock_h3_for(xqc_h3_request_t *request)
+{
+    uintptr_t id = (uintptr_t)request;
+    assert(id > 0 && id <= MOCK_H3_REQUESTS);
+    return &mock_h3_requests[id - 1];
+}
+
+static void
+mock_h3_reset(void)
+{
+    memset(mock_h3_requests, 0, sizeof(mock_h3_requests));
+    memset(mock_body_send_order, 0, sizeof(mock_body_send_order));
+    mock_body_send_order_len = 0;
+}
 
 ssize_t
 xqc_h3_request_send_headers(xqc_h3_request_t *request, xqc_http_headers_t *headers,
                             uint8_t fin)
 {
-    (void)request;
-    mock_h3.headers++;
+    mock_h3_t *mock = mock_h3_for(request);
+    mock->headers++;
     for (size_t i = 0; i < headers->count; i++) {
         xqc_http_header_t *header = &headers->headers[i];
         if (header->name.iov_len == 7 &&
             memcmp(header->name.iov_base, ":status", 7) == 0 &&
             header->value.iov_len == 3 && memcmp(header->value.iov_base, "200", 3) == 0)
-            mock_h3.status_200 = 1;
+            mock->status_200 = 1;
     }
-    if (fin) mock_h3.fin = 1;
+    if (fin) mock->fin = 1;
     return (ssize_t)headers->count;
 }
 
@@ -62,47 +83,51 @@ ssize_t
 xqc_h3_request_send_body(xqc_h3_request_t *request, unsigned char *data, size_t data_size,
                          uint8_t fin)
 {
-    (void)request;
-    mock_h3.body_send_calls++;
-    if (mock_h3.body_eagain_count > 0) {
-        mock_h3.body_eagain_count--;
+    mock_h3_t *mock = mock_h3_for(request);
+    mock->body_send_calls++;
+    assert(mock_body_send_order_len <
+           sizeof(mock_body_send_order) / sizeof(mock_body_send_order[0]));
+    mock_body_send_order[mock_body_send_order_len++] = (uintptr_t)request;
+    if (mock->body_eagain_count > 0) {
+        mock->body_eagain_count--;
         return -XQC_EAGAIN;
     }
-    assert(data_size <= sizeof(mock_h3.body) - mock_h3.body_len);
-    memcpy(mock_h3.body + mock_h3.body_len, data, data_size);
-    mock_h3.body_len += data_size;
-    if (fin) mock_h3.fin = 1;
+    assert(data_size <= sizeof(mock->body) - mock->body_len);
+    memcpy(mock->body + mock->body_len, data, data_size);
+    mock->body_len += data_size;
+    if (mock->raise_queue_bytes_on_send != 0) {
+        for (size_t i = 0; i < MOCK_H3_REQUESTS; i++)
+            mock_h3_requests[i].send_queue_bytes = mock->raise_queue_bytes_on_send;
+        mock->raise_queue_bytes_on_send = 0;
+    }
+    if (fin) mock->fin = 1;
     return (ssize_t)data_size;
 }
 
 ssize_t
 xqc_h3_request_finish(xqc_h3_request_t *request)
 {
-    (void)request;
-    mock_h3.fin = 1;
+    mock_h3_for(request)->fin = 1;
     return 0;
 }
 
 xqc_int_t
 xqc_h3_request_close(xqc_h3_request_t *request)
 {
-    (void)request;
-    mock_h3.closed++;
+    mock_h3_for(request)->closed++;
     return XQC_OK;
 }
 
 uint64_t
 xqc_h3_request_get_send_queue_bytes(xqc_h3_request_t *request)
 {
-    (void)request;
-    return mock_h3.send_queue_bytes;
+    return mock_h3_for(request)->send_queue_bytes;
 }
 
 xqc_int_t
 xqc_h3_request_set_write_notify(xqc_h3_request_t *request, uint8_t enabled)
 {
-    (void)request;
-    mock_h3.write_notify = enabled != 0;
+    mock_h3_for(request)->write_notify = enabled != 0;
     return XQC_OK;
 }
 
@@ -119,9 +144,9 @@ xqc_parse_http_priority(xqc_h3_priority_t *priority, const uint8_t *value,
 xqc_int_t
 xqc_h3_request_set_priority(xqc_h3_request_t *request, xqc_h3_priority_t *priority)
 {
-    (void)request;
-    mock_h3.priority_set++;
-    mock_h3.urgency = priority->urgency;
+    mock_h3_t *mock = mock_h3_for(request);
+    mock->priority_set++;
+    mock->urgency = priority->urgency;
     return XQC_OK;
 }
 
@@ -255,7 +280,7 @@ test_create_validation(void)
 
     h2_proxy_t *proxy = h2_proxy_create(&config, &callbacks);
     assert(proxy != NULL);
-    memset(&mock_h3, 0, sizeof(mock_h3));
+    mock_h3_reset();
     h2_proxy_stats_t stats;
     h2_proxy_get_stats(proxy, &stats);
     assert(stats.total_requests == 0);
@@ -400,6 +425,128 @@ test_h3_headers_submit_h2_request(void)
 }
 
 static void
+test_h3_response_round_robin_after_high_water(void)
+{
+    struct sockaddr_in backend;
+    int listener = create_listener(&backend);
+    test_ctx_t ctx = {.fd = -1};
+    h2_proxy_callbacks_t callbacks = proxy_callbacks(&ctx);
+    h2_proxy_config_t config = proxy_config(&backend);
+    h2_proxy_t *proxy = h2_proxy_create(&config, &callbacks);
+    assert(proxy != NULL);
+    mock_h3_reset();
+
+    xqc_http_header_t fields[] = {
+        {.name = {.iov_base = (void *)":method", .iov_len = 7},
+         .value = {.iov_base = (void *)"GET", .iov_len = 3}},
+        {.name = {.iov_base = (void *)":scheme", .iov_len = 7},
+         .value = {.iov_base = (void *)"https", .iov_len = 5}},
+        {.name = {.iov_base = (void *)":authority", .iov_len = 10},
+         .value = {.iov_base = (void *)"example.com", .iov_len = 11}},
+        {.name = {.iov_base = (void *)":path", .iov_len = 5},
+         .value = {.iov_base = (void *)"/asset", .iov_len = 6}},
+    };
+    xqc_http_headers_t headers = {
+        .headers = fields,
+        .count = sizeof(fields) / sizeof(fields[0]),
+        .capacity = sizeof(fields) / sizeof(fields[0]),
+    };
+    void *conn_key = (void *)(uintptr_t)30;
+    xqc_h3_request_t *large_request = (xqc_h3_request_t *)(uintptr_t)1;
+    xqc_h3_request_t *small_request = (xqc_h3_request_t *)(uintptr_t)2;
+    h2_proxy_stream_t *large = h2_proxy_handle_request(proxy, large_request, &headers, 1,
+                                                       NULL, conn_key, NULL, 0);
+    h2_proxy_stream_t *small = h2_proxy_handle_request(proxy, small_request, &headers, 1,
+                                                       NULL, conn_key, NULL, 0);
+    assert(large != NULL && small != NULL);
+
+    int backend_fd = accept(listener, NULL, NULL);
+    assert(backend_fd >= 0);
+    struct timeval timeout = {.tv_sec = 2};
+    assert(setsockopt(backend_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ==
+           0);
+    h2_proxy_on_backend_ready(proxy, ctx.fd, ctx.fd_ctx, 0, 1);
+    uint8_t wire[4096];
+    ssize_t wire_len = recv(backend_fd, wire, sizeof(wire), 0);
+    assert(wire_len > 0);
+
+    h2_server_ctx_t server_ctx = {.fd = backend_fd};
+    nghttp2_session_callbacks *server_callbacks = NULL;
+    assert(nghttp2_session_callbacks_new(&server_callbacks) == 0);
+    nghttp2_session_callbacks_set_send_callback(server_callbacks, h2_server_send);
+    nghttp2_session *server_session = NULL;
+    assert(nghttp2_session_server_new(&server_session, server_callbacks, &server_ctx) ==
+           0);
+    nghttp2_session_callbacks_del(server_callbacks);
+    assert(nghttp2_submit_settings(server_session, NGHTTP2_FLAG_NONE, NULL, 0) == 0);
+    assert(nghttp2_session_mem_recv(server_session, wire, (size_t)wire_len) == wire_len);
+
+    uint8_t large_body[24 * 1024];
+    uint8_t small_body[4 * 1024];
+    memset(large_body, 'L', sizeof(large_body));
+    memset(small_body, 's', sizeof(small_body));
+    h2_server_ctx_t large_response = {
+        .body = large_body,
+        .body_len = sizeof(large_body),
+    };
+    h2_server_ctx_t small_response = {
+        .body = small_body,
+        .body_len = sizeof(small_body),
+    };
+    nghttp2_data_provider large_provider = {
+        .source = {.ptr = &large_response},
+        .read_callback = h2_server_read_body,
+    };
+    nghttp2_data_provider small_provider = {
+        .source = {.ptr = &small_response},
+        .read_callback = h2_server_read_body,
+    };
+    nghttp2_nv response_headers[] = {
+        {(uint8_t *)":status", (uint8_t *)"200", 7, 3, NGHTTP2_NV_FLAG_NONE},
+    };
+    assert(nghttp2_submit_response(server_session, 1, response_headers, 1,
+                                   &large_provider) == 0);
+    assert(nghttp2_submit_response(server_session, 3, response_headers, 1,
+                                   &small_provider) == 0);
+    assert(nghttp2_session_send(server_session) == 0);
+    h2_proxy_on_backend_ready(proxy, ctx.fd, ctx.fd_ctx, 1, 0);
+    assert(mock_h3_requests[0].body_send_calls == 0);
+    assert(mock_h3_requests[1].body_send_calls == 0);
+    assert(h2_proxy_needs_tick(proxy) == 1);
+
+    /* The large stream gets one 16 KiB turn and makes the shared connection
+     * hit high water. The small stream must retain the recovery cursor when
+     * it observes that edge without sending. */
+    mock_h3_requests[0].raise_queue_bytes_on_send = 256u * 1024u;
+    h2_proxy_tick(proxy, 0);
+    assert(mock_h3_requests[0].body_send_calls == 1);
+    assert(mock_h3_requests[0].body_len == 16u * 1024u);
+    assert(mock_h3_requests[1].body_send_calls == 0);
+    assert(mock_h3_requests[1].write_notify == 1);
+    assert(mock_body_send_order_len == 1 && mock_body_send_order[0] == 1);
+
+    mock_h3_requests[0].send_queue_bytes = 128u * 1024u;
+    mock_h3_requests[1].send_queue_bytes = 128u * 1024u;
+    h2_proxy_tick(proxy, 0);
+    assert(mock_h3_requests[1].body_send_calls == 1);
+    assert(mock_h3_requests[1].body_len == sizeof(small_body));
+    assert(mock_h3_requests[0].body_send_calls == 2);
+    assert(mock_h3_requests[0].body_len == sizeof(large_body));
+    assert(mock_body_send_order_len == 3);
+    assert(mock_body_send_order[1] == 2 && mock_body_send_order[2] == 1);
+    assert(mock_h3_requests[0].fin == 1 && mock_h3_requests[1].fin == 1);
+    assert(h2_proxy_needs_tick(proxy) == 0);
+
+    h2_proxy_on_h3_close(small);
+    h2_proxy_on_h3_close(large);
+    nghttp2_session_del(server_session);
+    close(backend_fd);
+    close(listener);
+    h2_proxy_destroy(proxy);
+    assert(ctx.unregistered == 1);
+}
+
+static void
 test_h3_close_detaches_nghttp2_user_data(void)
 {
     struct sockaddr_in backend;
@@ -409,7 +556,7 @@ test_h3_close_detaches_nghttp2_user_data(void)
     h2_proxy_config_t config = proxy_config(&backend);
     h2_proxy_t *proxy = h2_proxy_create(&config, &callbacks);
     assert(proxy != NULL);
-    memset(&mock_h3, 0, sizeof(mock_h3));
+    mock_h3_reset();
 
     xqc_http_header_t fields[] = {
         {.name = {.iov_base = (void *)":method", .iov_len = 7},
@@ -426,7 +573,7 @@ test_h3_close_detaches_nghttp2_user_data(void)
         .count = sizeof(fields) / sizeof(fields[0]),
         .capacity = sizeof(fields) / sizeof(fields[0]),
     };
-    xqc_h3_request_t *fake_request = (xqc_h3_request_t *)(uintptr_t)2;
+    xqc_h3_request_t *fake_request = (xqc_h3_request_t *)(uintptr_t)1;
     h2_proxy_stream_t *stream = h2_proxy_handle_request(
         proxy, fake_request, &headers, 1, NULL, (void *)(uintptr_t)20, NULL, 0);
     assert(stream != NULL);
@@ -477,6 +624,7 @@ main(void)
 {
     test_create_validation();
     test_h3_headers_submit_h2_request();
+    test_h3_response_round_robin_after_high_water();
     test_h3_close_detaches_nghttp2_user_data();
     puts("All HTTP/2 proxy tests passed");
     return 0;

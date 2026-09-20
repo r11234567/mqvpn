@@ -64,9 +64,12 @@ void h2_proxy_on_h3_close(h2_proxy_stream_t *stream);
 int h2_proxy_owns_fd(const h2_proxy_t *proxy, int fd, const void *fd_ctx);
 void h2_proxy_on_backend_ready(h2_proxy_t *proxy, int fd, void *fd_ctx, int readable,
                                int writable);
-/* Retry response streams parked by xquic EAGAIN, then evict idle backends.
+/* Run one bounded, round-robin response pass, then evict idle backends.
  * Correctness must not depend on xquic delivering a stream write callback. */
 void h2_proxy_tick(h2_proxy_t *proxy, uint64_t now_sec);
+/* True while an H3 response has buffered headers/body/FIN work. The server
+ * event loop uses this to bound retry latency independently of xquic's timer. */
+int h2_proxy_needs_tick(const h2_proxy_t *proxy);
 void h2_proxy_get_stats(const h2_proxy_t *proxy, h2_proxy_stats_t *stats);
 
 #ifdef __cplusplus

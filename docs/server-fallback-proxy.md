@@ -234,6 +234,15 @@ per-stream buffer, while stream credit is returned only after xquic accepts the
 bytes. The server tick probes paused connections and retries them, so progress
 does not depend on receiving a stream write-notification callback.
 
+Recovery is fair within a downstream QUIC connection. Each pass starts at a
+persistent round-robin cursor and offers every response at most one 16 KiB body
+chunk. If an earlier response fills the connection queue, the first response
+that observes high water without sending retains the cursor and therefore runs
+first after low water. This prevents a large JavaScript response at the list
+head from repeatedly starving later module chunks on a high-RTT, lossy path.
+While any response work remains buffered, the server event loop wakes at least
+every 10 ms to run this pass even if xquic emits no stream writable callback.
+
 ## Resource limits
 
 | Resource | Limit |
