@@ -1018,7 +1018,7 @@ stream_flush_response(h2_proxy_stream_t *stream, size_t body_budget)
     }
 
     body_available = stream->response_body_len - stream->response_body_off;
-    while (body_available > 0 && body_budget > 0) {
+    if (body_available > 0 && body_budget > 0) {
         if (stream->send_pressure && stream->send_pressure->paused) return 0;
         if (xqc_h3_request_get_send_queue_bytes(stream->h3_request) >=
             H2_QUIC_QUEUE_HIGH_WATER) {
@@ -1043,7 +1043,6 @@ stream_flush_response(h2_proxy_stream_t *stream, size_t body_budget)
         }
         stream->response_body_off += (size_t)sent;
         body_available -= (size_t)sent;
-        body_budget -= (size_t)sent;
         if (stream_consume_response(stream, (size_t)sent) != 0) return -1;
         if (fin && body_available == 0) stream->response_fin_sent = 1;
     }

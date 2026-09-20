@@ -33,6 +33,7 @@ typedef struct {
     int closed;
     uint64_t send_queue_bytes;
     uint64_t raise_queue_bytes_on_send;
+    size_t max_body_send_size;
     int body_eagain_count;
     int body_send_calls;
     int write_notify;
@@ -92,6 +93,8 @@ xqc_h3_request_send_body(xqc_h3_request_t *request, unsigned char *data, size_t 
         mock->body_eagain_count--;
         return -XQC_EAGAIN;
     }
+    if (mock->max_body_send_size != 0 && data_size > mock->max_body_send_size)
+        data_size = mock->max_body_send_size;
     assert(data_size <= sizeof(mock->body) - mock->body_len);
     memcpy(mock->body + mock->body_len, data, data_size);
     mock->body_len += data_size;
@@ -390,7 +393,10 @@ test_h3_headers_submit_h2_request(void)
     mock_h3.body_eagain_count = 1;
     h2_proxy_on_backend_ready(proxy, ctx.fd, ctx.fd_ctx, 1, 0);
     assert(ctx.want_read == 1);
-    assert(mock_h3.write_notify == 1);
+    /* Backend callbacks only buffer bodies. The fair tick owns queue pressure
+     * checks and write notification, so shared h2c reads never race the
+     * connection scheduler. */
+    assert(mock_h3.write_notify == 0);
     assert(mock_h3.headers == 2);
     assert(mock_h3.body_len == 0);
     assert(mock_h3.body_send_calls == 0);
@@ -518,9 +524,10 @@ test_h3_response_round_robin_after_high_water(void)
      * hit high water. The small stream must retain the recovery cursor when
      * it observes that edge without sending. */
     mock_h3_requests[0].raise_queue_bytes_on_send = 256u * 1024u;
+    mock_h3_requests[0].max_body_send_size = 8u * 1024u;
     h2_proxy_tick(proxy, 0);
     assert(mock_h3_requests[0].body_send_calls == 1);
-    assert(mock_h3_requests[0].body_len == 16u * 1024u);
+    assert(mock_h3_requests[0].body_len == 8u * 1024u);
     assert(mock_h3_requests[1].body_send_calls == 0);
     assert(mock_h3_requests[1].write_notify == 1);
     assert(mock_body_send_order_len == 1 && mock_body_send_order[0] == 1);
@@ -531,9 +538,16 @@ test_h3_response_round_robin_after_high_water(void)
     assert(mock_h3_requests[1].body_send_calls == 1);
     assert(mock_h3_requests[1].body_len == sizeof(small_body));
     assert(mock_h3_requests[0].body_send_calls == 2);
-    assert(mock_h3_requests[0].body_len == sizeof(large_body));
+    assert(mock_h3_requests[0].body_len == 16u * 1024u);
     assert(mock_body_send_order_len == 3);
     assert(mock_body_send_order[1] == 2 && mock_body_send_order[2] == 1);
+
+    /* A partial xquic acceptance still consumes the stream's sole turn. */
+    h2_proxy_tick(proxy, 0);
+    assert(mock_h3_requests[0].body_send_calls == 3);
+    assert(mock_h3_requests[0].body_len == sizeof(large_body));
+    assert(mock_h3_requests[1].body_send_calls == 1);
+    assert(mock_body_send_order_len == 4 && mock_body_send_order[3] == 1);
     assert(mock_h3_requests[0].fin == 1 && mock_h3_requests[1].fin == 1);
     assert(h2_proxy_needs_tick(proxy) == 0);
 
