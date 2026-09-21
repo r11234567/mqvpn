@@ -1,3 +1,16 @@
+> **Fork Notice**
+>
+> This repository is a fork of [mp0rta/mqvpn](https://github.com/mp0rta/mqvpn), maintained primarily
+> for personal use, deployment, testing, and customization.
+>
+> It is **not an official upstream repository**, and changes made here
+> should not be considered part of the upstream project.
+>
+> Please refer to the upstream repository for the official project,
+> documentation, releases, and support.
+>
+> Upstream copyright, licensing, and attribution remain unchanged.
+
 <div align="center">
   <h1>
     <picture>
