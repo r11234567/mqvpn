@@ -4,149 +4,122 @@
 package com.mqvpn.sdk.native_
 
 import android.net.http.X509TrustManagerExtensions
+import androidx.annotation.Keep
 import java.io.ByteArrayInputStream
-import java.net.IDN
-import java.net.InetAddress
 import java.security.KeyStore
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
-import java.util.Locale
 import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
 
 /**
- * Server-certificate check backed by Android's CA store.
+ * The Android platform certificate verifier libmqvpn calls on every TLS
+ * handshake (via mqvpn_jni.c). Identity is decided here (RFC 9525 rules for
+ * ASCII identifiers: SAN only, no CN, no IDNA), then trust is delegated to
+ * the platform's X509TrustManager (system CA store plus the app's network
+ * security config). Stateless by design: nothing here can be swapped at run
+ * time by other code in the process.
  *
- * BoringSSL's `X509_STORE_set_default_paths` finds nothing on Android: the CA
- * store sits at none of the paths it compiles in, it moved into an updatable
- * APEX in Android 14, and user-installed CAs are reachable only through the
- * framework. Every server certificate therefore looked untrusted, the
- * handshake failed, and the client reconnected forever. Asking the platform is
- * the only check that stays correct across releases.
- *
- * Called from native code: `mqvpn_jni.c` resolves [checkServerTrusted] by name
- * in `JNI_OnLoad`; each native config installs it through
- * `mqvpn_config_set_cert_verifier`. The class name, method name and signature
- * are part of that contract — see `consumer-rules.pro`.
+ * Resolved from C by literal name ("verify"), so this object is public and
+ * its JVM name must not be mangled — kept by @Keep and by consumer-rules.pro.
  */
 object PlatformTrust {
+    /** Trust step. Throws when the chain is not trusted for [host]. */
+    internal fun interface TrustChecker {
+        fun check(chain: Array<X509Certificate>, host: String)
+    }
 
-    /**
-     * @param chain DER-encoded certificates as delivered by the TLS stack,
-     *   leaf first, peer-supplied intermediates after it.
-     * @param hostname effective TLS server name, or the configured address.
-     * @return `null` only when Android accepts the chain and the leaf SAN
-     *   matches [hostname], otherwise a short reason for the native log.
-     */
+    private const val REASON_INVALID_HOST = "invalid host"
+    private const val REASON_NO_SAN = "certificate has no subject alternative name"
+    private const val REASON_NO_IP_SAN = "certificate has no IP address SAN for"
+    private const val REASON_NO_DNS_SAN = "certificate has no DNS SAN for"
+    private const val REASON_MISMATCH = "certificate hostname mismatch for"
+    private const val REASON_MALFORMED_AT = "malformed certificate at index"
+    private const val REASON_EMPTY_CHAIN = "malformed certificate chain: empty"
+    private const val REASON_VERIFIER_ERROR = "verifier error"
+
+    /** Returns null when the chain is trusted for [host], else a non-null one-line reason. */
     @JvmStatic
-    fun checkServerTrusted(chain: Array<ByteArray>, hostname: String): String? {
-        if (chain.isEmpty()) return "empty certificate chain"
-        if (hostname.isBlank()) return "empty certificate hostname"
-        return try {
-            val certs = decode(chain)
-            val manager = systemTrustManager ?: return "no system X509 trust manager"
-            X509TrustManagerExtensions(manager).checkServerTrusted(
-                certs,
-                authTypeOf(certs[0]),
-                hostname,
-            )
-            if (!matchesHostname(certs[0], hostname)) {
-                return "certificate subjectAltName does not match $hostname"
-            }
-            null
+    @Keep
+    fun verify(chainDer: Array<ByteArray>, host: String): String? = verifyWith(chainDer, host, PlatformChecker)
+
+    /** Same as [verify] with the trust step supplied by the caller (JVM tests pass a fake). */
+    internal fun verifyWith(chainDer: Array<ByteArray>, host: String, checker: TrustChecker): String? {
+        try {
+            if (chainDer.isEmpty()) return REASON_EMPTY_CHAIN
+            val certs = Array(chainDer.size) { i -> parseCertificate(chainDer[i]) ?: return "$REASON_MALFORMED_AT $i" }
+            identity(certs[0], host)?.let { return it }
+            checker.check(certs, HostIdentifier.normalise(host))
+            return null
         } catch (t: Throwable) {
-            // Catch everything. This return value is the only channel back to
-            // the caller, and an exception left pending across the JNI
-            // boundary is a crash rather than a rejected certificate.
-            t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName
+            // A rejection reason is never null: null means trusted and nothing else may produce it.
+            return "$REASON_VERIFIER_ERROR: ${(t.message ?: t.javaClass.name).replace('\n', ' ').take(512)}"
+        }
+    }
+
+    /** Strict parse: the provider's re-encoding must equal the input byte-for-byte — rejects
+     *  trailing bytes, PEM, and (on Conscrypt) any non-DER outer encoding. */
+    internal fun parseCertificate(der: ByteArray): X509Certificate? = try {
+        val c = CertificateFactory.getInstance("X.509").generateCertificate(ByteArrayInputStream(der)) as? X509Certificate
+        if (c != null && c.encoded.contentEquals(der)) c else null
+    } catch (_: Exception) { null }
+
+    /** The identity rule (RFC 9525 rules for ASCII identifiers, leaf SAN only): null = the leaf
+     *  may speak for [host]; else a reason with a fixed prefix. */
+    internal fun identity(leaf: X509Certificate, host: String): String? {
+        val ref = HostIdentifier.classify(host)
+        if (ref is HostIdentifier.Result.Invalid) return REASON_INVALID_HOST   // steps 1-2 come before the SAN lookup
+        val ext = leaf.getExtensionValue("2.5.29.17") ?: return REASON_NO_SAN
+        val inner = SanDer.unwrapOctetString(ext) ?: return REASON_NO_SAN
+        val entries = SanDer.walk(inner) ?: return REASON_NO_SAN
+        val shown = HostIdentifier.normalise(host)
+        return when (ref) {
+            is HostIdentifier.Result.Ip -> {
+                if (entries.any { it.kind == SanDer.Kind.IP && it.bytes.contentEquals(ref.bytes) }) null
+                else "$REASON_NO_IP_SAN $shown"
+            }
+            is HostIdentifier.Result.Dns -> {
+                val names = entries.filter { it.kind == SanDer.Kind.DNS }
+                if (names.isEmpty()) return "$REASON_NO_DNS_SAN $shown"
+                if (names.any { dnsMatches(String(it.bytes, Charsets.US_ASCII), ref) }) null
+                else "$REASON_MISMATCH $shown"
+            }
+            HostIdentifier.Result.Invalid -> REASON_INVALID_HOST   // exhaustiveness only: returned above
         }
     }
 
     /**
-     * The platform's trust manager over the system CA store, which is what
-     * `init(null)` selects. Resolved once; a failure is not cached, so a later
-     * attempt can still succeed.
+     * Exact match, or a left-most whole-label "*" standing for exactly one
+     * non-empty host label. Only the SAN side is normalised here; [ref] is
+     * already lower-case, dot-stripped LDH.
      */
-    private val systemTrustManager: X509TrustManager? by lazy {
-        val factory =
-            TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
-        factory.init(null as KeyStore?)
-        factory.trustManagers.filterIsInstance<X509TrustManager>().firstOrNull()
+    internal fun dnsMatches(sanEntry: String, ref: HostIdentifier.Result.Dns): Boolean {
+        var e = HostIdentifier.asciiLower(sanEntry)
+        if (e.endsWith('.')) e = e.dropLast(1)
+        if (e == ref.name) return true
+        if (!e.startsWith("*.")) return false
+        val suffix = e.substring(1)                 // ".example.com"
+        if (suffix.indexOf('*') >= 0) return false
+        val dot = ref.name.indexOf('.')
+        if (dot <= 0) return false                  // host needs a non-empty first label and a rest
+        return ref.name.substring(dot) == suffix
     }
 
-    private fun decode(chain: Array<ByteArray>): Array<X509Certificate> {
-        val factory = CertificateFactory.getInstance("X.509")
-        return Array(chain.size) { i ->
-            factory.generateCertificate(ByteArrayInputStream(chain[i])) as X509Certificate
+    // Exercised only on a device: under isReturnDefaultValues the android.net.http stub would
+    // accept everything, so JVM tests must inject a fake through verifyWith.
+    /** Created lazily on first use so JVM unit tests (which inject a fake) never touch android.net.http. */
+    private object PlatformChecker : TrustChecker {
+        private val ext: X509TrustManagerExtensions by lazy {
+            val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+            tmf.init(null as KeyStore?)
+            val tm = tmf.trustManagers.filterIsInstance<X509TrustManager>().first()
+            X509TrustManagerExtensions(tm)
         }
-    }
-
-    /**
-     * Conscrypt uses authType for pinning decisions and rejects a blank one; it
-     * does not have to match the negotiated key exchange, so the leaf's key
-     * algorithm is both accurate enough and always available.
-     */
-    private fun authTypeOf(leaf: X509Certificate): String =
-        leaf.publicKey?.algorithm?.takeIf { it.isNotBlank() } ?: "GENERIC"
-
-    internal fun matchesHostname(certificate: X509Certificate, hostname: String): Boolean {
-        val unbracketed = hostname.removePrefix("[").removeSuffix("]").removeSuffix(".")
-        val address = parseIpLiteral(unbracketed)
-        val names = certificate.subjectAlternativeNames ?: return false
-        if (address != null) {
-            return names.any { entry ->
-                entry.size >= 2 && entry[0] == 7 && parseSanAddress(entry[1])
-                    ?.contentEquals(address) == true
-            }
+        override fun check(chain: Array<X509Certificate>, host: String) {
+            // authType is a dummy: Android only requires it non-empty, and Chromium passes "RSA" too.
+            // host selects the app's network-security-config <domain-config> (per-domain trust
+            // anchors and pins), not identity (decided before this).
+            ext.checkServerTrusted(chain, "RSA", host)
         }
-
-        val host = normalizeDnsName(unbracketed) ?: return false
-        return names.any { entry ->
-            entry.size >= 2 && entry[0] == 2 &&
-                (entry[1] as? String)?.let { matchesDnsName(host, it) } == true
-        }
-    }
-
-    private fun matchesDnsName(host: String, certificateName: String): Boolean {
-        val raw = certificateName.removeSuffix(".")
-        if (raw.startsWith("*.") && raw.indexOf('*', 1) == -1) {
-            val suffix = normalizeDnsName(raw.substring(2)) ?: return false
-            return host.endsWith(".$suffix") && host.count { it == '.' } == suffix.count { it == '.' } + 1
-        }
-        val name = normalizeDnsName(raw) ?: return false
-        return '*' !in name && host == name
-    }
-
-    private fun normalizeDnsName(name: String): String? = try {
-        IDN.toASCII(name, IDN.USE_STD3_ASCII_RULES).lowercase(Locale.US)
-            .takeIf { it.isNotEmpty() }
-    } catch (_: IllegalArgumentException) {
-        null
-    }
-
-    private fun parseSanAddress(value: Any?): ByteArray? = when (value) {
-        is ByteArray -> value.takeIf { it.size == 4 || it.size == 16 }
-        is String -> parseIpLiteral(value)
-        else -> null
-    }
-
-    private fun parseIpLiteral(value: String): ByteArray? {
-        if (':' in value) {
-            return try {
-                InetAddress.getByName(value).address.takeIf { it.size == 16 }
-            } catch (_: Exception) {
-                null
-            }
-        }
-        val parts = value.split('.')
-        if (parts.size != 4) return null
-        val bytes = ByteArray(4)
-        for (i in parts.indices) {
-            if (parts[i].isEmpty() || parts[i].any { !it.isDigit() }) return null
-            val octet = parts[i].toIntOrNull() ?: return null
-            if (octet !in 0..255) return null
-            bytes[i] = octet.toByte()
-        }
-        return bytes
     }
 }
