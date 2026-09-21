@@ -305,7 +305,8 @@ set(MQVPN_LIB_SOURCES
 # Native client trust stores are exposed through the public verifier callback.
 # Keep the platform implementation out of the portable core on other targets.
 if(WIN32)
-    list(APPEND MQVPN_LIB_SOURCES src/platform/windows/cert_verify_windows.c)
+    list(APPEND MQVPN_LIB_SOURCES src/platform/windows/cert_verify.c
+                                  src/platform/windows/cert_identity.c)
 elseif(APPLE)
     list(APPEND MQVPN_LIB_SOURCES src/platform/darwin/cert_verify_apple.c)
 endif()
@@ -599,17 +600,42 @@ if(MSVC)
     target_compile_definitions(mqvpn_lib PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+# ---------- Tests (Windows) ----------
+# The option and enable_testing() are declared here because the Darwin and
+# Linux declarations below are inside their own branches.
 option(BUILD_TESTING "Build unit tests" ON)
 if(BUILD_TESTING)
     enable_testing()
+    # Shared Windows/Apple adapter test: rejects NULL input, an untrusted
+    # self-signed fixture, an empty host and undecodable DER. Compiles the
+    # verifier and the identity core it calls, plus log.c for their rejection
+    # reasons.
     add_executable(test_platform_cert_verify tests/test_platform_cert_verify.c
-                   src/platform/windows/cert_verify_windows.c)
+                   src/platform/windows/cert_verify.c
+                   src/platform/windows/cert_identity.c
+                   src/log.c)
     target_compile_definitions(test_platform_cert_verify PRIVATE
         TEST_CERT_DER_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.der")
     target_include_directories(test_platform_cert_verify PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/src/platform/windows)
     target_link_libraries(test_platform_cert_verify PRIVATE crypt32)
     add_test(NAME test_platform_cert_verify COMMAND test_platform_cert_verify)
+
+    # Portable identity core: same test as on Linux.
+    add_executable(test_cert_identity tests/test_cert_identity.c src/platform/windows/cert_identity.c)
+    target_include_directories(test_cert_identity PRIVATE ${CMAKE_SOURCE_DIR}/src/platform/windows)
+    target_compile_definitions(test_cert_identity PRIVATE TEST_CERT_DIR="${CMAKE_SOURCE_DIR}/tests/certs")
+    add_test(NAME test_cert_identity COMMAND test_cert_identity)
+    # CryptoAPI half, driven with an exclusive-root chain engine. Links only
+    # what it needs.
+    add_executable(test_cert_verify_win tests/test_cert_verify_win.c
+        src/platform/windows/cert_verify.c src/platform/windows/cert_identity.c src/log.c)
+    target_include_directories(test_cert_verify_win PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/platform/windows)
+    target_link_libraries(test_cert_verify_win crypt32)
+    target_compile_definitions(test_cert_verify_win PRIVATE TEST_CERT_DIR="${CMAKE_SOURCE_DIR}/tests/certs")
+    add_test(NAME test_cert_verify_win COMMAND test_cert_verify_win)
 
     # Includes firewall.c directly so the cleanup-only WFP entry points can
     # be replaced with deterministic fakes while the remaining setup symbols
@@ -626,12 +652,16 @@ if(BUILD_TESTING)
     if(Libevent_FOUND)
         target_link_libraries(test_windows_firewall PRIVATE libevent::core)
     endif()
-    if(MSVC)
-        target_compile_options(test_windows_firewall PRIVATE /WX /utf-8)
-        target_compile_definitions(test_windows_firewall PRIVATE
-            _CRT_SECURE_NO_WARNINGS)
-    endif()
     add_test(NAME test_windows_firewall COMMAND test_windows_firewall)
+
+    if(MSVC)
+        # same gate as the product build; target-scoped options are not inherited
+        foreach(t test_platform_cert_verify test_cert_identity test_cert_verify_win
+                  test_windows_firewall)
+            target_compile_options(${t} PRIVATE /WX /utf-8)
+            target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
+        endforeach()
+    endif()
 endif()
 
 elseif(APPLE)
@@ -1229,6 +1259,15 @@ if(BUILD_TESTING)
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
         add_test(NAME test_linux_server_socket COMMAND test_linux_server_socket)
     endif()
+
+    # Portable core of the Windows certificate verifier (no Win32 headers):
+    # the host parser, SAN DER walker and identity match are unit-tested here
+    # as well as in the Windows CI job, which also tests the CryptoAPI half.
+    add_executable(test_cert_identity tests/test_cert_identity.c src/platform/windows/cert_identity.c)
+    target_include_directories(test_cert_identity PRIVATE ${CMAKE_SOURCE_DIR}/src/platform/windows)
+    target_compile_definitions(test_cert_identity PRIVATE TEST_CERT_DIR="${CMAKE_SOURCE_DIR}/tests/certs")
+    set_target_properties(test_cert_identity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_test(NAME test_cert_identity COMMAND test_cert_identity)
 
     # Pre-accept type-confusion DoS regression: drives a raw xquic client with
     # a bogus ALPN at the server to prove an unauthenticated pre-handshake

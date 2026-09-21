@@ -9,8 +9,8 @@
 #include <stdlib.h>
 
 #ifdef _WIN32
-#  include "cert_verify_windows.h"
-#  define platform_cert_verify mqvpn_windows_cert_verify
+#  include "cert_verify.h"
+#  define platform_cert_verify mqvpn_win_cert_verify
 #elif defined(__APPLE__)
 #  include "cert_verify_apple.h"
 #  define platform_cert_verify mqvpn_apple_cert_verify
