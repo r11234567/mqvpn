@@ -273,8 +273,12 @@ int mqvpn_tcp_lane_downlink_pump(mqvpn_tcp_lane_t *lane, void *stream);
  *
  * Semantics — these are RECVED-WITHHOLDING hysteresis thresholds, not hard
  * memory caps. They cover both bytes mqvpn has not handed to xquic yet and
- * xquic's connection-wide retained-packet estimate, including in-flight
- * packets. Bytes lwIP has already delivered to the recv callback were already
+ * xquic's connection-wide un-sent byte estimate. Packets in flight are
+ * deliberately outside that estimate: they are the congestion controller's
+ * budget, and a connection running at its BDP holds a congestion window of
+ * them continuously, so a gate that counted them would stop reopening on
+ * exactly the fast paths it exists to pace. Bytes lwIP has already delivered
+ * to the recv callback were already
  * sequenced and ACKed on the wire, so they can never be dropped and MUST be
  * queued when xquic won't take them. Withholding tcp_recved() only stops the
  * receive window from RE-opening; the peer may still fill whatever window was
@@ -441,10 +445,12 @@ int cli_tcp_lane_open_stream(void *client_ctx, void *flow_handle,
  * NULL only when len == 0. */
 ssize_t cli_tcp_lane_h3_send(void *h3_request, const uint8_t *buf, size_t len, int fin);
 
-/* Connection-wide bytes retained by xquic's packet send queue, including
- * packets in flight awaiting acknowledgement. This is an upper-bound estimate
- * used only for high/low-water backpressure. */
-uint64_t cli_tcp_lane_h3_send_queue_bytes(void *h3_request);
+/* Connection-wide bytes xquic has queued but not yet put on the wire.
+ * Packets in flight awaiting acknowledgement are excluded: they are the
+ * congestion controller's budget, and a connection running at its BDP holds
+ * a congestion window of them at all times, so a high/low-water gate that
+ * counted them would never reopen on a fast path. */
+uint64_t cli_tcp_lane_h3_unsent_queue_bytes(void *h3_request);
 
 /* Keep or release xquic write callbacks while the TCP lane is waiting for the
  * connection send queue to drain. */

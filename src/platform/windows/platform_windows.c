@@ -17,8 +17,8 @@
 
 #  include "platform_internal_win.h"
 #  include "platform_windows.h"
-#  include "cert_verify_windows.h"
 #  include "net_mon.h"
+#  include "cert_verify.h"
 #  include "log.h"
 #  include "mqvpn_internal.h" /* mqvpn_config_apply_hybrid (INI [Hybrid] bridge) */
 
@@ -271,15 +271,7 @@ cb_state_changed(mqvpn_client_state_t old_state, mqvpn_client_state_t new_state,
          * reappears, per the field comment in platform_internal_win.h. */
         if (p->ev_recover) event_del(p->ev_recover);
         memset(p->path_recover_failures, 0, sizeof(p->path_recover_failures));
-        if (win_cleanup_killswitch(p) < 0) {
-            /* Continuing into a fresh tunnel after an unverified WFP cleanup
-             * can stack filters and strand the host offline. Fail closed and
-             * let process teardown retry the retained engine handle. */
-            LOG_ERR("kill switch cleanup failed during reconnect; stopping client");
-            p->fatal_error = 1;
-            p->shutting_down = 1;
-            event_base_loopbreak(p->eb);
-        }
+        (void)win_cleanup_killswitch(p);
         if (p->manage_routes) win_cleanup_routes(p);
         win_cleanup_dns(p);
         if (p->tun_up) {
@@ -291,6 +283,18 @@ cb_state_changed(mqvpn_client_state_t old_state, mqvpn_client_state_t new_state,
             mqvpn_tun_win_destroy(&p->tun);
             p->tun_up = 0;
             mqvpn_client_set_tun_active(p->client, 0, -1);
+        }
+        /* A kill switch we could not tear down keeps blocking everything, and
+         * only process exit clears it (BFE runs down the dynamic session with
+         * its owner). Head for the exit instead of reconnecting into it —
+         * win_setup_killswitch() would refuse the new session anyway. Let the
+         * disconnect drive the loop to CLOSED rather than breaking out here,
+         * so the teardown below still runs. */
+        if (p->wfp_close_failed && !p->shutting_down) {
+            LOG_ERR("kill switch teardown failed, aborting");
+            p->fatal_error = 1;
+            p->shutting_down = 1;
+            if (new_state != MQVPN_STATE_CLOSED) mqvpn_client_disconnect(p->client);
         }
         if (new_state == MQVPN_STATE_CLOSED && p->shutting_down)
             event_base_loopbreak(p->eb);
@@ -471,7 +475,10 @@ on_shutdown_wake(evutil_socket_t fd, short what, void *arg)
     p->shutting_down = 1;
     LOG_INF("received Ctrl+C, shutting down...");
     mqvpn_client_disconnect(p->client);
-    /* state_changed callback will call event_base_loopbreak on CLOSED */
+    /* mqvpn_client_disconnect() emits no state transition when the client is
+     * already CLOSED or IDLE, so cb_state_changed cannot be the only loop-exit
+     * path. Mirror the POSIX signal handlers and break directly. */
+    event_base_loopbreak(p->eb);
 }
 
 static BOOL WINAPI
@@ -609,8 +616,6 @@ win_platform_run_client(const mqvpn_client_cfg_t *cfg)
     /* Shared CLI→library bridge (vpn_client.h) — the per-platform copy this
      * replaces once dropped InitMaxPathId on Windows only. */
     mqvpn_platform_apply_client_config(lib_cfg, cfg);
-    if (!cfg->insecure)
-        mqvpn_config_set_cert_verifier(lib_cfg, mqvpn_windows_cert_verify, NULL);
 
     /* Create callbacks */
     mqvpn_client_callbacks_t cbs = MQVPN_CLIENT_CALLBACKS_INIT;
@@ -624,6 +629,31 @@ win_platform_run_client(const mqvpn_client_cfg_t *cfg)
     cbs.mtu_updated = cb_mtu_updated;
     cbs.log = cb_log;
     cbs.reconnect_scheduled = cb_reconnect_scheduled;
+
+    /* Platform certificate verifier: the Windows stores decide trust and the
+     * shared rule decides identity. Not installed when the operator supplied
+     * a custom trust path for the library-side verifier (the public header
+     * names SSL_CERT_FILE / SSL_CERT_DIR as overrides of the default paths),
+     * nor with Insecure, where no verifier is ever consulted. */
+    if (!cfg->insecure) {
+        const char *cert_file = getenv("SSL_CERT_FILE");
+        const char *cert_dir = getenv("SSL_CERT_DIR");
+        if (cert_file && cert_file[0]) {
+            LOG_WRN("SSL_CERT_FILE set: verifying against that PEM bundle, not the "
+                    "Windows certificate store");
+        } else if (cert_dir && cert_dir[0]) {
+            LOG_WRN("SSL_CERT_DIR set: verifying against that hashed certificate "
+                    "directory, not the Windows certificate store");
+        } else {
+            int vrc =
+                mqvpn_config_set_cert_verifier(lib_cfg, mqvpn_win_cert_verify, NULL);
+            if (vrc != MQVPN_OK) {
+                LOG_ERR("failed to install the certificate verifier: %d", vrc);
+                mqvpn_config_free(lib_cfg);
+                return 1;
+            }
+        }
+    }
 
     /* Create client */
     ctx.client = mqvpn_client_new(lib_cfg, &cbs, &ctx);

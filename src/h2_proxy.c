@@ -24,9 +24,21 @@
 #define H2_DEFAULT_MAX_BUFFER      (1024u * 1024u)
 #define H2_MAX_RESPONSE_HEADERS    256u
 #define H2_MAX_HEADER_BYTES        (32u * 1024u)
-#define H2_QUIC_QUEUE_HIGH_WATER   (256u * 1024u)
-#define H2_QUIC_QUEUE_LOW_WATER    (128u * 1024u)
-#define H2_QUIC_SEND_CHUNK         (16u * 1024u)
+/* Slice handed to xquic per xqc_h3_request_send_body() call. Not a rate
+ * limit: stream_flush_response() keeps slicing until the buffer empties or
+ * xquic pushes back. */
+#define H2_QUIC_SEND_CHUNK (16u * 1024u)
+/*
+ * Memory valve, not a rate control. Bounds what one downstream QUIC
+ * connection may hold on mqvpn's behalf that has not reached the wire yet;
+ * xquic's own ceiling (sndq_packets_used_max, 16384 packets) is far too
+ * loose to multiply by MaxConnections.
+ *
+ * It cannot latch closed, because xqc_h3_request_get_unsent_queue_bytes()
+ * excludes packets in flight. Rate is governed by the short-write and
+ * -XQC_EAGAIN returns of xqc_h3_request_send_body(), which are per stream.
+ */
+#define H2_QUIC_UNSENT_MAX (1024u * 1024u)
 
 /* Proxy Protocol v2 constants */
 #define PROXY_PROTOCOL_V2_SIG       "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A"
@@ -71,6 +83,7 @@ struct h2_proxy_stream_s {
     int response_status_seen;
     int response_started;
     int response_blocked;
+    int write_notify_armed;
     int backend_stream_closed;
     size_t response_unconsumed;
     int closed;
@@ -91,15 +104,14 @@ struct h2_backend_conn_s {
     struct h2_backend_conn_s *next;
 };
 
-/* One gate per downstream QUIC connection. The queue-byte API reports this
- * scope (not an individual stream), so the ownership must match it. */
+/* One rotation per downstream QUIC connection. The unsent-byte valve reports
+ * this scope (not an individual stream), and a round-robin cursor keeps a
+ * large response at the list head from taking every turn. */
 struct h3_send_pressure_s {
     h2_proxy_t *proxy;
     void *conn_key;
-    h2_proxy_stream_t *notifier;
     h2_proxy_stream_t *rr_next;
     uint32_t stream_count;
-    int paused;
     struct h3_send_pressure_s *next;
 };
 
@@ -114,10 +126,8 @@ struct h2_proxy_s {
 };
 
 static void backend_destroy(h2_backend_conn_t *conn);
-static int stream_flush_response(h2_proxy_stream_t *stream, size_t body_budget);
+static int stream_flush_response(h2_proxy_stream_t *stream);
 static void stream_set_response_blocked(h2_proxy_stream_t *stream, int blocked);
-static void send_pressure_pause(h2_proxy_stream_t *stream);
-static void send_pressure_maybe_resume(h3_send_pressure_t *pressure);
 static void send_pressure_run_round(h3_send_pressure_t *pressure);
 static int is_hop_by_hop(const uint8_t *name, size_t len, const uint8_t *value,
                          size_t value_len);
@@ -463,8 +473,8 @@ stream_destroy(h2_proxy_stream_t *stream)
     h3_send_pressure_t *pressure = stream->send_pressure;
     if (pressure) {
         if (pressure->rr_next == stream) pressure->rr_next = stream->next;
-        if (pressure->notifier == stream) {
-            pressure->notifier = NULL;
+        if (stream->write_notify_armed) {
+            stream->write_notify_armed = 0;
             (void)xqc_h3_request_set_write_notify(stream->h3_request, 0);
         }
         if (pressure->stream_count > 0) pressure->stream_count--;
@@ -474,15 +484,6 @@ stream_destroy(h2_proxy_stream_t *stream)
                 pressure_link = &(*pressure_link)->next;
             if (*pressure_link) *pressure_link = pressure->next;
             free(pressure);
-        } else if (pressure->paused && !pressure->notifier) {
-            for (h2_proxy_stream_t *candidate = proxy->streams; candidate;
-                 candidate = candidate->next) {
-                if (candidate->send_pressure == pressure && !candidate->closed) {
-                    pressure->notifier = candidate;
-                    (void)xqc_h3_request_set_write_notify(candidate->h3_request, 1);
-                    break;
-                }
-            }
         }
     }
     response_headers_clear(stream);
@@ -514,38 +515,28 @@ backend_update_interest(h2_backend_conn_t *conn)
                                  proxy->callbacks.user_ctx);
 }
 
+/*
+ * Track whether xquic has pushed back on this stream, and keep the write
+ * notification armed for exactly as long as it has.
+ *
+ * Arming is re-issued on every transition into the blocked state rather than
+ * skipped when already armed: xqc_stream_send() removes a stream from
+ * writable scheduling as soon as it accepts a whole write, so a cached
+ * "already armed" would silently stop the notifications that resume us.
+ */
 static void
 stream_set_response_blocked(h2_proxy_stream_t *stream, int blocked)
 {
-    if (!stream || stream->response_blocked == blocked) return;
+    if (!stream) return;
     stream->response_blocked = blocked;
-    int notify = blocked || (stream->send_pressure && stream->send_pressure->paused &&
-                             stream->send_pressure->notifier == stream);
-    (void)xqc_h3_request_set_write_notify(stream->h3_request, notify != 0);
-}
+    if (blocked) {
+        stream->write_notify_armed = 1;
+        (void)xqc_h3_request_set_write_notify(stream->h3_request, 1);
 
-static void
-send_pressure_pause(h2_proxy_stream_t *stream)
-{
-    h3_send_pressure_t *pressure = stream->send_pressure;
-    if (!pressure || pressure->paused) return;
-    pressure->paused = 1;
-    pressure->notifier = stream;
-    (void)xqc_h3_request_set_write_notify(stream->h3_request, 1);
-}
-
-static void
-send_pressure_maybe_resume(h3_send_pressure_t *pressure)
-{
-    if (!pressure || !pressure->paused || !pressure->notifier) return;
-    if (xqc_h3_request_get_send_queue_bytes(pressure->notifier->h3_request) >
-        H2_QUIC_QUEUE_LOW_WATER)
-        return;
-    h2_proxy_stream_t *notifier = pressure->notifier;
-    pressure->paused = 0;
-    pressure->notifier = NULL;
-    (void)xqc_h3_request_set_write_notify(notifier->h3_request,
-                                          notifier->response_blocked != 0);
+    } else if (stream->write_notify_armed) {
+        stream->write_notify_armed = 0;
+        (void)xqc_h3_request_set_write_notify(stream->h3_request, 0);
+    }
 }
 
 static h2_proxy_stream_t *
@@ -568,34 +559,38 @@ send_pressure_next_stream(h3_send_pressure_t *pressure, h2_proxy_stream_t *after
     return send_pressure_first_stream(pressure);
 }
 
-/* Send one bounded chunk per stream and retain the next starting point across
- * ticks. In particular, a large response that reaches the connection high
- * water mark cannot become the first stream again as soon as the queue falls
- * below low water. */
+/*
+ * Offer every response of one downstream QUIC connection a turn, starting at
+ * a persistent cursor so a large response at the list head cannot take every
+ * turn. Each turn drains that response until xquic pushes back, which is what
+ * makes progress independent of how often this runs.
+ *
+ * If the connection's unsent-byte valve trips, the cursor stays on the stream
+ * that did not get to send rather than on the one that just filled the queue,
+ * so it runs first next time.
+ */
 static void
 send_pressure_run_round(h3_send_pressure_t *pressure)
 {
     if (!pressure || pressure->stream_count == 0) return;
-    send_pressure_maybe_resume(pressure);
-    if (pressure->paused) return;
 
     h2_proxy_stream_t *stream = pressure->rr_next;
     if (!stream || stream->closed || stream->send_pressure != pressure)
         stream = send_pressure_first_stream(pressure);
     uint32_t remaining = pressure->stream_count;
     while (stream && remaining-- > 0) {
+        if (xqc_h3_request_get_unsent_queue_bytes(stream->h3_request) >=
+            H2_QUIC_UNSENT_MAX) {
+            /* Hold the cursor here: this stream has not had its turn, and the
+             * acknowledgement that drains the queue must bring it back. */
+            pressure->rr_next = stream;
+            stream_set_response_blocked(stream, 1);
+            return;
+        }
         h2_proxy_stream_t *next = send_pressure_next_stream(pressure, stream);
-        /* Keep the current stream as the cursor until it actually receives its
-         * turn. If the previous stream filled the connection queue, this
-         * stream observes the high-water edge and pauses without sending;
-         * low-water recovery must resume here, not wrap to the large stream
-         * that just consumed the preceding turn. */
-        pressure->rr_next = stream;
-        if (stream->response_blocked) stream_set_response_blocked(stream, 0);
-        if (stream_flush_response(stream, H2_QUIC_SEND_CHUNK) != 0)
-            (void)xqc_h3_request_close(stream->h3_request);
-        if (pressure->paused) return;
         pressure->rr_next = next;
+        if (stream_flush_response(stream) != 0)
+            (void)xqc_h3_request_close(stream->h3_request);
         stream = next;
     }
 }
@@ -719,7 +714,7 @@ on_data_chunk_recv_callback(nghttp2_session *session, uint8_t flags, int32_t str
     if (nghttp2_session_consume_connection(session, len) != 0)
         return NGHTTP2_ERR_CALLBACK_FAILURE;
     stream->response_unconsumed += len;
-    return stream_flush_response(stream, 0) == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+    return stream_flush_response(stream) == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
 }
 
 static int
@@ -736,11 +731,11 @@ on_frame_recv_callback(nghttp2_session *session, const nghttp2_frame *frame,
             return NGHTTP2_ERR_CALLBACK_FAILURE;
         stream->response_headers_pending = 1;
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) stream->response_eof = 1;
-        if (stream_flush_response(stream, 0) != 0) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        if (stream_flush_response(stream) != 0) return NGHTTP2_ERR_CALLBACK_FAILURE;
     } else if (frame->hd.type == NGHTTP2_DATA &&
                (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
         stream->response_eof = 1;
-        if (stream_flush_response(stream, 0) != 0) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        if (stream_flush_response(stream) != 0) return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
     return 0;
 }
@@ -869,9 +864,17 @@ backend_destroy(h2_backend_conn_t *conn)
         link = &(*link)->next;
     if (*link) *link = conn->next;
 
-    for (h2_proxy_stream_t *stream = proxy->streams; stream; stream = stream->next) {
-        if (stream->backend_conn != conn) continue;
-        if (stream->response_blocked) {
+    /* Cache the successor: xqc_h3_request_close() below can reach
+     * h2_proxy_on_h3_close() and free this node. */
+    h2_proxy_stream_t *stream = proxy->streams;
+    while (stream) {
+        h2_proxy_stream_t *next_stream = stream->next;
+        if (stream->backend_conn != conn) {
+            stream = next_stream;
+            continue;
+        }
+        if (stream->write_notify_armed) {
+            stream->write_notify_armed = 0;
             stream->response_blocked = 0;
             (void)xqc_h3_request_set_write_notify(stream->h3_request, 0);
         }
@@ -887,6 +890,7 @@ backend_destroy(h2_backend_conn_t *conn)
         stream->backend_stream_closed = 1;
         stream->backend_conn = NULL;
         stream->backend_stream_id = -1;
+        stream = next_stream;
     }
     if (proxy->callbacks.unregister_fd)
         proxy->callbacks.unregister_fd(conn->fd, proxy->callbacks.user_ctx);
@@ -989,16 +993,16 @@ apply_request_priority(h2_proxy_stream_t *stream, const xqc_http_headers_t *head
 }
 
 static int
-stream_flush_response(h2_proxy_stream_t *stream, size_t body_budget)
+stream_flush_response(h2_proxy_stream_t *stream)
 {
     if (!stream || stream->closed || stream->response_fin_sent) return 0;
     size_t body_available = stream->response_body_len - stream->response_body_off;
 
-    /* Forward the bounded header block before applying body backpressure. A
-     * single backend read can contain 103 plus final headers; leaving the 103
-     * pending would make on_begin_headers reject the final block as re-entry.
-     * The parser caps each block and recv() caps the uninterruptible input at
-     * 16 KiB, so this does not reopen unbounded backend-to-QUIC buffering. */
+    /* Forward the bounded header block before the body. A single backend read
+     * can contain 103 plus final headers; leaving the 103 pending would make
+     * on_begin_headers reject the final block as re-entry. The parser caps
+     * each block and recv() caps the uninterruptible input at 16 KiB, so this
+     * does not reopen unbounded backend-to-QUIC buffering. */
     if (stream->response_headers_pending && !stream->response_headers_are_trailers) {
         xqc_http_headers_t headers = {
             .headers = stream->response_headers,
@@ -1018,16 +1022,21 @@ stream_flush_response(h2_proxy_stream_t *stream, size_t body_budget)
     }
 
     body_available = stream->response_body_len - stream->response_body_off;
-    if (body_available > 0 && body_budget > 0) {
-        if (stream->send_pressure && stream->send_pressure->paused) return 0;
-        if (xqc_h3_request_get_send_queue_bytes(stream->h3_request) >=
-            H2_QUIC_QUEUE_HIGH_WATER) {
-            send_pressure_pause(stream);
-            return 0;
-        }
+    /*
+     * Hand the body over until it is gone or xquic declines more. A short
+     * write or -XQC_EAGAIN from xqc_h3_request_send_body() is the only stop
+     * signal, and it is scoped to this stream.
+     *
+     * There is deliberately no per-turn byte quota. One used to exist, and
+     * because a fully accepted write also drops the stream from writable
+     * scheduling, the quota left nothing to re-arm the notification: the
+     * response then advanced only on the server's recovery tick, one slice
+     * per tick, which capped a single response at slice/tick regardless of
+     * how much capacity the path had.
+     */
+    while (body_available > 0) {
         size_t chunk = body_available;
         if (chunk > H2_QUIC_SEND_CHUNK) chunk = H2_QUIC_SEND_CHUNK;
-        if (chunk > body_budget) chunk = body_budget;
         int fin = stream->response_eof && !stream->response_headers_pending;
         ssize_t sent = xqc_h3_request_send_body(
             stream->h3_request, stream->response_body + stream->response_body_off, chunk,
@@ -1045,6 +1054,11 @@ stream_flush_response(h2_proxy_stream_t *stream, size_t body_budget)
         body_available -= (size_t)sent;
         if (stream_consume_response(stream, (size_t)sent) != 0) return -1;
         if (fin && body_available == 0) stream->response_fin_sent = 1;
+        if ((size_t)sent < chunk) {
+            /* Partial acceptance is xquic pushing back mid-slice. */
+            stream_set_response_blocked(stream, 1);
+            return 0;
+        }
     }
     if (stream->response_body_off == stream->response_body_len) {
         free(stream->response_body);
@@ -1083,6 +1097,9 @@ stream_flush_response(h2_proxy_stream_t *stream, size_t body_budget)
     if (stream->backend_stream_closed && stream->response_unconsumed == 0 &&
         stream->response_fin_sent)
         stream_detach_backend(stream);
+    /* Everything offered has been accepted. Release the notification so an
+     * idle transport stream leaves writable scheduling. */
+    stream_set_response_blocked(stream, 0);
     return 0;
 }
 
@@ -1181,12 +1198,18 @@ int
 h2_proxy_on_h3_writable(h2_proxy_stream_t *stream)
 {
     if (!stream || stream->closed) return -1;
+    /*
+     * This is the acknowledgement-driven resume. xquic keeps a stream in
+     * writable scheduling for as long as it has declined part of a write, so
+     * the ACK that releases queue space arrives here without a timer. Run the
+     * whole connection's rotation rather than just this stream, so one
+     * notified response cannot monopolise the recovered capacity.
+     */
     if (stream->send_pressure) {
         send_pressure_run_round(stream->send_pressure);
         return 0;
     }
-    if (stream->response_blocked) stream_set_response_blocked(stream, 0);
-    return stream_flush_response(stream, H2_QUIC_SEND_CHUNK);
+    return stream_flush_response(stream);
 }
 
 void
@@ -1274,11 +1297,14 @@ void
 h2_proxy_tick(h2_proxy_t *proxy, uint64_t now_sec)
 {
     if (!proxy) return;
-    /* Write notification is a latency optimization, not the recovery owner.
-     * xquic can suppress it while connection DATA_BLOCKED is set. Each tick
-     * probes the low-water edge and runs one fair, bounded round per QUIC
-     * connection. The persistent cursor prevents a large response at the list
-     * head from refilling the queue before small siblings get a turn. */
+    /*
+     * Safety net only. The write notification owns recovery, but xquic
+     * suppresses it while connection-level DATA_BLOCKED is set, so a tick
+     * still has to reach responses that are waiting on a MAX_DATA update.
+     * Each tick runs one fair rotation per QUIC connection; the rotation is
+     * not byte-limited, so a longer tick interval costs latency after a
+     * suppressed notification and not throughput.
+     */
     for (h3_send_pressure_t *pressure = proxy->send_pressures; pressure;
          pressure = pressure->next)
         send_pressure_run_round(pressure);

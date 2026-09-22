@@ -18,6 +18,30 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 #   2 -> 3  udp_tx_sends / udp_tx_datagrams
 set(MQVPN_SOVERSION 3)
 
+# Build identity for anything that is not a tagged release. project(VERSION)
+# only accepts numeric x.y.z, so a snapshot cannot express itself there, and
+# leaving it alone made every main build claim to be the release whose number
+# happened to be checked in. Artifacts, the deb version and mqvpn --version
+# then could not be told apart from the real thing.
+#
+# The release workflow passes the suffix for non-tag builds, e.g.
+# "+snapshot.20260922.g1a2b3c4d5e6f". Keep it to characters a Debian version
+# accepts (alphanumerics and . + ~; never "-", which starts the Debian
+# revision) so CPACK_PACKAGE_VERSION stays valid, and keep the leading "+" so
+# it sorts after the release it is built on top of.
+set(MQVPN_VERSION_SUFFIX "" CACHE STRING
+    "Build-identity suffix appended to the release version (snapshot builds)")
+set(MQVPN_FULL_VERSION "${PROJECT_VERSION}${MQVPN_VERSION_SUFFIX}")
+if(MQVPN_VERSION_SUFFIX)
+    if(NOT MQVPN_VERSION_SUFFIX MATCHES "^[+~][A-Za-z0-9.+~]*$")
+        message(FATAL_ERROR
+            "MQVPN_VERSION_SUFFIX must start with + or ~ and contain only "
+            "Debian-safe version characters: ${MQVPN_VERSION_SUFFIX}")
+    endif()
+    add_compile_definitions(MQVPN_VERSION_SUFFIX_STR="${MQVPN_VERSION_SUFFIX}")
+endif()
+message(STATUS "mqvpn build version: ${MQVPN_FULL_VERSION}")
+
 # ---------- Options ----------
 option(XQUIC_BUILD_DIR "Path to pre-built xquic build directory" "")
 option(ENABLE_SANITIZERS "Enable ASan + UBSan" OFF)
@@ -281,7 +305,8 @@ set(MQVPN_LIB_SOURCES
 # Native client trust stores are exposed through the public verifier callback.
 # Keep the platform implementation out of the portable core on other targets.
 if(WIN32)
-    list(APPEND MQVPN_LIB_SOURCES src/platform/windows/cert_verify_windows.c)
+    list(APPEND MQVPN_LIB_SOURCES src/platform/windows/cert_verify.c
+                                  src/platform/windows/cert_identity.c)
 elseif(APPLE)
     list(APPEND MQVPN_LIB_SOURCES src/platform/darwin/cert_verify_apple.c)
 endif()
@@ -575,17 +600,42 @@ if(MSVC)
     target_compile_definitions(mqvpn_lib PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+# ---------- Tests (Windows) ----------
+# The option and enable_testing() are declared here because the Darwin and
+# Linux declarations below are inside their own branches.
 option(BUILD_TESTING "Build unit tests" ON)
 if(BUILD_TESTING)
     enable_testing()
+    # Shared Windows/Apple adapter test: rejects NULL input, an untrusted
+    # self-signed fixture, an empty host and undecodable DER. Compiles the
+    # verifier and the identity core it calls, plus log.c for their rejection
+    # reasons.
     add_executable(test_platform_cert_verify tests/test_platform_cert_verify.c
-                   src/platform/windows/cert_verify_windows.c)
+                   src/platform/windows/cert_verify.c
+                   src/platform/windows/cert_identity.c
+                   src/log.c)
     target_compile_definitions(test_platform_cert_verify PRIVATE
         TEST_CERT_DER_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.der")
     target_include_directories(test_platform_cert_verify PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/src/platform/windows)
     target_link_libraries(test_platform_cert_verify PRIVATE crypt32)
     add_test(NAME test_platform_cert_verify COMMAND test_platform_cert_verify)
+
+    # Portable identity core: same test as on Linux.
+    add_executable(test_cert_identity tests/test_cert_identity.c src/platform/windows/cert_identity.c)
+    target_include_directories(test_cert_identity PRIVATE ${CMAKE_SOURCE_DIR}/src/platform/windows)
+    target_compile_definitions(test_cert_identity PRIVATE TEST_CERT_DIR="${CMAKE_SOURCE_DIR}/tests/certs")
+    add_test(NAME test_cert_identity COMMAND test_cert_identity)
+    # CryptoAPI half, driven with an exclusive-root chain engine. Links only
+    # what it needs.
+    add_executable(test_cert_verify_win tests/test_cert_verify_win.c
+        src/platform/windows/cert_verify.c src/platform/windows/cert_identity.c src/log.c)
+    target_include_directories(test_cert_verify_win PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/platform/windows)
+    target_link_libraries(test_cert_verify_win crypt32)
+    target_compile_definitions(test_cert_verify_win PRIVATE TEST_CERT_DIR="${CMAKE_SOURCE_DIR}/tests/certs")
+    add_test(NAME test_cert_verify_win COMMAND test_cert_verify_win)
 
     # Includes firewall.c directly so the cleanup-only WFP entry points can
     # be replaced with deterministic fakes while the remaining setup symbols
@@ -602,12 +652,16 @@ if(BUILD_TESTING)
     if(Libevent_FOUND)
         target_link_libraries(test_windows_firewall PRIVATE libevent::core)
     endif()
-    if(MSVC)
-        target_compile_options(test_windows_firewall PRIVATE /WX /utf-8)
-        target_compile_definitions(test_windows_firewall PRIVATE
-            _CRT_SECURE_NO_WARNINGS)
-    endif()
     add_test(NAME test_windows_firewall COMMAND test_windows_firewall)
+
+    if(MSVC)
+        # same gate as the product build; target-scoped options are not inherited
+        foreach(t test_platform_cert_verify test_cert_identity test_cert_verify_win
+                  test_windows_firewall)
+            target_compile_options(${t} PRIVATE /WX /utf-8)
+            target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
+        endforeach()
+    endif()
 endif()
 
 elseif(APPLE)
@@ -950,6 +1004,12 @@ if(BUILD_TESTING)
     add_test(NAME check_bssl_build_guard
              COMMAND bash ${CMAKE_SOURCE_DIR}/tests/check_bssl_build_guard.sh)
 
+    # Committed certificate fixtures must be one consistent set (openssl
+    # verify on the DER files + the exact patched bytes the identity tests
+    # depend on). Bash + openssl + python3 only, no target.
+    add_test(NAME check_cert_fixtures
+             COMMAND bash ${CMAKE_SOURCE_DIR}/tests/check_cert_fixtures.sh)
+
     # Each test links only the source files it needs (no xquic dependency)
     add_executable(test_config  tests/test_config.c  src/config.c  src/log.c)
     add_executable(test_auth    tests/test_auth.c    src/auth.c    src/log.c)
@@ -1180,7 +1240,8 @@ if(BUILD_TESTING)
         # regenerate with `openssl x509 -in test.crt -outform DER -out test.der`
         # whenever test.crt changes (a stale copy fails the memcmp loudly).
         TEST_CERT_DER_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.der"
-        # Two-tier chain (leaf <- intermediate <- uncommitted root), generated
+        # Two-tier chain (leaf <- intermediate <- chain-root.der, committed but
+        # trusted only where a test says so), generated
         # by tests/certs/gen_chain.sh: pins the leaf-first presented-chain
         # contract and the unknown-issuer path.
         TEST_CHAIN_CERT_FILE="${CMAKE_SOURCE_DIR}/tests/certs/chain-fullchain.crt"
@@ -1198,6 +1259,15 @@ if(BUILD_TESTING)
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
         add_test(NAME test_linux_server_socket COMMAND test_linux_server_socket)
     endif()
+
+    # Portable core of the Windows certificate verifier (no Win32 headers):
+    # the host parser, SAN DER walker and identity match are unit-tested here
+    # as well as in the Windows CI job, which also tests the CryptoAPI half.
+    add_executable(test_cert_identity tests/test_cert_identity.c src/platform/windows/cert_identity.c)
+    target_include_directories(test_cert_identity PRIVATE ${CMAKE_SOURCE_DIR}/src/platform/windows)
+    target_compile_definitions(test_cert_identity PRIVATE TEST_CERT_DIR="${CMAKE_SOURCE_DIR}/tests/certs")
+    set_target_properties(test_cert_identity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_test(NAME test_cert_identity COMMAND test_cert_identity)
 
     # Pre-accept type-confusion DoS regression: drives a raw xquic client with
     # a bogus ALPN at the server to prove an unauthenticated pre-handshake
@@ -1283,6 +1353,13 @@ if(BUILD_TESTING)
     add_test(NAME test_cli_path_argv
         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/test_cli_path_argv.sh $<TARGET_FILE:mqvpn>)
 
+    # SIGTERM-while-CLOSED shell test (runs the built mqvpn binary). Needs no
+    # root, no server and no TUN — the client reaches CLOSED on a handshake
+    # that times out — so it runs here rather than in the sudo+netns suite.
+    # ~10s: the failed handshake waits out xquic's init_idle_time_out.
+    add_test(NAME test_cli_sigterm_closed
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tests/test_cli_sigterm_closed.sh $<TARGET_FILE:mqvpn>)
+
     # Guard: every tests/test_*.c using bare assert() must #undef NDEBUG,
     # since CI also runs ctest on a Release (-DNDEBUG) build.
     add_test(NAME test_ndebug_guard
@@ -1358,9 +1435,9 @@ if(DPKG_CMD)
 
     set(CPACK_GENERATOR "DEB")
     set(CPACK_DEBIAN_PACKAGE_NAME "mqvpn")
-    set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+    set(CPACK_PACKAGE_VERSION "${MQVPN_FULL_VERSION}")
     set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "${DPKG_ARCH}")
-    set(CPACK_DEBIAN_FILE_NAME "mqvpn_${PROJECT_VERSION}_${DPKG_ARCH}.deb")
+    set(CPACK_DEBIAN_FILE_NAME "mqvpn_${MQVPN_FULL_VERSION}_${DPKG_ARCH}.deb")
     set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
     set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "Multipath QUIC VPN using MASQUE CONNECT-IP (RFC 9484)")
     set(CPACK_DEBIAN_PACKAGE_MAINTAINER "mp0rta")

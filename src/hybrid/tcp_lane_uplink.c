@@ -36,7 +36,7 @@ tcp_lane_recved(struct tcp_pcb *pcb, uint32_t len)
 static uint64_t
 tcp_lane_uplink_xquic_bytes(const mqvpn_tcp_flow_t *f)
 {
-    return f->h3_request ? cli_tcp_lane_h3_send_queue_bytes(f->h3_request) : 0;
+    return f->h3_request ? cli_tcp_lane_h3_unsent_queue_bytes(f->h3_request) : 0;
 }
 
 static void

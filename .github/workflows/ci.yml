@@ -458,6 +458,16 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: sudo -E scripts/ci_e2e/run_udp_gso_config_test.sh
 
+      # The abort path reaches exit() for the first time, so this is where the
+      # sanitizers get to see it. The client under test exits non-zero by
+      # design; the suite keeps it away from stop_and_check_sanitizer and
+      # asserts the status and the absence of sanitizer reports itself.
+      - name: E2E setup-abort exit test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_setup_abort_exit_test.sh
+
   msan:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -584,6 +594,9 @@ jobs:
 
       - name: Smoke test (netns)
         run: sudo scripts/ci_e2e/run_test.sh
+
+      - name: Setup-abort exit test (netns)
+        run: sudo scripts/ci_e2e/run_setup_abort_exit_test.sh
 
       - name: Multi-client test (netns)
         run: sudo scripts/ci_e2e/test_multiclient.sh
@@ -1034,6 +1047,16 @@ jobs:
             -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON ..
           cmake --build . --config Release
 
+      # The only place the CryptoAPI half of the verifier is compiled and run.
+      # Both tests use their own checks, not assert(), so Release is fine.
+      - name: Certificate verifier tests
+        run: ctest --test-dir build -C Release -R "test_cert_(identity|verify_win)" --no-tests=error --output-on-failure
+
+      # Weak: presence and order of the install call only (see the script).
+      - name: Verifier wiring tripwire
+        shell: bash
+        run: bash scripts/ci_check_windows_verifier_wiring.sh
+
       - name: Verify binary
         run: |
           Test-Path build/Release/mqvpn.exe
@@ -1048,7 +1071,16 @@ jobs:
       - name: Run Windows platform tests
         run: >-
           ctest --test-dir build -C Release --output-on-failure
-          -R 'test_(platform_cert_verify|windows_firewall)'
+          -R 'test_(platform_cert_verify|cert_identity|cert_verify_win|windows_firewall)'
+
+      # For on-machine checks the runner cannot do (real certificate stores,
+      # a real server). Needs wintun.dll next to it: take it from a release zip.
+      - name: Upload mqvpn.exe
+        uses: actions/upload-artifact@v7
+        with:
+          name: mqvpn-windows-x64
+          path: build/Release/mqvpn.exe
+          retention-days: 7
 
   android:
     runs-on: ubuntu-latest
@@ -1132,6 +1164,7 @@ jobs:
             android/sdk-core/build/reports/tests/
             android/sdk-runtime/build/reports/tests/
             android/sdk-network/build/reports/tests/
+            android/sdk-native/build/reports/tests/
           retention-days: 7
 
   # Instrumented (androidTest) run on an x86_64 emulator. This is the only
