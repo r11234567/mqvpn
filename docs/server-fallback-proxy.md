@@ -225,23 +225,44 @@ Backend sockets are nonblocking and reused. One H2 connection supports up to
 Request and response buffers are bounded; a stream is closed if it exceeds a
 limit rather than consuming unbounded memory.
 
-Response backpressure is scoped to the downstream QUIC connection, because
-xquic's retained-send-byte estimate covers that connection rather than one H3
-stream. Crossing 256 KiB pauses response bodies for that QUIC connection until
-the estimate falls to 128 KiB. It does not disable reads on the shared h2c
-socket: nghttp2 connection credit is returned after bytes enter the bounded
-per-stream buffer, while stream credit is returned only after xquic accepts the
-bytes. The server tick probes paused connections and retries them, so progress
-does not depend on receiving a stream write-notification callback.
+Response pacing is per stream and comes from xquic itself. mqvpn hands a
+response body to `xqc_h3_request_send_body` until the buffer empties or xquic
+declines — a short write or `-XQC_EAGAIN`. There is no per-turn byte quota: a
+quota cannot work here, because xquic also removes a stream from writable
+scheduling as soon as it accepts a whole write, so a response that stopped
+early had nothing left to re-arm its notification and advanced only on the
+server's recovery tick.
+
+While a response is waiting, mqvpn keeps its write notification armed, and
+xquic keeps such a stream in writable scheduling. The acknowledgement that
+releases queue space therefore resumes the response directly, with no timer
+involved. Reads on the shared h2c socket are never disabled: nghttp2
+connection credit is returned once bytes enter the bounded per-stream buffer,
+while stream credit is returned only after xquic accepts them, so
+backpressure stays scoped to the one stream.
+
+A separate valve bounds memory rather than rate. If one QUIC connection is
+holding more than 1 MiB that has not reached the wire,
+`xqc_h3_request_get_unsent_queue_bytes` reports it and the next response in
+the rotation waits. That estimate excludes packets in flight on purpose:
+in-flight bytes are the congestion controller's budget, and a connection
+running at its bandwidth-delay product holds a congestion window of them at
+all times, so a threshold that counted them stayed closed on exactly the fast
+connections it was meant to pace.
 
 Recovery is fair within a downstream QUIC connection. Each pass starts at a
-persistent round-robin cursor and offers every response at most one 16 KiB body
-chunk. If an earlier response fills the connection queue, the first response
-that observes high water without sending retains the cursor and therefore runs
-first after low water. This prevents a large JavaScript response at the list
-head from repeatedly starving later module chunks on a high-RTT, lossy path.
-While any response work remains buffered, the server event loop wakes at least
-every 10 ms to run this pass even if xquic emits no stream writable callback.
+persistent round-robin cursor and offers every response a turn. If the valve
+trips, the cursor stays on the response that did not get to send rather than
+on the one that just filled the queue, so it runs first once the queue
+drains. This prevents a large JavaScript response at the list head from
+repeatedly starving later module chunks on a high-RTT, lossy path.
+
+The server event loop also wakes every 50 ms while response work is
+outstanding. That is a safety net, not the recovery path: xquic suppresses
+write notification while connection-level `DATA_BLOCKED` is set, so a
+response waiting on a `MAX_DATA` update needs some other wakeup. Because a
+rotation is not byte-limited, this interval bounds recovery latency after a
+suppressed notification and does not bound throughput.
 
 ## Resource limits
 

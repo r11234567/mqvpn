@@ -414,7 +414,7 @@ cli_tcp_lane_h3_send(void *h3_request, const uint8_t *buf, size_t len, int fin)
 }
 
 uint64_t
-cli_tcp_lane_h3_send_queue_bytes(void *h3_request)
+cli_tcp_lane_h3_unsent_queue_bytes(void *h3_request)
 {
     (void)h3_request;
     return g_h3_send_queue_bytes;

@@ -31,12 +31,14 @@ typedef struct {
     size_t body_len;
     int fin;
     int closed;
-    uint64_t send_queue_bytes;
+    uint64_t unsent_queue_bytes;
     uint64_t raise_queue_bytes_on_send;
     size_t max_body_send_size;
     int body_eagain_count;
+    int body_block;
     int body_send_calls;
     int write_notify;
+    int write_notify_arms;
     int priority_set;
     uint8_t urgency;
 } mock_h3_t;
@@ -44,7 +46,7 @@ typedef struct {
 #define MOCK_H3_REQUESTS 4
 static mock_h3_t mock_h3_requests[MOCK_H3_REQUESTS];
 #define mock_h3 mock_h3_requests[0]
-static uintptr_t mock_body_send_order[32];
+static uintptr_t mock_body_send_order[64];
 static size_t mock_body_send_order_len;
 
 static mock_h3_t *
@@ -89,6 +91,7 @@ xqc_h3_request_send_body(xqc_h3_request_t *request, unsigned char *data, size_t 
     assert(mock_body_send_order_len <
            sizeof(mock_body_send_order) / sizeof(mock_body_send_order[0]));
     mock_body_send_order[mock_body_send_order_len++] = (uintptr_t)request;
+    if (mock->body_block) return -XQC_EAGAIN;
     if (mock->body_eagain_count > 0) {
         mock->body_eagain_count--;
         return -XQC_EAGAIN;
@@ -100,7 +103,7 @@ xqc_h3_request_send_body(xqc_h3_request_t *request, unsigned char *data, size_t 
     mock->body_len += data_size;
     if (mock->raise_queue_bytes_on_send != 0) {
         for (size_t i = 0; i < MOCK_H3_REQUESTS; i++)
-            mock_h3_requests[i].send_queue_bytes = mock->raise_queue_bytes_on_send;
+            mock_h3_requests[i].unsent_queue_bytes = mock->raise_queue_bytes_on_send;
         mock->raise_queue_bytes_on_send = 0;
     }
     if (fin) mock->fin = 1;
@@ -122,15 +125,17 @@ xqc_h3_request_close(xqc_h3_request_t *request)
 }
 
 uint64_t
-xqc_h3_request_get_send_queue_bytes(xqc_h3_request_t *request)
+xqc_h3_request_get_unsent_queue_bytes(xqc_h3_request_t *request)
 {
-    return mock_h3_for(request)->send_queue_bytes;
+    return mock_h3_for(request)->unsent_queue_bytes;
 }
 
 xqc_int_t
 xqc_h3_request_set_write_notify(xqc_h3_request_t *request, uint8_t enabled)
 {
-    mock_h3_for(request)->write_notify = enabled != 0;
+    mock_h3_t *mock = mock_h3_for(request);
+    mock->write_notify = enabled != 0;
+    if (enabled) mock->write_notify_arms++;
     return XQC_OK;
 }
 
@@ -385,36 +390,39 @@ test_h3_headers_submit_h2_request(void)
                                    sizeof(response_headers) / sizeof(response_headers[0]),
                                    &provider) == 0);
     assert(nghttp2_session_send(server_session) == 0);
-    /* Queue bytes are connection-wide, so a busy sibling stream may pause this
-     * QUIC connection but must not disable the multiplexed h2c fd. Recovery
-     * below deliberately arrives via tick only, without simulating xquic's
-     * optional write notification. */
-    mock_h3.send_queue_bytes = 256u * 1024u;
-    mock_h3.body_eagain_count = 1;
+    /*
+     * Decline every body write while the backend data arrives. The response
+     * must be retained and the write notification armed, because that
+     * notification -- not a timer -- is what resumes it.
+     */
+    mock_h3.unsent_queue_bytes = 256u * 1024u;
+    mock_h3.body_block = 1;
     h2_proxy_on_backend_ready(proxy, ctx.fd, ctx.fd_ctx, 1, 0);
-    assert(ctx.want_read == 1);
-    /* Backend callbacks only buffer bodies. The fair tick owns queue pressure
-     * checks and write notification, so shared h2c reads never race the
-     * connection scheduler. */
-    assert(mock_h3.write_notify == 0);
-    assert(mock_h3.headers == 2);
-    assert(mock_h3.body_len == 0);
-    assert(mock_h3.body_send_calls == 0);
-
-    mock_h3.send_queue_bytes = 128u * 1024u;
-    h2_proxy_tick(proxy, 0);
+    /* A single H3 stream declining a write must not disarm reads for the
+     * other streams multiplexed on the shared h2c fd. */
     assert(ctx.want_read == 1);
     assert(mock_h3.write_notify == 1);
-    assert(mock_h3.body_send_calls == 1);
+    assert(mock_h3.headers == 2);
     assert(mock_h3.body_len == 0);
-
-    h2_proxy_tick(proxy, 0);
-    assert(ctx.want_read == 1);
-    assert(mock_h3.write_notify == 0);
-    assert(mock_h3.body_send_calls == 2);
     assert(mock_h3.status_200 == 1);
+    assert(mock_h3.fin == 0);
+    assert(h2_proxy_needs_tick(proxy) == 1);
+
+    /*
+     * The writable notification completes the response in a single pass.
+     * There is no per-turn byte quota, so this must not need a second call --
+     * a quota here is what previously limited one response to one slice per
+     * server tick regardless of path capacity.
+     */
+    mock_h3.body_block = 0;
+    assert(h2_proxy_on_h3_writable(stream) == 0);
+    assert(ctx.want_read == 1);
     assert(mock_h3.body_len == 2 && memcmp(mock_h3.body, "ok", 2) == 0);
     assert(mock_h3.fin == 1);
+    /* Nothing left to send: the stream leaves writable scheduling, and the
+     * recovery tick is no longer needed. */
+    assert(mock_h3.write_notify == 0);
+    assert(h2_proxy_needs_tick(proxy) == 0);
 
     h2_proxy_stats_t stats;
     h2_proxy_get_stats(proxy, &stats);
@@ -431,7 +439,7 @@ test_h3_headers_submit_h2_request(void)
 }
 
 static void
-test_h3_response_round_robin_after_high_water(void)
+test_h3_response_fair_recovery_on_pushback(void)
 {
     struct sockaddr_in backend;
     int listener = create_listener(&backend);
@@ -515,40 +523,56 @@ test_h3_response_round_robin_after_high_water(void)
     assert(nghttp2_submit_response(server_session, 3, response_headers, 1,
                                    &small_provider) == 0);
     assert(nghttp2_session_send(server_session) == 0);
+    /* Decline every body write while the backend data arrives, so both
+     * responses end up buffered and both armed for notification. */
+    mock_h3_requests[0].body_block = 1;
+    mock_h3_requests[1].body_block = 1;
     h2_proxy_on_backend_ready(proxy, ctx.fd, ctx.fd_ctx, 1, 0);
-    assert(mock_h3_requests[0].body_send_calls == 0);
-    assert(mock_h3_requests[1].body_send_calls == 0);
+    assert(mock_h3_requests[0].body_len == 0);
+    assert(mock_h3_requests[1].body_len == 0);
+    assert(mock_h3_requests[0].write_notify == 1);
+    assert(mock_h3_requests[1].write_notify == 1);
     assert(h2_proxy_needs_tick(proxy) == 1);
 
-    /* The large stream gets one 16 KiB turn and makes the shared connection
-     * hit high water. The small stream must retain the recovery cursor when
-     * it observes that edge without sending. */
-    mock_h3_requests[0].raise_queue_bytes_on_send = 256u * 1024u;
+    /* The large response fills the connection's unsent-byte budget as it
+     * sends, and xquic accepts only part of its slice. The small response
+     * then observes the valve without sending, and must keep the cursor so
+     * that it -- not the response that just filled the queue -- goes first
+     * once the queue drains. */
+    mock_h3_requests[0].body_block = 0;
+    mock_h3_requests[1].body_block = 0;
     mock_h3_requests[0].max_body_send_size = 8u * 1024u;
+    mock_h3_requests[0].raise_queue_bytes_on_send = 1024u * 1024u;
+    /* Declining a write still counts as a send call, so compare deltas. */
+    int large_calls = mock_h3_requests[0].body_send_calls;
+    int small_calls = mock_h3_requests[1].body_send_calls;
+    size_t order_at_valve = mock_body_send_order_len;
     h2_proxy_tick(proxy, 0);
-    assert(mock_h3_requests[0].body_send_calls == 1);
+    assert(mock_h3_requests[0].body_send_calls == large_calls + 1);
     assert(mock_h3_requests[0].body_len == 8u * 1024u);
-    assert(mock_h3_requests[1].body_send_calls == 0);
+    /* The valve stopped the small response before it reached xquic at all. */
+    assert(mock_h3_requests[1].body_send_calls == small_calls);
     assert(mock_h3_requests[1].write_notify == 1);
-    assert(mock_body_send_order_len == 1 && mock_body_send_order[0] == 1);
+    assert(mock_body_send_order_len == order_at_valve + 1);
+    assert(mock_body_send_order[order_at_valve] == 1);
 
-    mock_h3_requests[0].send_queue_bytes = 128u * 1024u;
-    mock_h3_requests[1].send_queue_bytes = 128u * 1024u;
+    /*
+     * The valve reports unsent bytes only, so acknowledgements clear it; it
+     * can never latch the way an in-flight-inclusive estimate did. Recovery
+     * starts at the small response, and because no per-turn byte quota
+     * remains, one pass finishes both.
+     */
+    mock_h3_requests[0].unsent_queue_bytes = 0;
+    mock_h3_requests[1].unsent_queue_bytes = 0;
+    mock_h3_requests[0].max_body_send_size = 0;
+    size_t order_before = mock_body_send_order_len;
     h2_proxy_tick(proxy, 0);
-    assert(mock_h3_requests[1].body_send_calls == 1);
+    assert(mock_body_send_order[order_before] == 2);
     assert(mock_h3_requests[1].body_len == sizeof(small_body));
-    assert(mock_h3_requests[0].body_send_calls == 2);
-    assert(mock_h3_requests[0].body_len == 16u * 1024u);
-    assert(mock_body_send_order_len == 3);
-    assert(mock_body_send_order[1] == 2 && mock_body_send_order[2] == 1);
-
-    /* A partial xquic acceptance still consumes the stream's sole turn. */
-    h2_proxy_tick(proxy, 0);
-    assert(mock_h3_requests[0].body_send_calls == 3);
     assert(mock_h3_requests[0].body_len == sizeof(large_body));
-    assert(mock_h3_requests[1].body_send_calls == 1);
-    assert(mock_body_send_order_len == 4 && mock_body_send_order[3] == 1);
     assert(mock_h3_requests[0].fin == 1 && mock_h3_requests[1].fin == 1);
+    assert(mock_h3_requests[0].write_notify == 0);
+    assert(mock_h3_requests[1].write_notify == 0);
     assert(h2_proxy_needs_tick(proxy) == 0);
 
     h2_proxy_on_h3_close(small);
@@ -638,7 +662,7 @@ main(void)
 {
     test_create_validation();
     test_h3_headers_submit_h2_request();
-    test_h3_response_round_robin_after_high_water();
+    test_h3_response_fair_recovery_on_pushback();
     test_h3_close_detaches_nghttp2_user_data();
     puts("All HTTP/2 proxy tests passed");
     return 0;
