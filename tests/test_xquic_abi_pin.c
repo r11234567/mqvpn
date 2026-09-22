@@ -64,11 +64,13 @@ _Static_assert(MQVPN_MAX_PATHS == 8,
  * evaluates its controlling operand, so the signature is checked against the
  * header alone -- which is what the pin is for. */
 _Static_assert(_Generic(&xqc_h3_request_get_unsent_queue_bytes,
-                        uint64_t (*)(xqc_h3_request_t *): 1, default: 0),
+               uint64_t (*)(xqc_h3_request_t *): 1,
+               default: 0),
                "xquic must declare "
                "uint64_t xqc_h3_request_get_unsent_queue_bytes(xqc_h3_request_t *)");
 _Static_assert(_Generic(&xqc_h3_request_set_write_notify,
-                        xqc_int_t (*)(xqc_h3_request_t *, uint8_t): 1, default: 0),
+               xqc_int_t (*)(xqc_h3_request_t *, uint8_t): 1,
+               default: 0),
                "xquic must declare "
                "xqc_int_t xqc_h3_request_set_write_notify(xqc_h3_request_t *, uint8_t)");
 

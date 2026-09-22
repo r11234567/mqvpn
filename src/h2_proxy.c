@@ -27,7 +27,7 @@
 /* Slice handed to xquic per xqc_h3_request_send_body() call. Not a rate
  * limit: stream_flush_response() keeps slicing until the buffer empties or
  * xquic pushes back. */
-#define H2_QUIC_SEND_CHUNK         (16u * 1024u)
+#define H2_QUIC_SEND_CHUNK (16u * 1024u)
 /*
  * Memory valve, not a rate control. Bounds what one downstream QUIC
  * connection may hold on mqvpn's behalf that has not reached the wire yet;
@@ -38,7 +38,7 @@
  * excludes packets in flight. Rate is governed by the short-write and
  * -XQC_EAGAIN returns of xqc_h3_request_send_body(), which are per stream.
  */
-#define H2_QUIC_UNSENT_MAX         (1024u * 1024u)
+#define H2_QUIC_UNSENT_MAX (1024u * 1024u)
 
 /* Proxy Protocol v2 constants */
 #define PROXY_PROTOCOL_V2_SIG       "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A"
