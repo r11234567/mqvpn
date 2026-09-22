@@ -72,13 +72,14 @@ jobs:
         shell: bash
         run: bash scripts/apply_xquic_patches.sh
 
-      - name: Verify tag matches CMake version
+      - name: Resolve build version
         shell: bash
         run: |
           # Use sed (BRE) instead of `grep -oP` because Git for Windows' grep
           # rejects -P with the runner's default locale ("supports only unibyte
           # and UTF-8 locales"). sed avoids the PCRE dependency entirely.
           CMAKE_VERSION=$(sed -n 's/^project(mqvpn VERSION \([0-9.][0-9.]*\).*/\1/p' CMakeLists.txt)
+          SUFFIX=""
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             TAG_VERSION="${GITHUB_REF_NAME#v}"
             # Skip the strict tag/CMake match for SemVer pre-release tags
@@ -90,8 +91,24 @@ jobs:
               echo "ERROR: Tag $TAG_VERSION != CMakeLists.txt $CMAKE_VERSION"
               exit 1
             fi
+          else
+            # Not a tag: this is a rolling snapshot of main. It must not claim
+            # to be the release number that happens to be checked in, or its
+            # artifacts, deb version and `mqvpn --version` are
+            # indistinguishable from the real release. "+" sorts after that
+            # release for dpkg; "-" is not used because it would start a
+            # Debian revision.
+            #
+            # The date comes from the commit, not from `date`: the Android
+            # reproducibility gate rebuilds the same commit later and compares
+            # the APK byte for byte, so anything in the version string has to
+            # be a function of the commit alone.
+            COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y%m%d "$GITHUB_SHA")
+            SUFFIX="+snapshot.${COMMIT_DATE}.g${GITHUB_SHA:0:12}"
           fi
-          echo "VERSION=$CMAKE_VERSION" >> "$GITHUB_ENV"
+          echo "VERSION=${CMAKE_VERSION}${SUFFIX}" >> "$GITHUB_ENV"
+          echo "VERSION_SUFFIX=$SUFFIX" >> "$GITHUB_ENV"
+          echo "building ${CMAKE_VERSION}${SUFFIX}"
 
       - name: Install dependencies
         if: matrix.os == 'linux'
@@ -135,6 +152,7 @@ jobs:
           cmake -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX=/usr \
                 -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
+                -DMQVPN_VERSION_SUFFIX="$VERSION_SUFFIX" \
                 -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
           make -j$(nproc)
 
@@ -261,6 +279,7 @@ jobs:
                 -DXQUIC_BUILD_DIR="$GITHUB_WORKSPACE/third_party/xquic/build" \
                 -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
                 -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
+                -DMQVPN_VERSION_SUFFIX="$VERSION_SUFFIX" \
                 -DEVENT_LIB="$(brew --prefix libevent)/lib/libevent.a"
           cmake --build build -j "$(sysctl -n hw.ncpu)"
 
@@ -463,7 +482,8 @@ jobs:
             -DBORINGSSL_BUILD_DIR="${{ github.workspace }}/third_party/xquic/third_party/boringssl/build/Release" `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=${{ matrix.arch == 'amd64' && 'x64-windows-static' || 'arm64-windows-static' }} `
-            -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON ..
+            -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON `
+            -DMQVPN_VERSION_SUFFIX="$env:VERSION_SUFFIX" ..
           cmake --build . --config Release
 
       - name: Smoke test mqvpn.exe (Windows)
@@ -607,10 +627,24 @@ jobs:
         shell: bash
         run: bash scripts/apply_xquic_patches.sh
 
-      - name: Resolve version from CMakeLists.txt
+      - name: Resolve build version
+        # Must match build-release's step, including the snapshot suffix: the
+        # APK name and the native version string are compared against the
+        # other platforms' artifacts in the same release.
         run: |
           CMAKE_VERSION=$(sed -n 's/^project(mqvpn VERSION \([0-9.][0-9.]*\).*/\1/p' CMakeLists.txt)
-          echo "VERSION=$CMAKE_VERSION" >> "$GITHUB_ENV"
+          SUFFIX=""
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y%m%d "$GITHUB_SHA")
+            SUFFIX="+snapshot.${COMMIT_DATE}.g${GITHUB_SHA:0:12}"
+          fi
+          # Deliberately not exported as MQVPN_VERSION_SUFFIX: the native
+          # library is compared byte for byte by android-repro.yml, which
+          # rebuilds through scripts/build_android.sh without this variable.
+          # The suffix therefore reaches the APK name only, and the Android
+          # native version string stays at the release number.
+          echo "VERSION=${CMAKE_VERSION}${SUFFIX}" >> "$GITHUB_ENV"
+          echo "building ${CMAKE_VERSION}${SUFFIX}"
 
       - name: Install pinned NDK
         id: ndk
@@ -839,20 +873,32 @@ jobs:
             exit 0
           }
 
+          # Recompute the snapshot version exactly as the build jobs did, so
+          # the release title names the version stamped into the assets
+          # instead of only the commit.
+          cmake_version=$(sed -n 's/^project(mqvpn VERSION \([0-9.][0-9.]*\).*/\1/p' CMakeLists.txt)
+          commit_date=$(git show -s --format=%cd --date=format:%Y%m%d "$GITHUB_SHA")
           short_sha=${GITHUB_SHA:0:12}
+          version="${cmake_version}+snapshot.${commit_date}.g${short_sha}"
+          notes=$(printf '%s\n' \
+            "Automated prerelease from main at $GITHUB_SHA." \
+            "" \
+            "Version \`$version\`. Every asset carries that version, so a snapshot is never mistaken for the \`v${cmake_version}\` release; the \`+\` also makes dpkg sort it after that release." \
+            "" \
+            "Assets are replaced after every successful main build, and this rolling tag always points at the newest one.")
           if gh release view snapshot >/dev/null 2>&1; then
             gh api --method PATCH \
               "repos/$GITHUB_REPOSITORY/git/refs/tags/snapshot" \
               -f sha="$GITHUB_SHA" -F force=true >/dev/null
             gh release edit snapshot \
-              --title "mqvpn snapshot ($short_sha)" \
-              --notes "Automated prerelease from main at $GITHUB_SHA. Assets are replaced after every successful main build." \
+              --title "mqvpn snapshot $version" \
+              --notes "$notes" \
               --prerelease
           else
             gh release create snapshot \
               --target "$GITHUB_SHA" \
-              --title "mqvpn snapshot ($short_sha)" \
-              --notes "Automated prerelease from main at $GITHUB_SHA. Assets are replaced after every successful main build." \
+              --title "mqvpn snapshot $version" \
+              --notes "$notes" \
               --prerelease
           fi
 

@@ -18,6 +18,30 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 #   2 -> 3  udp_tx_sends / udp_tx_datagrams
 set(MQVPN_SOVERSION 3)
 
+# Build identity for anything that is not a tagged release. project(VERSION)
+# only accepts numeric x.y.z, so a snapshot cannot express itself there, and
+# leaving it alone made every main build claim to be the release whose number
+# happened to be checked in. Artifacts, the deb version and mqvpn --version
+# then could not be told apart from the real thing.
+#
+# The release workflow passes the suffix for non-tag builds, e.g.
+# "+snapshot.20260922.g1a2b3c4d5e6f". Keep it to characters a Debian version
+# accepts (alphanumerics and . + ~; never "-", which starts the Debian
+# revision) so CPACK_PACKAGE_VERSION stays valid, and keep the leading "+" so
+# it sorts after the release it is built on top of.
+set(MQVPN_VERSION_SUFFIX "" CACHE STRING
+    "Build-identity suffix appended to the release version (snapshot builds)")
+set(MQVPN_FULL_VERSION "${PROJECT_VERSION}${MQVPN_VERSION_SUFFIX}")
+if(MQVPN_VERSION_SUFFIX)
+    if(NOT MQVPN_VERSION_SUFFIX MATCHES "^[+~][A-Za-z0-9.+~]*$")
+        message(FATAL_ERROR
+            "MQVPN_VERSION_SUFFIX must start with + or ~ and contain only "
+            "Debian-safe version characters: ${MQVPN_VERSION_SUFFIX}")
+    endif()
+    add_compile_definitions(MQVPN_VERSION_SUFFIX_STR="${MQVPN_VERSION_SUFFIX}")
+endif()
+message(STATUS "mqvpn build version: ${MQVPN_FULL_VERSION}")
+
 # ---------- Options ----------
 option(XQUIC_BUILD_DIR "Path to pre-built xquic build directory" "")
 option(ENABLE_SANITIZERS "Enable ASan + UBSan" OFF)
@@ -1358,9 +1382,9 @@ if(DPKG_CMD)
 
     set(CPACK_GENERATOR "DEB")
     set(CPACK_DEBIAN_PACKAGE_NAME "mqvpn")
-    set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+    set(CPACK_PACKAGE_VERSION "${MQVPN_FULL_VERSION}")
     set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "${DPKG_ARCH}")
-    set(CPACK_DEBIAN_FILE_NAME "mqvpn_${PROJECT_VERSION}_${DPKG_ARCH}.deb")
+    set(CPACK_DEBIAN_FILE_NAME "mqvpn_${MQVPN_FULL_VERSION}_${DPKG_ARCH}.deb")
     set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
     set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "Multipath QUIC VPN using MASQUE CONNECT-IP (RFC 9484)")
     set(CPACK_DEBIAN_PACKAGE_MAINTAINER "mp0rta")

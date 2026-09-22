@@ -42,10 +42,18 @@ const char *
 mqvpn_version_string(void)
 {
     /* Computed once — no thread-safety concern (identical writes). */
-    static char buf[32];
+    static char buf[64];
     if (buf[0] == '\0') {
+        /* MQVPN_VERSION_SUFFIX_STR is defined only for builds that are not a
+         * tagged release (see MQVPN_VERSION_SUFFIX in CMakeLists.txt), so a
+         * snapshot does not report itself as the release it was built on. */
+#ifdef MQVPN_VERSION_SUFFIX_STR
+        snprintf(buf, sizeof(buf), "%d.%d.%d%s", MQVPN_VERSION_MAJOR,
+                 MQVPN_VERSION_MINOR, MQVPN_VERSION_PATCH, MQVPN_VERSION_SUFFIX_STR);
+#else
         snprintf(buf, sizeof(buf), "%d.%d.%d", MQVPN_VERSION_MAJOR, MQVPN_VERSION_MINOR,
                  MQVPN_VERSION_PATCH);
+#endif
     }
     return buf;
 }
