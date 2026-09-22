@@ -182,6 +182,10 @@ active_context(void)
     memset(&p, 0, sizeof(p));
     p.wfp_engine = (HANDLE)(uintptr_t)0x1234;
     p.killswitch_active = 1;
+    /* An active kill switch implies a configured one. Without this,
+     * win_setup_killswitch() returns 0 at its !killswitch_enabled guard
+     * before reaching the stale-session refusal under test. */
+    p.killswitch_enabled = 1;
     p.wfp_filter_ids[0] = 11;
     p.wfp_filter_ids[1] = 22;
     p.wfp_filter_ids[2] = 33;
@@ -293,6 +297,14 @@ test_close_failure_is_terminal(void)
     p.killswitch_active = 0;
     ASSERT_TRUE(win_setup_killswitch(&p) < 0,
                 "setup refuses to open a session over a stale one");
+
+    /* The other half of the same guard: a live engine handle on its own is
+     * enough to refuse, so a missed cleanup cannot leak a second session
+     * either. Both halves must return before FwpmEngineOpen0, which is not
+     * faked here. */
+    p.wfp_close_failed = 0;
+    ASSERT_TRUE(win_setup_killswitch(&p) < 0, "setup refuses while an engine is open");
+    ASSERT_TRUE(g_n_calls == 1, "a refused setup touches no WFP object");
     return 0;
 }
 
@@ -305,8 +317,7 @@ main(void)
         test_server_exception_is_process_udp_endpoint_scoped() ||
         test_interface_bound_traffic_reaches_unconditional_block() ||
         test_cleanup_closes_dynamic_session() ||
-        test_cleanup_without_engine_is_idempotent() ||
-        test_close_failure_is_terminal())
+        test_cleanup_without_engine_is_idempotent() || test_close_failure_is_terminal())
         return 1;
     puts("test_windows_firewall: OK");
     return 0;
