@@ -268,6 +268,14 @@ win_setup_killswitch(platform_win_ctx_t *p)
 {
     if (!p->killswitch_enabled || p->killswitch_active) return 0;
 
+    /* A session whose close failed is unreachable but may still be blocking.
+     * Stacking a second one on top of it cannot help: WFP arbitrates across
+     * sublayers by veto, so the stale block-all would keep winning. */
+    if (p->wfp_close_failed || p->wfp_engine) {
+        LOG_ERR("refusing to open a second WFP session over a stale one");
+        return -1;
+    }
+
     DWORD err;
 
     /* A dynamic session makes every object created through this engine
@@ -343,40 +351,47 @@ win_cleanup_killswitch(platform_win_ctx_t *p)
         return 0;
     }
 
-    int failed = 0;
+    /* Never close a handle whose close already failed: a WFP engine handle is
+     * an RPC context handle, and its state after a failed close is undefined.
+     * The caller's job now is to end the process, not to retry. */
+    if (p->wfp_close_failed) return -1;
 
-    /* WFP refuses to delete a sublayer while filters still reference it.
-     * Delete in reverse creation order, attempting every ID even after one
-     * failure so cleanup makes as much progress as possible. */
-    for (int i = p->n_wfp_filters - 1; i >= 0; i--) {
-        DWORD err = FwpmFilterDeleteById0(p->wfp_engine, p->wfp_filter_ids[i]);
-        if (err != ERROR_SUCCESS && err != FWP_E_FILTER_NOT_FOUND) {
-            LOG_ERR("FwpmFilterDeleteById0(filter=%llu): error %lu",
-                    (unsigned long long)p->wfp_filter_ids[i], err);
-            failed = 1;
-        }
-    }
-
-    DWORD err = FwpmSubLayerDeleteByKey0(p->wfp_engine, &p->wfp_sublayer_key);
-    if (err != ERROR_SUCCESS && err != FWP_E_SUBLAYER_NOT_FOUND) {
-        LOG_ERR("FwpmSubLayerDeleteByKey0: error %lu", err);
-        failed = 1;
-    }
-
-    err = FwpmEngineClose0(p->wfp_engine);
+    /*
+     * Closing the engine ends the dynamic session, and BFE then removes the
+     * sublayer and every filter added through it.
+     *
+     * Do not delete the objects by hand first. WFP has no cascade delete --
+     * "An object cannot be deleted until all objects that reference it have
+     * first been deleted" (WFP Object Management) -- so deleting the sublayer
+     * alone used to leave every filter in place, block-all among them, which
+     * is the shape of mp0rta/mqvpn#330. Deleting each filter by ID as well
+     * closes that hole but only on the orderly path; the session is what also
+     * covers a crash or a kill, because BFE runs a dynamic session down with
+     * its owner.
+     */
+    DWORD err = FwpmEngineClose0(p->wfp_engine);
     if (err != ERROR_SUCCESS) {
-        /* Keep the handle and bookkeeping so a later cleanup can retry. */
-        LOG_ERR("FwpmEngineClose0: error %lu", err);
+        /*
+         * The session may still be blocking everything, and nothing can reach
+         * it any more: this handle was the only reference, and the next setup
+         * would mint a fresh sublayer GUID. Keep wfp_engine and
+         * killswitch_active set so no second session is stacked on the stale
+         * one -- WFP arbitrates across sublayers by veto, so a stale
+         * block-all keeps winning while its permits stay pinned to the
+         * previous adapter LUID and server endpoint, and the host stays cut
+         * off for the rest of the process lifetime (mp0rta/mqvpn#331).
+         */
+        p->wfp_close_failed = 1;
+        LOG_ERR("FwpmEngineClose0: error %lu; kill switch filters are still "
+                "live and can no longer be addressed - shutting down so BFE "
+                "removes them",
+                err);
         return -1;
     }
 
     p->wfp_engine = NULL;
     p->killswitch_active = 0;
     p->n_wfp_filters = 0;
-    if (failed) {
-        LOG_ERR("kill switch cleanup reported WFP errors; dynamic session closed");
-        return -1;
-    }
 
     LOG_INF("kill switch deactivated");
     return 0;

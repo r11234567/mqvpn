@@ -271,15 +271,7 @@ cb_state_changed(mqvpn_client_state_t old_state, mqvpn_client_state_t new_state,
          * reappears, per the field comment in platform_internal_win.h. */
         if (p->ev_recover) event_del(p->ev_recover);
         memset(p->path_recover_failures, 0, sizeof(p->path_recover_failures));
-        if (win_cleanup_killswitch(p) < 0) {
-            /* Continuing into a fresh tunnel after an unverified WFP cleanup
-             * can stack filters and strand the host offline. Fail closed and
-             * let process teardown retry the retained engine handle. */
-            LOG_ERR("kill switch cleanup failed during reconnect; stopping client");
-            p->fatal_error = 1;
-            p->shutting_down = 1;
-            event_base_loopbreak(p->eb);
-        }
+        (void)win_cleanup_killswitch(p);
         if (p->manage_routes) win_cleanup_routes(p);
         win_cleanup_dns(p);
         if (p->tun_up) {
@@ -291,6 +283,18 @@ cb_state_changed(mqvpn_client_state_t old_state, mqvpn_client_state_t new_state,
             mqvpn_tun_win_destroy(&p->tun);
             p->tun_up = 0;
             mqvpn_client_set_tun_active(p->client, 0, -1);
+        }
+        /* A kill switch we could not tear down keeps blocking everything, and
+         * only process exit clears it (BFE runs down the dynamic session with
+         * its owner). Head for the exit instead of reconnecting into it —
+         * win_setup_killswitch() would refuse the new session anyway. Let the
+         * disconnect drive the loop to CLOSED rather than breaking out here,
+         * so the teardown below still runs. */
+        if (p->wfp_close_failed && !p->shutting_down) {
+            LOG_ERR("kill switch teardown failed, aborting");
+            p->fatal_error = 1;
+            p->shutting_down = 1;
+            if (new_state != MQVPN_STATE_CLOSED) mqvpn_client_disconnect(p->client);
         }
         if (new_state == MQVPN_STATE_CLOSED && p->shutting_down)
             event_base_loopbreak(p->eb);

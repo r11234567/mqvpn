@@ -105,6 +105,19 @@ test_engine_close(HANDLE engine)
     return g_close_error;
 }
 
+/*
+ * The per-object delete fakes stay wired even though cleanup no longer calls
+ * them. firewall.c is included in this translation unit, so the #defines
+ * above capture any hand deletion that gets reintroduced, and
+ * test_cleanup_closes_dynamic_session() then sees more than the single
+ * CALL_CLOSE it asserts. These typed aliases only keep the fakes referenced
+ * so /W4 /WX does not reject them as unused.
+ */
+typedef DWORD(WINAPI *wfp_filter_delete_fn)(HANDLE, UINT64);
+typedef DWORD(WINAPI *wfp_sublayer_delete_fn)(HANDLE, const GUID *);
+static const wfp_filter_delete_fn g_filter_delete_fake = test_filter_delete;
+static const wfp_sublayer_delete_fn g_sublayer_delete_fake = test_sublayer_delete;
+
 static DWORD WINAPI
 test_filter_add(HANDLE engine, const FWPM_FILTER0 *filter, PSECURITY_DESCRIPTOR sd,
                 UINT64 *id)
@@ -225,73 +238,75 @@ test_interface_bound_traffic_reaches_unconditional_block(void)
 }
 
 static int
-test_cleanup_order(void)
+test_cleanup_closes_dynamic_session(void)
 {
     fake_reset();
     platform_win_ctx_t p = active_context();
     ASSERT_TRUE(win_cleanup_killswitch(&p) == 0, "cleanup succeeds");
-    ASSERT_TRUE(g_n_calls == 5, "three filters, sublayer, and engine are handled");
-    ASSERT_TRUE(g_calls[0] == 33 && g_calls[1] == 22 && g_calls[2] == 11,
-                "filters are deleted in reverse creation order");
-    ASSERT_TRUE(g_calls[3] == CALL_SUBLAYER && g_calls[4] == CALL_CLOSE,
-                "sublayer is deleted before engine close");
+    /* WFP has no cascade delete, so deleting the sublayer by hand used to
+     * leave every filter -- block-all included -- in place (mqvpn#330). The
+     * fix is not to delete more objects by hand but to let the dynamic
+     * session own them: closing the engine ends the session and BFE removes
+     * them, which also covers a crash or a kill. */
+    ASSERT_TRUE(g_n_calls == 1 && g_calls[0] == CALL_CLOSE,
+                "the engine close is the whole teardown");
     ASSERT_TRUE(!p.killswitch_active && !p.wfp_engine && p.n_wfp_filters == 0,
                 "successful cleanup clears bookkeeping");
+    ASSERT_TRUE(!p.wfp_close_failed, "a successful close is not marked failed");
     return 0;
 }
 
 static int
-test_not_found_is_idempotent(void)
+test_cleanup_without_engine_is_idempotent(void)
 {
     fake_reset();
     platform_win_ctx_t p = active_context();
-    g_fail_filter = 22;
-    g_filter_error = FWP_E_FILTER_NOT_FOUND;
-    g_sublayer_error = FWP_E_SUBLAYER_NOT_FOUND;
-    ASSERT_TRUE(win_cleanup_killswitch(&p) == 0, "missing WFP objects are already clean");
+    ASSERT_TRUE(win_cleanup_killswitch(&p) == 0, "first cleanup succeeds");
+    ASSERT_TRUE(win_cleanup_killswitch(&p) == 0, "second cleanup is a no-op");
+    ASSERT_TRUE(g_n_calls == 1, "no WFP call is repeated");
     ASSERT_TRUE(!p.wfp_engine && !p.killswitch_active,
                 "idempotent cleanup clears bookkeeping");
     return 0;
 }
 
 static int
-test_delete_failure_still_closes_dynamic_session(void)
-{
-    fake_reset();
-    platform_win_ctx_t p = active_context();
-    g_fail_filter = 22;
-    g_filter_error = ERROR_ACCESS_DENIED;
-    ASSERT_TRUE(win_cleanup_killswitch(&p) < 0, "filter deletion failure is reported");
-    ASSERT_TRUE(g_n_calls == 5, "cleanup continues after one filter failure");
-    ASSERT_TRUE(g_calls[2] == 11 && g_calls[3] == CALL_SUBLAYER &&
-                    g_calls[4] == CALL_CLOSE,
-                "remaining objects and dynamic session are still cleaned");
-    ASSERT_TRUE(!p.wfp_engine && !p.killswitch_active,
-                "successful engine close releases the dynamic session");
-    return 0;
-}
-
-static int
-test_close_failure_preserves_retry_state(void)
+test_close_failure_is_terminal(void)
 {
     fake_reset();
     platform_win_ctx_t p = active_context();
     g_close_error = ERROR_ACCESS_DENIED;
     ASSERT_TRUE(win_cleanup_killswitch(&p) < 0, "engine close failure is reported");
-    ASSERT_TRUE(p.wfp_engine != NULL && p.killswitch_active && p.n_wfp_filters == 3,
-                "failed close retains state for a later retry");
+    ASSERT_TRUE(p.wfp_close_failed, "the failure is recorded");
+    ASSERT_TRUE(p.wfp_engine != NULL && p.killswitch_active,
+                "state is retained so no second session is stacked on the stale one");
+
+    /* A WFP engine handle is an RPC context handle: its state after a failed
+     * close is undefined, so it must never be closed again. Only process exit
+     * clears the session, because BFE runs a dynamic session down with its
+     * owner. */
+    ASSERT_TRUE(win_cleanup_killswitch(&p) < 0, "a retry still reports failure");
+    ASSERT_TRUE(g_n_calls == 1, "the failed handle is not closed twice");
+
+    /* WFP arbitrates across sublayers by veto, so a second session cannot
+     * override the stale block-all; setup must refuse rather than stack one
+     * (mqvpn#331). This returns before touching the real SDK. */
+    p.killswitch_active = 0;
+    ASSERT_TRUE(win_setup_killswitch(&p) < 0,
+                "setup refuses to open a session over a stale one");
     return 0;
 }
 
 int
 main(void)
 {
+    (void)g_filter_delete_fake;
+    (void)g_sublayer_delete_fake;
     if (test_dynamic_session() ||
         test_server_exception_is_process_udp_endpoint_scoped() ||
         test_interface_bound_traffic_reaches_unconditional_block() ||
-        test_cleanup_order() || test_not_found_is_idempotent() ||
-        test_delete_failure_still_closes_dynamic_session() ||
-        test_close_failure_preserves_retry_state())
+        test_cleanup_closes_dynamic_session() ||
+        test_cleanup_without_engine_is_idempotent() ||
+        test_close_failure_is_terminal())
         return 1;
     puts("test_windows_firewall: OK");
     return 0;
