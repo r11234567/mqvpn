@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(mqvpn VERSION 0.16.4 LANGUAGES C)
+project(mqvpn VERSION 0.16.4.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -19,10 +19,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(MQVPN_SOVERSION 3)
 
 # Build identity for anything that is not a tagged release. project(VERSION)
-# only accepts numeric x.y.z, so a snapshot cannot express itself there, and
-# leaving it alone made every main build claim to be the release whose number
-# happened to be checked in. Artifacts, the deb version and mqvpn --version
-# then could not be told apart from the real thing.
+# only accepts numeric version components, so a snapshot cannot express itself
+# there, and leaving it alone made every main build claim to be the release
+# whose number happened to be checked in. Artifacts, the deb version and
+# mqvpn --version then could not be told apart from the real thing.
 #
 # The release workflow passes the suffix for non-tag builds, e.g.
 # "+snapshot.20260922.g1a2b3c4d5e6f". Keep it to characters a Debian version

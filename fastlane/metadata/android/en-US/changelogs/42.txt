@@ -1,0 +1,7 @@
+- Platform-owned TLS certificate verification is now wired through the
+  Android, iOS, and Windows integrations, including certificate identity
+  checks for DNS names and IP addresses.
+- Android and iOS tunnel lifecycle handling is more reliable across setup,
+  reconnect, and teardown transitions.
+- H3 fallback proxy backpressure and Windows kill-switch cleanup are fixed,
+  preventing stalls and ensuring aborted tunnel setup exits cleanly.

@@ -631,9 +631,10 @@ TEST(error_string)
 
 #define STRINGIFY2(x) #x
 #define STRINGIFY(x)  STRINGIFY2(x)
-#define EXPECTED_VERSION           \
-    STRINGIFY(MQVPN_VERSION_MAJOR) \
-    "." STRINGIFY(MQVPN_VERSION_MINOR) "." STRINGIFY(MQVPN_VERSION_PATCH)
+#define EXPECTED_VERSION                                                                 \
+    STRINGIFY(MQVPN_VERSION_MAJOR)                                                       \
+    "." STRINGIFY(MQVPN_VERSION_MINOR) "." STRINGIFY(MQVPN_VERSION_PATCH) "." STRINGIFY( \
+        MQVPN_VERSION_TWEAK)
 
 TEST(version_string)
 {
