@@ -24,6 +24,7 @@
  */
 
 #include "mqvpn_internal.h"              /* MQVPN_XQC_PATH_STATE_* */
+#include <xquic/xqc_http3.h>             /* H3 proxy backpressure API */
 #include "src/transport/xqc_multipath.h" /* xqc_path_state_t (private)  */
 
 #define PIN_PATH_STATE(mirror, real)                                                 \
@@ -46,6 +47,27 @@ PIN_PATH_STATE(MQVPN_XQC_PATH_STATE_CLOSED, XQC_PATH_STATE_CLOSED);
 _Static_assert(MQVPN_MAX_PATHS == 8,
                "MQVPN_MAX_PATHS is ABI-frozen (embedded in mqvpn_client_info_t "
                "layout) — see libmqvpn.h before changing this pin");
+
+/* The H3-to-h2c proxy relies on these public symbols from the pinned xquic
+ * fork. Pinning their declared types here makes an accidental submodule
+ * rollback fail at compile time instead of silently restoring the unbounded
+ * reader.
+ *
+ * _Generic, not an initialised function pointer: this target deliberately
+ * links no xquic (see CMakeLists.txt), and taking a function's address emits
+ * a relocation that needs the definition at link time. _Generic never
+ * evaluates its controlling operand, so the signature is checked against the
+ * header alone -- which is what the pin is for. */
+_Static_assert(_Generic(&xqc_h3_request_get_unsent_queue_bytes,
+               uint64_t (*)(xqc_h3_request_t *): 1,
+               default: 0),
+               "xquic must declare "
+               "uint64_t xqc_h3_request_get_unsent_queue_bytes(xqc_h3_request_t *)");
+_Static_assert(_Generic(&xqc_h3_request_set_write_notify,
+               xqc_int_t (*)(xqc_h3_request_t *, uint8_t): 1,
+               default: 0),
+               "xquic must declare "
+               "xqc_int_t xqc_h3_request_set_write_notify(xqc_h3_request_t *, uint8_t)");
 
 int
 main(void)

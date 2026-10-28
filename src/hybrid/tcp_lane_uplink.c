@@ -23,6 +23,21 @@
 /* tcp_recved takes a u16_t; the deferred resume total can exceed 65535
  * (bounded by TCP_WND, 512 KiB on the non-iOS profile), so re-open the
  * window in u16-sized steps. */
+static inline uint64_t
+tcp_lane_uplink_xquic_bytes(const mqvpn_tcp_flow_t *f)
+{
+    return f->h3_request ? cli_tcp_lane_h3_unsent_queue_bytes(f->h3_request) : 0;
+}
+
+static inline void
+tcp_lane_uplink_withhold(mqvpn_tcp_flow_t *f)
+{
+    f->uplink_withheld = 1;
+    if (f->h3_request) {
+        (void)cli_tcp_lane_h3_set_write_notify(f->h3_request, 1);
+    }
+}
+
 static void
 tcp_lane_recved(struct tcp_pcb *pcb, uint32_t len)
 {
@@ -88,6 +103,11 @@ tcp_lane_uplink_send_from(mqvpn_tcp_flow_t *f, struct pbuf *p, uint16_t offset)
         offset = (uint16_t)(offset + (uint16_t)sent);
         if ((size_t)sent < (size_t)chunk) {
             break; /* partial accept == backpressure; resume from offset */
+        }
+        if (offset < p->tot_len &&
+            tcp_lane_uplink_xquic_bytes(f) >= MQVPN_TCP_LANE_BP_HIGH_WATER) {
+            tcp_lane_uplink_withhold(f);
+            break;
         }
     }
     return (int32_t)offset;
@@ -193,6 +213,10 @@ tcp_lane_uplink_flush(mqvpn_tcp_flow_t *f)
         return TCP_LANE_FLOW_LIVE;
     }
     while (f->uplink_q_head) {
+        if (tcp_lane_uplink_xquic_bytes(f) >= MQVPN_TCP_LANE_BP_HIGH_WATER) {
+            tcp_lane_uplink_withhold(f);
+            break;
+        }
         mqvpn_tcp_uplink_node_t *n = f->uplink_q_head;
         int32_t off = tcp_lane_uplink_send_from(f, n->p, n->offset);
         if (off < 0) {
@@ -201,6 +225,7 @@ tcp_lane_uplink_flush(mqvpn_tcp_flow_t *f)
         f->uplink_queued_bytes -= ((uint32_t)off - n->offset);
         n->offset = (uint16_t)off;
         if (n->offset < n->p->tot_len) {
+            tcp_lane_uplink_withhold(f);
             break; /* backpressure — retry from here on the next notify */
         }
         f->uplink_q_head = n->next;
@@ -209,6 +234,10 @@ tcp_lane_uplink_flush(mqvpn_tcp_flow_t *f)
         }
         pbuf_free(n->p);
         free(n);
+        if (tcp_lane_uplink_xquic_bytes(f) >= MQVPN_TCP_LANE_BP_HIGH_WATER) {
+            tcp_lane_uplink_withhold(f);
+            break;
+        }
     }
 
     tcp_lane_flow_status_t st = tcp_lane_uplink_maybe_fin(f);
@@ -216,12 +245,19 @@ tcp_lane_uplink_flush(mqvpn_tcp_flow_t *f)
         return st; /* f was torn down (fatal error or clean-close completion) */
     }
 
-    if (f->uplink_withheld && f->uplink_queued_bytes < MQVPN_TCP_LANE_BP_LOW_WATER) {
+    uint64_t xquic_bytes = tcp_lane_uplink_xquic_bytes(f);
+    if (f->uplink_withheld && !f->uplink_q_head &&
+        xquic_bytes <= MQVPN_TCP_LANE_BP_LOW_WATER) {
         f->uplink_withheld = 0;
         if (f->uplink_withheld_recved > 0 && f->pcb) {
             tcp_lane_recved(f->pcb, f->uplink_withheld_recved);
         }
         f->uplink_withheld_recved = 0;
+        if (!f->tcp_fin_seen || f->fin_sent_to_h3) {
+            (void)cli_tcp_lane_h3_set_write_notify(f->h3_request, 0);
+        }
+    } else if (f->uplink_withheld) {
+        (void)cli_tcp_lane_h3_set_write_notify(f->h3_request, 1);
     }
     return TCP_LANE_FLOW_LIVE;
 }
@@ -244,7 +280,8 @@ tcp_lane_uplink_deliver(mqvpn_tcp_flow_t *f, struct pbuf *p)
     uint16_t tot = p->tot_len;
     uint16_t off = 0;
 
-    if (f->state == TCP_FLOW_ACTIVE && !f->uplink_q_head && f->h3_request) {
+    if (f->state == TCP_FLOW_ACTIVE && !f->uplink_q_head && f->h3_request &&
+        tcp_lane_uplink_xquic_bytes(f) < MQVPN_TCP_LANE_BP_HIGH_WATER) {
         int32_t r = tcp_lane_uplink_send_from(f, p, 0);
         if (r < 0) {
             pbuf_free(p);
@@ -255,7 +292,12 @@ tcp_lane_uplink_deliver(mqvpn_tcp_flow_t *f, struct pbuf *p)
 
     if (off == tot) {
         pbuf_free(p);
-        tcp_lane_recved(f->pcb, tot); /* fully accepted — window re-opens */
+        if (tcp_lane_uplink_xquic_bytes(f) >= MQVPN_TCP_LANE_BP_HIGH_WATER) {
+            tcp_lane_uplink_withhold(f);
+            f->uplink_withheld_recved += tot;
+        } else {
+            tcp_lane_recved(f->pcb, tot);
+        }
         return TCP_LANE_FLOW_LIVE;
     }
 
@@ -277,7 +319,7 @@ tcp_lane_uplink_deliver(mqvpn_tcp_flow_t *f, struct pbuf *p)
      * recved in one batch at the low-water resume in flush(). */
     if (f->state == TCP_FLOW_ACTIVE ||
         f->uplink_queued_bytes >= MQVPN_TCP_LANE_BP_HIGH_WATER) {
-        f->uplink_withheld = 1;
+        tcp_lane_uplink_withhold(f);
     }
     if (f->uplink_withheld) {
         f->uplink_withheld_recved += tot;

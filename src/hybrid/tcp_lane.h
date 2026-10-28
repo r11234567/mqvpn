@@ -241,9 +241,10 @@ void mqvpn_tcp_lane_on_h3_closing(mqvpn_tcp_lane_t *lane, void *stream);
 
 /* H3 send-window became writable again: flush the flow's uplink retry queue
  * (FIFO, stops at the first EAGAIN — idempotent under repeated notifies) and,
- * once the queue drains below the low-water mark, re-open the lwIP receive
- * window that was withheld under backpressure (tcp_recved for every byte
- * whose acknowledgment-to-lwIP was deferred). */
+ * once both the local retry queue is empty and xquic's connection send queue
+ * drains below the low-water mark, re-open the lwIP receive window that was
+ * withheld under backpressure (tcp_recved for every byte whose
+ * acknowledgment-to-lwIP was deferred). */
 int mqvpn_tcp_lane_on_h3_writable(mqvpn_tcp_lane_t *lane, void *stream);
 
 /* H3 downlink body/EMPTY_FIN notify: drain the flow's H3 response
@@ -437,6 +438,17 @@ int cli_tcp_lane_open_stream(void *client_ctx, void *flow_handle,
  * MQVPN_TCP_LANE_H3_SEND_AGAIN, or MQVPN_TCP_LANE_H3_SEND_ERR. buf may be
  * NULL only when len == 0. */
 ssize_t cli_tcp_lane_h3_send(void *h3_request, const uint8_t *buf, size_t len, int fin);
+
+/* Connection-wide bytes xquic has queued but not yet put on the wire.
+ * Packets in flight awaiting acknowledgement are excluded: they are the
+ * congestion controller's budget, and a connection running at its BDP holds
+ * a congestion window of them at all times, so a high/low-water gate that
+ * counted them would never reopen on a fast path. */
+uint64_t cli_tcp_lane_h3_unsent_queue_bytes(void *h3_request);
+
+/* Keep or release xquic write callbacks while the TCP lane is waiting for the
+ * connection send queue to drain. */
+int cli_tcp_lane_h3_set_write_notify(void *h3_request, int enabled);
 
 /* Recv downlink body bytes from the flow's bound H3 request. buf/
  * len is the caller's scratch buffer; *fin is written 1 when the request's
