@@ -1,0 +1,52 @@
+name: Windows GUI (.NET 9)
+
+on:
+  push:
+    branches: [main, dev, 'sync/**']
+    paths:
+      - 'windows/**'
+      - '.github/workflows/windows-gui.yml'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'windows/**'
+      - '.github/workflows/windows-gui.yml'
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore dependencies
+        run: |
+          dotnet restore windows/gui/TruckersMP.Proxy.csproj
+          dotnet restore windows/tests/GUI.Tests.csproj
+
+      - name: Run GUI Tests
+        run: |
+          dotnet run --project windows/tests/GUI.Tests.csproj
+
+      - name: Build GUI Application (Release Single-File)
+        run: |
+          dotnet publish windows/gui/TruckersMP.Proxy.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish/
+
+      - name: Verify build artifact
+        shell: pwsh
+        run: |
+          Test-Path publish/MQVPN.exe
+          Get-Item publish/MQVPN.exe | Select-Object Name, Length
+
+      - name: Upload GUI Release Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mqvpn-windows-gui-x64
+          path: publish/
+          retention-days: 14
