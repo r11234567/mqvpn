@@ -262,6 +262,8 @@ else()
         HINTS ${BORINGSSL_BUILD_DIR} ${BORINGSSL_BUILD_DIR}/crypto /usr/local/lib /usr/local/babassl/lib)
 endif()
 message(STATUS "SSL_LIB=${SSL_LIB} CRYPTO_LIB=${CRYPTO_LIB}")
+set(BORINGSSL_INCLUDE_DIR
+    "${CMAKE_SOURCE_DIR}/third_party/xquic/third_party/boringssl/include")
 
 # ---------- libmqvpn source files (shared between static and shared targets) ----------
 set(MQVPN_LIB_SOURCES
@@ -1053,6 +1055,35 @@ if(BUILD_TESTING)
     add_executable(test_path_line tests/test_path_line.c src/mqvpn_util.c)
     # Library clock on its own (test_clock covers it with xquic's tokens).
     add_executable(test_clock_source tests/test_clock_source.c src/mqvpn_clock.c)
+
+    # SNI router test (Linux/POSIX server path only)
+    if(NOT WIN32)
+        add_executable(test_sni_router tests/test_sni_router.c src/sni_router.c src/log.c)
+        target_link_libraries(test_sni_router ${SSL_LIB} ${CRYPTO_LIB} stdc++)
+        target_include_directories(test_sni_router PRIVATE ${BORINGSSL_INCLUDE_DIR})
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(test_sni_router PRIVATE -Wall -Wextra -Werror)
+        endif()
+    endif()
+
+    # HTTP/2 proxy test (conditional on nghttp2 availability)
+    if(MQVPN_ENABLE_H2_PROXY)
+        add_executable(test_h2_proxy tests/test_h2_proxy.c src/h2_proxy.c src/log.c)
+        if(NGHTTP2_LIBRARIES)
+            target_link_libraries(test_h2_proxy ${NGHTTP2_LIBRARIES} ${SSL_LIB} ${CRYPTO_LIB} stdc++)
+        else()
+            target_link_libraries(test_h2_proxy ${NGHTTP2_LIB} ${SSL_LIB} ${CRYPTO_LIB} stdc++)
+        endif()
+        target_include_directories(test_h2_proxy PRIVATE ${XQUIC_INCLUDE_DIR} ${BORINGSSL_INCLUDE_DIR})
+        if(NGHTTP2_INCLUDE_DIR)
+            target_include_directories(test_h2_proxy PRIVATE ${NGHTTP2_INCLUDE_DIR})
+        elseif(NGHTTP2_INCLUDE_DIRS)
+            target_include_directories(test_h2_proxy PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+        endif()
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(test_h2_proxy PRIVATE -Wall -Wextra -Werror)
+        endif()
+    endif()
     set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_redundant_tx test_status test_path_state_machine test_path_slot_oracle test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_config_bridge test_classifier test_icmp test_reorder_gate test_path_readd test_path_line test_clock_source)
 
     # test_tcp_lane #include's BOTH src/hybrid/tcp_lane.c AND
@@ -1076,6 +1107,13 @@ if(BUILD_TESTING)
         list(APPEND MQVPN_UNIT_TESTS test_tcp_lane)
     endif()
 
+    if(NOT WIN32)
+        list(APPEND MQVPN_UNIT_TESTS test_sni_router)
+    endif()
+    if(MQVPN_ENABLE_H2_PROXY)
+        list(APPEND MQVPN_UNIT_TESTS test_h2_proxy)
+    endif()
+
     foreach(t ${MQVPN_UNIT_TESTS})
         target_include_directories(${t} PRIVATE
             ${CMAKE_SOURCE_DIR}/src
@@ -1086,6 +1124,22 @@ if(BUILD_TESTING)
         set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
         add_test(NAME ${t} COMMAND ${t})
     endforeach()
+
+    if(WIN32)
+        add_executable(test_windows_firewall tests/test_windows_firewall.c src/log.c)
+        target_include_directories(test_windows_firewall PRIVATE
+            ${EVENT_INCLUDE_DIR}
+            ${CMAKE_SOURCE_DIR}/include
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/platform/windows
+            ${WINTUN_INCLUDE_DIR})
+        target_link_libraries(test_windows_firewall PRIVATE
+            ws2_32 iphlpapi fwpuclnt ole32)
+        if(Libevent_FOUND)
+            target_link_libraries(test_windows_firewall PRIVATE libevent::core)
+        endif()
+        add_test(NAME test_windows_firewall COMMAND test_windows_firewall)
+    endif()
 
     # UDP GSO TX offload (issue #167): pure syscall/mechanics layer, no xquic
     # dependency. MQVPN_OFFLOAD_TEST_SEAM is wired: it swaps sendmsg/sendmmsg
@@ -1418,6 +1472,11 @@ if(BUILD_TESTING)
     add_test(NAME test_nat_config
         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/test_nat_config.sh
             $<TARGET_FILE:mqvpn-nat-config> ${CMAKE_SOURCE_DIR}/scripts/mqvpn-server-nat.sh)
+
+    if(MQVPN_ENABLE_H2_PROXY)
+        add_test(NAME test_h2_proxy_protocol
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tests/test_h2_proxy_protocol.sh $<TARGET_FILE:mqvpn>)
+    endif()
 
     # Exit-at-CLOSED shell test (runs the built mqvpn binary). Needs no root,
     # no server and no TUN — the client reaches CLOSED on a handshake that is

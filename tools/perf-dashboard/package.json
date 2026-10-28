@@ -1,0 +1,16 @@
+{
+  "name": "mqvpn-perf-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only Cloudflare Worker that charts mqvpn CI benchmark history from R2",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "test": "node test/check.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

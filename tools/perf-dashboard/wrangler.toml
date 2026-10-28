@@ -1,0 +1,36 @@
+name = "mqvpn-perf-dashboard"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# dashboard.html is imported as a string by src/index.js. Without this rule
+# wrangler tries to parse it as a module and the build fails.
+rules = [
+  { type = "Text", globs = ["**/*.html"] }
+]
+
+# The R2 bucket the CI publisher writes to. `bucket_name` must match the
+# bucket you created in the Cloudflare dashboard; `binding` is the name the
+# Worker code looks for and must stay PERF_BUCKET.
+#
+# The Worker only ever calls .get() on this binding — never .put() or
+# .delete() — so deploying this code cannot modify benchmark history.
+[[r2_buckets]]
+binding = "PERF_BUCKET"
+bucket_name = "mqvpn-perf"
+
+[vars]
+# Key prefixes inside the bucket. These must match the arguments the
+# workflows pass to scripts/ci_publish/publish_to_r2.sh:
+#   perf.yml        -> publish_to_r2.sh perf-data        push
+#   perf-weekly.yml -> publish_to_r2.sh perf-data/weekly weekly
+PUSH_PREFIX = "perf-data"
+WEEKLY_PREFIX = "perf-data/weekly"
+
+# How many runs a chart covers by default. The publisher caps index.json at
+# 100 entries, so values above that gain nothing.
+DEFAULT_LIMIT = "40"
+
+# VIEW_TOKEN is deliberately NOT set here. Leave it unset and the dashboard is
+# public; set it as a secret to require a token:
+#   npx wrangler secret put VIEW_TOKEN
+# Never put it in this file — wrangler.toml is committed.

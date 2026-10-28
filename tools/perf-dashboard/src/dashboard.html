@@ -1,0 +1,1115 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>mqvpn 性能历史 · perf history</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfc; --panel: #fff; --border: #e3e5e9; --ink: #1b1d22;
+  --muted: #6b7280; --line: #3b6fd4; --chip: #f1f3f7;
+  --warn: #9a5b00; --warn-bg: #fff4e0; --up: #17803d; --dn: #b42318;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a; --panel: #1b1e24; --border: #2b2f37; --ink: #e6e8ec;
+    --muted: #98a0ad; --line: #7aa5f0; --chip: #23272f;
+    --warn: #ffcf8a; --warn-bg: #3a2c12; --up: #5ed69a; --dn: #ff9a8f;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+        "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif; }
+header { position: sticky; top: 0; z-index: 5; background: var(--panel);
+  border-bottom: 1px solid var(--border); padding: 11px 18px; }
+.titlerow { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+h1 { font-size: 15px; margin: 0; font-weight: 650; }
+h1 small { font-weight: 400; color: var(--muted); margin-left: 6px; font-size: 12px; }
+.controls { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; margin-top: 9px; }
+label.ctl { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+select, input[type=search] { font: inherit; font-size: 13px; background: var(--bg);
+  color: var(--ink); border: 1px solid var(--border); border-radius: 7px; padding: 5px 8px; }
+input[type=search] { min-width: 180px; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+.seg button { font: inherit; font-size: 12.5px; padding: 5px 11px; border: 0;
+  background: var(--bg); color: var(--muted); cursor: pointer; }
+.seg button[aria-pressed=true] { background: var(--line); color: #fff; }
+.about { margin: 10px 18px 0; padding: 9px 12px; background: var(--panel);
+  border: 1px solid var(--border); border-left: 3px solid var(--line);
+  border-radius: 8px; font-size: 12.5px; line-height: 1.6; color: var(--ink); }
+.kind { display: inline-block; font-size: 11px; padding: 1px 7px; margin-right: 7px;
+  border-radius: 999px; background: var(--line); color: #fff; vertical-align: 1px; }
+.meta { padding: 9px 18px; color: var(--muted); font-size: 12.5px; }
+.notice { margin: 9px 18px; padding: 9px 12px; background: var(--warn-bg);
+  color: var(--warn); border-radius: 8px; font-size: 12.5px; }
+main { padding: 0 18px 44px; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(272px, 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 11px 12px 8px; cursor: pointer; text-align: left; width: 100%;
+  font: inherit; color: inherit; }
+.card:hover, .card:focus-visible { border-color: var(--line); outline: none; }
+.card .nm { font-size: 13px; font-weight: 600; line-height: 1.3; }
+.card .grp { font-size: 11px; color: var(--muted); margin-top: 2px; word-break: break-all; }
+.card .val { font-size: 19px; font-weight: 620; font-variant-numeric: tabular-nums; margin-top: 5px; }
+.card .val .u { font-size: 12px; font-weight: 500; color: var(--muted); margin-left: 3px; }
+/* Clamped rather than truncated: two lines is enough to tell which direction is
+   good, and the full text is on the card's title attribute. */
+.card .help { font-size: 11px; color: var(--muted); margin-top: 6px; line-height: 1.45;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+/* Context chips read as conditions, not measurements, so they sit back a shade
+   from the delta/CV chips above them. */
+.card .ctx { margin-top: 4px; opacity: 0.85; }
+.card .ctx .chip { font-size: 10px; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 5px 0 2px; }
+.chip { font-size: 11px; padding: 1.5px 6px; border-radius: 999px; background: var(--chip);
+  color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.chip.up { color: var(--up); } .chip.dn { color: var(--dn); }
+svg { display: block; width: 100%; }
+.spark { height: 44px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 9px; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 600; font-size: 12px; position: sticky; top: 0;
+  background: var(--panel); cursor: pointer; }
+td.n { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:hover { background: var(--chip); }
+.tblwrap { background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; overflow-x: auto; }
+#detail { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px 16px; margin-bottom: 16px; }
+#detail.hidden { display: none; }
+.dhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.close { border: 1px solid var(--border); background: var(--bg); color: var(--muted);
+  border-radius: 7px; padding: 3px 9px; cursor: pointer; font: inherit; font-size: 12px; }
+.plotwrap { position: relative; margin-top: 10px; }
+.plot { height: 300px; }
+.gridline { stroke: var(--border); stroke-width: 1; stroke-dasharray: 3 4; opacity: .7; }
+.tick { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+#tip { position: absolute; pointer-events: none; opacity: 0; transform: translate(-50%, -100%);
+  background: var(--ink); color: var(--bg); padding: 5px 8px; border-radius: 6px;
+  font-size: 11.5px; white-space: nowrap; transition: opacity .08s; }
+.empty { color: var(--muted); padding: 30px 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="titlerow">
+    <h1 id="h1">mqvpn 性能历史<small id="sub">加载中…</small></h1>
+    <span style="flex:1"></span>
+    <div class="seg" id="langSeg">
+      <button type="button" data-lang="zh">中文</button>
+      <button type="button" data-lang="en">EN</button>
+    </div>
+  </div>
+  <div class="controls">
+    <label class="ctl"><span data-i="src"></span>
+      <select id="channel">
+        <option value="push"></option>
+        <option value="weekly"></option>
+      </select>
+    </label>
+    <label class="ctl"><span data-i="bench"></span> <select id="test"></select></label>
+    <label class="ctl"><span data-i="runs"></span>
+      <select id="limit"><option>10</option><option>20</option><option selected>40</option>
+        <option>60</option><option>100</option></select>
+    </label>
+    <div class="seg" id="viewSeg">
+      <button type="button" data-view="trend"></button>
+      <button type="button" data-view="latest"></button>
+      <button type="button" data-view="run"></button>
+    </div>
+    <label class="ctl" id="commitWrap" style="display:none"><span data-i="commit"></span>
+      <select id="commit"></select>
+    </label>
+    <label class="ctl"><span data-i="sort"></span>
+      <select id="sort">
+        <option value="name"></option><option value="move"></option><option value="noise"></option>
+      </select>
+    </label>
+    <label class="ctl"><input type="checkbox" id="hideflat" checked> <span data-i="hideflat"></span></label>
+    <input type="search" id="filter">
+  </div>
+</header>
+
+<div class="about" id="about" hidden>
+  <span class="kind" id="aboutKind"></span>
+  <span id="aboutText"></span>
+</div>
+<p class="meta" id="meta"></p>
+<div class="notice" id="notice" hidden></div>
+
+<main>
+  <section id="detail" class="hidden">
+    <div class="dhead">
+      <div>
+        <div id="dTitle" style="font-size:13.5px;font-weight:620"></div>
+        <div class="chips" id="dChips"></div>
+      </div>
+      <button class="close" id="dClose"></button>
+    </div>
+    <div class="plotwrap"><svg class="plot" id="dPlot" preserveAspectRatio="none"></svg><div id="tip"></div></div>
+  </section>
+  <div class="grid" id="grid"></div>
+  <div class="tblwrap" id="tblwrap" hidden><table id="tbl"><thead></thead><tbody></tbody></table></div>
+  <p class="empty" id="empty" hidden></p>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+/* ── i18n ────────────────────────────────────────────────────────────────
+ * Two languages, one dictionary. Default follows the browser, then whatever
+ * the viewer last chose (localStorage is per-artifact-origin and may throw in
+ * a private window, hence the try/catch).                                  */
+const I18N = {
+  zh: {
+    title: 'mqvpn 性能历史', src: '数据源', bench: '基准项', runs: '运行数',
+    sort: '排序', hideflat: '隐藏无变化', filterPh: '筛选指标…',
+    trend: '趋势', latest: '仅最新', run: '单次提交', commit: '提交',
+    push: '每次提交', weekly: '每周全量',
+    byname: '按名称', bymove: '按变动幅度', bynoise: '按噪声',
+    close: '关闭', noData: '该基准项暂无数据。',
+    noMatch: '没有指标匹配当前筛选。取消“隐藏无变化”可显示常量(如 netem 配置、时长)。',
+    loading: '加载中…', noPub: '尚未发布数据',
+    runsIndexed: (n, c) => `已索引 ${n} 次运行 · 最新 ${c}`,
+    range: (n, a, b, m) => `${n} 次运行 · ${a} → ${b} · ${m} 个指标`,
+    truncated: (k, t) => `仅显示 ${t} 个指标中的前 ${k} 个。`,
+    readErr: (n) => `${n} 个结果文件无法读取,对应点显示为断口。`,
+    loadFail: (m) => `加载失败:${m}`,
+    colMetric: '指标', colValue: '数值', colDelta: '相对上次', colCv: '波动(CV)',
+    colTrend: '走势', colUnit: '单位',
+    latestVal: '最新值', vsPrev: '相对上次', median: '中位数', min: '最小', max: '最大',
+    noRun: '该次运行没有可用指标。',
+    cvHint: 'CV 为变异系数 —— 共享 runner 上,先看它再看涨跌:CV 25% 的指标动 10% 说明不了什么。',
+  },
+  en: {
+    title: 'mqvpn perf history', src: 'source', bench: 'benchmark', runs: 'runs',
+    sort: 'sort', hideflat: 'hide unchanging', filterPh: 'filter metrics…',
+    trend: 'Trend', latest: 'Latest only', run: 'Single run', commit: 'commit',
+    push: 'per-commit', weekly: 'weekly',
+    byname: 'by name', bymove: 'by biggest move', bynoise: 'by noisiest',
+    close: 'close', noData: 'No data for this benchmark yet.',
+    noMatch: 'No metric matches the filter. Unchecking “hide unchanging” shows constants such as netem settings and durations.',
+    loading: 'loading…', noPub: 'no data published yet',
+    runsIndexed: (n, c) => `${n} runs indexed · newest ${c}`,
+    range: (n, a, b, m) => `${n} runs · ${a} → ${b} · ${m} metrics`,
+    truncated: (k, t) => `Only the first ${k} of ${t} metrics are shown.`,
+    readErr: (n) => `${n} result file(s) could not be read; those points are gaps.`,
+    loadFail: (m) => `Failed to load: ${m}`,
+    colMetric: 'Metric', colValue: 'Value', colDelta: 'vs prev', colCv: 'CV',
+    colTrend: 'Trend', colUnit: 'Unit',
+    latestVal: 'latest', vsPrev: 'vs prev', median: 'median', min: 'min', max: 'max',
+    noRun: 'This run recorded no metrics.',
+    cvHint: 'CV is the coefficient of variation — on a shared runner, read it before reading a movement: a metric with CV 25% has not told you much by moving 10%.',
+  },
+};
+let LANG = 'zh';
+const t = (k) => I18N[LANG][k];
+
+/* ── what each benchmark actually is ────────────────────────────────────
+ * The picker only ever showed an id and a run count, so a reader could not
+ * tell a gated throughput benchmark from a smoke test over a deliberately
+ * broken network — and reading a number without knowing which of those
+ * produced it is worse than not seeing it.
+ *
+ * Keyed by the `test` field every result document already carries. Entries are
+ * [English, Chinese] and matched longest-prefix-first, so a family like
+ * netsim_catalog_* needs one entry rather than one per transit profile. */
+const TEST_INFO = [
+  ['netsim_percommit', {
+    kind: ['gate', '门禁'],
+    en: 'Per-commit gate. One deliberately hostile network (premium wired path + '
+      + 'a barely-connected 5G path on junk transit behind symmetric NAT). Gated '
+      + 'on ratios only, never on absolute Mbps.',
+    zh: '每次提交的门禁。一个刻意恶劣的网络组合(优质有线路径 + 几乎没信号的 5G 走垃圾骨干、'
+      + '对称 NAT 之后)。只对比值设门槛,绝不对绝对速率设门槛。',
+  }],
+  ['netsim_classes', {
+    kind: ['trend', '趋势'],
+    en: 'Curated multipath pairs, grouped by the KIND of disagreement between '
+      + 'the two legs: capacity, latency, stability, NAT, MTU, plus real-world '
+      + 'composites (home fibre + tethered phone, dual mobile, satellite + cell).',
+    zh: '精选的多路组合,按两条腿"哪里不一致"来分类:容量、延迟、稳定性、NAT、MTU,'
+      + '外加真实场景组合(家庭光纤+手机热点、双移动、卫星+蜂窝)。',
+  }],
+  ['netsim_mtu', {
+    kind: ['trend', '趋势'],
+    en: 'The MTU axis on its own: 1500/1400/1280 against a fixed 1500 reference leg, '
+      + 'the same sizes under a packet-rate cap (where goodput tracks bytes-per-packet '
+      + 'rather than bandwidth, so GSO batching becomes measurable), and a PMTUD black '
+      + 'hole — a hop that drops oversized packets AND the ICMP that would explain why, '
+      + 'which stalls a tunnel instead of slowing it.',
+    zh: '单独的 MTU 轴:1500/1400/1280 各自对照固定 1500 的参考腿;同样的尺寸再放到包速率'
+      + '受限的路径下(此时有效吞吐取决于每包字节数而非带宽,GSO 批量因此变得可测);以及 '
+      + 'PMTUD 黑洞 —— 中间跳既丢弃超长包、又丢弃本该解释原因的 ICMP,结果是隧道卡死而不是变慢。',
+  }],
+  ['netsim_sched', {
+    kind: ['trend', '趋势'],
+    en: 'WLB vs MinRTT vs backup-FEC over the three classes where they should diverge: '
+      + 'hetero_extreme, asym_latency and one_flapping. Watch vs_best_single — a value '
+      + 'below 1.0 means multipath came out slower than just using the better path.',
+    zh: 'WLB / MinRTT / backup-FEC 在三个本该拉开差距的场景上的对比:hetero_extreme、'
+      + 'asym_latency、one_flapping。重点看"相对最优单路":低于 1.0 就说明多路径反而比'
+      + '只用好的那条路还慢。',
+  }],
+  ['netsim_tiers', {
+    kind: ['trend', '趋势'],
+    en: 'Server box as the variable, network held wide open so it is not the bottleneck. '
+      + 'Four instance tiers as cgroup CPU/memory caps, then three host states on one tier '
+      + '(noisy neighbour, softirq storm, mid-run CPU throttle). Tier labels are nominal: '
+      + 'a quota caps throughput, it does not reproduce a slower core, and steal time '
+      + 'cannot be emulated from inside the guest at all.',
+    zh: '把服务器规格当变量,网络放到足够宽以免成为瓶颈。四档实例用 cgroup 的 CPU/内存限制'
+      + '模拟,再在其中一档上跑三种母鸡状态(邻居抢占、softirq 风暴、运行中被限流)。档位名称'
+      + '只是标签:配额只能压住吞吐上限,复现不了慢核心,steal time 更是无法在客户机内部模拟。',
+  }],
+  ['netsim_combo', {
+    kind: ['trend', '趋势'],
+    en: 'Generated covering set over access x transit x NAT x MTU. Every level of '
+      + 'every axis appears at least once on each side of a pair, which catches '
+      + 'single-factor faults without enumerating the ~810k possible pairs.',
+    zh: '接入 x 骨干 x NAT x MTU 的生成式覆盖阵。每个轴的每个取值都至少在组合的两侧各出现一次,'
+      + '能抓出单因子故障,而不必穷举约 81 万种组合。',
+  }],
+  ['netsim_catalog', {
+    kind: ['trend', '趋势'],
+    en: 'One backbone profile swept across all ten client access types, single '
+      + 'path. Shows how much of a given transit a given last mile can actually use.',
+    zh: '一种骨干配置扫过全部十种客户端接入方式,单路径。用来看某种接入方式实际能吃下'
+      + '这条骨干多少带宽。',
+  }],
+  ['netsim_special', {
+    kind: ['regression', '回归'],
+    en: 'The pathological conditions, run UNDER LOAD rather than idle: NAT state '
+      + 'aging past the 30 s conntrack timeout, corrupt/reorder/duplicate packets, '
+      + 'and ACK starvation behind a bloated uplink queue.',
+    zh: '病态场景,而且是在满载流量下跑而非空载(这才是缺口所在):NAT 状态超过 conntrack '
+      + '30 秒老化、畸变/乱序/重复包、以及上行队列膨胀导致的 ACK 饥饿。',
+  }],
+  ['aggregate', {
+    kind: ['trend', '趋势'],
+    en: 'Multipath aggregation on the clean reference topology (300 Mbit/10 ms + '
+      + '80 Mbit/30 ms), swept over stream counts for both schedulers. Gain is '
+      + 'only meaningful at 16+ streams — below that its variance exceeds it.',
+    zh: '在干净的参考拓扑上测多路聚合(300M/10ms + 80M/30ms),对两种调度器扫不同并发流数。'
+      + '增益只在 16 流以上才有意义 —— 低于此其波动大于数值本身。',
+  }],
+  ['raw_throughput', {
+    kind: ['trend', '趋势'],
+    en: 'Tunnel overhead: direct throughput versus single-path and multipath '
+      + 'through the VPN, per direction. The overhead percentages are the point.',
+    zh: '隧道开销:直连吞吐 对比 经 VPN 的单路和多路,分上下行。重点看开销百分比。',
+  }],
+  ['failover', {
+    kind: ['trend', '趋势'],
+    en: 'Path fault and recovery: time to detect, time to recover, and the '
+      + 'throughput held while degraded, for each scheduler and each faulted path.',
+    zh: '路径故障与恢复:检测耗时、恢复耗时,以及降级期间还能保住多少吞吐,'
+      + '按调度器和故障路径分别统计。',
+  }],
+  ['udp_sweep', {
+    kind: ['trend', '趋势'],
+    en: 'UDP rate sweep: offered rate versus achieved throughput, loss and jitter, '
+      + 'at several packet sizes. Where a policer or a PPS cap shows up.',
+    zh: 'UDP 速率扫描:目标速率 对比 实际吞吐、丢包和抖动,涵盖多种包长。'
+      + '限速器或 PPS 上限会在这里现形。',
+  }],
+  ['multipath_scheduler', {
+    kind: ['trend', '趋势'],
+    en: 'Scheduler comparison across eight scenarios — the direct WLB versus '
+      + 'MinRTT versus backup-FEC read.',
+    zh: '八个场景下的调度器对比 —— 直接比较 WLB / MinRTT / backup-FEC。',
+  }],
+  ['backup_fec', {
+    kind: ['trend', '趋势'],
+    en: 'Backup-FEC scheduler against a sweep of loss on the primary path: how '
+      + 'much loss redundancy actually buys back.',
+    zh: 'backup-FEC 调度器在主路径丢包率扫描下的表现:冗余到底换回了多少。',
+  }],
+  ['ntn', {
+    kind: ['trend', '趋势'],
+    en: 'Non-terrestrial (satellite) profiles, where propagation delay dominates '
+      + 'every other term.',
+    zh: '非地面(卫星)场景,传播延迟主导一切其他因素。',
+  }],
+];
+
+function testInfo(id) {
+  if (!id) return null;
+  // Longest prefix wins so netsim_catalog_bgp_junk resolves to the family entry.
+  let best = null;
+  for (const [prefix, info] of TEST_INFO) {
+    if (id.startsWith(prefix) && (!best || prefix.length > best[0].length)) {
+      best = [prefix, info];
+    }
+  }
+  return best ? best[1] : null;
+}
+
+/* ── metric naming ───────────────────────────────────────────────────────
+ * The API returns dotted paths (`results[scenario=hetero_extreme].vs_best_single`)
+ * because the Worker charts whatever numbers it finds and has no schema. That
+ * is the right call server-side, but it is not a name a human reads, so the
+ * naming lives here: split the path into group + leaf, look the leaf up, and
+ * fall back to a humanised form so an unknown metric is still legible.     */
+const METRIC_LABELS = {
+  // throughput / aggregation
+  solo_a_mbps: ['Path A alone', '仅路径 A'],
+  solo_b_mbps: ['Path B alone', '仅路径 B'],
+  multipath_mbps: ['Multipath total', '多路径合计'],
+  single_path_mbps: ['Single path', '单路径'],
+  direct_mbps: ['Direct (no VPN)', '直连(无 VPN)'],
+  multipath_wlb_mbps: ['Multipath · WLB', '多路径 · WLB'],
+  multipath_minrtt_mbps: ['Multipath · MinRTT', '多路径 · MinRTT'],
+  theoretical_max_mbps: ['Theoretical max', '理论上限'],
+  throughput_mbps: ['Throughput', '吞吐'],
+  aggregation_efficiency: ['Aggregation efficiency', '聚合效率'],
+  vs_best_single: ['vs best single path', '相对最优单路'],
+  gain_pct: ['Multipath gain', '多路径增益'],
+  gain: ['Multipath gain', '多路径增益'],
+  utilization: ['Link utilization', '链路利用率'],
+  // latency
+  srtt_ms: ['Smoothed RTT', '平滑 RTT'],
+  srtt: ['Smoothed RTT', '平滑 RTT'],
+  min_rtt_ms: ['Minimum RTT', '最小 RTT'],
+  min_rtt: ['Minimum RTT', '最小 RTT'],
+  rtt_ms: ['RTT', 'RTT'],
+  one_way_delay_ms: ['One-way delay', '单向延迟'],
+  delay_ms: ['Emulated delay', '模拟延迟'],
+  rtt_inflation: ['RTT inflation (bufferbloat)', 'RTT 膨胀(缓冲膨胀)'],
+  jitter_ms: ['Jitter', '抖动'],
+  // loss / integrity
+  pkt_lost: ['Packets lost', '丢包数'],
+  dgram_lost: ['Datagrams lost', '数据报丢失'],
+  dgram_sent: ['Datagrams sent', '数据报发送'],
+  dgram_acked: ['Datagrams acked', '数据报确认'],
+  lost_percent: ['Loss rate', '丢包率'],
+  lost_dgram_count: ['Datagrams lost', '数据报丢失'],
+  fec_recover_cnt: ['FEC recovered', 'FEC 恢复'],
+  fec_send_cnt: ['FEC sent', 'FEC 发送'],
+  // path fairness
+  path_minshare: ['Path balance (min/max)', '路径均衡度(小/大)'],
+  minshare: ['Path balance (min/max)', '路径均衡度(小/大)'],
+  bytes_tx: ['Bytes sent', '发送字节'],
+  bytes_rx: ['Bytes received', '接收字节'],
+  // failover
+  ttf_sec: ['Time to detect failure', '故障检测耗时'],
+  ttr_sec: ['Time to recover', '恢复耗时'],
+  pre_fault_avg_mbps: ['Before fault', '故障前'],
+  degraded_avg_mbps: ['While degraded', '降级期间'],
+  recovery_avg_mbps: ['After recovery', '恢复后'],
+  post_recover_avg_mbps: ['After both recovered', '双路恢复后'],
+  // batching (the readout that makes a PPS-capped carrier profile actionable)
+  gso_factor: ['GSO batching factor', 'GSO 批量倍率'],
+  gro_factor: ['GRO batching factor', 'GRO 批量倍率'],
+  // resource
+  server_rss_peak_kb: ['Server peak memory', '服务端峰值内存'],
+  client_rss_peak_kb: ['Client peak memory', '客户端峰值内存'],
+  server_rss: ['Server memory', '服务端内存'],
+  client_rss: ['Client memory', '客户端内存'],
+  // stability
+  cv_pct: ['Variability (CV)', '波动(CV)'],
+  multipath_cv_pct: ['Multipath variability', '多路径波动'],
+  // special conditions
+  before_idle_mbps: ['Before idle', '空闲前'],
+  after_idle_mbps: ['After 35 s idle', '空闲 35 秒后'],
+  survived_ratio: ['Survival ratio', '存活比'],
+  recovered: ['Recovered', '已恢复'],
+  survived: ['Survived', '存活'],
+  pre_roam_mbps: ['Before roam', '漫游前'],
+  post_roam_mbps: ['After roam', '漫游后'],
+  roam_retention: ['Roam retention', '漫游保持率'],
+  roam_applied: ['Roam actually applied', '漫游确实发生'],
+  dl_idle_mbps: ['Downlink, idle uplink', '下行(上行空闲)'],
+  dl_under_ul_load_mbps: ['Downlink, uplink saturated', '下行(上行满载)'],
+  dl_retention: ['Downlink retention', '下行保持率'],
+  // overhead ratios
+  single_path: ['Single-path overhead', '单路开销'],
+  multipath_minrtt: ['MinRTT overhead', 'MinRTT 开销'],
+  multipath_wlb: ['WLB overhead', 'WLB 开销'],
+  // context
+  rate_mbit: ['Emulated bandwidth', '模拟带宽'],
+  streams: ['Parallel streams', '并发流数'],
+  target_mbps: ['Target rate', '目标速率'],
+  packet_size: ['Packet size', '包长'],
+  duration_sec: ['Duration', '时长'],
+  iperf_sec: ['iperf duration', 'iperf 时长'],
+  repeats: ['Repeats', '重复次数'],
+  netem_seed: ['netem seed available', 'netem seed 可用'],
+  pps_police: ['PPS cap available', 'PPS 限速可用'],
+  nat: ['NAT emulation available', 'NAT 模拟可用'],
+  cycles_ok: ['Cycles passed', '通过轮次'],
+  cycles_failed: ['Cycles failed', '失败轮次'],
+  num_cycles: ['Cycles', '总轮次'],
+  // tier / host state
+  tier: ['Server tier', '服务器档位'],
+  host_state: ['Host state', '母鸡状态'],
+  path_a: ['Path A', '路径 A'],
+  path_b: ['Path B', '路径 B'],
+  scheduler: ['Scheduler', '调度器'],
+  net_class: ['Network class', '网络类型'],
+  tier_props: ['cgroup limits', 'cgroup 限制'],
+  icmp_drop: ['ICMP drop available', 'ICMP 丢弃可用'],
+};
+
+/* ── metric glossary ─────────────────────────────────────────────────────
+ * A translated name still does not say which way is better. `vs_best_single`
+ * of 1.4 is good, `rtt_inflation` of 1.4 is not, and `path_minshare` of 0 is a
+ * failure rather than a small number. Each entry is [en, zh, direction], where
+ * direction drives the arrow next to the name: 'up' = higher is better,
+ * 'down' = lower is better, 'flat' = context, not a score.
+ * Only metrics whose reading is not self-evident are listed; anything absent
+ * falls back to its label alone.                                           */
+const METRIC_HELP = {
+  aggregation_efficiency: [
+    'Multipath throughput divided by the sum of both paths measured alone. 1.0 means the two paths added up perfectly; below 1.0 is the cost of splitting traffic.',
+    '多路径吞吐 ÷ 两条路各自单跑之和。1.0 表示两条路完美相加,低于 1.0 就是分流的损耗。',
+    'up'],
+  vs_best_single: [
+    'Multipath throughput divided by the better single path. Below 1.0 means multipath is SLOWER than just using the good path — the failure this number exists to catch.',
+    '多路径吞吐 ÷ 较好的那条单路。低于 1.0 说明多路径比只用好路还慢 —— 这个指标就是为抓这种情况而存在的。',
+    'up'],
+  rtt_inflation: [
+    'Working RTT divided by the path\'s floor RTT. This is bufferbloat: 1.0 is an empty queue, 3.0 means packets wait three times the propagation delay.',
+    '工作 RTT ÷ 该路径的最小 RTT。这就是缓冲膨胀:1.0 表示队列为空,3.0 表示报文排队时间达到传播延迟的三倍。',
+    'down'],
+  path_minshare: [
+    'Traffic on the quieter path divided by the busier one. 0 means one path carried nothing at all, which is the aggregation failure worth alerting on; 1.0 is a perfectly even split.',
+    '较闲路径的流量 ÷ 较忙路径。0 表示有一条路完全没跑流量,这是最该报警的聚合失败;1.0 表示完全均分。',
+    'up'],
+  gso_factor: [
+    'Datagrams per sendmsg call. Under a packet-rate cap goodput scales with this, so a drop here explains a throughput drop that bandwidth alone cannot.',
+    '每次 sendmsg 发出的数据报数。在包速率受限时有效吞吐与它成正比,所以它下降能解释带宽无法解释的吞吐下降。',
+    'up'],
+  gro_factor: [
+    'Datagrams per recvmmsg call — the receive-side counterpart of the GSO factor.',
+    '每次 recvmmsg 收到的数据报数 —— GSO 倍率的接收侧对应项。',
+    'up'],
+  multipath_cv_pct: [
+    'Spread across repeats of the same measurement. High CV means the number is noise and a trend line through it is not evidence.',
+    '同一测量多次重复之间的离散度。CV 高说明这个数字是噪声,基于它的趋势线不能作为证据。',
+    'down'],
+  cv_pct: [
+    'Spread across repeats of the same measurement. High CV means the number is noise.',
+    '同一测量多次重复之间的离散度。CV 高说明这个数字是噪声。',
+    'down'],
+  ttf_sec: [
+    'How long the tunnel took to notice a path had died.',
+    '隧道发现某条路已死所用的时间。',
+    'down'],
+  ttr_sec: [
+    'How long throughput took to come back after the path returned.',
+    '路径恢复后吞吐重新回升所用的时间。',
+    'down'],
+  dl_retention: [
+    'Downlink throughput with the uplink saturated, divided by downlink with the uplink idle. Below 1.0 means ACK traffic is being starved by bulk upload.',
+    '上行满载时的下行吞吐 ÷ 上行空闲时的下行吞吐。低于 1.0 说明 ACK 被上行大流量挤掉了。',
+    'up'],
+  after_idle_mbps: [
+    'Throughput after idling past the NAT UDP timeout (30 s by default). A collapse here is a dead NAT binding, not congestion.',
+    '空闲超过 NAT UDP 超时(默认 30 秒)后的吞吐。这里崩掉是 NAT 映射失效,不是拥塞。',
+    'up'],
+  roam_retention: [
+    'Throughput after the client\'s source address moved mid-transfer, divided by throughput before. Read it together with "roam actually applied" — a perfect 1.0 with that flag at 0 means the address never moved and nothing was tested.',
+    '客户端源地址在传输中途变更之后的吞吐 ÷ 变更之前的吞吐。要和"漫游确实发生"一起看:若该标志为 0 而这里是完美的 1.0,说明地址根本没变,什么也没测到。',
+    'up'],
+  roam_applied: [
+    '1 when the source address really was rotated (needs iptables and conntrack on the runner), 0 when the tooling was missing and the run is not evidence of anything.',
+    '为 1 表示源地址确实被轮换了(需要 runner 上有 iptables 和 conntrack),为 0 表示工具缺失,这次运行不能作为任何结论的依据。',
+    'flat'],
+  server_rss_peak_kb: [
+    'Peak resident memory of the server process (VmHWM), the number a small instance runs out of first.',
+    '服务端进程的峰值常驻内存(VmHWM),小规格实例最先耗尽的就是它。',
+    'down'],
+  tier: [
+    'Emulated server size, applied as cgroup CPU and memory limits. A quota caps throughput; it does not reproduce a slower core\'s per-operation latency.',
+    '模拟的服务器规格,通过 cgroup 的 CPU/内存限制实现。配额只能压住吞吐上限,并不能复现慢核心的单次操作延迟。',
+    'flat'],
+  host_state: [
+    'What else was competing for the machine. Contention from a neighbour process is a proxy for a busy hypervisor — steal time cannot be emulated from inside the guest.',
+    '当时还有什么在抢这台机器。邻居进程的争抢只是"母鸡繁忙"的近似 —— steal time 无法在客户机内部模拟。',
+    'flat'],
+  multipath_mbps: [
+    'Throughput with both paths active. Absolute Mbps depends on the runner, so compare it against the ratios rather than across machines.',
+    '两条路同时启用时的吞吐。绝对 Mbps 取决于 runner,应与比值类指标对照看,不要跨机器比较。',
+    'up'],
+};
+
+function metricHelp(leaf) {
+  const h = METRIC_HELP[leaf];
+  if (!h) return null;
+  return { text: h[LANG === 'zh' ? 1 : 0], dir: h[2] };
+}
+const DIR_MARK = { up: '↑', down: '↓', flat: '·' };
+
+/* ── scenario context ────────────────────────────────────────────────────
+ * The string fields sharing a metric's object — for a netsim row that is the
+ * pair of path specs the number was measured over, and for a tier row the
+ * cgroup limits that were in force. A throughput figure means nothing without
+ * them, so they ride along on the card rather than living in the raw JSON.
+ *
+ * Matching is by object path: `results[scenario=x].multipath_mbps` and
+ * `results[scenario=x].path_a` share the prefix `results[scenario=x].`.     */
+const CONTEXT_LEAVES = ['path_a', 'path_b', 'tier_props', 'net_class', 'host_state', 'scheduler'];
+
+function scenarioContext(metricName) {
+  const ctx = (state.data && state.data.context) || {};
+  const cut = metricName.lastIndexOf('.');
+  if (cut < 0) return [];
+  const prefix = metricName.slice(0, cut + 1);
+  const out = [];
+  for (const leaf of CONTEXT_LEAVES) {
+    const v = ctx[prefix + leaf];
+    if (v) out.push([leaf, v]);
+  }
+  return out;
+}
+
+// Unit from the leaf's suffix, so an unknown metric still gets one right.
+function unitOf(leaf) {
+  if (/_mbps$|_mbit$/.test(leaf)) return 'Mbps';
+  if (/_ms$/.test(leaf)) return 'ms';
+  if (/_sec$/.test(leaf)) return 's';
+  if (/_kb$/.test(leaf)) return 'KB';
+  if (/_pct$|percent$/.test(leaf)) return '%';
+  if (/_bytes$|^bytes_/.test(leaf)) return 'B';
+  if (/efficiency$|_ratio$|_factor$|inflation$|minshare$|retention$|utilization$/.test(leaf)) return '×';
+  return '';
+}
+
+function humanise(leaf) {
+  return leaf.replace(/_(mbps|ms|sec|kb|pct|bytes)$/, '')
+             .replace(/_/g, ' ')
+             .replace(/^./, (c) => c.toUpperCase());
+}
+
+/* Split a dotted path on dots that are OUTSIDE brackets. A naive split breaks
+ * `intervals[time_sec=0.5].mbps`, where the bracket key itself contains a dot. */
+function splitPath(path) {
+  const out = [];
+  let cur = '', depth = 0;
+  for (const ch of path) {
+    if (ch === '[') depth++;
+    else if (ch === ']') depth--;
+    if (ch === '.' && depth === 0) { out.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/* Generic container names that carry no information once the leaf is named.
+ * Everything else in the path does: `results.wlb[streams=1].multipath_mbps`
+ * and `netem.path_a.rate_mbit` are only distinguishable by their object keys
+ * (wlb/minrtt, path_a/path_b), so dropping those would collapse two
+ * schedulers -- or two links -- into identical rows. */
+const PATH_NOISE = new Set(['results', 'result', 'data', 'end']);
+
+/** path -> {label, group, unit}. Group is every non-leaf segment, object keys
+ *  and bracket keys alike, which is what makes near-duplicate rows tellable
+ *  apart. */
+function describe(path) {
+  const segs = splitPath(path);
+  const leafSeg = segs.pop() || '';
+  const leaf = leafSeg.replace(/\[[^\]]*\]/g, '');
+
+  const parts = [];
+  const pushSeg = (seg) => {
+    const base = seg.replace(/\[[^\]]*\]/g, '');
+    if (base && !PATH_NOISE.has(base)) parts.push(base);
+    for (const m of seg.matchAll(/\[([^\]]*)\]/g)) parts.push(m[1]);
+  };
+  segs.forEach(pushSeg);
+  // A trailing bracket on the leaf segment is a group key too, not a name.
+  for (const m of leafSeg.matchAll(/\[([^\]]*)\]/g)) parts.push(m[1]);
+
+  const known = METRIC_LABELS[leaf];
+  return {
+    label: known ? known[LANG === 'zh' ? 1 : 0] : humanise(leaf),
+    group: parts.join(' · '),
+    unit: unitOf(leaf),
+    leaf,
+  };
+}
+
+/* ── formatting / stats ─────────────────────────────────────────────────── */
+function fmt(v) {
+  if (v === null || v === undefined || !Number.isFinite(v)) return '—';
+  const a = Math.abs(v);
+  if (a === 0) return '0';
+  if (a >= 1000) return v.toFixed(0);
+  if (a >= 100) return v.toFixed(1);
+  if (a >= 1) return v.toFixed(2);
+  if (a >= 0.01) return v.toFixed(3);
+  return v.toExponential(1);
+}
+function shortTime(iso) {
+  if (!iso) return '?';
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toISOString().slice(0, 16).replace('T', ' ');
+}
+function stats(values) {
+  const f = values.filter((v) => v !== null && Number.isFinite(v));
+  if (!f.length) return null;
+  const mean = f.reduce((a, b) => a + b, 0) / f.length;
+  const s = [...f].sort((a, b) => a - b);
+  const mid = s.length >> 1;
+  const median = s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+  const sd = f.length > 1
+    ? Math.sqrt(f.reduce((a, b) => a + (b - mean) ** 2, 0) / (f.length - 1)) : 0;
+  const last = f[f.length - 1];
+  const prev = f.length > 1 ? f[f.length - 2] : null;
+  return { n: f.length, mean, median, sd,
+    cv: mean !== 0 ? (sd / Math.abs(mean)) * 100 : null,
+    last, prev,
+    delta: prev !== null && prev !== 0 ? ((last - prev) / Math.abs(prev)) * 100 : null,
+    flat: s[0] === s[s.length - 1], min: s[0], max: s[s.length - 1] };
+}
+
+/* ── svg ────────────────────────────────────────────────────────────────── */
+function scale(values, w, h, padX, padY) {
+  const f = values.filter((v) => v !== null && Number.isFinite(v));
+  let min = Math.min(...f), max = Math.max(...f);
+  if (!Number.isFinite(min)) { min = 0; max = 1; }
+  if (min === max) { const b = Math.abs(min) || 1; min -= b * 0.05; max += b * 0.05; }
+  const n = values.length;
+  return { min, max,
+    x: (i) => (n <= 1 ? w / 2 : padX + (i * (w - 2 * padX)) / (n - 1)),
+    y: (v) => h - padY - ((v - min) / (max - min)) * (h - 2 * padY) };
+}
+// Gaps break the line rather than being drawn through, so a run whose file was
+// unreadable never looks like a measured value.
+function linePath(values, s) {
+  let d = '', pen = false;
+  values.forEach((v, i) => {
+    if (v === null || !Number.isFinite(v)) { pen = false; return; }
+    d += `${pen ? 'L' : 'M'}${s.x(i).toFixed(2)} ${s.y(v).toFixed(2)} `;
+    pen = true;
+  });
+  return d.trim();
+}
+function svgEl(tag, attrs) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  return el;
+}
+function sparkline(values, w = 240, h = 44) {
+  const s = scale(values, w, h, 2, 5);
+  const svg = svgEl('svg', { class: 'spark', viewBox: `0 0 ${w} ${h}`, preserveAspectRatio: 'none' });
+  const d = linePath(values, s);
+  if (d) {
+    svg.appendChild(svgEl('path', { d, fill: 'none', stroke: 'var(--line)',
+      'stroke-width': 1.6, 'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+      'vector-effect': 'non-scaling-stroke' }));
+    for (let i = values.length - 1; i >= 0; i--) {
+      if (values[i] !== null && Number.isFinite(values[i])) {
+        svg.appendChild(svgEl('circle', { cx: s.x(i), cy: s.y(values[i]), r: 2.4,
+          fill: 'var(--line)', 'vector-effect': 'non-scaling-stroke' }));
+        break;
+      }
+    }
+  }
+  return svg;
+}
+
+/* ── state ──────────────────────────────────────────────────────────────── */
+const state = { data: null, selected: null, view: 'trend', runIdx: null };
+
+function store(k, v) { try { v === undefined ? 0 : localStorage.setItem(k, v); } catch {} }
+function recall(k) { try { return localStorage.getItem(k); } catch { return null; } }
+
+function metricItems() {
+  const d = state.data;
+  if (!d) return [];
+  const q = $('filter').value.trim().toLowerCase();
+  const hideFlat = $('hideflat').checked;
+  const mode = $('sort').value;
+
+  let items = Object.keys(d.metrics).map((name) => {
+    const desc = describe(name);
+    return { name, desc, values: d.metrics[name], st: stats(d.metrics[name]) };
+  }).filter((it) => it.st);
+
+  if (hideFlat) items = items.filter((it) => !it.st.flat);
+  if (q) items = items.filter((it) =>
+    it.name.toLowerCase().includes(q) ||
+    it.desc.label.toLowerCase().includes(q) ||
+    it.desc.group.toLowerCase().includes(q));
+
+  const byName = (a, b) => a.desc.group.localeCompare(b.desc.group) || a.desc.label.localeCompare(b.desc.label);
+  if (mode === 'move') items.sort((a, b) => Math.abs(b.st.delta ?? 0) - Math.abs(a.st.delta ?? 0) || byName(a, b));
+  else if (mode === 'noise') items.sort((a, b) => (b.st.cv ?? 0) - (a.st.cv ?? 0) || byName(a, b));
+  else items.sort(byName);
+  return items;
+}
+
+function chip(text, cls) {
+  const el = document.createElement('span');
+  el.className = 'chip' + (cls ? ' ' + cls : '');
+  el.textContent = text;
+  return el;
+}
+// Deltas carry no good/bad colour by default: direction is not interpretable
+// across metrics (higher _mbps is better, lower ttr_sec is better), so colouring
+// a throughput drop green would be worse than no colour at all. The arrow shows
+// direction and the reader supplies the meaning.
+function deltaChip(delta) {
+  if (delta === null || delta === undefined) return null;
+  return chip(`${delta >= 0 ? '▲' : '▼'} ${Math.abs(delta).toFixed(1)}% ${t('vsPrev')}`);
+}
+
+/* ── view: trend (cards + sparkline) ───────────────────────────────────── */
+function renderTrend(items) {
+  const grid = $('grid');
+  grid.hidden = false; $('tblwrap').hidden = true;
+  grid.textContent = '';
+  for (const it of items) {
+    const card = document.createElement('button');
+    card.className = 'card'; card.type = 'button';
+
+    const help = metricHelp(it.desc.leaf);
+
+    const nm = document.createElement('div');
+    nm.className = 'nm';
+    nm.textContent = help
+      ? `${it.desc.label} ${DIR_MARK[help.dir] || ''}`.trim()
+      : it.desc.label;
+    const grp = document.createElement('div');
+    grp.className = 'grp'; grp.textContent = it.desc.group || it.desc.leaf;
+
+    // The whole card gets the explanation, so hovering anywhere on it answers
+    // "which direction is good?" without a trip to the glossary below.
+    if (help) card.title = help.text;
+
+    const val = document.createElement('div');
+    val.className = 'val'; val.textContent = fmt(it.st.last);
+    if (it.desc.unit) {
+      const u = document.createElement('span');
+      u.className = 'u'; u.textContent = it.desc.unit; val.appendChild(u);
+    }
+
+    const chips = document.createElement('div');
+    chips.className = 'chips';
+    const dc = deltaChip(it.st.delta); if (dc) chips.appendChild(dc);
+    if (it.st.cv !== null) chips.appendChild(chip(`CV ${it.st.cv.toFixed(1)}%`));
+    chips.appendChild(chip(`${t('median')} ${fmt(it.st.median)}`));
+    chips.appendChild(chip(`n=${it.st.n}`));
+
+    card.append(nm, grp, val, chips);
+
+    const ctx = scenarioContext(it.name);
+    if (ctx.length) {
+      const cc = document.createElement('div');
+      cc.className = 'chips ctx';
+      for (const [leaf, v] of ctx) {
+        const label = (METRIC_LABELS[leaf] || [leaf, leaf])[LANG === 'zh' ? 1 : 0];
+        cc.appendChild(chip(`${label}: ${v}`));
+      }
+      card.appendChild(cc);
+    }
+
+    card.appendChild(sparkline(it.values));
+    if (help) {
+      const hl = document.createElement('div');
+      hl.className = 'help'; hl.textContent = help.text;
+      card.appendChild(hl);
+    }
+    card.addEventListener('click', () => openDetail(it.name));
+    grid.appendChild(card);
+  }
+}
+
+/* ── view: latest only (compact table of the newest value) ─────────────── */
+function renderLatest(items) {
+  $('grid').hidden = true;
+  const wrap = $('tblwrap'); wrap.hidden = false;
+  const tbl = $('tbl');
+  tbl.tHead.innerHTML = `<tr><th>${t('colMetric')}</th><th></th>`
+    + `<th class="n">${t('colValue')}</th><th>${t('colUnit')}</th>`
+    + `<th class="n">${t('colDelta')}</th><th class="n">${t('colCv')}</th>`
+    + `<th>${t('colTrend')}</th></tr>`;
+  const tb = tbl.tBodies[0]; tb.textContent = '';
+  for (const it of items) {
+    const tr = document.createElement('tr');
+    const mk = (txt, cls) => { const td = document.createElement('td');
+      if (cls) td.className = cls; td.textContent = txt; return td; };
+    tr.append(mk(it.desc.label), mk(it.desc.group || ''), mk(fmt(it.st.last), 'n'),
+      mk(it.desc.unit, ''),
+      mk(it.st.delta === null ? '—' : `${it.st.delta >= 0 ? '+' : ''}${it.st.delta.toFixed(1)}%`, 'n'),
+      mk(it.st.cv === null ? '—' : it.st.cv.toFixed(1) + '%', 'n'));
+    const tdSpark = document.createElement('td');
+    tdSpark.style.width = '150px';
+    tdSpark.appendChild(sparkline(it.values, 150, 26));
+    tr.appendChild(tdSpark);
+    tr.addEventListener('click', () => openDetail(it.name));
+    tb.appendChild(tr);
+  }
+}
+
+/* ── view: single run (one commit, every metric it recorded) ───────────── */
+function renderRun(items) {
+  $('grid').hidden = true;
+  const wrap = $('tblwrap'); wrap.hidden = false;
+  const idx = state.runIdx;
+  const tbl = $('tbl');
+  tbl.tHead.innerHTML = `<tr><th>${t('colMetric')}</th><th></th>`
+    + `<th class="n">${t('colValue')}</th><th>${t('colUnit')}</th>`
+    + `<th class="n">${t('colDelta')}</th></tr>`;
+  const tb = tbl.tBodies[0]; tb.textContent = '';
+
+  let shown = 0;
+  for (const it of items) {
+    const v = it.values[idx];
+    if (v === null || v === undefined || !Number.isFinite(v)) continue;
+    // Compare against the nearest earlier run that recorded this metric, not
+    // blindly idx-1: a gap there would otherwise read as "no change".
+    let prev = null;
+    for (let j = idx - 1; j >= 0; j--) {
+      if (it.values[j] !== null && Number.isFinite(it.values[j])) { prev = it.values[j]; break; }
+    }
+    const d = prev !== null && prev !== 0 ? ((v - prev) / Math.abs(prev)) * 100 : null;
+    const tr = document.createElement('tr');
+    const mk = (txt, cls) => { const td = document.createElement('td');
+      if (cls) td.className = cls; td.textContent = txt; return td; };
+    tr.append(mk(it.desc.label), mk(it.desc.group || ''), mk(fmt(v), 'n'), mk(it.desc.unit, ''),
+      mk(d === null ? '—' : `${d >= 0 ? '+' : ''}${d.toFixed(1)}%`, 'n'));
+    tr.addEventListener('click', () => openDetail(it.name));
+    tb.appendChild(tr);
+    shown++;
+  }
+  if (!shown) {
+    $('empty').hidden = false; $('empty').textContent = t('noRun');
+    wrap.hidden = true;
+  }
+}
+
+function render() {
+  const items = metricItems();
+  const has = items.length > 0;
+  $('empty').hidden = has;
+  if (!has) {
+    $('grid').hidden = true; $('tblwrap').hidden = true;
+    $('empty').textContent = state.data && Object.keys(state.data.metrics).length
+      ? t('noMatch') : t('noData');
+    return;
+  }
+  if (state.view === 'trend') renderTrend(items);
+  else if (state.view === 'latest') renderLatest(items);
+  else renderRun(items);
+}
+
+/* ── detail plot ───────────────────────────────────────────────────────── */
+function openDetail(name) {
+  state.selected = name;
+  const d = state.data, values = d.metrics[name], st = stats(values);
+  if (!st) return;
+  const desc = describe(name);
+  $('detail').classList.remove('hidden');
+  $('dTitle').textContent = desc.label + (desc.group ? `  ·  ${desc.group}` : '')
+    + (desc.unit ? `  (${desc.unit})` : '');
+  const chips = $('dChips'); chips.textContent = '';
+  chips.appendChild(chip(`${t('latestVal')} ${fmt(st.last)}`));
+  chips.appendChild(chip(`${t('median')} ${fmt(st.median)}`));
+  chips.appendChild(chip(`${t('min')} ${fmt(st.min)}`));
+  chips.appendChild(chip(`${t('max')} ${fmt(st.max)}`));
+  if (st.cv !== null) chips.appendChild(chip(`CV ${st.cv.toFixed(1)}%`));
+  chips.appendChild(chip(name));
+  drawDetail(values, d.runs);
+  $('detail').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function drawDetail(values, runs) {
+  const W = 900, H = 300, padX = 56, padY = 18;
+  const svg = $('dPlot'); svg.textContent = '';
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const s = scale(values, W, H, padX, padY);
+
+  for (let i = 0; i <= 4; i++) {
+    const v = s.min + ((s.max - s.min) * i) / 4, y = s.y(v);
+    svg.appendChild(svgEl('line', { x1: padX, y1: y, x2: W - padX / 3, y2: y, class: 'gridline' }));
+    const tx = svgEl('text', { x: padX - 8, y: y + 3.5, class: 'tick', 'text-anchor': 'end' });
+    tx.textContent = fmt(v); svg.appendChild(tx);
+  }
+  const d = linePath(values, s);
+  if (d) svg.appendChild(svgEl('path', { d, fill: 'none', stroke: 'var(--line)',
+    'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+    'vector-effect': 'non-scaling-stroke' }));
+  values.forEach((v, i) => {
+    if (v === null || !Number.isFinite(v)) return;
+    svg.appendChild(svgEl('circle', { cx: s.x(i), cy: s.y(v), r: 3, fill: 'var(--line)' }));
+  });
+  if (runs.length) {
+    const a = svgEl('text', { x: padX, y: H - 3, class: 'tick', 'text-anchor': 'start' });
+    a.textContent = `${runs[0].commit || '?'} · ${shortTime(runs[0].timestamp)}`;
+    const lr = runs[runs.length - 1];
+    const b = svgEl('text', { x: W - padX / 3, y: H - 3, class: 'tick', 'text-anchor': 'end' });
+    b.textContent = `${lr.commit || '?'} · ${shortTime(lr.timestamp)}`;
+    svg.append(a, b);
+  }
+  const cursor = svgEl('line', { x1: 0, y1: padY, x2: 0, y2: H - padY,
+    stroke: 'var(--line)', 'stroke-width': 1, opacity: 0 });
+  svg.appendChild(cursor);
+  const tip = $('tip');
+  svg.onmousemove = (ev) => {
+    const box = svg.getBoundingClientRect();
+    if (!box.width) return;
+    const vx = ((ev.clientX - box.left) / box.width) * W;
+    let best = -1, bestDist = Infinity;
+    for (let i = 0; i < values.length; i++) {
+      if (values[i] === null || !Number.isFinite(values[i])) continue;
+      const dist = Math.abs(s.x(i) - vx);
+      if (dist < bestDist) { bestDist = dist; best = i; }
+    }
+    if (best < 0) return;
+    cursor.setAttribute('x1', s.x(best)); cursor.setAttribute('x2', s.x(best));
+    cursor.setAttribute('opacity', 0.45);
+    const run = runs[best] || {};
+    tip.textContent = `${fmt(values[best])} · ${run.commit || '?'} · ${shortTime(run.timestamp)}`;
+    tip.style.left = `${(s.x(best) / W) * box.width}px`;
+    tip.style.top = `${((s.y(values[best]) - 10) / H) * box.height}px`;
+    tip.style.opacity = 1;
+  };
+  svg.onmouseleave = () => { tip.style.opacity = 0; cursor.setAttribute('opacity', 0); };
+}
+
+/* ── chrome / i18n application ─────────────────────────────────────────── */
+function applyLang() {
+  document.documentElement.lang = LANG === 'zh' ? 'zh' : 'en';
+  $('h1').firstChild.textContent = t('title');
+  document.title = LANG === 'zh' ? 'mqvpn 性能历史' : 'mqvpn perf history';
+  for (const el of document.querySelectorAll('[data-i]')) el.textContent = t(el.dataset.i);
+  $('filter').placeholder = t('filterPh');
+  $('dClose').textContent = t('close');
+  const ch = $('channel');
+  ch.options[0].textContent = t('push'); ch.options[1].textContent = t('weekly');
+  const so = $('sort');
+  so.options[0].textContent = t('byname'); so.options[1].textContent = t('bymove');
+  so.options[2].textContent = t('bynoise');
+  for (const b of $('viewSeg').children) {
+    b.textContent = t(b.dataset.view);
+    b.setAttribute('aria-pressed', String(b.dataset.view === state.view));
+  }
+  for (const b of $('langSeg').children) b.setAttribute('aria-pressed', String(b.dataset.lang === LANG));
+  $('commitWrap').style.display = state.view === 'run' ? '' : 'none';
+}
+
+function fillCommits() {
+  const sel = $('commit'); sel.textContent = '';
+  const runs = (state.data && state.data.runs) || [];
+  // Newest first in the picker even though the series is oldest-first.
+  for (let i = runs.length - 1; i >= 0; i--) {
+    const o = document.createElement('option');
+    o.value = String(i);
+    o.textContent = `${runs[i].commit || '?'} · ${shortTime(runs[i].timestamp)}`;
+    sel.appendChild(o);
+  }
+  if (state.runIdx === null || state.runIdx >= runs.length) state.runIdx = runs.length - 1;
+  sel.value = String(state.runIdx);
+}
+
+/* ── data ──────────────────────────────────────────────────────────────── */
+async function getJSON(path, params) {
+  const url = new URL(path, location.origin);
+  for (const [k, v] of Object.entries(params || {})) url.searchParams.set(k, v);
+  const res = await fetch(url, { credentials: 'same-origin' });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText} — ${await res.text()}`);
+  return res.json();
+}
+
+async function loadTests() {
+  const info = await getJSON('/api/tests', { channel: $('channel').value });
+  const sel = $('test'), prev = sel.value;
+  sel.textContent = '';
+  for (const x of info.tests) {
+    const o = document.createElement('option');
+    o.value = x.id; o.textContent = `${x.id} (${x.runs})`;
+    sel.appendChild(o);
+  }
+  if (prev && info.tests.some((x) => x.id === prev)) sel.value = prev;
+  $('sub').textContent = info.tests.length
+    ? ' · ' + t('runsIndexed')(info.runs, info.newest ? info.newest.commit : '?')
+    : ' · ' + t('noPub');
+}
+
+// Say what the selected benchmark is, above its numbers.
+function renderAbout() {
+  const info = testInfo($('test').value);
+  const box = $('about');
+  if (!info) { box.hidden = true; return; }
+  box.hidden = false;
+  $('aboutKind').textContent = info.kind[LANG === 'zh' ? 1 : 0];
+  $('aboutText').textContent = LANG === 'zh' ? info.zh : info.en;
+}
+
+async function loadSeries() {
+  const test = $('test').value;
+  renderAbout();
+  if (!test) { state.data = null; $('meta').textContent = ''; render(); return; }
+  $('meta').textContent = t('loading');
+  const data = await getJSON('/api/series',
+    { channel: $('channel').value, test, limit: $('limit').value });
+  state.data = data;
+  state.runIdx = null;
+  fillCommits();
+
+  const first = data.runs[0], last = data.runs[data.runs.length - 1];
+  $('meta').textContent = data.runs.length
+    ? t('range')(data.runs.length, shortTime(first.timestamp), shortTime(last.timestamp), data.totalMetrics)
+      + '  ·  ' + t('cvHint')
+    : t('noData');
+
+  const problems = [];
+  if (data.truncated) problems.push(t('truncated')(Object.keys(data.metrics).length, data.totalMetrics));
+  if (data.errors && data.errors.length) problems.push(t('readErr')(data.errors.length));
+  $('notice').hidden = problems.length === 0;
+  $('notice').textContent = problems.join(' ');
+
+  $('detail').classList.add('hidden'); state.selected = null;
+  render();
+}
+
+const guard = (fn) => () => fn().catch((e) => {
+  $('notice').hidden = false; $('notice').textContent = t('loadFail')(e.message);
+});
+const refreshAll = guard(async () => { await loadTests(); await loadSeries(); });
+
+/* ── wiring ────────────────────────────────────────────────────────────── */
+$('langSeg').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  LANG = b.dataset.lang; store('perf_lang', LANG);
+  applyLang(); renderAbout();
+  if (state.data) { fillCommits(); render(); }
+  if (state.selected) openDetail(state.selected);
+});
+$('viewSeg').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  state.view = b.dataset.view; store('perf_view', state.view);
+  applyLang(); render();
+});
+$('commit').addEventListener('change', () => { state.runIdx = Number($('commit').value); render(); });
+$('channel').addEventListener('change', refreshAll);
+$('test').addEventListener('change', guard(loadSeries));
+$('limit').addEventListener('change', guard(loadSeries));
+$('filter').addEventListener('input', render);
+$('sort').addEventListener('change', render);
+$('hideflat').addEventListener('change', render);
+$('dClose').addEventListener('click', () => {
+  $('detail').classList.add('hidden'); state.selected = null;
+});
+window.addEventListener('resize', () => {
+  if (state.selected && state.data) drawDetail(state.data.metrics[state.selected], state.data.runs);
+});
+
+// Chinese by default. The viewer's own choice still wins once made; only the
+// initial guess changed, because the browser locale was sending this dashboard
+// to English for its primary reader.
+LANG = recall('perf_lang') || 'zh';
+state.view = recall('perf_view') || 'trend';
+applyLang();
+refreshAll();
+</script>
+</body>
+</html>
