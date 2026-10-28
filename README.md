@@ -1,3 +1,16 @@
+> **Fork Notice**
+>
+> This repository is a fork of [mp0rta/mqvpn](https://github.com/mp0rta/mqvpn), maintained primarily
+> for personal use, deployment, testing, and customization.
+>
+> It is **not an official upstream repository**, and changes made here
+> should not be considered part of the upstream project.
+>
+> Please refer to the upstream repository for the official project,
+> documentation, releases, and support.
+>
+> Upstream copyright, licensing, and attribution remain unchanged.
+
 <div align="center">
   <h1>
     <picture>
@@ -17,21 +30,6 @@
     <a href="https://docs.mqvpn.org/">Documentation</a> |
     <a href="https://discord.gg/5rsqnZfBqu">Discord community</a>
   </p>
-
-  <p>
-    <a href="https://play.google.com/store/apps/details?id=org.mqvpn.app">
-      <img
-        src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png"
-        alt="Get it on Google Play"
-        height="80">
-    </a>
-    <a href="https://f-droid.org/packages/org.mqvpn.app/">
-      <img
-        src="https://fdroid.gitlab.io/artwork/badge/get-it-on.png"
-        alt="Get it on F-Droid"
-        height="80">
-    </a>
-  </p>
 </div>
 
 mqvpn is an open-source VPN that combines multiple internet connections—such as Wi-Fi, cellular, Starlink, and multiple ISPs—for bandwidth aggregation and seamless failover.
@@ -43,6 +41,7 @@ https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
 ## Table of Contents
 
 <!--toc:start-->
+- [Differences from upstream](#differences-from-upstream)
 - [Supported Platforms](#supported-platforms)
 - [Features](#features)
 - [Key Use Cases](#key-use-cases)
@@ -56,18 +55,24 @@ https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
 - [Configuration](#configuration)
   - [INI config](#ini-config)
   - [JSON config](#json-config)
+  - [TUN MTU](#tun-mtu)
+  - [TUN queue depth and drain batch](#tun-queue-depth-and-drain-batch)
+  - [`[Advanced]` — UDP offload](#advanced--udp-offload)
 - [Schedulers](#schedulers)
 - [Reorder buffer (datagram lane)](#reorder-buffer-datagram-lane)
 - [Reinjection (speculative duplication)](#reinjection-speculative-duplication)
 - [Hybrid mode (TCP lane)](#hybrid-mode-tcp-lane)
+- [Server fallback proxy](#server-fallback-proxy)
 - [systemd](#systemd)
 - [Control API](#control-api)
 - [Benchmarks](#benchmarks)
 - [Architecture](#architecture)
+- [Security Maintenance](#security-maintenance)
 - [Building](#building)
   - [Android SDK](#android-sdk)
 - [Testing](#testing)
 - [Usage](#usage)
+- [Known issues](#known-issues)
 - [Roadmap](#roadmap)
 - [Protocol Standards](#protocol-standards)
 - [Community](#community)
@@ -76,6 +81,360 @@ https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
 - [License](#license)
 - [Acknowledgments](#acknowledgments)
 <!--toc:end-->
+
+## Differences from upstream
+
+This repository is a fork of [mp0rta/mqvpn](https://github.com/mp0rta/mqvpn).
+The table below is the merge index: it records what is still fork-only, what
+has been replaced by a stronger upstream design, and where each behavior is
+implemented and tested. Do not infer fork status from an old commit alone.
+
+| Area | Status | Implementation and verification |
+|---|---|---|
+| Client TLS ownership | **Upstream design + platform adapters** | Core uses upstream's config-scoped `mqvpn_config_set_cert_verifier()` and xquic `APP_VERIFY`; Windows uses CryptoAPI, Apple uses `SecTrust`, Android uses `X509TrustManager`, and Linux uses BoringSSL's configured default paths. Core handshake ownership/chain tests are in `tests/test_server.c`; native fail-closed tests are in `tests/test_platform_cert_verify.c`; Android SAN matching is pinned by `PlatformTrustTest.kt`. See `src/platform/*/cert_verify_*`, `PlatformTrust.kt`, and `docs/client-certificate-verification.md`. |
+| ~~Global `cert_verify.c` fallback and Android `mqvpn_set_cert_trust_check()`~~ | ~~Fork-only~~ **Synchronized with upstream; removed** | The old process-global hook and “library failure, then platform fallback” path were deleted. Verification now has one owner per handshake. |
+| ~~mqvpn-side replacement of all BoringSSL chain/hostname checks~~ | ~~Fork-only~~ **Synchronized with upstream; removed** | Linux delegates to xquic/BoringSSL. Platforms whose trust stores are not filesystem bundles explicitly install an application verifier. |
+| Shared UDP-port routing | **Fork-only** | QUIC v1/v2 Initial SNI inspection, raw QUIC fallback, and H3-to-h2c translation live in `src/sni_router.c` and `src/h2_proxy.c`; protocol tests are `tests/test_sni_router.c` and `tests/test_h2_proxy.c`. |
+| H3-to-h2c backpressure and Priority | **Fork-only, corrected after field deadlock, lossy-path starvation, and a throughput ceiling** | ~~256/128 KiB connection queue watermarks were tracked per stream and paused the shared h2c socket.~~ ~~**Replaced:** the watermarks now form one state machine per downstream QUIC connection.~~ **Replaced again:** the watermarks were the deadlock. They were fed an estimate that counted packets in flight, and a connection running at its bandwidth-delay product holds a congestion window of those continuously, so on a fast path the gate never reopened — the larger the response, the more certainly it latched. Pacing is now per stream and comes from xquic: mqvpn writes until `xqc_h3_request_send_body` returns a short write or `-XQC_EAGAIN`, keeps the write notification armed while a response waits, and is resumed directly by the acknowledgement that releases queue space. ~~Each connection admits at most one 16 KiB body chunk per stream per pass.~~ **Removed:** that quota capped one response at a slice per server tick, because a fully accepted write also drops a stream from writable scheduling and left nothing to re-arm the notification. A round-robin cursor still gives every response a turn, and `xqc_h3_request_get_unsent_queue_bytes` remains as a 1 MiB per-connection *memory* valve that cannot latch. The shared h2c fd stays readable: nghttp2 connection credit is returned after copying into the bounded response buffer, stream credit only after xquic accepts those bytes. The 50 ms event-loop clamp is a safety net for xquic suppressing notification under `DATA_BLOCKED`, not the recovery path. RFC 9218 `Priority` mapping and xquic's urgent packet queue remain. Pushback, valve, and fair-recovery coverage is in `tests/test_h2_proxy.c`. |
+| Hybrid TCP-lane uplink backpressure | **Fork-only, requires pinned xquic API** | `src/hybrid/tcp_lane_uplink.c` stops granting lwIP receive credit when either xquic returns EAGAIN/partial or its connection-wide **un-sent** byte estimate reaches 256 KiB. Credit resumes only after the local retry queue is empty and xquic drains to 64 KiB. Packets in flight are outside that estimate on purpose — counting them made the same gate latch closed on fast paths, which is what broke the H3 proxy above. The xquic boundary wrappers live in `src/mqvpn_client.c`; full-accept, pre-send-high-water, and repeated-EAGAIN regressions are pinned in `tests/test_tcp_lane.c`; memory accounting is in `docs/hybrid_h2_memory_budget.md`. |
+| ~~Unbounded Hybrid server egress read per reactor grant~~ | ~~Fork-only~~ **Synchronized from upstream ([mp0rta/mqvpn#349](https://github.com/mp0rta/mqvpn/pull/349); fixes [#348](https://github.com/mp0rta/mqvpn/issues/348))** | `src/hybrid/tcp_egress.c` limits each readable dispatch to a 64 KiB, whole-chunk budget so one busy TCP flow yields to its peers without disarming the level-triggered read event. `tests/test_tcp_egress.c` pins the exact first-dispatch budget and verifies that a later dispatch drains the remainder without manual re-arming. This is server-side reactor fairness; it complements rather than replaces the client-side xquic/lwIP backpressure above. |
+| Windows WFP cleanup lifecycle ([upstream #331](https://github.com/mp0rta/mqvpn/issues/331)) | **Fork-only** | `src/platform/windows/firewall.c` uses a dynamic WFP session for crash cleanup and, on normal exit or reconnect, deletes every tracked filter before its referenced sublayer. Cleanup failures are returned instead of logging a false success; reconnect then stops rather than stacking another ruleset. `tests/test_windows_firewall.c` pins deletion order, idempotent not-found handling, best-effort continuation, and retained retry state after an engine-close failure. |
+| Windows kill-switch teardown and interface-bound leak protection ([upstream #330](https://github.com/mp0rta/mqvpn/issues/330), [#331](https://github.com/mp0rta/mqvpn/issues/331)) | **Leak protection fork-only; teardown synchronized from upstream ([mp0rta/mqvpn#356](https://github.com/mp0rta/mqvpn/pull/356))** | Windows split-default routes cannot redirect applications that select a physical interface with `IP_UNICAST_IF`/`IPV6_UNICAST_IF`, so the explicit `KillSwitch` is the protection boundary: its unconditional ALE block also covers interface-bound sockets, while the transport exception is restricted to the current mqvpn executable, UDP, and the configured server endpoint. ~~Teardown deleted each filter by ID and then the sublayer before closing the engine, and retried `FwpmEngineClose0` on a handle whose close had already failed.~~ **Replaced by upstream's design:** the dynamic session owns the objects, so closing the engine is the whole teardown and BFE also covers a crash or a kill; a failed close is terminal because a WFP engine handle is an RPC context handle whose post-failure state is undefined, so mqvpn records it, refuses to stack a second session over the stale one, and drives the process to exit. Policy-shape and teardown tests live in `tests/test_windows_firewall.c`; the operator contract is in `docs/windows_build.md` and the configuration guide. |
+| Android native logs | **Fork-only, retained** | JNI Logcat output, `onNativeLog`, and the app log view are intentionally retained across upstream syncs; see `docs/logging.md`. |
+| Hybrid TCP lane, reorder buffering, multipath recovery, route/killswitch hardening | **Fork-only** | Indexed by their public config sections below and covered by the corresponding `tests/test_*`, `scripts/ci_e2e/*`, and platform routing tests. |
+| ~~xquic var-buffer underflow and submatrix overflow patch files~~ | ~~Local patch stack~~ **Synchronized into the pinned xquic fork** | Replaced by xquic commit `2ae918c`; the obsolete duplicate patch hunks must not be restored. |
+| ~~xquic active_connection_id_limit backport~~ | ~~`patches/xquic/0001-*`~~ **Synchronized upstream; local patch removed** | The new xquic pin already contains the exact RFC 9000 peer-CID accounting fix, confirmed by reverse-applying the former patch. |
+| xquic parser/allocation CodeQL hardening | **Local patch retained** | `patches/xquic/0002-*` still applies cleanly and covers null checks, bounds checks, and failure cleanup not present in the pin. |
+| xquic STREAM multipath scheduling | **Local patch retained** | `patches/xquic/0003-*` keeps stream packets on WLB's unpinned per-packet path so the hybrid TCP lane can aggregate links. |
+| ~~xquic fork-local WLB flow placement and recovery~~ | ~~Fork-only~~ **Synchronized from [mp0rta/xquic#71](https://github.com/mp0rta/xquic/pull/71); replaced** | The pinned xquic now uses acknowledged-goodput weights, independent smooth deficits for flow placement and packet scheduling, topology refresh, blackhole eviction, and bounded recovery probes. The upstream series deliberately keeps STREAM/control traffic on MinRTT; mqvpn's retained `0003-*` patch is the documented hybrid-mode override. Tests and implementation paths are indexed below. |
+| ~~xquic fixed STREAM reassembly-node limit~~ | ~~Fork-only mitigation~~ **Synchronized from [mp0rta/xquic#71](https://github.com/mp0rta/xquic/pull/71); replaced** | The stronger two-tier budget admits a dense 16 MiB receive window while rejecting sparse-node amplification: 8192 sparse nodes, a 256-byte/node density floor, a 32768 hard ceiling, and a reserved prefix slot for retransmission progress. |
+| xquic upstream sync, Retry sizing, PMTU, receive-buffer, WLB and TLS hardening | **Pinned xquic fork (synchronized with upstream mqvpn-main; 100% green CI)** | Synchronized with upstream `mp0rta/xquic:mqvpn-main`. All custom fixes (WLB last-path deadlock prevention, PMTUD RFC 8899 raise interval, RFC 9000 varint clamp, HQ parser partial-read fix, unit tests) ported and verified with 100% green CI (370/370 unit tests, 310/310 case tests, 48/48 WLB tests pass). Pinned at `f249ef4`. See [End-to-end fixes carried in the pinned xquic](#end-to-end-fixes-carried-in-the-pinned-xquic). |
+| Rolling binaries from `main` | **Fork-only** | `.github/workflows/release.yml` updates the `snapshot` prerelease only after Linux, macOS, Windows, and Android builds succeed; tagged releases remain immutable. |
+
+### Client certificate verification against the OS trust store
+
+The core now follows upstream's verifier ownership model. With no callback,
+xquic/BoringSSL verifies the chain and hostname. With a callback, `APP_VERIFY`
+makes that callback the sole decision maker; there is no retry or fallback after
+a failed library check. `--insecure` is the only bypass.
+
+- **Linux** installs no callback and uses BoringSSL's default CA file/directory
+  (`SSL_CERT_FILE` and `SSL_CERT_DIR` can override them).
+- **Windows** installs a config-scoped CryptoAPI verifier using
+  `CertGetCertificateChain` and `CERT_CHAIN_POLICY_SSL`.
+- **macOS and iOS** install a config-scoped `SecTrust` verifier with an SSL
+  policy bound to the effective server name.
+- **Android** installs a config-scoped JNI verifier. The framework validates
+  the chain using `X509TrustManager`; the leaf must also match a DNS or IP SAN.
+
+All callback paths receive the same effective name used for SNI: `ServerName`
+when configured, otherwise the host part of `Address`. The old process-global
+Android hook and shared `src/cert_verify.c` implementation are deliberately
+gone because they allowed verification ownership to vary depending on which
+BoringSSL error happened first.
+
+```ini
+# /etc/mqvpn/client.conf
+[Server]
+Address    = 203.0.113.10:443
+ServerName = vpn.example.com   # TLS SNI, and the name the certificate is checked
+                               # against (default: the host part of Address)
+# Insecure = true              # skip verification entirely — testing only
+```
+
+`ServerName` (CLI: `--tls-server-name`) is the setting to reach for when
+connecting to a bare IP that presents a **DNS** certificate: without it the IP
+literal is what gets matched, and a certificate naming only DNS hosts does not
+match it. A certificate issued *for the address* needs no `ServerName`. Full
+details, and the procedure for preserving this while merging upstream releases,
+are in
+[docs/client-certificate-verification.md](docs/client-certificate-verification.md).
+
+### Server fallback proxy — share one UDP port with another QUIC service
+
+On Linux the mqvpn listener can front a second QUIC service on the same port.
+The router reads the SNI out of QUIC v1/v2 Initial packets **without terminating
+the fallback connection's TLS**: configured names stay in mqvpn, ordinary HTTP/3
+goes to an h2c backend, and anything unmatched is forwarded as raw UDP.
+
+```ini
+# /etc/mqvpn/server.conf — Linux only, disabled by default
+[Proxy]
+Enabled         = true
+SNI             = vpn.example.com,*.edge.example  # names that stay in mqvpn
+QuicFallback    = 127.0.0.1:4443                  # unmatched SNI, raw UDP
+Http2Backend    = 127.0.0.1:8080                  # prior-knowledge h2c
+Http2BackendTLS = false                           # true is rejected on purpose
+MaxConnections  = 64
+IdleTimeoutSec  = 60
+```
+
+Both backends are required for the feature to start. `Http2BackendTLS = true` is
+rejected deliberately rather than ignored. See
+[docs/server-fallback-proxy.md](docs/server-fallback-proxy.md) for the routing
+rules, an nginx example, the security properties, and the current limitations.
+
+### Post-quantum key exchange (X25519MLKEM768)
+
+Both ends request hybrid ML-KEM-768 by default. It is compiled in rather than
+exposed as a config key; these two lines are identical in `src/mqvpn_client.c`
+and `src/mqvpn_server.c`:
+
+```c
+/* Prioritize AES-256-GCM for stronger encryption */
+engine_ssl.ciphers =
+    "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256";
+/* Enable post-quantum key exchange with X25519MLKEM768 */
+engine_ssl.groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
+```
+
+ML-KEM-768 is listed first with the classical curves behind it, so a peer that
+does not offer it still negotiates X25519 — turning this on does not cut off
+older clients or servers.
+
+ML-KEM-768's 1184-byte key share breaks assumptions the transport was built on,
+so it needs these supporting settings to work at all:
+
+| Setting | Value | Where |
+|---|---|---|
+| `enable_pmtud` | `1` | `src/mqvpn_conn_settings.c:131` |
+| `MQVPN_MAX_PKT_OUT_SIZE` | `1400` | `src/mqvpn_internal.h:40` |
+| `XQC_QUIC_MIN_MSS` / `XQC_QUIC_MAX_MSS` | `1200` / `1420` | xquic `src/transport/xqc_packet.h` |
+| `XQC_PACKET_OUT_HDR_GROWTH` | 277-byte reserve | xquic `src/transport/xqc_packet_out.h` |
+
+The MSS pair is back at upstream's numbers on purpose. Raising
+`XQC_QUIC_MIN_MSS` to 1500 was the first attempt at making the PQC handshake fit
+([6322682](https://github.com/r11234567/xquic/commit/6322682)); it was reverted
+in favour of PMTUD plus the header reserve
+([987c57c](https://github.com/r11234567/xquic/commit/987c57c)), which is the
+combination that actually works and does not assume a 1500-byte path. One
+residual limitation remains — see [Known issues](#known-issues).
+
+### Two paths were worse than one: what a WiFi + tethered-5G run exposed
+
+Symptom, from a two-path run on an ordinary laptop — WiFi plus a handset
+tethered over USB (which appears as an Ethernet adapter, so it is the
+`以太网 4` path in the log below, not the `WLAN` one):
+
+- adding the second path made throughput *worse* than either path alone;
+- availability tracked the WiFi link exactly. Pulling WiFi stalled the tunnel
+  for three minutes even though the tethered path stayed `ACTIVE` the whole
+  time, and it only recovered when WiFi came back.
+
+These turned out to be **two independent defects in xquic**, both fixed:
+the packet size could only ever grow (below), and WLB could lock out the last
+remaining path ([further down](#the-three-minute-stall-wlb-locked-out-the-last-path)).
+The first accounts for the throughput loss, the second for the stall.
+
+#### The packet size could only go up
+
+Visible in the log as a size that moves in one direction only:
+
+```
+20:10:34 [INF] [conn:1] datagram MSS updated: 1384     <- one path up
+20:10:35 [INF] [conn:1] datagram MSS updated: 1404     <- second path up, MSS RISES
+20:10:35 [INF] TUN MTU updated to 1402
+```
+
+A second path joining a connection can only ever *lower* the size every path
+has to carry, never raise it. It rose because `conn->pkt_out_size` was
+monotonically non-decreasing: the cross-path minimum was applied only when it
+came out larger than the current value, a new path was seeded from the
+connection's size rather than the size QUIC guarantees, and the PMTU search
+could not probe below the value already in use. Details and the fix are in the
+[xquic README](https://github.com/r11234567/xquic#per-path-pmtu-discovery).
+
+`MQVPN_MAX_PKT_OUT_SIZE` is 1400, which is 1428 bytes on the wire once IPv4 and
+UDP headers are on the datagram. Any link whose MTU is below that — 1400 is the
+common case for tethered cellular — received packets it could not forward, and
+every drop reached congestion control as congestion rather than as "too big".
+Worse after a failover than before it: the size had been raised while both paths
+were up, and losing the wide path could not bring it back down, so the surviving
+narrow path was left being sent packets sized for a link that no longer existed.
+
+The fix makes the PMTU search per path, starts a new path at the guaranteed
+size, and recomputes the connection's size in both directions — so losing a
+path now gives the size back instead of stranding the connection above what it
+can send.
+
+Consuming it needed one more xquic change. `cb_dgram_mss_updated` does react to
+whatever it is told, but xquic only *told* it when the MSS grew: the notify flag
+was raised on an increase alone, which was very nearly complete back when the
+packet size could only rise. Left that way, the connection would have shrunk to
+fit the tethered link while the TUN MTU stayed at 1402, and mqvpn would have
+gone on handing over datagrams that no longer fit — trading a black hole for a
+stream of rejected sends. The callback now fires on any change, so the TUN MTU
+follows the size down as readily as up.
+
+Two caveats. Adding a path now causes a brief dip while the new path confirms
+its size, which is the price of one buffer size serving every path. And nothing
+here is backed by a throughput measurement yet — the change is static analysis
+plus unit tests, so read a weekly netsim run before believing the aggregation
+numbers moved.
+
+#### The three-minute stall: WLB locked out the last path
+
+The availability half of the report is a different bug, in the scheduler mqvpn
+uses by default ([WLB](#schedulers)).
+
+WLB declines to schedule onto a path whose consecutive-PTO count suggests it is
+blackholed — a link that is down while `sendto()` still succeeds. Sensible as a
+*preference*; it was written as an absolute exclusion, in the single-path fast
+path and in the MinRTT fallback that carries control and ACK traffic alike.
+
+So when the path over the threshold was the only path left, every branch
+returned "no path" and nothing was sent. `ctl_pto_count` is cleared only when an
+ACK arrives, and no ACK can arrive on a path nothing is sent on — the exclusion
+kept itself true. The loss burst that accompanies a link disappearing is exactly
+what drives the surviving path's PTO count up in the first place.
+
+The log shows the shape of it precisely:
+
+```
+20:13:57 [WRN] netmon: interface WLAN carrier lost, closing path 1
+20:14:02 [INF] xquic removed path: path_id=1 iface=WLAN state=CLOSED_DROPPED
+20:14:12 [LATENCY] Real connection latency test failed: The operation was canceled.
+   ... 以太网 4 ACTIVE throughout, nothing moving ...
+20:16:54 [INF] path[1] activated: path_id=2 iface=WLAN state=ACTIVE
+20:17:16 [LATENCY] Real connection latency test recovered
+```
+
+Recovery arrives 22 seconds after a *new* path appears, not from the surviving
+one healing — because a new path brings a fresh `send_ctl` with `pto_count` at
+zero. That is what made availability look like it followed WiFi.
+
+The guard now applies only while a healthier path actually exists. With an
+alternative present nothing changes; with none, the suspect path is used rather
+than nothing at all.
+
+#### The loudest line in the log was not an error
+
+The most frequent line in the whole capture was
+`xqc_h3_stream_process_data|xqc_stream_recv error|-626`, at ERROR level. `-626`
+is `XQC_ESTREAM_RESET`, and it is what xquic returns to a reader on a stream the
+peer has reset — which is not a failure but the answer to a question the library
+itself asked. `xqc_process_reset_stream_frame()` calls `xqc_stream_ready_to_read()`
+specifically so the application wakes up and discovers the reset.
+
+The volume is explained by what sits on top. Closing a proxied connection calls
+`xqc_h3_request_close()` → `xqc_stream_close()`, which sends RESET_STREAM plus
+STOP_SENDING with `H3_REQUEST_CANCELLED` (`0x10C` = 268, the `err:268` and
+`close_msg:local reset` also in the log). RFC 9000 §3.5 has the peer answer
+STOP_SENDING with a RESET_STREAM of its own, that echo comes back, the reader is
+woken, and one ERROR line is printed. Per cancelled request. A proxy workload
+cancels constantly, so the log filled with the sound of its own request
+teardown. The neighbouring `cannot find stream` warning is the same echo
+arriving after the local stream was already retired.
+
+Nothing was wrong with the handling — `xqc_h3_stream_read_notify()` already maps
+the result to `XQC_OK` and the write side already classified it as routine. Only
+the log level was out of step, and it is DEBUG now
+([`0caa07c`](https://github.com/r11234567/xquic/commit/0caa07c)).
+
+#### What the scheduler numbers still do not explain
+
+The netsim matrix reports things the two fixes above do not account for, because
+those rows ran at the default MTU with both paths healthy: two identical paths
+aggregating at 0.521, `asym_capacity` multipath reaching only 0.531× the better
+single path, and WLB landing below single-path where MinRTT reaches 1.164.
+
+Reading `xqc_scheduler_wlb.c` suggests one cause for all four. WLB weights paths
+by a LATE throughput estimate computed from cwnd, and cwnd is a function of the
+traffic WLB already sent that path — so whichever path warms first wins the
+weight comparison, takes the next flow, and warms further. Flow pins then hold
+for 60 s of idle expiry. Compounding it, weights are recomputed only at a WRR
+round boundary, and pinned traffic returns from the flow-hit fast path before
+the round check runs, so the split can freeze at whatever transient cwnd skew
+existed at pin time. That would also explain why the reported byte split varies
+so widely between runs (0.126–0.338) and why MinRTT, which has neither a weight
+model nor pinning, aggregates where WLB does not.
+
+That is a reading, not a measurement. xquic
+[`8b9e4b5`](https://github.com/r11234567/xquic/commit/8b9e4b5) adds the counters
+needed to settle it — pins, packets and rounds per path, once a second — and
+`CI_BENCH_WLB_INSTR=1` makes the scenario harness collect them into
+`wlb_pin_minshare`, `wlb_sched_minshare`, `wlb_pkts_per_round` and
+`wlb_weight_ratio`, with findings raised when they match the prediction:
+
+```bash
+sudo CI_BENCH_WLB_INSTR=1 scripts/ci_benchmarks/ci_bench_scenarios.sh
+```
+
+Run 33621937964 carried them, on 78 rows, and split the reading in two. The
+mechanism is real: on two identical unshaped legs the pins came out 2:13, 12:3
+and 8:43, and the weights between those same legs differed 2.4×–10.4×. Fixed in
+xquic [`4de3bb8`](https://github.com/r11234567/xquic/commit/4de3bb8) by pinning
+each flow to the path furthest below its weight-entitled share.
+
+But it is not what caps the throughput. At 16 streams `homo_good`'s weight ratio
+fell to 1.04 and its packet split improved to 0.28, and its aggregation did not
+move — 0.531 to 0.529. With the mechanism largely gone the deficit is unchanged,
+so the scheduler's split was never the bottleneck for that scenario. What is
+still open is in `docs/network_emulation_matrix.md` §1.3.7: two legs each shaped
+at 150 Mbit, zero loss, both carried, neither saturated, and 140 Mbps total.
+
+Two details of the collection are load-bearing, and both were wrong on the first
+attempt. The counters are read from the **server** log: every measurement is
+iperf3 in the DL direction, so the server's scheduler moves the bulk data and
+the client's only schedules the returning ACKs — reading the client reported the
+ACK split as though it were the throughput split. And the window matters: one
+server serves solo-A, solo-B and multipath in turn, so `measure_pathset` marks
+the log before its own samples and only that window is read. Within it the values
+stand as they are rather than being differenced, because the scheduler is
+allocated per connection (`xqc_conn.c:1258`) and a fresh client means counters
+already starting at zero.
+
+### Running the netsim matrix as an A/B
+
+One dispatch of the `Performance Tests (Weekly)` workflow can run the same modes
+under two configurations as parallel jobs:
+
+| input | value |
+|---|---|
+| `netsim_modes` | empty for all 11 modes; a comma-separated subset to narrow |
+| `arms` | `default`, `reorder_on`, `reorder_off`, `streams4`, `streams16`, `streams64` |
+| `wlb_instr` | `true` to collect the scheduler counters |
+| `iperf_streams` | applies to every arm; a `streams*` arm overrides it |
+
+An arm is just a named set of environment overrides, so anything worth an A/B can
+be one. Cells are modes x arms, so narrow the modes when using several arms.
+
+Every row is stamped with `arm`, and a `netsim-compare` job diffs the arms and
+writes the table into the run summary. Doing it this way rather than as two
+dispatches is not only faster: these numbers move several percent run to run on
+shared cloud vCPUs, so two arms measured in different runs are not comparable in
+the first place.
+
+### End-to-end fixes carried in the pinned xquic
+
+`third_party/xquic` is pinned at
+[`4ecd9d7`](https://github.com/r11234567/xquic/commit/4ecd9d7afbc7b4f3d90a89c40e55c022bb424b56).
+Enabling the
+features above exposed transport bugs that the e2e suite caught and that had to
+be fixed in xquic rather than here:
+
+| xquic commit | What it fixes |
+|---|---|
+| [ff6ad84](https://github.com/r11234567/xquic/commit/ff6ad84180465030a4e4cb20c628ec859cdcb2d6) | **WLB packet-hot-path allocation regression.** The acknowledged-goodput sync initially rebuilt the complete path cache with `malloc`/copy/free every 100 scheduling opportunities. Hybrid E2E measured a 47% single-path STREAM regression, and ASan overhead pushed 40 ms reorder arrivals beyond a 60 ms wait. Scheduling rounds now rotate deficits independently, learned weights update in place at most every 200 ms, and only a real topology change migrates path state. The standalone `wlb_tests` target runs all 45 scheduler cases. |
+| [fa349e6](https://github.com/r11234567/xquic/commit/fa349e616374e33abc00c550d99fbc169f933f5a) ([mp0rta/xquic#71](https://github.com/mp0rta/xquic/pull/71)) | **Reviewed WLB fairness, liveness, and recovery synchronization.** Replaces the fork-local instantaneous LATE/cwnd feedback loop with acknowledged application-goodput learning and separate smooth deficits for pinned flows and unpinned packets. Topology changes refresh every data mode; silent-blackhole paths leave weights and pins, then receive bounded rotating DATAGRAM probes so they can recover without placing reliable STREAM data behind a reassembly hole. The merge preserves this fork's last-usable-path PTO fallback, PMTUD work, and log-format safety. `src/transport/scheduler/xqc_scheduler_wlb.c`, `src/transport/xqc_send_ctl.c`, and `include/xquic/xquic.h` hold the implementation; 45 registered cases in `tests/unittest/xqc_wlb_test.c` cover collisions, weighted placement, ACK accounting, independent deficits, topology changes, eviction, probing, recovery, and STREAM/control routing. |
+| [c579f35](https://github.com/r11234567/xquic/commit/c579f35) · [329854f](https://github.com/r11234567/xquic/commit/329854f) · [02e7fd5](https://github.com/r11234567/xquic/commit/02e7fd5) | **Two-tier STREAM reassembly budget synchronized from `mqvpn-main`.** The old fixed-node mitigation is replaced by an 8192-node sparse threshold, 256-byte/node density requirement, 32768-node hard cap, and one reserved prefix slot so a retransmission that closes the leftmost gap cannot be rejected. Byte accounting is decremented on delivery and cleared on reset; dense 16 MiB admission, sparse rejection, hard-cap rejection, prefix progress, FIN repair, and per-connection overrides are pinned in `tests/unittest/xqc_stream_frame_test.c`. |
+| [36b99db](https://github.com/r11234567/xquic/commit/36b99db734240fbbcdca30fdfd83ed28578e4999) | **H3 write-notify release lifecycle.** Disabling mqvpn's retained write callback now removes an otherwise idle stream from writable scheduling while preserving scheduling for H3-internal buffered-frame retries. This prevents needless callbacks after a backpressured h2c producer resumes; `tests/unittest/xqc_h3_test.c` covers both idle removal and buffered-send retention. |
+| [6969d22](https://github.com/r11234567/xquic/commit/6969d223058187a961a2d0657d99109841470688) | **H3 write notification and RFC 9218 urgency.** ~~Its connection send-queue estimate originally drove one per-stream gate that disabled the shared h2c read event.~~ **Corrected:** mqvpn now consumes that estimate at its real connection scope and tick owns low-water recovery; write notify is only a fast wakeup. Urgency 0/1 packets still use the congestion-controlled urgent queue; retry, 0-RTT rejection, packet drop, stream close and connection destruction clean up or migrate it. The bounded `Priority` parser still prevents reads past non-NUL-terminated header slices. |
+| [11ceb3a](https://github.com/r11234567/xquic/commit/11ceb3a4f8fe9e189dc8213d3d8758fb5967191f) | **Alibaba protocol/security sync plus mqvpn-main TLS fixes.** Pulls the useful upstream transport, HTTP/3, parser, allocation and test hardening into this fork while retaining its multipath fixes. It also provides the config-scoped `APP_VERIFY` ownership used here: platform callbacks receive the presented DER chain and are the sole verifier, while clients without a callback use BoringSSL's chain and hostname verification with default trust paths. |
+| [4de3bb8](https://github.com/r11234567/xquic/commit/4de3bb8) | ~~**Fork-local WLB pinned-flow deficit.** It assigned new pins to the path furthest below its LATE weight-entitled flow share, but the weight still came from cwnd influenced by the scheduler's own traffic.~~ **Synchronized upstream and replaced by `fa349e6`**, which learns acknowledged goodput and separates flow and packet deficits. The old benchmark evidence remains under [the scheduler numbers](#what-the-scheduler-numbers-still-do-not-explain). |
+| [e1abe04](https://github.com/r11234567/xquic/commit/e1abe04) · [77ede10](https://github.com/r11234567/xquic/commit/77ede10) · [54f98ef](https://github.com/r11234567/xquic/commit/54f98ef) | **The WLB counters emitted nothing**, so the first instrumented netsim run came back with `wlb_instr: no_lines` on all 22 rows. They were logged at xquic INFO, and mqvpn deliberately maps its own INFO to xquic WARN to keep per-packet traffic out of the log, so xquic's own filter dropped the line before the callback. Moved to the REPORT statistics channel, which passes any level — and `77ede10` then had to give the unit-test fixture logs a callback sink, since REPORT is level 0 and so passes their filter too, where `xqc_log_implement()` dereferenced their NULL `log_callbacks`. And `54f98ef` fixed the last reason they stayed empty: `%lld` is not a specifier xquic's own `xqc_vsprintf` knows, so the line rendered `deficit:19ld|` and the parser matched nothing. Do not bisect onto `e1abe04` or `77ede10` alone. |
+| [bcb7381](https://github.com/r11234567/xquic/commit/bcb7381) | **A converged PMTU search never reopened**, so a path MTU that *grew* mid-connection was never found and a long-lived connection kept the size it first settled on. Convergence now rearms the probing timer as RFC 8899 §5.3's PMTU_RAISE_TIMER (600 s). The reopen raises only the search's ceiling, not the size in use, so it costs probe packets and no throughput. Also fixes an error-code collision: `XQC_EAEAD_LIMIT` shared the value 623 with `XQC_ESTREAM_NFOUND`, so an AEAD-integrity-limit close and a stream-not-found were indistinguishable to a caller comparing codes. |
+| [8b9e4b5](https://github.com/r11234567/xquic/commit/8b9e4b5) | **WLB instrumentation**, no behaviour change: per-path pin/packet/round counters emitted once a second, with the three per-packet log statements dropped to DEBUG so measuring the split does not move it. Read by `CI_BENCH_WLB_INSTR=1`; see [the aggregation numbers](#what-the-scheduler-numbers-still-do-not-explain). |
+| [0caa07c](https://github.com/r11234567/xquic/commit/0caa07c) | **`xqc_conn_set_path_pmtu()`**, so a path MTU the kernel already knows can be handed to the PLPMTU search instead of being rediscovered over several probe intervals. Also drops the request-cancellation log path from ERROR to DEBUG — see [the log noise](#the-loudest-line-in-the-log-was-not-an-error). |
+| [6ba4261](https://github.com/r11234567/xquic/commit/6ba4261) | **WLB's PTO guard could exclude the last usable path**, so nothing was sent at all and the ACK that would have cleared the guard could never arrive. See [the three-minute stall](#the-three-minute-stall-wlb-locked-out-the-last-path). |
+| [f3c05a2](https://github.com/r11234567/xquic/commit/f3c05a2) · [be82b29](https://github.com/r11234567/xquic/commit/be82b29) | **A path's packet size could only go up, so the narrower path black-holed.** The PMTU search is now per path and the connection's size moves in both directions. See [the packet size](#the-packet-size-could-only-go-up) — this is the one that made a second path cost throughput instead of adding it. |
+| [a40cbd5](https://github.com/r11234567/xquic/commit/a40cbd5) | **A Retry could not follow a full Initial.** `xqc_conn_reassemble_packet()` rebuilt the Initial with the Retry token in the header but copied the payload in verbatim, sized against the shorter header. With a PQC key share filling the packet, AEAD needed 1453 bytes of a 1452-byte buffer and encryption failed with `XQC_TLS_ENCRYPT_DATA_ERROR` (-736), so no handshake completed at all. Surfaced as a 10 s dispatch timeout in `tests/test_tcp_egress.c`. Fixed by reserving worst-case header growth; the payload copy is now bounds-checked too. |
+| [513a991](https://github.com/r11234567/xquic/commit/513a991) | ~~**A fixed 8192-node cap sat below the advertised 16 MiB receive window.** This raised it to `window/1KiB` and tied the values with a `_Static_assert`.~~ **Synchronized upstream and replaced by the stronger `c579f35`/`329854f`/`02e7fd5` two-tier byte-density design**, while retaining the 32768-node hard ceiling and compile-time relationship to the receive window. |
+| [2ae918c](https://github.com/r11234567/xquic/commit/2ae918c) | Hardens `xqc_var_buf_reduce` against a wrapping subtraction and casts both operands in `xqc_submatrix`, replacing the equivalent hunks this repo carried in `patches/xquic/`. |
+
+On this side the matching work is in the netns e2e harness: the failover route
+fix and diagnostics in `42eac6c`, and waiting on `closing_notify` rather than
+`close_notify` in the TCP idle-eviction tests (`19f2e89`).
 
 ## Supported Platforms
 
@@ -96,7 +455,7 @@ https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
 | [Windows (amd64/arm64)](#windows-client) | Windows 10 | ✅ | 📋 | Release archive |
 | [macOS arm64](https://github.com/mp0rta/homebrew-tap#install) | macOS 14 (Sonoma) | ✅ | 📋 | Homebrew / Release archive |
 | iOS | iOS 15 | — | 🚧 | App Store planned |
-| [Android](https://f-droid.org/packages/org.mqvpn.app/) | Android 8.0 (API 26) | — | 🧪 | F-Droid / APK / Play Store |
+| [Android](https://github.com/mp0rta/mqvpn/releases) | Android 8.0 (API 26) | — | 🧪 | APK / F-Droid pending / Play Store planned |
 
 > ✅ Supported · 🧪 Experimental · 🚧 In development · 📋 Planned
 
@@ -107,6 +466,8 @@ https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
 - **Dual-stack** — IPv4 + IPv6 inside the tunnel.
 - **Multi-Platform** — Available on Linux (server/client), Windows (client only), macOS (client only) and Android (client only) support.
 - **PSK auth** — Pre-shared key over TLS 1.3.
+- **Verified server identity** — Clients verify the server certificate chain and hostname by default; `--insecure` is an explicit testing-only bypass.
+- **Shared-port fallback proxy** — A Linux server can route unmatched QUIC SNI to another QUIC service and proxy ordinary matched HTTP/3 requests to an h2c backend.
 - **DNS override** — Prevents DNS leaks. Uses `resolvectl` on systemd-resolved systems, falls back to resolv.conf.
 
 
@@ -203,6 +564,8 @@ sudo mqvpn --mode client --server YOUR_SERVER:443 \
 ## Configuration
 
 Config files support both INI and JSON. CLI arguments override config values.
+INI keys are case-insensitive, but values (such as paths and URLs) are preserved as given.
+
 ### INI config
 
 ```ini
@@ -231,6 +594,17 @@ Enabled = true
 
 [Reorder]
 Enabled = true
+
+# Optional Linux-only shared-port routing. Keep disabled unless both backends
+# below are configured. See docs/server-fallback-proxy.md.
+[Proxy]
+Enabled = false
+# SNI = vpn.example.com,*.edge.example
+# QuicFallback = 127.0.0.1:4443
+# Http2Backend = 127.0.0.1:8080
+# Http2BackendTLS = false
+# MaxConnections = 64
+# IdleTimeoutSec = 60
 ```
 
 ```ini
@@ -244,6 +618,7 @@ Key = mPyVpoQWcp/5gr404xvS19aRC03o0XS2mrb2tZJ1Ii4=
 
 [Interface]
 DNS = 1.1.1.1, 8.8.8.8
+# KillSwitch = true              # Windows: also blocks interface-bound bypasses
 # MTU = 1280                   # TUN MTU (1280–9000, default: auto = ~1382)
 
 [Multipath]
@@ -282,7 +657,16 @@ Server example:
     "scheduler": "wlb",
     "cc": "bbr2",
     "hybrid": { "enabled": true },
-    "reorder": { "enabled": true }
+    "reorder": { "enabled": true },
+    "proxy": {
+        "enabled": false,
+        "sni": "vpn.example.com,*.edge.example",
+        "quic_fallback": "127.0.0.1:4443",
+        "http2_backend": "127.0.0.1:8080",
+        "http2_backend_tls": false,
+        "max_connections": 64,
+        "idle_timeout_sec": 60
+    }
 }
 ```
 
@@ -311,6 +695,7 @@ Notes:
 - `auth_key` remains supported as a single legacy/global key.
 - `mode` is optional if it can be inferred (`listen` implies server).
 - `manage_routes` defaults to `true`; set it to `false` on router/embedded integrations where an external orchestrator owns the host routing table and mqvpn should only bring up the TUN.
+- On Windows, route management alone cannot capture programs that bind directly to a physical interface. Set `KillSwitch = true` (or `"kill_switch": true`) when traffic must not bypass mqvpn; the WFP policy permits only loopback, the Wintun interface, and this mqvpn process's UDP connection to the configured server.
 - **[mqvpn-prometheus-exporter](https://github.com/mp0rta/mqvpn-prometheus-exporter) requires per-user keys.** Using mqvpn-prometheus-exporter, you can correct and visualize mqvpn metrics. If you use it, sharing a single `auth_key` across
   multiple clients works for the VPN data plane, but the control API
   surfaces those sessions as `user="(global)"` and the Prometheus exporter
@@ -323,6 +708,165 @@ Notes:
 sudo mqvpn --config /etc/mqvpn/server.conf
 sudo mqvpn --config /etc/mqvpn/client.conf
 ```
+
+### TUN MTU
+
+`[Interface] MTU` sets the tunnel interface's MTU. Accepts `0` (auto) or
+`1280`–`9000`; anything else is rejected at parse time rather than clamped.
+
+| | `MTU = 0` (default) | `MTU = N` |
+|---|---|---|
+| **Server** | 1382 — the outer datagram less QUIC and DATAGRAM/MASQUE headers | Sets the TUN MTU, and caps what any client may negotiate |
+| **Client** | Whatever the server negotiates, adjusted for PMTU discovery | A **cap** on the negotiated value, never a raise |
+
+The client side is a cap, not an override: asking for 9000 on a path whose
+real MTU is 1400 gets you 1400, because the negotiated value already reflects
+what the path will carry. Lowering it is the operation that always works.
+
+Three reasons to set it explicitly:
+
+- **A link that lies about its MTU.** PMTU discovery needs the ICMP
+  *Fragmentation Needed* reply to come back; a middlebox that swallows ICMP
+  turns a too-large packet into a silent black hole. Pinning the MTU below the
+  real path MTU sidesteps the discovery entirely.
+- **`[Reorder]` costs 8 bytes.** The reorder header comes out of the inner
+  MTU, and the client subtracts it *after* applying your cap — so `MTU = 1400`
+  with the reorder shim on gives a 1392-byte TUN. When IPv6 is assigned the
+  result is floored at 1280, which is the one case your setting is not what
+  runs.
+- **Jumbo frames.** A 9000-byte MTU is only useful when every hop carries it;
+  one 1500-byte hop in the middle makes it worse than the default.
+
+```ini
+[Interface]
+MTU = 1400
+```
+
+```json
+{ "tun_mtu": 1400 }
+```
+
+```bash
+sudo mqvpn --mode server --mtu 1400 ...
+```
+
+CLI beats config file; `0` from either means auto.
+
+### TUN queue depth and drain batch
+
+Two knobs for **bursty small-packet traffic** — a game server broadcasting on a
+tick, VoIP, telemetry. Both are `[Interface]`, both Linux-only, and both
+default to leaving current behaviour untouched.
+
+| Key | Default | Range | What it is |
+|---|---|---|---|
+| `TxQueueLen` | `0` = kernel default (**500**) | 100–65536 | Depth of the TUN's transmit ring, in packets |
+| `TunReadBatch` | `0` = built-in default (**64**) | 1–4096 | Packets drained from the TUN per event-loop wakeup |
+
+**Why they matter.** A game server on a 10 Hz tick delivers a whole tick's
+worth of packets in a few milliseconds. Anything arriving past the ring's depth
+is dropped, and the only trace it leaves is the interface's `tx_dropped`
+counter — the qdisc shows nothing, the network shows nothing, and throughput
+looks fine because there is barely any. Measured in the netsim harness
+(run `34084331771`): **1707 packets per tick lost 23–49%** at the TUN with a
+qdisc that dropped zero. At 2000 pps the same tunnel lost 0.016%.
+
+The two work together, and raising one alone is usually not enough: the ring
+buys time, and the batch is the rate the ring is emptied at. At the default 64,
+clearing a 1707-packet tick takes 27 wakeups.
+
+**Sizing.** Start from your peak burst — packets per tick, including whatever
+spike multiple you expect:
+
+```
+TxQueueLen   ≈ 2 × (peak packets in one tick)
+TunReadBatch ≈ peak packets in one tick
+```
+
+At 200 KB/s of 20-byte payloads (~4,270 pps) on a 10 Hz tick that is ~427
+packets per tick, doubling to ~853 on a spike — already over the 500 default.
+`TxQueueLen = 2048` and `TunReadBatch = 512` covers it with room.
+
+`TunReadBatch` is bounded at 4096 on purpose: the drain runs inside one
+event-loop callback, so an unbounded batch starves every other descriptor in
+that loop — including the UDP socket the drained packets have to leave through.
+
+**Server side is the one that matters** for a game proxy: the downlink
+broadcast is what a player sees. Set it on the client too if the uplink is also
+bursty.
+
+```ini
+# /etc/mqvpn/server.conf
+[Interface]
+TxQueueLen = 2048
+TunReadBatch = 512
+```
+
+```json
+{ "tx_queue_len": 2048, "tun_read_batch": 512 }
+```
+
+There is no CLI flag for either; they are config-file only. Out-of-range values
+are rejected when the config is parsed rather than clamped, so a typo fails
+loudly instead of silently becoming a different depth. On macOS and Windows
+both are accepted and ignored — `txqueuelen` is a Linux netdev concept.
+
+**Check whether it helped**: `tx_dropped` on the tunnel interface should be the
+number that moves.
+
+```bash
+ip -s link show mqvpn0        # TX errors/dropped column
+tc -s qdisc show dev mqvpn0   # if THIS shows drops, the ring was not the problem
+```
+
+### `[Advanced]` — UDP offload
+
+Both keys default to `true` and both are Linux-only; on other platforms the
+code path does not exist and the setting is inert.
+
+| Key | Default | What it does |
+|---|---|---|
+| `UdpGso` | `true` | Transmit batching. Hands several outer datagrams to the kernel in one `sendmsg`, which the NIC or the kernel then segments. |
+| `UdpGro` | `true` | Receive coalescing. The kernel merges several arriving datagrams into one `recvmsg`. |
+
+Both trade syscalls for latency, and both are worth turning off for
+**latency-sensitive small-packet traffic** — a game protocol, or anything where
+a packet's arrival *time* matters more than the throughput.
+
+`UdpGso = false` does two things, not one: it stops the batched send path
+*and* clears xquic's `defer_send_flush`, which is what holds packets back so a
+batch can form (both come from a single predicate,
+`mqvpn_tx_batch_enabled()`, precisely so they cannot disagree). With it on, a
+sender at a few thousand packets per second defers the first datagram until
+the batch is worth a syscall; the receiver then sees the batch arrive
+together, and an inner protocol that infers loss from arrival gaps can read
+that as a stall.
+
+Whether it is actually happening is measurable rather than guessable — the
+control API reports the achieved factors, and `1.0` means every datagram cost
+its own syscall:
+
+```bash
+echo '{"cmd":"get_stats"}' | nc 127.0.0.1 9090
+# udp_tx_datagrams / udp_tx_sends     -> transmit batching factor
+# udp_rx_datagrams / udp_rx_receives  -> receive coalescing factor
+```
+
+A factor of 2.0 on the transmit side means two datagrams left per syscall. The
+startup markers (`udp-gso: GSO enabled`) report only the kernel *capability
+probe*, so they cannot tell you whether batching is occurring — the ratio can.
+
+```ini
+[Advanced]
+UdpGso = false
+UdpGro = false
+```
+
+```json
+{ "udp_gso": false, "udp_gro": false }
+```
+
+There is no CLI flag for either; they are config-file only.
 
 ## Schedulers
 
@@ -356,8 +900,9 @@ reordered, and many inner protocols treat reorder as loss and back off. The
 reorder buffer holds datagrams in a short receive-side window and releases them
 in order, so one inner flow can aggregate both paths — the datagram-lane
 counterpart to what the [hybrid TCP stream lane](#hybrid-mode-tcp-lane) does for
-TCP. Off by default; negotiated end-to-end (both client and server must enable
-it) and a no-op when either side has it off.
+TCP. **Off by default**; negotiated end-to-end, so a sender waits for the peer's
+advertisement before stamping anything and it is a no-op — and safe — against a
+peer that has it off or does not know about it.
 
 ```ini
 [Reorder]
@@ -372,34 +917,54 @@ Port = 443
 Profile = cellular_bond  # cellular_bond (wait=50ms, cap=1024) | fiber_lte (wait=50ms, cap=2048)
 ```
 
-INI/JSON only (no CLI flag). Best on asymmetric-RTT path pairs (e.g. Wi-Fi +
-LTE); for symmetric, loss-dominated paths leave it off. See
-[docs/report/](docs/report/) for the parameter sweep and measured numbers.
+INI/JSON only (no CLI flag). It has to stay off wherever duplicates are the
+point — `Reinjection = dgram` deliberately sends every datagram twice, and the
+shim would deduplicate them. See [docs/report/](docs/report/) for the parameter
+sweep and measured numbers.
+
+**Why it is not on by default.** It was, briefly. A netsim A/B — both arms in one
+dispatch, all 11 modes, 96 paired measurements — put the median difference at
+**+0.1%**, with no mode showing a consistent direction. Against that, the shim
+costs 8 bytes of inner MTU, and with no `[ReorderRule]` entries §15.1 makes
+*every* inner flow eligible, TCP included, so a default ON puts all of them
+through a hold window. Enable it deliberately for the traffic it was measured on;
+the general case has no measured gain to justify the cost.
+
+Read the same run for what it says about the harness rather than the shim: on
+`catalog` rows, which are single-path measurements the shim can barely touch, the
+two arms still disagreed by −45% to +71% (stdev 21.6%). Effects smaller than
+roughly ±40% are not resolvable at three repeats, which is worth knowing before
+reading any single row of this matrix as a result.
 
 ## Reinjection (speculative duplication)
 
 Sends copies of selected packets over a second link. This costs some extra
 bandwidth, and in return the tunnel rides out packet loss and sudden link
-trouble much more smoothly. Off by default. Sender-side only — each side's setting
-protects the traffic it *sends*, so set it on the **server** to protect
+trouble much more smoothly. Off by default. Sender-side only — each side's
+setting protects the traffic it *sends*, so set it on the **server** to protect
 download traffic (and on the client for upload). Requires multipath with two
 or more active paths — silently inactive with only one.
 
 ```ini
 [Multipath]
-Reinjection = off                     # off (default) | deadline | idle
+Reinjection = off                     # off (default) | deadline | idle | dgram
 ReinjectionSrttFactorPct = 110        # deadline mode: duplicate an unacked packet older than factor x min_srtt (100-1000; 110 = 1.1x)
 ReinjectionHardDeadlineMs = 500       # deadline mode: upper clamp (1-60000)
 ReinjectionDeadlineLowerBoundMs = 20  # deadline mode: lower clamp (1-60000; clamped down to the hard deadline if it would exceed it)
 ```
 
-- `deadline` — insurance for bonded tunnels running the [hybrid TCP lane](#hybrid-mode-tcp-lane). Most of the time it does nothing and costs nothing. When a link suddenly goes bad, data already sent on it must be recovered before in-order delivery lets anything behind it through — even data that already arrived via the healthy link — which in bad cases stalls transfers for up to a second; `deadline` resends the late data on the healthy link right away, shrinking that stall to a barely noticeable blip. Protects stream (TCP-lane) traffic only — with the hybrid lane disabled its effect is limited to control streams and a warning is logged. Protects TCP/stream traffic only — with the hybrid lane disabled its effect is limited to control streams and a warning is logged.
+- `deadline` — insurance for bonded tunnels running the [hybrid TCP lane](#hybrid-mode-tcp-lane). Most of the time it does nothing and costs nothing. When a link suddenly goes bad, data already sent on it must be recovered before in-order delivery lets anything behind it through — even data that already arrived via the healthy link — which in bad cases stalls transfers for up to a second; `deadline` resends the late data on the healthy link right away, shrinking that stall to a barely noticeable blip. Protects stream (TCP-lane) traffic only — with the hybrid lane disabled its effect is limited to control streams and a warning is logged.
 - `idle` — low-cost smoothing for interactive use (SSH, browsing): whenever the tunnel has nothing else to send, it uses that spare moment to send a copy of recent still-unconfirmed data over another link, shaving off occasional hiccups. No tuning needed.
 
 The former `dgram` value was removed. To keep live UDP streams alive across a dropped link, use redundant mode, which covers client uploads (`[Multipath] Redundant = true`; see the [website guide](https://docs.mqvpn.org/guide/multipath#redundant-mode)); every link should be able to carry the stream on its own (recommended).
 
 Per-path duplicated bytes are reported as `reinject_tx_bytes` in the control
 API `get_status` response.
+
+> **Upstream redundant mode note:**
+> To keep live UDP streams alive across a dropped link without datagram-lane duplication overhead,
+> redundant mode (`[Multipath] Redundant = on`) is also available, which covers client uploads;
+> every link should be able to carry the stream on its own (recommended).
 
 ## Hybrid mode (TCP lane)
 
@@ -428,9 +993,25 @@ EgressAllow = 10.0.5.0/24  # server: punch a hole through the default-deny egres
 ```
 
 Disabled by default; existing users see no behavior change. See
-[Configuration → `[Hybrid]`](website/guide/configuration.md#hybrid)
-for the full config key reference, and
-[Control API §5.4](docs/control-api.md#54-get_stats) for runtime counters.
+[docs/control-api.md §9](docs/control-api.md#9-hybrid-mode-configuration-keys)
+for the full `[Hybrid]` config key reference and the `get_stats` counters
+this mode exposes.
+
+## Server fallback proxy
+
+On Linux, one mqvpn UDP listener can also front another QUIC service. The
+router reads SNI from QUIC v1/v2 Initial packets without terminating the
+fallback connection's TLS:
+
+- configured SNI names stay in mqvpn; CONNECT-IP and Hybrid TCP keep their
+  existing behavior, while ordinary HTTP/3 requests go to an h2c backend;
+- unmatched SNI names are forwarded as raw UDP datagrams to `QuicFallback`.
+
+The feature is disabled by default and requires both a UDP QUIC fallback and a
+prior-knowledge h2c backend. `Http2BackendTLS=true` is intentionally rejected.
+See [Server fallback proxy](docs/server-fallback-proxy.md) for the complete
+configuration, nginx example, routing rules, security properties, and current
+limitations.
 
 ## systemd
 
@@ -628,6 +1209,13 @@ Full report with all numbers: [`docs/report/2026-08-11-rtmp-direct-vs-mqvpn-bond
      Client                                      Server
 ```
 
+## Security Maintenance
+
+This fork carries a secure-by-default client TLS verifier. See
+[Client TLS Certificate Verification](docs/client-certificate-verification.md)
+for its security invariants, platform behavior, validation procedure, and the
+checklist for preserving the patch while merging future upstream releases.
+
 ## Building
 
 Requirements: Linux, CMake 3.10+, GCC/Clang (C11), libevent 2.x
@@ -726,6 +1314,30 @@ mqvpn [--config PATH] --mode client|server [options]
   --help                 Show all options
 ```
 
+## Known issues
+
+### Post-quantum handshake behind a Retry — mitigated in xquic, not fully fixed
+
+`X25519MLKEM768` is requested by default on both sides (`src/mqvpn_client.c`,
+`src/mqvpn_server.c`). Its 1184-byte key share fills the client's first Initial packet
+to `MQVPN_MAX_PKT_OUT_SIZE` (1400). The server then answers with a Retry for address
+validation, and xquic rebuilds that Initial with the Retry token added to the header
+while copying the payload in unchanged — pushing the packet past the AEAD output buffer
+by a single byte. Encryption failed with `XQC_TLS_ENCRYPT_DATA_ERROR` (-736) and the
+connection closed locally, so **no handshake could complete at all**. It surfaced as a
+10-second dispatch timeout in `tests/test_tcp_egress.c`, but production clients hit the
+same path.
+
+Mitigated in the xquic fork by reserving worst-case header-growth space
+([r11234567/xquic@a40cbd5](https://github.com/r11234567/xquic/commit/a40cbd5)), pinned
+through `third_party/xquic`. PMTUD cannot help here: it only takes effect after the
+handshake negotiates transport parameters, while the failure is in the handshake itself.
+
+**Still open:** the re-sent Initial can exceed the configured `max_pkt_out_size`, so it
+may be dropped on a path whose real MTU is that small. The proper fix is re-fragmenting
+the CRYPTO data under the new header; tracked under "Known issues" in the xquic fork's
+README.
+
 ## Roadmap
 
 - [x] v0.1.0 — TLS verification, WLB scheduler, multi-client, PSK auth, DNS, config file
@@ -751,7 +1363,7 @@ mqvpn is designed to comply with the following RFCs as much as possible.
 
 ## Community
 
-Welcome to join the [mqvpn community on Discord](https://discord.gg/5rsqnZfBqu) to ask questions, discuss use cases, share feedback, and contribute to the project. Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
+Welcome to join the [mqvpn community on Discord](https://discord.gg/5rsqnZfBqu) to ask questions, discuss use cases, share feedback, and contribute to the project.
 
 ## Disclaimer
 
