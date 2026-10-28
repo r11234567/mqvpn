@@ -622,6 +622,7 @@ if(BUILD_TESTING)
     target_compile_definitions(test_platform_cert_verify PRIVATE
         TEST_CERT_DER_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.der")
     target_include_directories(test_platform_cert_verify PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/src/platform/windows)
     target_link_libraries(test_platform_cert_verify PRIVATE crypt32)
