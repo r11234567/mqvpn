@@ -1,0 +1,14 @@
+name: mqvpn-codeql
+
+# These are maintainability/style checks rather than security diagnostics. In
+# this project they primarily fire in vendored headers, while the compiler and
+# normal review already cover the corresponding first-party concerns.
+query-filters:
+  - exclude:
+      id: cpp/commented-out-code
+  - exclude:
+      id: cpp/irregular-enum-init
+  - exclude:
+      id: cpp/long-switch
+  - exclude:
+      id: cpp/unused-static-variable
