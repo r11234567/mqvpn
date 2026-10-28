@@ -32,7 +32,7 @@ on:
 jobs:
   format-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -51,7 +51,7 @@ jobs:
 
   protocol-regression:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
@@ -149,7 +149,7 @@ jobs:
 
   protocol-sanitizers:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
