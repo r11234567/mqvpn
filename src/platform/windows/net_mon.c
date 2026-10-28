@@ -172,7 +172,7 @@ static DWORD
 resolve_iface_luid(const char *ifname, NET_LUID *luid)
 {
     wchar_t wname[IF_MAX_STRING_SIZE + 1];
-    int wlen = MultiByteToWideChar(CP_ACP, 0, ifname, -1, wname,
+    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, ifname, -1, wname,
                                    (int)(sizeof(wname) / sizeof(wname[0])));
     if (wlen <= 0) return ERROR_INVALID_PARAMETER;
 
