@@ -120,6 +120,10 @@ mqvpn_config_new(void)
 
     /* H1: hybrid classifier defaults (disabled until explicitly enabled). */
     mqvpn_hybrid_config_default(&cfg->hybrid);
+    cfg->proxy_max_connections = 64;
+    cfg->proxy_idle_timeout_sec = 60;
+    cfg->proxy_quic_fallback_proxy_protocol = 1;
+    cfg->proxy_h2_backend_proxy_protocol = 1;
 
     return cfg;
 }
@@ -394,6 +398,40 @@ mqvpn_config_load_json(mqvpn_config_t *cfg, const char *json_text)
         cfg->pmtud = yyjson_get_bool(v) ? 1 : 0;
     }
 
+    v = yyjson_obj_get(root, "tun_txqueuelen");
+    if (!v) v = yyjson_obj_get(root, "tx_queue_len");
+    if (v) {
+        if (json_get_int(v, &iv) != 0 || (iv != 0 && (iv < 100 || iv > 65536))) goto out;
+        cfg->tun_txqueuelen = iv;
+    }
+
+    v = yyjson_obj_get(root, "tun_read_batch");
+    if (v) {
+        if (json_get_int(v, &iv) != 0 || (iv != 0 && (iv < 1 || iv > 4096))) goto out;
+        cfg->tun_read_batch = iv;
+    }
+
+    v = yyjson_obj_get(root, "proxy");
+    if (v && yyjson_is_obj(v)) {
+        yyjson_val *pv = yyjson_obj_get(v, "enabled");
+        if (yyjson_is_bool(pv)) cfg->proxy_enabled = yyjson_get_bool(pv);
+        json_copy_str(yyjson_obj_get(v, "sni"), cfg->proxy_sni, sizeof(cfg->proxy_sni));
+        json_copy_str(yyjson_obj_get(v, "quic_fallback"), cfg->proxy_quic_fallback, sizeof(cfg->proxy_quic_fallback));
+        pv = yyjson_obj_get(v, "quic_fallback_proxy_protocol");
+        if (yyjson_is_bool(pv)) cfg->proxy_quic_fallback_proxy_protocol = yyjson_get_bool(pv);
+        json_copy_str(yyjson_obj_get(v, "h2_backend"), cfg->proxy_h2_backend, sizeof(cfg->proxy_h2_backend));
+        pv = yyjson_obj_get(v, "h2_backend_tls");
+        if (yyjson_is_bool(pv)) cfg->proxy_h2_backend_tls = yyjson_get_bool(pv);
+        pv = yyjson_obj_get(v, "h2_backend_proxy_protocol");
+        if (yyjson_is_bool(pv)) cfg->proxy_h2_backend_proxy_protocol = yyjson_get_bool(pv);
+        if (json_get_int(yyjson_obj_get(v, "max_connections"), &iv) == 0 && iv >= 0 && iv <= 65535) {
+            cfg->proxy_max_connections = (uint32_t)iv;
+        }
+        if (json_get_int(yyjson_obj_get(v, "idle_timeout_sec"), &iv) == 0 && iv >= 0 && iv <= 86400) {
+            cfg->proxy_idle_timeout_sec = (uint32_t)iv;
+        }
+    }
+
     v = yyjson_obj_get(root, "users");
     if (v && json_read_users(cfg, v) != MQVPN_OK) goto out;
 
@@ -574,6 +612,68 @@ mqvpn_config_set_max_clients(mqvpn_config_t *cfg, int max)
 {
     if (!cfg) return MQVPN_ERR_INVALID_ARG;
     cfg->max_clients = max;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_proxy(mqvpn_config_t *cfg, int enabled, const char *sni_csv,
+                       const char *quic_fallback, const char *http2_backend,
+                       int http2_backend_tls, uint32_t max_connections,
+                       uint32_t idle_timeout_sec)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    if (enabled && (!sni_csv || !sni_csv[0] || !quic_fallback || !quic_fallback[0] ||
+                    !http2_backend || !http2_backend[0]))
+        return MQVPN_ERR_INVALID_ARG;
+    if ((sni_csv && strlen(sni_csv) >= sizeof(cfg->proxy_sni)) ||
+        (quic_fallback && strlen(quic_fallback) >= sizeof(cfg->proxy_quic_fallback)) ||
+        (http2_backend && strlen(http2_backend) >= sizeof(cfg->proxy_h2_backend)))
+        return MQVPN_ERR_INVALID_ARG;
+    if (max_connections > 65535 || idle_timeout_sec > 86400) return MQVPN_ERR_INVALID_ARG;
+
+    cfg->proxy_enabled = enabled != 0;
+    snprintf(cfg->proxy_sni, sizeof(cfg->proxy_sni), "%s", sni_csv ? sni_csv : "");
+    snprintf(cfg->proxy_quic_fallback, sizeof(cfg->proxy_quic_fallback), "%s",
+             quic_fallback ? quic_fallback : "");
+    snprintf(cfg->proxy_h2_backend, sizeof(cfg->proxy_h2_backend), "%s",
+             http2_backend ? http2_backend : "");
+    cfg->proxy_h2_backend_tls = http2_backend_tls != 0;
+    cfg->proxy_max_connections = max_connections ? max_connections : 64;
+    cfg->proxy_idle_timeout_sec = idle_timeout_sec ? idle_timeout_sec : 60;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_proxy_protocol(mqvpn_config_t *cfg, int enabled)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    cfg->proxy_h2_backend_proxy_protocol = enabled != 0;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_quic_fallback_proxy_protocol(mqvpn_config_t *cfg, int enabled)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    cfg->proxy_quic_fallback_proxy_protocol = enabled != 0;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_tun_txqueuelen(mqvpn_config_t *cfg, int qlen)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    if (qlen != 0 && (qlen < 100 || qlen > 65536)) return MQVPN_ERR_INVALID_ARG;
+    cfg->tun_txqueuelen = qlen;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_tun_read_batch(mqvpn_config_t *cfg, int n)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    if (n != 0 && (n < 1 || n > 4096)) return MQVPN_ERR_INVALID_ARG;
+    cfg->tun_read_batch = n;
     return MQVPN_OK;
 }
 

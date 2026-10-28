@@ -174,6 +174,18 @@ struct mqvpn_config_s {
                      TUN MTU */
     int path_mtu; /* 0 = default packet size, >0 = underlay MTU to size packets for */
     int pmtud;    /* 1 = discover the path MTU, path_mtu is the upper bound */
+    int tun_txqueuelen;
+    int tun_read_batch;
+
+    int proxy_enabled;
+    char proxy_sni[280];
+    char proxy_quic_fallback[280];
+    int proxy_quic_fallback_proxy_protocol;
+    char proxy_h2_backend[280];
+    int proxy_h2_backend_tls;
+    int proxy_h2_backend_proxy_protocol;
+    uint32_t proxy_max_connections;
+    uint32_t proxy_idle_timeout_sec;
 
     /* Flow-aware reorder shim config (§16). Seeded with
      * mqvpn_reorder_config_default() in mqvpn_config_new(); the library

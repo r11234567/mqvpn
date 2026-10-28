@@ -111,6 +111,39 @@ if(NOT ANDROID_CROSS_COMPILE)
     endif()
 endif()
 
+# ---------- nghttp2 (for HTTP/2 proxy support) ----------
+# Default: disabled. Only enable if explicitly found.
+set(MQVPN_ENABLE_H2_PROXY OFF)
+
+# h2_proxy.c currently uses POSIX socket APIs and headers, so only enable it on Linux.
+if(NOT WIN32 AND NOT IOS AND NOT ANDROID_CROSS_COMPILE AND NOT APPLE)
+    find_package(PkgConfig)
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(NGHTTP2 libnghttp2)
+        if(NGHTTP2_FOUND AND NGHTTP2_LIBRARIES)
+            set(MQVPN_ENABLE_H2_PROXY ON)
+            message(STATUS "nghttp2 found via pkg-config: ${NGHTTP2_LIBRARIES}")
+        endif()
+    endif()
+
+    if(NOT MQVPN_ENABLE_H2_PROXY)
+        find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h)
+        find_library(NGHTTP2_LIB nghttp2)
+        if(NGHTTP2_INCLUDE_DIR AND NGHTTP2_LIB)
+            if(EXISTS "${NGHTTP2_LIB}")
+                set(MQVPN_ENABLE_H2_PROXY ON)
+                message(STATUS "nghttp2 found: ${NGHTTP2_LIB}")
+            endif()
+        endif()
+    endif()
+endif()
+
+if(NOT MQVPN_ENABLE_H2_PROXY)
+    message(STATUS "nghttp2 disabled or not found. HTTP/2 proxy support will be disabled.")
+endif()
+
+message(STATUS "MQVPN_ENABLE_H2_PROXY: ${MQVPN_ENABLE_H2_PROXY}")
+
 # ---------- Hybrid mode TCP lane (lwIP) ----------
 option(MQVPN_ENABLE_HYBRID_TCP_LANE
        "Build the hybrid-mode lwIP TCP lane" ON)
@@ -424,6 +457,26 @@ if(MQVPN_HYBRID_TCP_EGRESS_BUILD)
     list(APPEND MQVPN_LIB_SOURCES ${CMAKE_SOURCE_DIR}/src/hybrid/tcp_egress.c)
 endif()
 
+# SNI inspection and fallback use the POSIX server reactor; Windows builds are
+# client-only and must not pull this server-side translation unit in.
+if(NOT WIN32)
+    list(APPEND MQVPN_LIB_SOURCES src/sni_router.c)
+endif()
+
+# Add H2 proxy only if nghttp2 is available
+if(MQVPN_ENABLE_H2_PROXY)
+    list(APPEND MQVPN_LIB_SOURCES src/h2_proxy.c)
+endif()
+
+if(NOT WIN32 AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(src/sni_router.c
+        PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+    if(MQVPN_ENABLE_H2_PROXY)
+        set_source_files_properties(src/h2_proxy.c
+            PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+    endif()
+endif()
+
 # fuzz_tcp_lane links classifier.c + lwip_glue.c directly (mirrors
 # tcp_lane_microbench) against the instrumented lwip_core_fuzz built inside
 # the block above — MQVPN_ENABLE_FUZZING with the hybrid TCP lane unavailable
@@ -462,6 +515,19 @@ if(MQVPN_HYBRID_TCP_LANE_BUILD)
 endif()
 if(MQVPN_HYBRID_TCP_EGRESS_BUILD)
     target_compile_definitions(mqvpn_lib PRIVATE MQVPN_HYBRID_TCP_EGRESS_ENABLED)
+endif()
+if(MQVPN_ENABLE_H2_PROXY)
+    if(NGHTTP2_INCLUDE_DIR)
+        target_include_directories(mqvpn_lib PRIVATE ${NGHTTP2_INCLUDE_DIR})
+    elseif(NGHTTP2_INCLUDE_DIRS)
+        target_include_directories(mqvpn_lib PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+    endif()
+    target_compile_definitions(mqvpn_lib PRIVATE MQVPN_H2_PROXY_ENABLED)
+    if(NGHTTP2_LIB)
+        target_link_libraries(mqvpn_lib ${NGHTTP2_LIB})
+    elseif(NGHTTP2_LIBRARIES)
+        target_link_libraries(mqvpn_lib ${NGHTTP2_LIBRARIES})
+    endif()
 endif()
 
 # Everything below requires libevent and a platform layer — skip for Android
@@ -693,6 +759,19 @@ endif()
 if(MQVPN_HYBRID_TCP_EGRESS_BUILD)
     target_compile_definitions(mqvpn_shared PRIVATE MQVPN_HYBRID_TCP_EGRESS_ENABLED)
 endif()
+if(MQVPN_ENABLE_H2_PROXY)
+    if(NGHTTP2_INCLUDE_DIR)
+        target_include_directories(mqvpn_shared PRIVATE ${NGHTTP2_INCLUDE_DIR})
+    elseif(NGHTTP2_INCLUDE_DIRS)
+        target_include_directories(mqvpn_shared PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+    endif()
+    target_compile_definitions(mqvpn_shared PRIVATE MQVPN_H2_PROXY_ENABLED)
+    if(NGHTTP2_LIB)
+        target_link_libraries(mqvpn_shared ${NGHTTP2_LIB})
+    elseif(NGHTTP2_LIBRARIES)
+        target_link_libraries(mqvpn_shared ${NGHTTP2_LIBRARIES})
+    endif()
+endif()
 
 # ---------- Tests (Darwin) ----------
 # Only the tests that exercise Darwin-specific parsing/formatting run here
@@ -861,6 +940,21 @@ target_link_libraries(mqvpn
     m
     stdc++
 )
+
+# Enable H2 proxy support in CLI if nghttp2 was found
+if(MQVPN_ENABLE_H2_PROXY)
+    target_compile_definitions(mqvpn PRIVATE MQVPN_H2_PROXY_ENABLED)
+    if(NGHTTP2_LIBRARIES)
+        target_link_libraries(mqvpn ${NGHTTP2_LIBRARIES})
+    else()
+        target_link_libraries(mqvpn ${NGHTTP2_LIB})
+    endif()
+    if(NGHTTP2_INCLUDE_DIR)
+        target_include_directories(mqvpn PRIVATE ${NGHTTP2_INCLUDE_DIR})
+    elseif(NGHTTP2_INCLUDE_DIRS)
+        target_include_directories(mqvpn PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+    endif()
+endif()
 
 # Private systemd/NAT helper; deliberately shares the CLI config parser.
 add_executable(mqvpn-nat-config src/nat_config.c src/config.c
