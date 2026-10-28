@@ -67,3 +67,9 @@ docs/report/2026-07-04-hybrid-h2b-throughput.md
 # keep curated *.bin seeds tracked, ignore SHA-named fuzzer output.
 fuzz/corpus/control_dispatch/*
 !fuzz/corpus/control_dispatch/*.bin
+
+# .NET build artifacts
+bin/
+obj/
+*.user
+*.suo
