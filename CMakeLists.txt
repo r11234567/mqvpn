@@ -611,6 +611,22 @@ endif()
 option(BUILD_TESTING "Build unit tests" ON)
 if(BUILD_TESTING)
     enable_testing()
+    # Shared Windows/Apple adapter test: rejects NULL input, an untrusted
+    # self-signed fixture, an empty host and undecodable DER. Compiles the
+    # verifier and the identity core it calls, plus log.c for their rejection
+    # reasons.
+    add_executable(test_platform_cert_verify tests/test_platform_cert_verify.c
+                   src/platform/windows/cert_verify.c
+                   src/platform/windows/cert_identity.c
+                   src/log.c)
+    target_compile_definitions(test_platform_cert_verify PRIVATE
+        TEST_CERT_DER_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.der")
+    target_include_directories(test_platform_cert_verify PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/platform/windows)
+    target_link_libraries(test_platform_cert_verify PRIVATE crypt32)
+    add_test(NAME test_platform_cert_verify COMMAND test_platform_cert_verify)
+
     # Portable identity core: same test as on Linux.
     add_executable(test_cert_identity tests/test_cert_identity.c src/platform/windows/cert_identity.c)
     target_include_directories(test_cert_identity PRIVATE ${CMAKE_SOURCE_DIR}/src/platform/windows)
@@ -652,7 +668,7 @@ if(BUILD_TESTING)
     add_test(NAME test_clock_source COMMAND test_clock_source)
     if(MSVC)
         # same gate as the product build; target-scoped options are not inherited
-        foreach(t test_cert_identity test_cert_verify_win test_bind_winsock test_path_readd test_path_line test_clock_source)
+        foreach(t test_platform_cert_verify test_cert_identity test_cert_verify_win test_bind_winsock test_path_readd test_path_line test_clock_source)
             target_compile_options(${t} PRIVATE /WX /utf-8)
             target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
         endforeach()
@@ -874,6 +890,16 @@ if(BUILD_TESTING)
     set_target_properties(test_conn_settings PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_conn_settings COMMAND test_conn_settings)
+
+    add_executable(test_platform_cert_verify tests/test_platform_cert_verify.c
+                   src/platform/darwin/cert_verify_apple.c)
+    target_compile_definitions(test_platform_cert_verify PRIVATE
+        TEST_CERT_DER_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.der")
+    target_include_directories(test_platform_cert_verify PRIVATE
+        ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/platform/darwin)
+    target_link_libraries(test_platform_cert_verify PRIVATE
+                          "-framework Security" "-framework CoreFoundation")
+    add_test(NAME test_platform_cert_verify COMMAND test_platform_cert_verify)
 endif()
 
 else() # NOT WIN32, NOT APPLE — Linux
