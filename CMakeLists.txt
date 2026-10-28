@@ -501,7 +501,7 @@ else()
 endif()
 target_include_directories(mqvpn_lib
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
-    PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR}
+    PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR} ${BORINGSSL_INCLUDE_DIR}
 )
 if(ANDROID_CROSS_COMPILE)
     # Android NDK: pthread is in libc, no separate -lpthread
@@ -687,6 +687,7 @@ add_executable(mqvpn
 target_include_directories(mqvpn PRIVATE
     ${XQUIC_INCLUDE_DIR}
     ${EVENT_INCLUDE_DIR}
+    ${BORINGSSL_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/platform/posix
@@ -745,7 +746,7 @@ set_target_properties(mqvpn_shared PROPERTIES
 )
 target_include_directories(mqvpn_shared
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
-    PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR}
+    PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR} ${BORINGSSL_INCLUDE_DIR}
 )
 # Shared lib links shared xquic, same as Linux (static .a is unusable there
 # for -fPIC reasons; kept symmetric here even though clang on Darwin emits
@@ -889,7 +890,7 @@ set_target_properties(mqvpn_shared PROPERTIES
 )
 target_include_directories(mqvpn_shared
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
-    PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR}
+    PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR} ${BORINGSSL_INCLUDE_DIR}
 )
 # Shared lib needs shared xquic (static .a lacks -fPIC)
 target_link_libraries(mqvpn_shared xquic ${SSL_LIB} ${CRYPTO_LIB} pthread)
@@ -925,6 +926,7 @@ add_executable(mqvpn
 target_include_directories(mqvpn PRIVATE
     ${XQUIC_INCLUDE_DIR}
     ${EVENT_INCLUDE_DIR}
+    ${BORINGSSL_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/platform/posix
@@ -1355,6 +1357,14 @@ if(BUILD_TESTING)
     )
     set_target_properties(test_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_server COMMAND test_server)
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test_linux_server_socket tests/test_linux_server_socket.c)
+        target_include_directories(test_linux_server_socket PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        set_target_properties(test_linux_server_socket PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+        add_test(NAME test_linux_server_socket COMMAND test_linux_server_socket)
+    endif()
 
     # Portable core of the Windows certificate verifier (no Win32 headers):
     # the host parser, SAN DER walker and identity match are unit-tested here

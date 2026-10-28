@@ -63,8 +63,8 @@ int
 win_pin_socket_to_iface(SOCKET sock, const char *friendly_name, ADDRESS_FAMILY af)
 {
     wchar_t wname[IF_MAX_STRING_SIZE + 1];
-    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, friendly_name, -1, wname,
-                                   (int)(sizeof(wname) / sizeof(wname[0])));
+    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, friendly_name, -1,
+                                   wname, (int)(sizeof(wname) / sizeof(wname[0])));
     if (wlen <= 0) {
         LOG_WRN("MultiByteToWideChar('%s') failed: %lu", friendly_name, GetLastError());
         return -1;

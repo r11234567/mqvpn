@@ -146,7 +146,8 @@ win_setup_dns(platform_win_ctx_t *p)
         int off = 0;
         for (int i = 0; i < p->n_dns; i++) {
             WCHAR addr[64];
-            MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, p->dns_servers[i], -1, addr, 64);
+            MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, p->dns_servers[i], -1,
+                                addr, 64);
             if (i > 0) ns[off++] = L',';
             int len = (int)wcslen(addr);
             memcpy(ns + off, addr, len * sizeof(WCHAR));

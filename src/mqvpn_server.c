@@ -360,6 +360,42 @@ svr_compute_egress_fd_budget(uint32_t configured_max)
     return budget;
 }
 
+static int64_t
+now_ms_mono(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER freq, cnt;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&cnt);
+    return (int64_t)(cnt.QuadPart * 1000 / freq.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+
+#ifndef _MSC_VER
+static void server_log(mqvpn_server_t *s, mqvpn_log_level_t level, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+#endif
+
+static void
+server_log(mqvpn_server_t *s, mqvpn_log_level_t level, const char *fmt, ...)
+{
+    if (!s->cbs.log || level < s->log_level) return;
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    s->cbs.log(level, buf, s->user_ctx);
+}
+
+#define LOG_D(s, ...) server_log(s, MQVPN_LOG_DEBUG, __VA_ARGS__)
+#define LOG_I(s, ...) server_log(s, MQVPN_LOG_INFO, __VA_ARGS__)
+#define LOG_W(s, ...) server_log(s, MQVPN_LOG_WARN, __VA_ARGS__)
+#define LOG_E(s, ...) server_log(s, MQVPN_LOG_ERROR, __VA_ARGS__)
 
 static ssize_t svr_do_send(mqvpn_server_t *s, mqvpn_server_tx_scope_t scope,
                            const unsigned char *buf, size_t size,
@@ -610,44 +646,7 @@ svr_h2_proxy_init(mqvpn_server_t *s)
 }
 #endif
 
-static int64_t
-now_ms_mono(void)
-{
-#ifdef _WIN32
-    LARGE_INTEGER freq, cnt;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&cnt);
-    return (int64_t)(cnt.QuadPart * 1000 / freq.QuadPart);
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-#endif
-}
-
-#ifndef _MSC_VER
-static void server_log(mqvpn_server_t *s, mqvpn_log_level_t level, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
-#endif
-
 #include "mqvpn_conn_settings.h"
-
-static void
-server_log(mqvpn_server_t *s, mqvpn_log_level_t level, const char *fmt, ...)
-{
-    if (!s->cbs.log || level < s->log_level) return;
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    s->cbs.log(level, buf, s->user_ctx);
-}
-
-#define LOG_D(s, ...) server_log(s, MQVPN_LOG_DEBUG, __VA_ARGS__)
-#define LOG_I(s, ...) server_log(s, MQVPN_LOG_INFO, __VA_ARGS__)
-#define LOG_W(s, ...) server_log(s, MQVPN_LOG_WARN, __VA_ARGS__)
-#define LOG_E(s, ...) server_log(s, MQVPN_LOG_ERROR, __VA_ARGS__)
 
 #ifndef NDEBUG
 #  ifdef _WIN32
