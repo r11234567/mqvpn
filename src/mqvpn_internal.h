@@ -66,7 +66,6 @@ mqvpn_pkt_out_size(int path_mtu)
     if (path_mtu - 40 - 8 - MQVPN_AEAD_TAG_LEN >= MQVPN_XQC_MAX_PKT_OUT_SIZE)
         return MQVPN_XQC_MAX_PKT_OUT_SIZE;
     int v = path_mtu - 40 - 8 - MQVPN_PKT_OUT_OVERHEAD;
-    if (v > MQVPN_XQC_MAX_PKT_OUT_SIZE) v = MQVPN_XQC_MAX_PKT_OUT_SIZE;
     if (v < 1200) v = 1200;
     return (size_t)v;
 }

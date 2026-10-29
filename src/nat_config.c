@@ -14,6 +14,9 @@ main(int argc, char **argv)
     if (argc != 2) return 1;
     mqvpn_file_config_t cfg;
     mqvpn_config_defaults(&cfg);
+    /* This non-setuid CLI intentionally reads the operator-selected file,
+     * including absolute paths. It does not resolve a remote path fragment
+     * inside a privileged directory or execute the configuration contents. */
     if (mqvpn_config_load(&cfg, argv[1]) < 0) return 1;
 
     const char *values[] = {cfg.subnet, cfg.subnet6, cfg.tun_name};

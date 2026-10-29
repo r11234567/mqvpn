@@ -2,10 +2,14 @@ name: H2 Proxy Protocol
 
 on:
   push:
-    branches: [main, 'sync/**']
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: h2-proxy-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   h2-proxy-protocol-test:

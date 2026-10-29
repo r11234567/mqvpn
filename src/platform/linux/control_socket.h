@@ -50,6 +50,9 @@ typedef void (*ctrl_rx_stats_fn)(void *rx_ctx, uint64_t *receives, uint64_t *dat
  * carries the transport-agnostic TX pair only. The transmit-side pair does
  * cross that ABI (mqvpn_stats_t.udp_tx_*) precisely because the library
  * issues those sends itself. */
+/* rx_ctx is borrowed until ctrl_socket_destroy. A caller-owned stack context
+ * is valid when that caller drives the loop and destroys this socket before
+ * returning (as linux_platform_run_server does). */
 ctrl_socket_t *ctrl_socket_create(struct event_base *eb, const char *addr, int port,
                                   mqvpn_server_t *server, ctrl_rx_stats_fn rx_stats,
                                   void *rx_ctx);

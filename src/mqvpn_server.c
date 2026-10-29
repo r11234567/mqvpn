@@ -357,7 +357,6 @@ svr_compute_egress_fd_budget(uint32_t configured_max)
         if (headroom < budget) budget = (int)headroom;
     }
 #endif
-    if (budget < 0) budget = 0;
     return budget;
 }
 
@@ -2462,7 +2461,9 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
                           ? cbs->struct_size
                           : sizeof(*cbs);
     memcpy(&s->cbs, cbs, cbs_size);
-    s->user_ctx = user_ctx; // lgtm[cpp/stack-address-escape]
+    /* Borrowed callback context: the caller keeps it alive until destroy,
+     * including when its event loop and cleanup share one stack frame. */
+    s->user_ctx = user_ctx;
     s->log_level = cfg->log_level;
     s->max_clients = cfg->max_clients > 0 ? cfg->max_clients : 64;
     mqvpn_ptb_bucket_init(&s->ptb_bucket);

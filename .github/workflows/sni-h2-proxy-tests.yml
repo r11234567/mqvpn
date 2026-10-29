@@ -2,6 +2,7 @@ name: SNI and H2 Protocol Tests
 
 on:
   push:
+    branches: [main, dev]
     paths:
       - 'src/sni_router.*'
       - 'src/h2_proxy.*'
@@ -27,6 +28,10 @@ on:
   pull_request:
     branches: [main, 'sync/**']
   workflow_dispatch:
+
+concurrency:
+  group: sni-h2-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   format-check:

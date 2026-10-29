@@ -2,7 +2,7 @@ name: Windows GUI (Test, Build & Package Multi-Arch)
 
 on:
   push:
-    branches: [main, dev, 'sync/**']
+    branches: [main, dev]
     paths:
       - 'windows/**'
       - 'scripts/package_windows_gui.ps1'
@@ -14,6 +14,10 @@ on:
       - 'scripts/package_windows_gui.ps1'
       - '.github/workflows/windows-gui.yml'
   workflow_dispatch:
+
+concurrency:
+  group: windows-gui-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-gui:

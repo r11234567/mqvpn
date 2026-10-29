@@ -318,7 +318,7 @@ wait_for_carrier "$VETH_A0" 10 || fail "${VETH_A0} reported no carrier within 10
 # first, so every later re-add of A is the timer's.
 sleep 2
 
-GATE_PATTERN="netlink: ${VETH_A0} has a usable address but no route to the server — re-add deferred until a route appears"
+GATE_PATTERN="netlink: ${VETH_A0} has a usable address but no route to the server -- re-add deferred until a route appears"
 wait_for_log_after "$CLIENT_LOG" "$GATE_PATTERN" "$A_UP_MARK" 10 ||
     fail "route-gate deferral for ${VETH_A0} not logged within 10s: the recovery timer never evaluated A"
 echo "OK: the recovery timer evaluates ${VETH_A0} (route-gate deferral logged)"
