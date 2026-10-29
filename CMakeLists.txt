@@ -1342,6 +1342,7 @@ if(BUILD_TESTING)
     # xquic) and path_state_machine.c, both with asserts on; never mqvpn_lib's.
     set(MBT_LIB_SOURCES ${MQVPN_LIB_SOURCES})
     list(REMOVE_ITEM MBT_LIB_SOURCES src/mqvpn_client.c src/mqvpn_server.c
+         src/sni_router.c src/h2_proxy.c
          src/path_state_machine.c ${CMAKE_SOURCE_DIR}/src/hybrid/tcp_egress.c)
     add_executable(test_path_slot_mbt tests/test_path_slot_mbt.c tests/mbt_client_tu.c
         tests/fake_xquic.c tests/fake_transport.c src/path_state_machine.c
