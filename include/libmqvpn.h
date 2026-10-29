@@ -691,13 +691,18 @@ MQVPN_API int mqvpn_config_set_init_max_path_id(mqvpn_config_t *cfg, uint64_t v)
 /* TUN MTU cap: 0 = auto (MSS-derived), 1280..9000 = upper bound. */
 MQVPN_API int mqvpn_config_set_tun_mtu(mqvpn_config_t *cfg, int mtu);
 /* TUN transmit ring depth in packets. 0 keeps the kernel default (500),
- * otherwise 100..65536. Shallow rings drop bursty small-packet traffic with
- * tx_dropped and no other trace; Linux only, accepted and ignored elsewhere. */
+ * otherwise
+ * 100..65536. Shallow rings drop bursty small-packet traffic with
+ * tx_dropped and no
+ * other trace; Linux only, accepted and ignored elsewhere. */
 MQVPN_API int mqvpn_config_set_tun_txqueuelen(mqvpn_config_t *cfg, int qlen);
 /* Packets drained from the TUN per event-loop wakeup. 0 keeps the built-in
- * default (64), otherwise 1..4096. Bounded above because an unbounded batch
- * starves every other fd in the same loop, including the socket the drained
- * packets leave through. */
+ * default
+ * (64), otherwise 1..4096. Bounded above because an unbounded batch
+ * starves every
+ * other fd in the same loop, including the socket the drained
+ * packets leave through.
+ */
 MQVPN_API int mqvpn_config_set_tun_read_batch(mqvpn_config_t *cfg, int n);
 /* Underlay path MTU the outer QUIC packets are sized for: 0 = default
  * (1400-byte packets, TUN MTU ~1382), 1280..9000 = largest IP packet the
@@ -863,20 +868,27 @@ MQVPN_API int mqvpn_config_set_tls_cert(mqvpn_config_t *cfg, const char *cert,
                                         const char *key);
 MQVPN_API int mqvpn_config_set_max_clients(mqvpn_config_t *cfg, int max);
 /* Enable Linux server-side QUIC SNI routing and H3-to-H2 proxying. `sni_csv`
- * is a comma-separated list of DNS names or left-most single-label wildcards.
- * Endpoints use host:port syntax. The HTTP/2 upstream is h2c only;
- * http2_backend_tls != 0 is rejected when the server starts. */
+ * is a
+ * comma-separated list of DNS names or left-most single-label wildcards.
+ * Endpoints use
+ * host:port syntax. The HTTP/2 upstream is h2c only;
+ * http2_backend_tls != 0 is
+ * rejected when the server starts. */
 MQVPN_API int mqvpn_config_set_proxy(mqvpn_config_t *cfg, int enabled,
                                      const char *sni_csv, const char *quic_fallback,
                                      const char *http2_backend, int http2_backend_tls,
                                      uint32_t max_connections, uint32_t idle_timeout_sec);
 /* Select whether H2 backend connections send a PROXY protocol v2 header
- * before the HTTP/2 preface. This is independent of the endpoint settings
- * above so older callers remain source and ABI compatible. */
+ * before the
+ * HTTP/2 preface. This is independent of the endpoint settings
+ * above so older callers
+ * remain source and ABI compatible. */
 MQVPN_API int mqvpn_config_set_proxy_protocol(mqvpn_config_t *cfg, int enabled);
 /* Select whether unmatched-SNI QUIC fallback datagrams start with a PROXY v2
- * header. Disable this for QUIC listeners (such as nginx QUIC) that do not
- * support PROXY protocol on their UDP listener. */
+ * header.
+ * Disable this for QUIC listeners (such as nginx QUIC) that do not
+ * support PROXY
+ * protocol on their UDP listener. */
 MQVPN_API int mqvpn_config_set_quic_fallback_proxy_protocol(mqvpn_config_t *cfg,
                                                             int enabled);
 

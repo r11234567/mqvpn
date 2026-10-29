@@ -416,18 +416,24 @@ mqvpn_config_load_json(mqvpn_config_t *cfg, const char *json_text)
         yyjson_val *pv = yyjson_obj_get(v, "enabled");
         if (yyjson_is_bool(pv)) cfg->proxy_enabled = yyjson_get_bool(pv);
         json_copy_str(yyjson_obj_get(v, "sni"), cfg->proxy_sni, sizeof(cfg->proxy_sni));
-        json_copy_str(yyjson_obj_get(v, "quic_fallback"), cfg->proxy_quic_fallback, sizeof(cfg->proxy_quic_fallback));
+        json_copy_str(yyjson_obj_get(v, "quic_fallback"), cfg->proxy_quic_fallback,
+                      sizeof(cfg->proxy_quic_fallback));
         pv = yyjson_obj_get(v, "quic_fallback_proxy_protocol");
-        if (yyjson_is_bool(pv)) cfg->proxy_quic_fallback_proxy_protocol = yyjson_get_bool(pv);
-        json_copy_str(yyjson_obj_get(v, "h2_backend"), cfg->proxy_h2_backend, sizeof(cfg->proxy_h2_backend));
+        if (yyjson_is_bool(pv))
+            cfg->proxy_quic_fallback_proxy_protocol = yyjson_get_bool(pv);
+        json_copy_str(yyjson_obj_get(v, "h2_backend"), cfg->proxy_h2_backend,
+                      sizeof(cfg->proxy_h2_backend));
         pv = yyjson_obj_get(v, "h2_backend_tls");
         if (yyjson_is_bool(pv)) cfg->proxy_h2_backend_tls = yyjson_get_bool(pv);
         pv = yyjson_obj_get(v, "h2_backend_proxy_protocol");
-        if (yyjson_is_bool(pv)) cfg->proxy_h2_backend_proxy_protocol = yyjson_get_bool(pv);
-        if (json_get_int(yyjson_obj_get(v, "max_connections"), &iv) == 0 && iv >= 0 && iv <= 65535) {
+        if (yyjson_is_bool(pv))
+            cfg->proxy_h2_backend_proxy_protocol = yyjson_get_bool(pv);
+        if (json_get_int(yyjson_obj_get(v, "max_connections"), &iv) == 0 && iv >= 0 &&
+            iv <= 65535) {
             cfg->proxy_max_connections = (uint32_t)iv;
         }
-        if (json_get_int(yyjson_obj_get(v, "idle_timeout_sec"), &iv) == 0 && iv >= 0 && iv <= 86400) {
+        if (json_get_int(yyjson_obj_get(v, "idle_timeout_sec"), &iv) == 0 && iv >= 0 &&
+            iv <= 86400) {
             cfg->proxy_idle_timeout_sec = (uint32_t)iv;
         }
     }

@@ -686,8 +686,7 @@ main(int argc, char *argv[])
                 file_cfg.proxy_quic_fallback_proxy_protocol,
             .proxy_h2_backend = file_cfg.proxy_h2_backend,
             .proxy_h2_backend_tls = file_cfg.proxy_h2_backend_tls,
-            .proxy_h2_backend_proxy_protocol =
-                file_cfg.proxy_h2_backend_proxy_protocol,
+            .proxy_h2_backend_proxy_protocol = file_cfg.proxy_h2_backend_proxy_protocol,
             .proxy_max_connections = file_cfg.proxy_max_connections,
             .proxy_idle_timeout_sec = file_cfg.proxy_idle_timeout_sec,
             /* [Advanced] UdpGso; default 1. Applies to client and server. */

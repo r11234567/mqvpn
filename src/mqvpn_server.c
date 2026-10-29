@@ -29,6 +29,7 @@
 #  include <sys/time.h>
 #  include <sys/resource.h>
 #  include <arpa/inet.h>
+#  include <netdb.h>
 #  include <pthread.h>
 #endif
 #ifndef _WIN32
@@ -358,6 +359,11 @@ svr_compute_egress_fd_budget(uint32_t configured_max)
     if (budget < 0) budget = 0;
     return budget;
 }
+
+
+static ssize_t svr_do_send(mqvpn_server_t *s, mqvpn_server_tx_scope_t scope,
+                           const unsigned char *buf, size_t size,
+                           const struct sockaddr *peer, socklen_t peerlen);
 
 static int
 svr_process_xquic(mqvpn_server_t *s, const uint8_t *pkt, size_t len,
