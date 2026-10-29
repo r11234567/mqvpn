@@ -21,8 +21,7 @@ on:
       - 'tests/test_server.c'
       - 'tests/test_config.c'
       - 'tests/test_tcp_egress.c'
-      - 'patches/xquic/**'
-      - 'scripts/apply_xquic_patches.sh'
+      - 'scripts/check_xquic_pin.sh'
       - '.github/workflows/sni-h2-proxy-tests.yml'
       - 'CMakeLists.txt'
   pull_request:
@@ -57,9 +56,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Install dependencies
         run: |
@@ -97,7 +96,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: proxy-xquic-${{ steps.pins.outputs.xquic }}-bssl-${{ steps.pins.outputs.bssl }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-linux-gcc-release-v1
+          key: proxy-xquic-${{ steps.pins.outputs.xquic }}-bssl-${{ steps.pins.outputs.bssl }}-source-v1-linux-gcc-release-v1
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -155,9 +154,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Install dependencies
         run: |

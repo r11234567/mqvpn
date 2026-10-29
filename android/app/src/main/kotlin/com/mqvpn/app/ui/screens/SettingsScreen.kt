@@ -61,6 +61,7 @@ import com.mqvpn.app.ui.serverSchedulerLine
 import com.mqvpn.app.ui.theme.LocalMqColors
 import com.mqvpn.app.ui.theme.MqColors
 import com.mqvpn.sdk.core.MqvpnSdk
+import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnState
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -223,6 +224,21 @@ fun SettingsScreen(
                         } else btBlocked = true
                     }
                     if (btBlocked) Text(LAST_PATH_CAPTION, color = c.red, fontSize = 11.sp, modifier = Modifier.padding(bottom = 8.dp))
+                }
+            }
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            SectionLabel("Logging")
+            MqCard(padding = PaddingValuesRows) {
+                Column(Modifier.selectableGroup()) {
+                    Text("Log level (next connection)", color = c.t2, fontSize = 12.sp)
+                    MqvpnConfig.LogLevel.entries.forEach { level ->
+                        SplitRadio(level == s.logLevelEnum(), editable, level.name.lowercase(), "", c) {
+                            settingsVm.update { it.copy(logLevel = level.name) }
+                        }
+                    }
+                    TextButton(onClick = { onNavigate("logs") }) { Text("Open diagnostic log") }
                 }
             }
         }

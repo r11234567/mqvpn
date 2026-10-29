@@ -9,6 +9,7 @@
 
 #include "libmqvpn.h"
 #include "mqvpn_internal.h"
+#include "tls_policy.h"
 #include "mqvpn_scheduler.h"
 #include "mqvpn_sched_names.h" /* mqvpn_reinj_to_name for the startup log */
 
@@ -1313,6 +1314,7 @@ cb_cert_verify(const unsigned char *certs[], const size_t cert_len[], size_t cer
                void *conn_user_data)
 {
     cli_conn_t *conn = (cli_conn_t *)conn_user_data;
+    if (!conn || !conn->client) return -1;
     const mqvpn_config_t *cfg = &conn->client->config;
 
     if (!cfg->cert_verify_fn) return -1;
@@ -3126,11 +3128,8 @@ init_xquic_engine(mqvpn_client_t *c)
     const mqvpn_config_t *cfg = &c->config;
     xqc_engine_ssl_config_t engine_ssl;
     memset(&engine_ssl, 0, sizeof(engine_ssl));
-    /* Prioritize AES-256-GCM for stronger encryption */
-    engine_ssl.ciphers =
-        "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256";
-    /* Enable post-quantum key exchange with X25519MLKEM768 */
-    engine_ssl.groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
+    engine_ssl.ciphers = MQVPN_TLS_CIPHERS;
+    engine_ssl.groups = MQVPN_TLS_GROUPS;
 
     xqc_engine_callback_t engine_cbs = {
         .set_event_timer = cb_set_event_timer,

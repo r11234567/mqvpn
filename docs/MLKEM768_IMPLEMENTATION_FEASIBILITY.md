@@ -1,3 +1,8 @@
+> Historical investigation. Current behavior and validation are documented in
+> [the README](../README.md#post-quantum-key-exchange-x25519mlkem768).
+> In particular, the current build supports the hybrid group, and BoringSSL
+> does not honor custom TLS 1.3 cipher ordering.
+
 # X25519MLKEM768 Implementation Feasibility Report
 
 ## Executive Summary

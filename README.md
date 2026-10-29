@@ -98,18 +98,18 @@ implemented and tested. Do not infer fork status from an old commit alone.
 | H3-to-h2c backpressure and Priority | **Fork-only, corrected after field deadlock, lossy-path starvation, and a throughput ceiling** | ~~256/128 KiB connection queue watermarks were tracked per stream and paused the shared h2c socket.~~ ~~**Replaced:** the watermarks now form one state machine per downstream QUIC connection.~~ **Replaced again:** the watermarks were the deadlock. They were fed an estimate that counted packets in flight, and a connection running at its bandwidth-delay product holds a congestion window of those continuously, so on a fast path the gate never reopened — the larger the response, the more certainly it latched. Pacing is now per stream and comes from xquic: mqvpn writes until `xqc_h3_request_send_body` returns a short write or `-XQC_EAGAIN`, keeps the write notification armed while a response waits, and is resumed directly by the acknowledgement that releases queue space. ~~Each connection admits at most one 16 KiB body chunk per stream per pass.~~ **Removed:** that quota capped one response at a slice per server tick, because a fully accepted write also drops a stream from writable scheduling and left nothing to re-arm the notification. A round-robin cursor still gives every response a turn, and `xqc_h3_request_get_unsent_queue_bytes` remains as a 1 MiB per-connection *memory* valve that cannot latch. The shared h2c fd stays readable: nghttp2 connection credit is returned after copying into the bounded response buffer, stream credit only after xquic accepts those bytes. The 50 ms event-loop clamp is a safety net for xquic suppressing notification under `DATA_BLOCKED`, not the recovery path. RFC 9218 `Priority` mapping and xquic's urgent packet queue remain. Pushback, valve, and fair-recovery coverage is in `tests/test_h2_proxy.c`. |
 | Hybrid TCP-lane uplink backpressure | **Fork-only, requires pinned xquic API** | `src/hybrid/tcp_lane_uplink.c` stops granting lwIP receive credit when either xquic returns EAGAIN/partial or its connection-wide **un-sent** byte estimate reaches 256 KiB. Credit resumes only after the local retry queue is empty and xquic drains to 64 KiB. Packets in flight are outside that estimate on purpose — counting them made the same gate latch closed on fast paths, which is what broke the H3 proxy above. The xquic boundary wrappers live in `src/mqvpn_client.c`; full-accept, pre-send-high-water, and repeated-EAGAIN regressions are pinned in `tests/test_tcp_lane.c`; memory accounting is in `docs/hybrid_h2_memory_budget.md`. |
 | ~~Unbounded Hybrid server egress read per reactor grant~~ | ~~Fork-only~~ **Synchronized from upstream ([mp0rta/mqvpn#349](https://github.com/mp0rta/mqvpn/pull/349); fixes [#348](https://github.com/mp0rta/mqvpn/issues/348))** | `src/hybrid/tcp_egress.c` limits each readable dispatch to a 64 KiB, whole-chunk budget so one busy TCP flow yields to its peers without disarming the level-triggered read event. `tests/test_tcp_egress.c` pins the exact first-dispatch budget and verifies that a later dispatch drains the remainder without manual re-arming. This is server-side reactor fairness; it complements rather than replaces the client-side xquic/lwIP backpressure above. |
-| Windows WFP cleanup lifecycle ([upstream #331](https://github.com/mp0rta/mqvpn/issues/331)) | **Fork-only** | `src/platform/windows/firewall.c` uses a dynamic WFP session for crash cleanup and, on normal exit or reconnect, deletes every tracked filter before its referenced sublayer. Cleanup failures are returned instead of logging a false success; reconnect then stops rather than stacking another ruleset. `tests/test_windows_firewall.c` pins deletion order, idempotent not-found handling, best-effort continuation, and retained retry state after an engine-close failure. |
+| Windows WFP cleanup lifecycle | **Upstream lifecycle + fork scoping** | The dynamic WFP session owns all filters and removes them when closed. Server permits match the mqvpn executable, UDP, and the exact endpoint. `tests/test_windows_firewall.c` is registered in the Windows test branch and checks session lifetime, failure handling and permit conditions. |
 | Windows kill-switch teardown and interface-bound leak protection ([upstream #330](https://github.com/mp0rta/mqvpn/issues/330), [#331](https://github.com/mp0rta/mqvpn/issues/331)) | **Leak protection fork-only; teardown synchronized from upstream ([mp0rta/mqvpn#356](https://github.com/mp0rta/mqvpn/pull/356))** | Windows split-default routes cannot redirect applications that select a physical interface with `IP_UNICAST_IF`/`IPV6_UNICAST_IF`, so the explicit `KillSwitch` is the protection boundary: its unconditional ALE block also covers interface-bound sockets, while the transport exception is restricted to the current mqvpn executable, UDP, and the configured server endpoint. ~~Teardown deleted each filter by ID and then the sublayer before closing the engine, and retried `FwpmEngineClose0` on a handle whose close had already failed.~~ **Replaced by upstream's design:** the dynamic session owns the objects, so closing the engine is the whole teardown and BFE also covers a crash or a kill; a failed close is terminal because a WFP engine handle is an RPC context handle whose post-failure state is undefined, so mqvpn records it, refuses to stack a second session over the stale one, and drives the process to exit. Policy-shape and teardown tests live in `tests/test_windows_firewall.c`; the operator contract is in `docs/windows_build.md` and the configuration guide. |
 | Android native logs | **Fork-only, retained** | JNI Logcat output, `onNativeLog`, and the app log view are intentionally retained across upstream syncs; see `docs/logging.md`. |
-| Hybrid TCP lane, reorder buffering, multipath recovery, route/killswitch hardening | **Fork-only** | Indexed by their public config sections below and covered by the corresponding `tests/test_*`, `scripts/ci_e2e/*`, and platform routing tests. |
+| Hybrid TCP lane, reorder buffering, multipath recovery, route/killswitch hardening | **Upstream baseline + independent fork increments** | Preserve the current upstream sans-I/O transport, Native Reactor, PMTUD and yyjson implementations. Keep the proxy, backpressure, platform scoping and benchmark increments indexed here. |
 | ~~xquic var-buffer underflow and submatrix overflow patch files~~ | ~~Local patch stack~~ **Synchronized into the pinned xquic fork** | Replaced by xquic commit `2ae918c`; the obsolete duplicate patch hunks must not be restored. |
 | ~~xquic active_connection_id_limit backport~~ | ~~`patches/xquic/0001-*`~~ **Synchronized upstream; local patch removed** | The new xquic pin already contains the exact RFC 9000 peer-CID accounting fix, confirmed by reverse-applying the former patch. |
-| xquic parser/allocation CodeQL hardening | **Local patch retained** | `patches/xquic/0002-*` still applies cleanly and covers null checks, bounds checks, and failure cleanup not present in the pin. |
-| xquic STREAM multipath scheduling | **Local patch retained** | `patches/xquic/0003-*` keeps stream packets on WLB's unpinned per-packet path so the hybrid TCP lane can aggregate links. |
-| ~~xquic fork-local WLB flow placement and recovery~~ | ~~Fork-only~~ **Synchronized from [mp0rta/xquic#71](https://github.com/mp0rta/xquic/pull/71); replaced** | The pinned xquic now uses acknowledged-goodput weights, independent smooth deficits for flow placement and packet scheduling, topology refresh, blackhole eviction, and bounded recovery probes. The upstream series deliberately keeps STREAM/control traffic on MinRTT; mqvpn's retained `0003-*` patch is the documented hybrid-mode override. Tests and implementation paths are indexed below. |
+| xquic parser/allocation CodeQL hardening | **Pinned dependency source** | The remaining defensive checks from the former `0002` overlay are now in the pinned xquic commit; upstream early-list initialization is retained. No workflow applies source patches. |
+| xquic STREAM multipath scheduling | **Upstream MinRTT** | The obsolete `0003` WRR overlay is removed. STREAM uses the measured upstream MinRTT fallback; WLB remains the datagram scheduler. |
+| xquic WLB flow placement and recovery | **Upstream design with retained fork fixes** | Acknowledged-goodput weights, independent flow/packet deficits, topology refresh and bounded recovery come from upstream. STREAM/control stays on MinRTT. Fork recovery and observability fixes remain in the pinned source. |
 | ~~xquic fixed STREAM reassembly-node limit~~ | ~~Fork-only mitigation~~ **Synchronized from [mp0rta/xquic#71](https://github.com/mp0rta/xquic/pull/71); replaced** | The stronger two-tier budget admits a dense 16 MiB receive window while rejecting sparse-node amplification: 8192 sparse nodes, a 256-byte/node density floor, a 32768 hard ceiling, and a reserved prefix slot for retransmission progress. |
 | xquic Retry sizing, PMTU, receive-buffer, WLB and TLS hardening | **Pinned xquic fork** | The detailed commit-to-fix map remains in [End-to-end fixes carried in the pinned xquic](#end-to-end-fixes-carried-in-the-pinned-xquic). |
-| Rolling binaries from `main` | **Fork-only** | `.github/workflows/release.yml` updates the `snapshot` prerelease only after Linux, macOS, Windows, and Android builds succeed; tagged releases remain immutable. |
+| Rolling native binaries from `main` | **Fork-only** | `.github/workflows/release.yml` updates the native `snapshot` prerelease after platform builds succeed. Native binaries carry a commit-derived version suffix. Canonically signed Android releases remain tag-only; ephemeral Android test APKs stay in workflow artifacts. |
 
 ### Client certificate verification against the OS trust store
 
@@ -176,28 +176,23 @@ rules, an nginx example, the security properties, and the current limitations.
 
 ### Post-quantum key exchange (X25519MLKEM768)
 
-Both ends request hybrid ML-KEM-768 by default. It is compiled in rather than
-exposed as a config key; these two lines are identical in `src/mqvpn_client.c`
-and `src/mqvpn_server.c`:
+Both ends use the shared policy in `src/tls_policy.h`. Hybrid ML-KEM-768
+is first, followed by X25519 and the supported classical curves. A peer that
+only offers X25519 can still connect. `tests/test_tls_policy.c` checks both
+normal negotiations against the pinned BoringSSL, and the core loopback tests
+exercise the policy through xquic.
 
-```c
-/* Prioritize AES-256-GCM for stronger encryption */
-engine_ssl.ciphers =
-    "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256";
-/* Enable post-quantum key exchange with X25519MLKEM768 */
-engine_ssl.groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
-```
+BoringSSL chooses its own TLS 1.3 cipher preference order. Its xquic adapter
+ignores the cipher-order string, so this build does **not** guarantee AES-256
+priority. AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 remain available under
+BoringSSL's negotiation policy.
 
-ML-KEM-768 is listed first with the classical curves behind it, so a peer that
-does not offer it still negotiates X25519 — turning this on does not cut off
-older clients or servers.
-
-ML-KEM-768's 1184-byte key share breaks assumptions the transport was built on,
-so it needs these supporting settings to work at all:
+ML-KEM-768's large key share relies on the current packet-size handling and
+Retry header reserve. PMTUD is optional and follows the upstream configuration:
 
 | Setting | Value | Where |
 |---|---|---|
-| `enable_pmtud` | `1` | `src/mqvpn_conn_settings.c:131` |
+| `enable_pmtud` | Off by default; `0x3` (probe + blackhole recovery) when enabled | `src/mqvpn_conn_settings.c` |
 | `MQVPN_MAX_PKT_OUT_SIZE` | `1400` | `src/mqvpn_internal.h:40` |
 | `XQC_QUIC_MIN_MSS` / `XQC_QUIC_MAX_MSS` | `1200` / `1420` | xquic `src/transport/xqc_packet.h` |
 | `XQC_PACKET_OUT_HDR_GROWTH` | 277-byte reserve | xquic `src/transport/xqc_packet_out.h` |

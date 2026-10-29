@@ -16,6 +16,7 @@
 #ifdef _WIN32
 #  include "platform_windows.h"
 #  include <winsock2.h>
+#  include <windows.h>
 #elif defined(__APPLE__)
 #  include "platform_darwin.h"
 #  include "status.h"
@@ -133,6 +134,11 @@ parse_mtu_arg(const char *opt, const char *str, int *out)
 int
 main(int argc, char *argv[])
 {
+#ifdef _WIN32
+    /* Logs and configuration strings are UTF-8; redirected streams keep
+     * their raw UTF-8 bytes, while an attached console needs this code page. */
+    SetConsoleOutputCP(CP_UTF8);
+#endif
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {

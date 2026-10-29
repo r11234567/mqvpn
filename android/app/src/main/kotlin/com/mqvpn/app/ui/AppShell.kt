@@ -64,6 +64,7 @@ fun AppShell(vm: MqvpnViewModel, settingsVm: SettingsViewModel, nav: NavHostCont
         composable("reorderDetail") { ReorderDetailScreen(settingsVm, onBack = { nav.popBackStack() }) }
         composable("redundantDetail") { RedundantDetailScreen(settingsVm, onBack = { nav.popBackStack() }) }
         composable("hybridDetail") { HybridDetailScreen(settingsVm, onBack = { nav.popBackStack() }) }
+        composable("logs") { LogScreen(onNavigateUp = { nav.popBackStack() }) }
     }
 }
 

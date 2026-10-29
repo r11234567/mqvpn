@@ -2,8 +2,13 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
   workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 # Actions in this workflow — and in android-repro.yml, which it calls — are
 # pinned to commit SHAs with the version in a trailing comment; ci.yml
@@ -63,32 +68,19 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Verify tag matches CMake version
+      - name: Verify pinned xquic source
         shell: bash
-        run: |
-          # Use sed (BRE) instead of `grep -oP` because Git for Windows' grep
-          # rejects -P with the runner's default locale ("supports only unibyte
-          # and UTF-8 locales"). sed avoids the PCRE dependency entirely.
-          CMAKE_VERSION=$(sed -n 's/^project(mqvpn VERSION \([0-9.][0-9.]*\).*/\1/p' CMakeLists.txt)
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            TAG_VERSION="${GITHUB_REF_NAME#v}"
-            # Skip the strict tag/CMake match for SemVer pre-release tags
-            # (e.g. v0.4.0-beta1) — CMake project(VERSION) only accepts
-            # numeric x.y.z, so the suffix is intentionally not in CMake.
-            if [[ "$TAG_VERSION" == *-* ]]; then
-              echo "Pre-release tag $TAG_VERSION — skipping strict version match"
-            elif [ "$TAG_VERSION" != "$CMAKE_VERSION" ]; then
-              echo "ERROR: Tag $TAG_VERSION != CMakeLists.txt $CMAKE_VERSION"
-              exit 1
-            fi
-          fi
-          echo "VERSION=$CMAKE_VERSION" >> "$GITHUB_ENV"
+        run: bash scripts/check_xquic_pin.sh
+
+      - name: Resolve build version
+        shell: bash
+        run: bash scripts/resolve_build_version.sh >> "$GITHUB_ENV"
 
       - name: Install dependencies
         if: matrix.os == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev golang iptables
+          sudo apt-get install -y cmake libevent-dev golang iptables libnghttp2-dev pkg-config
 
       - name: Build BoringSSL
         if: matrix.os == 'linux'
@@ -126,6 +118,7 @@ jobs:
           cmake -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX=/usr \
                 -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
+                -DMQVPN_VERSION_SUFFIX="$VERSION_SUFFIX" \
                 -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
           make -j$(nproc)
 
@@ -253,6 +246,7 @@ jobs:
                 -DXQUIC_BUILD_DIR="$GITHUB_WORKSPACE/third_party/xquic/build" \
                 -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
                 -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
+                -DMQVPN_VERSION_SUFFIX="$VERSION_SUFFIX" \
                 -DEVENT_LIB="$(brew --prefix libevent)/lib/libevent.a"
           cmake --build build -j "$(sysctl -n hw.ncpu)"
 
@@ -456,6 +450,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=${{ matrix.arch == 'amd64' && 'x64-windows-static' || 'arm64-windows-static' }} `
             -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON `
+            -DMQVPN_VERSION_SUFFIX="$env:VERSION_SUFFIX" `
             -DBUILD_TESTING=OFF ..
           cmake --build . --config Release
 
@@ -603,10 +598,12 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Resolve version from CMakeLists.txt
-        run: |
-          CMAKE_VERSION=$(sed -n 's/^project(mqvpn VERSION \([0-9.][0-9.]*\).*/\1/p' CMakeLists.txt)
-          echo "VERSION=$CMAKE_VERSION" >> "$GITHUB_ENV"
+      - name: Verify pinned xquic source
+        shell: bash
+        run: bash scripts/check_xquic_pin.sh
+
+      - name: Resolve build version
+        run: bash scripts/resolve_build_version.sh >> "$GITHUB_ENV"
 
       - name: Install pinned NDK
         id: ndk
@@ -939,3 +936,74 @@ jobs:
             scripts/install.sh \
             LICENSE \
             NOTICE
+
+  publish-snapshot:
+    if: github.ref == 'refs/heads/main'
+    needs: [build-release, build-android]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          shopt -s nullglob
+          files=(mqvpn_*.tar.gz mqvpn_*.deb mqvpn_*.zip)
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no snapshot artifacts"; exit 1; }
+          sha256sum "${files[@]}" > SHA256SUMS
+
+      - name: Publish rolling snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          [ "$latest" = "$GITHUB_SHA" ] || {
+            echo "main advanced to $latest; refusing to publish stale snapshot $GITHUB_SHA"
+            exit 0
+          }
+
+          # Recompute the snapshot version exactly as the build jobs did, so
+          # the release title names the version stamped into the assets
+          # instead of only the commit.
+          cmake_version=$(sed -n 's/^project(mqvpn VERSION \([0-9.][0-9.]*\).*/\1/p' CMakeLists.txt)
+          commit_date=$(git show -s --format=%cd --date=format:%Y%m%d "$GITHUB_SHA")
+          short_sha=${GITHUB_SHA:0:12}
+          version="${cmake_version}+snapshot.${commit_date}.g${short_sha}"
+          notes=$(printf '%s\n' \
+            "Automated prerelease from main at $GITHUB_SHA." \
+            "" \
+            "Version \`$version\`. Native assets carry that version, so a snapshot is never mistaken for the \`v${cmake_version}\` release; the \`+\` also makes dpkg sort it after that release." \
+            "" \
+            "Native assets are replaced after each successful main build." \
+            "Android test APKs remain workflow artifacts with an ephemeral signing key; installable signed Android releases are published from v* tags.")
+          if gh release view snapshot >/dev/null 2>&1; then
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/git/refs/tags/snapshot" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+            gh release edit snapshot \
+              --title "mqvpn snapshot $version" \
+              --notes "$notes" \
+              --prerelease
+          else
+            gh release create snapshot \
+              --target "$GITHUB_SHA" \
+              --title "mqvpn snapshot $version" \
+              --notes "$notes" \
+              --prerelease
+          fi
+
+          shopt -s nullglob
+          assets=(artifacts/mqvpn_*.tar.gz artifacts/mqvpn_*.deb \
+                  artifacts/mqvpn_*.zip \
+                  artifacts/SHA256SUMS scripts/install.sh LICENSE NOTICE)
+          gh release upload snapshot --clobber "${assets[@]}"

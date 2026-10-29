@@ -34,12 +34,6 @@ jobs:
             exit 1
           fi
 
-      # A UTF-8 character in a printed string is mojibake on a non-UTF-8
-      # console, and the log line it lands in can end up half-readable: the
-      # interface name comes from a Win32 API already in the console codepage
-      # while our own literal does not. See the script header.
-      - name: Check log strings are ASCII
-        run: python3 scripts/lint/check_log_string_ascii.py
 
   build:
     # Cache key conventions for BoringSSL / xquic / libevent-msan in this
@@ -54,9 +48,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Install dependencies
         # A stuck mirror otherwise eats the whole job timeout.
@@ -116,7 +110,7 @@ jobs:
           # v5: libxquic.so statically absorbs BoringSSL (hidden-visibility
           # symbols), so a cached xquic build outlives a BoringSSL flag change
           # unless this key moves with it.
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v5
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-v5
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -177,6 +171,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      - name: Verify pinned xquic source
+        shell: bash
+        run: bash scripts/check_xquic_pin.sh
 
       # qemu-user-binfmt lets tests that exec the ARM mqvpn binary run too.
       - name: Install dependencies
@@ -289,9 +287,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Install dependencies
         # A stuck mirror otherwise eats the whole job timeout.
@@ -336,7 +334,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v4
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-v4
 
       - name: Build xquic (clang)
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -376,11 +374,9 @@ jobs:
                 -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
           make -j$(nproc) fuzz_tcp_lane fuzz_control_dispatch
 
-      # Runs alongside the netns e2e steps below (one core, in-process, no
-      # sockets or files outside build-fuzz); "Wait for fuzz" collects it.
+      # Run as a normal Actions step so its exit status gates the job.
       - name: Fuzz tcp_lane (short budget)
         id: fuzz
-        background: true
         run: |
           cd build-fuzz
           ASAN_OPTIONS=abort_on_error=1 \
@@ -618,19 +614,6 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: sudo -E scripts/ci_e2e/run_setup_abort_exit_test.sh
 
-      - name: Wait for fuzz
-        wait: fuzz
-
-      # The abort path reaches exit() for the first time, so this is where the
-      # sanitizers get to see it. The client under test exits non-zero by
-      # design; the suite keeps it away from stop_and_check_sanitizer and
-      # asserts the status and the absence of sanitizer reports itself.
-      - name: E2E setup-abort exit test (netns)
-        env:
-          ASAN_OPTIONS: detect_leaks=1
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: sudo -E scripts/ci_e2e/run_setup_abort_exit_test.sh
-
   msan:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -639,9 +622,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Install dependencies
         # A stuck mirror otherwise eats the whole job timeout.
@@ -709,7 +692,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-msan-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v4
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-msan-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-v4
 
       - name: Build xquic (clang + MSan)
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -880,9 +863,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Install libevent
         run: brew install libevent
@@ -925,7 +908,7 @@ jobs:
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
           # v2: bumped with the BoringSSL cache — see the linux-build job.
-          key: xquic-${{ steps.xqsha.outputs.sha }}-darwin-arm64-clang-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v2
+          key: xquic-${{ steps.xqsha.outputs.sha }}-darwin-arm64-clang-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-v2
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -1040,9 +1023,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       # Newest installed toolchain, deterministically — the image default can
       # lag behind what the generated project format requires (>= 16.3).
@@ -1095,7 +1078,7 @@ jobs:
           path: |
             third_party/xquic/build-ios
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-ios-arm64-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v2
+          key: xquic-${{ steps.xqsha.outputs.sha }}-ios-arm64-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-v2
 
       - name: Build xquic (iOS)
         if: steps.xquic-ios-cache.outputs.cache-hit != 'true'
@@ -1134,9 +1117,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -1205,7 +1188,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-windows-msvc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v5
+          key: xquic-${{ steps.xqsha.outputs.sha }}-windows-msvc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-v5
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -1314,9 +1297,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Compute NDK cache key
         id: ndk-cache-key
@@ -1407,6 +1390,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      - name: Verify pinned xquic source
+        shell: bash
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Compute NDK cache key (x86_64)
         id: ndk-cache-key
@@ -1522,9 +1509,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Install dependencies
         # A stuck mirror otherwise eats the whole job timeout.
@@ -1568,7 +1555,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v4
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-v4
 
       - name: Build xquic (clang)
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -1644,9 +1631,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Install dependencies
         # A stuck mirror otherwise eats the whole job timeout.
@@ -1690,7 +1677,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v4
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-v4
 
       - name: Build xquic (clang)
         if: steps.xquic-cache.outputs.cache-hit != 'true'

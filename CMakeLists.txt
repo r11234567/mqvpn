@@ -49,6 +49,8 @@ message(STATUS "mqvpn build version: ${MQVPN_FULL_VERSION}")
 option(XQUIC_BUILD_DIR "Path to pre-built xquic build directory" "")
 option(ENABLE_SANITIZERS "Enable ASan + UBSan" OFF)
 option(ENABLE_MSAN "Enable MemorySanitizer" OFF)
+option(MQVPN_ENABLE_PROXY_E2E_TESTS
+       "Register proxy integration tests (requires nginx, xquic test_client and root)" OFF)
 option(MQVPN_DEBUG_QOS_OVERRIDE
        "Enable MQVPN_DGRAM_QOS_OVERRIDE env var for FEC ablation testing — debug only"
        OFF)
@@ -1527,6 +1529,15 @@ if(BUILD_TESTING)
     set_target_properties(test_xquic_abi_pin PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_xquic_abi_pin COMMAND test_xquic_abi_pin)
 
+    add_executable(test_tls_policy tests/test_tls_policy.c)
+    target_include_directories(test_tls_policy PRIVATE src ${BORINGSSL_INCLUDE_DIR})
+    target_compile_definitions(test_tls_policy PRIVATE
+        TEST_CERT_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.crt"
+        TEST_KEY_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.key")
+    target_link_libraries(test_tls_policy ${SSL_LIB} ${CRYPTO_LIB} stdc++ pthread)
+    set_target_properties(test_tls_policy PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_test(NAME test_tls_policy COMMAND test_tls_policy)
+
     add_executable(test_conn_settings tests/test_conn_settings.c)
     target_link_libraries(test_conn_settings mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} dl m stdc++)
     target_include_directories(test_conn_settings PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR})
@@ -1557,9 +1568,15 @@ if(BUILD_TESTING)
         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/test_nat_config.sh
             $<TARGET_FILE:mqvpn-nat-config> ${CMAKE_SOURCE_DIR}/scripts/mqvpn-server-nat.sh)
 
-    if(MQVPN_ENABLE_H2_PROXY)
+    if(MQVPN_ENABLE_PROXY_E2E_TESTS)
+        if(NOT MQVPN_ENABLE_H2_PROXY)
+            message(FATAL_ERROR "MQVPN_ENABLE_PROXY_E2E_TESTS requires nghttp2")
+        endif()
         add_test(NAME test_h2_proxy_protocol
             COMMAND bash ${CMAKE_SOURCE_DIR}/tests/test_h2_proxy_protocol.sh $<TARGET_FILE:mqvpn>)
+        set_tests_properties(test_h2_proxy_protocol PROPERTIES
+            ENVIRONMENT "XQUIC_CLIENT=${XQUIC_BUILD_DIR}/tests/test_client"
+            LABELS integration)
     endif()
 
     # Exit-at-CLOSED shell test (runs the built mqvpn binary). Needs no root,

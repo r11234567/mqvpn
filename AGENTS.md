@@ -25,7 +25,7 @@ rules belong here, reasons there.
 - `src/bind/`, `include/mqvpn_bind_{posix,winsock}.h` — bundled transports
 - `src/platform/{linux,windows,darwin,android,posix}/` — platform layers
 - `src/hybrid/` — hybrid TCP lane on lwIP
-- `third_party/xquic` — fork `mp0rta/xquic`, branch `mqvpn-main`;
+- `third_party/xquic` — fork `r11234567/xquic`, long-term branch `main`;
   `third_party/lwip` — fork `mp0rta/heiher-lwip`, branch `mqvpn-main`
   (`git submodule update --init --recursive` after checkout)
 - `third_party/yyjson` — vendored yyjson 0.13.0 (JSON parse/serialize;
@@ -128,13 +128,15 @@ rules belong here, reasons there.
 - A bug-fix branch starts from the tip of the branch where the bug was
   found; decide the base per fix. [DD §11]
 - A submodule bump PR names the fork PR or tag it comes from; the commit must
-  be on the fork's `mqvpn-main`.
+  be published by the named dependency PR before the parent PR is pushed.
+  Merge the dependency PR first; until then its head is available on the PR
+  branch and `main` is only the long-term tracking branch.
 - In the xquic fork, `include/xquic/xqc_configure.h` is cmake-generated into
   the source tree: stage files explicitly (never `git add -A`), and any CI
   cache of the xquic build must include that header.
-- xquic fork branches: `mqvpn-main` (pinned; tags `mqvpn-vX.Y.Z`),
-  `mqvpn-dev` (integration), `main` (pure upstream mirror). Upstream is
-  tracked by full merges, not cherry-picks, so every line of fork-local
+- This fork uses xquic `main` as its maintained product branch; upstream's
+  `mqvpn-main`/`mqvpn-dev` layout is not the downstream branch layout.
+  Upstream is tracked by full merges, not cherry-picks, so every line of fork-local
   divergence is re-paid at every merge: prefer a fix that can land upstream,
   then one confined to files upstream rarely touches. [DD §12]
 

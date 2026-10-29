@@ -52,6 +52,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Verify pinned xquic source
+        shell: bash
+        run: bash scripts/check_xquic_pin.sh
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -121,7 +125,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-perf-v1
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-perf-v1
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'

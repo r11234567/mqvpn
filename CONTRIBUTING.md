@@ -44,6 +44,12 @@ CC=clang cmake -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON \
 ctest --output-on-failure
 ```
 
+The nginx/HTTP3 PROXY-protocol integration test runs separately in
+`h2-proxy-protocol.yml`; it needs nginx, xquic's `test_client`, and root/TUN
+access. To include it in a prepared local CTest run, configure with
+`-DMQVPN_ENABLE_PROXY_E2E_TESTS=ON`. Normal H2 unit tests remain in the default
+suite whenever nghttp2 is installed.
+
 Formatting is checked with clang-format 18.1.3 exactly; `mise install` pins
 it, or `pipx install clang-format==18.1.3` without mise. When the
 `format-check` job fails, the CI log prints the command that fixes it.

@@ -9,6 +9,7 @@
 
 #include "libmqvpn.h"
 #include "mqvpn_internal.h"
+#include "tls_policy.h"
 #include "mqvpn_scheduler.h"
 #include "mqvpn_sched_names.h"
 #include "mqvpn_server_internal.h"
@@ -749,10 +750,11 @@ cb_xqc_log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *user_d
      * relabelled as INFO. Don't symmetrize the two. */
     mqvpn_log_level_t ml;
     switch (lvl) {
-    case XQC_LOG_REPORT:
     case XQC_LOG_FATAL:
     case XQC_LOG_ERROR: ml = MQVPN_LOG_ERROR; break;
     case XQC_LOG_WARN: ml = MQVPN_LOG_WARN; break;
+    /* REPORT carries routine connection summaries, like STATS. */
+    case XQC_LOG_REPORT:
     case XQC_LOG_STATS:
     case XQC_LOG_INFO: ml = MQVPN_LOG_INFO; break;
     case XQC_LOG_DEBUG:
@@ -2549,8 +2551,8 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
     memset(&engine_ssl, 0, sizeof(engine_ssl));
     engine_ssl.private_key_file = cfg->tls_key[0] ? (char *)cfg->tls_key : NULL;
     engine_ssl.cert_file = cfg->tls_cert[0] ? (char *)cfg->tls_cert : NULL;
-    engine_ssl.ciphers = XQC_TLS_CIPHERS;
-    engine_ssl.groups = XQC_TLS_GROUPS;
+    engine_ssl.ciphers = MQVPN_TLS_CIPHERS;
+    engine_ssl.groups = MQVPN_TLS_GROUPS;
 
     xqc_engine_callback_t engine_cbs = {
         .set_event_timer = cb_set_event_timer,
@@ -2699,9 +2701,19 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
 
 #ifndef _WIN32
     if (svr_sni_router_init(s) != 0) goto cleanup;
+#else
+    if (s->config.proxy_enabled) {
+        LOG_E(s, "[Proxy] is not supported by the Windows platform reactor");
+        goto cleanup;
+    }
 #endif
 #ifdef MQVPN_H2_PROXY_ENABLED
     if (s->config.proxy_enabled && svr_h2_proxy_init(s) != 0) goto cleanup;
+#else
+    if (s->config.proxy_enabled) {
+        LOG_E(s, "[Proxy] requires a build with nghttp2 support");
+        goto cleanup;
+    }
 #endif
     return s;
 
@@ -2911,7 +2923,9 @@ mqvpn_server_on_socket_recv(mqvpn_server_t *s, const uint8_t *pkt, size_t len,
 
 #ifndef _WIN32
     if (s->sni_router) {
-        return sni_router_process(s->sni_router, pkt, len, peer, peer_len);
+        sni_route_result_t route =
+            sni_router_process(s->sni_router, pkt, len, peer, peer_len);
+        return route == SNI_ROUTE_ERROR ? MQVPN_ERR_ENGINE : MQVPN_OK;
     }
 #endif
     return svr_process_xquic(s, pkt, len, peer, peer_len);

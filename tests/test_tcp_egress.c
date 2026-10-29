@@ -1329,7 +1329,7 @@ probe_report_timeout(const harness_t *h, const char *awaiting, int budget_ms)
      * stream the peer reset while xquic still holds it on its 3x-max_pto
      * close linger — not a stall. */
     TDIAG("  status seen : \"%s\"  closing_err=%ld", p->status, p->closing_err);
-    mqvpn_bind_posix_stats_t svr_stats = { .struct_size = sizeof(svr_stats) };
+    mqvpn_bind_posix_stats_t svr_stats = {.struct_size = sizeof(svr_stats)};
     mqvpn_bind_posix_server_get_stats(h->svr_tctx, &svr_stats);
     TDIAG("  cli -> svr  : %llu datagrams / %llu bytes sent, %llu datagrams arrived",
           (unsigned long long)p->tx_datagrams, (unsigned long long)p->tx_bytes,

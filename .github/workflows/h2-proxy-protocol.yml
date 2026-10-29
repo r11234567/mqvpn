@@ -16,9 +16,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Install dependencies
         run: |
@@ -60,7 +60,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-h3-client-v2
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-h3-client-v2
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
