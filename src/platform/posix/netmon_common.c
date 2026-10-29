@@ -648,7 +648,7 @@ recover_dropped_paths_cb(evutil_socket_t fd, short what, void *arg)
              * only the Linux rendering is covered today. */
             if (s->route_gate_blocked++ % 10 == 0)
                 LOG_WRN("%s: %s has a usable address but no route to "
-                        "the server — re-add deferred until a route appears",
+                        "the server -- re-add deferred until a route appears",
                         netmon_log_tag, ifname);
             continue;
         }

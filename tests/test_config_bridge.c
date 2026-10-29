@@ -76,6 +76,8 @@ test_all_fields_forwarded(void)
     cfg.tun_mtu = 1400;
     cfg.path_mtu = 1492;
     cfg.pmtud = 1;
+    cfg.tun_txqueuelen = 1234;
+    cfg.tun_read_batch = 321;
     cfg.reorder.max_wait_ms = 33; /* spot-check: apply_reorder ran */
     cfg.hybrid.enabled = 1;       /* spot-check: apply_hybrid ran */
     cfg.hybrid.tcp_max_flows = 77;
@@ -113,6 +115,8 @@ test_all_fields_forwarded(void)
     ASSERT_EQ_INT(lc->tun_mtu, 1400, "tun_mtu");
     ASSERT_EQ_INT(lc->path_mtu, 1492, "path_mtu");
     ASSERT_EQ_INT(lc->pmtud, 1, "pmtud");
+    ASSERT_EQ_INT(lc->tun_txqueuelen, 1234, "tun_txqueuelen");
+    ASSERT_EQ_INT(lc->tun_read_batch, 321, "tun_read_batch");
     ASSERT_EQ_INT(lc->reorder.mode, cfg.reorder.mode, "reorder.mode bridged");
     ASSERT_EQ_INT(lc->reorder.max_wait_ms, 33, "reorder.max_wait_ms bridged");
     ASSERT_EQ_INT(lc->hybrid.enabled, 1, "hybrid.enabled bridged");
@@ -154,9 +158,9 @@ test_defaults_and_fallbacks(void)
     ASSERT_EQ_INT(lc->multipath, 0, "multipath (n_paths=1)");
     ASSERT_EQ_INT(lc->scheduler, MQVPN_SCHED_MINRTT, "scheduler fallback");
     ASSERT_EQ_INT(lc->reconnect_interval_sec, 5, "reconnect interval default 5");
-    ASSERT_EQ_INT(lc->tls_server_name[0], '\0', "tls_server_name NULL → unset");
-    ASSERT_EQ_INT(lc->auth_key[0], '\0', "auth_key NULL → unset");
-    ASSERT_EQ_INT(lc->recv_rate_limit, rrl_default, "recv_rate_limit 0 → untouched");
+    ASSERT_EQ_INT(lc->tls_server_name[0], '\0', "tls_server_name NULL -> unset");
+    ASSERT_EQ_INT(lc->auth_key[0], '\0', "auth_key NULL -> unset");
+    ASSERT_EQ_INT(lc->recv_rate_limit, rrl_default, "recv_rate_limit 0 -> untouched");
 
     /* remaining scheduler codepoints */
     cfg.scheduler = 1;

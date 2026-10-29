@@ -28,10 +28,7 @@ for patch_file in "${patches[@]}"; do
         continue
     fi
 
-    if git -C "$xquic_dir" apply --check "$patch_file" >/dev/null 2>&1; then
-        git -C "$xquic_dir" apply "$patch_file"
-        echo "applied xquic patch: ${patch_file##*/}"
-    else
-        echo "skipping patch that cannot be applied cleanly: ${patch_file##*/}"
-    fi
+    git -C "$xquic_dir" apply --check "$patch_file"
+    git -C "$xquic_dir" apply "$patch_file"
+    echo "applied xquic patch: ${patch_file##*/}"
 done

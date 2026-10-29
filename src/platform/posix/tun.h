@@ -37,7 +37,17 @@ int mqvpn_tun_set_addr(mqvpn_tun_t *tun, const char *addr, const char *peer_addr
 int mqvpn_tun_set_mtu(mqvpn_tun_t *tun, int mtu);
 
 /* Set the TUN device's transmit queue length, in packets.
- * Linux only; a no-op returning 0 elsewhere. */
+ *
+ * This is the ring a packet lands in on its way OUT of the tunnel, and the
+ * kernel default of 500 is shallow for bursty small-packet traffic: a game
+ * server broadcasting on a 10 Hz tick delivers a whole tick's worth in a few
+ * milliseconds, and anything past 500 in that window is dropped with
+ * tx_dropped and no other trace. Measured (run 34084331771): 1707 packets per
+ * tick lost 23-49% here while the qdisc dropped nothing and the emulated
+ * network dropped nothing.
+ *
+ * Linux only; a no-op returning 0 elsewhere, since the concept is
+ * netdev-specific. */
 int mqvpn_tun_set_txqueuelen(mqvpn_tun_t *tun, int qlen);
 
 /* Bring the TUN interface up. */

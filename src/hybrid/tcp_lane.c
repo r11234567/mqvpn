@@ -1265,6 +1265,7 @@ void
 mqvpn_tcp_lane_bind_h3_request(void *flow_handle, void *h3_request, void *stream)
 {
     mqvpn_tcp_flow_t *f = (mqvpn_tcp_flow_t *)flow_handle;
+    // codeql[cpp/stack-address-escape] xquic owns this handle for the stream lifetime
     f->h3_request = h3_request;
     flow_set_stream(f->lane, f, stream);
     /* Stay PENDING_STREAM: the request is sent but no response has arrived.
@@ -1450,6 +1451,7 @@ mqvpn_tcp_lane_lwip_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
         return ERR_MEM;
     }
 
+    // codeql[cpp/stack-address-escape] lwIP owns newpcb until its close callback
     f->pcb = newpcb;
     f->target_ip = newpcb->local_ip; /* whole union: family + address */
     f->target_port = newpcb->local_port;

@@ -591,7 +591,7 @@ test_rx_timeout_skip_rearms_when_nonempty(void)
     ASSERT_EQ_INT(f->expected, 3, "expected jumped to 3 (past skip)");
     ASSERT_TRUE(f->gap_timer_active, "rearmed (buffer still non-empty)");
     ASSERT_EQ_INT(f->stats.gap_timeout_count, 1, "one timeout");
-    ASSERT_EQ_INT(f->stats.gap_count, 2, "rearmed → second period opened");
+    ASSERT_EQ_INT(f->stats.gap_count, 2, "rearmed -> second period opened");
     ASSERT_TRUE(invariant_holds(rx), "invariant after rearm");
     ASSERT_TRUE(accounting_holds_33(f), "accounting after rearm");
     mqvpn_reorder_rx_free(rx);
@@ -1139,7 +1139,7 @@ test_rx_reset_burst_no_rollback(void)
     size_t n = build_reorder_dgram(buf, MQVPN_REORDER_FLAG_RESET, 3, 30, 5000, 443, 100);
     mqvpn_reorder_rx_on_packet(rx, buf, n, 1000000);
     mqvpn_reorder_flow_t *f = only_flow(rx);
-    ASSERT_EQ_INT(f->expected, 4, "epoch anchored at seq=3 → expected=4");
+    ASSERT_EQ_INT(f->expected, 4, "epoch anchored at seq=3 -> expected=4");
     ASSERT_EQ_INT(rec.n, 1, "seq3 delivered (cold-start honor)");
 
     /* seq=0 reset-burst packet arrives 1ms later (< 10s grace) → NOT honored,

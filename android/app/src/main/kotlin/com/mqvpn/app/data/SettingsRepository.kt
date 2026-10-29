@@ -50,6 +50,7 @@ class SettingsRepository @Inject constructor(
         val PATH_ETHERNET = booleanPreferencesKey("path_ethernet")
         val AUTO_RECONNECT = booleanPreferencesKey("auto_reconnect")
         val SCHEDULER = stringPreferencesKey("scheduler")
+        val LOG_LEVEL = stringPreferencesKey("log_level")
         val SCHEMA = intPreferencesKey("settings_schema_version")
     }
 
@@ -104,6 +105,7 @@ class SettingsRepository @Inject constructor(
                 pathEthernet = prefs[Keys.PATH_ETHERNET] ?: defaults.pathEthernet,
                 autoReconnect = prefs[Keys.AUTO_RECONNECT] ?: defaults.autoReconnect,
                 scheduler = prefs[Keys.SCHEDULER] ?: defaults.scheduler,
+                logLevel = prefs[Keys.LOG_LEVEL] ?: defaults.logLevel,
             )
         }
 
@@ -128,6 +130,7 @@ class SettingsRepository @Inject constructor(
             prefs[Keys.PATH_ETHERNET] = newSettings.pathEthernet
             prefs[Keys.AUTO_RECONNECT] = newSettings.autoReconnect
             prefs[Keys.SCHEDULER] = newSettings.scheduler
+            prefs[Keys.LOG_LEVEL] = newSettings.logLevel
         }
     }
 }

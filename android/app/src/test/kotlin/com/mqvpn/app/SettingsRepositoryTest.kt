@@ -100,6 +100,7 @@ class SettingsRepositoryTest {
             pathEthernet = false,
             autoReconnect = false,
             scheduler = "WLB",
+            logLevel = "DEBUG",
         )
 
         repo.save(nonDefault)
@@ -222,6 +223,7 @@ class SettingsRepositoryTest {
             pathEthernet = false,
             autoReconnect = false,
             scheduler = "WLB",
+            logLevel = "DEBUG",
         )
 
         repo.save(nonDefault)

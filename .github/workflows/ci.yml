@@ -34,6 +34,13 @@ jobs:
             exit 1
           fi
 
+      # A UTF-8 character in a printed string is mojibake on a non-UTF-8
+      # console, and the log line it lands in can end up half-readable: the
+      # interface name comes from a Win32 API already in the console codepage
+      # while our own literal does not. See the script header.
+      - name: Check log strings are ASCII
+        run: python3 scripts/lint/check_log_string_ascii.py
+
   build:
     # Cache key conventions for BoringSSL / xquic / libevent-msan in this
     # workflow: keys carry a trailing `-vN`. Bump that suffix in *every*
@@ -47,6 +54,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
       - name: Install dependencies
         # A stuck mirror otherwise eats the whole job timeout.
         timeout-minutes: 5
@@ -54,7 +65,7 @@ jobs:
           # The Azure mirror is often throttled and stalls apt for 10+ minutes.
           sudo sed -i '/azure.archive.ubuntu.com/d' /etc/apt/apt-mirrors.txt
           sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev golang iptables
+          sudo apt-get install -y cmake libevent-dev golang iptables libnghttp2-dev pkg-config
 
       - name: Compute xquic SHA
         id: xqsha
@@ -105,7 +116,7 @@ jobs:
           # v5: libxquic.so statically absorbs BoringSSL (hidden-visibility
           # symbols), so a cached xquic build outlives a BoringSSL flag change
           # unless this key moves with it.
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-v5
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v5
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -278,6 +289,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
       - name: Install dependencies
         # A stuck mirror otherwise eats the whole job timeout.
         timeout-minutes: 5
@@ -321,7 +336,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-v4
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v4
 
       - name: Build xquic (clang)
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -606,6 +621,16 @@ jobs:
       - name: Wait for fuzz
         wait: fuzz
 
+      # The abort path reaches exit() for the first time, so this is where the
+      # sanitizers get to see it. The client under test exits non-zero by
+      # design; the suite keeps it away from stop_and_check_sanitizer and
+      # asserts the status and the absence of sanitizer reports itself.
+      - name: E2E setup-abort exit test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_setup_abort_exit_test.sh
+
   msan:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -613,6 +638,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
 
       - name: Install dependencies
         # A stuck mirror otherwise eats the whole job timeout.
@@ -680,7 +709,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-msan-bssl-${{ steps.bssl-pin.outputs.sha }}-v4
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-msan-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v4
 
       - name: Build xquic (clang + MSan)
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -851,6 +880,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
       - name: Install libevent
         run: brew install libevent
 
@@ -892,7 +925,7 @@ jobs:
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
           # v2: bumped with the BoringSSL cache — see the linux-build job.
-          key: xquic-${{ steps.xqsha.outputs.sha }}-darwin-arm64-clang-release-bssl-${{ steps.bssl-pin.outputs.sha }}-v2
+          key: xquic-${{ steps.xqsha.outputs.sha }}-darwin-arm64-clang-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v2
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -1007,6 +1040,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
       # Newest installed toolchain, deterministically — the image default can
       # lag behind what the generated project format requires (>= 16.3).
       - name: Select newest Xcode
@@ -1058,7 +1095,7 @@ jobs:
           path: |
             third_party/xquic/build-ios
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-ios-arm64-release-bssl-${{ steps.bssl-pin.outputs.sha }}-v2
+          key: xquic-${{ steps.xqsha.outputs.sha }}-ios-arm64-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v2
 
       - name: Build xquic (iOS)
         if: steps.xquic-ios-cache.outputs.cache-hit != 'true'
@@ -1096,6 +1133,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -1164,7 +1205,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-windows-msvc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-v5
+          key: xquic-${{ steps.xqsha.outputs.sha }}-windows-msvc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v5
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -1251,6 +1292,10 @@ jobs:
           if (-not $lo) { throw "no IPv4 loopback interface alias found" }
           python scripts/ci_transport_smoke.py --path "$lo" build/Release/mqvpn.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run Windows platform tests
+        run: >-
+          ctest --test-dir build -C Release --output-on-failure
+          -R 'test_(platform_cert_verify|cert_identity|cert_verify_win|windows_firewall)'
 
       # For on-machine checks the runner cannot do (real certificate stores,
       # a real server). Needs wintun.dll next to it: take it from a release zip.
@@ -1268,6 +1313,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
 
       - name: Compute NDK cache key
         id: ndk-cache-key
@@ -1350,7 +1399,7 @@ jobs:
   # sdk-core's TunnelCallbacksJniTest runs the upcalls against the real
   # TunnelCallbacks interface).
   # Builds its own x86_64 prebuilts (the release ABI is arm64-v8a only);
-  # sdk-native reads -PmqvpnAbiFilters so release/F-Droid stay arm64-only.
+  # sdk-native reads -PmqvpnAbiFilters so release output stays arm64-only.
   android-emulator:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
@@ -1473,6 +1522,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
       - name: Install dependencies
         # A stuck mirror otherwise eats the whole job timeout.
         timeout-minutes: 5
@@ -1515,7 +1568,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-v4
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v4
 
       - name: Build xquic (clang)
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -1558,10 +1611,24 @@ jobs:
         run: sudo -E tests/test_e2e_hybrid_h1.sh build/mqvpn
 
       - name: E2E hybrid H2 TCP-lane suite (netns, functional phases)
-        run: sudo -E tests/test_e2e_hybrid_h2.sh build/mqvpn
+        run: HYBRID_H2_PHASES=functional sudo -E timeout --foreground --kill-after=15s 10m tests/test_e2e_hybrid_h2.sh build/mqvpn
 
       - name: E2E hybrid H2 throughput gate (netns, Release build)
-        run: HYBRID_H2_PHASES=perf sudo -E tests/test_e2e_hybrid_h2.sh build-release/mqvpn
+        run: HYBRID_H2_PHASES=perf sudo -E timeout --foreground --kill-after=15s 12m tests/test_e2e_hybrid_h2.sh build-release/mqvpn
+
+      # Test 8 fails intermittently with the server rejecting a client frame
+      # (FRAME_ENCODING_ERROR) tens of MB into a multipath IPv6 transfer. The
+      # in-log dumps are a triage summary; the full per-test logs make the
+      # next occurrence answerable without spending another CI cycle adding
+      # one more grep. Written by the suite only on failure.
+      - name: Upload hybrid-e2e logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hybrid-e2e-logs-${{ github.run_attempt }}
+          path: hybrid-e2e-logs/
+          if-no-files-found: ignore
+          retention-days: 14
 
   hybrid-egress-off:
     # Pins the LANE=ON / EGRESS=OFF build shape (client TCP lane compiled
@@ -1577,6 +1644,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
       - name: Install dependencies
         # A stuck mirror otherwise eats the whole job timeout.
         timeout-minutes: 5
@@ -1584,7 +1655,7 @@ jobs:
           # The Azure mirror is often throttled and stalls apt for 10+ minutes.
           sudo sed -i '/azure.archive.ubuntu.com/d' /etc/apt/apt-mirrors.txt
           sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev golang iptables conntrack clang iperf3 jq netcat-openbsd curl python3
+          sudo apt-get install -y cmake libevent-dev golang iptables conntrack clang iperf3 jq netcat-openbsd curl python3 libnghttp2-dev pkg-config
 
       - name: Compute xquic SHA
         id: xqsha
@@ -1619,7 +1690,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-v4
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v4
 
       - name: Build xquic (clang)
         if: steps.xquic-cache.outputs.cache-hit != 'true'

@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 
 static int g_pass = 0, g_fail = 0;
@@ -65,11 +66,16 @@ read_file(const char *path, char *buf, size_t bufsize)
 static void
 write_file(const char *path, const char *content)
 {
-    FILE *fp = fopen(path, "w");
-    if (fp) {
-        fputs(content, fp);
-        fclose(fp);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) return;
+
+    FILE *fp = fdopen(fd, "w");
+    if (!fp) {
+        close(fd);
+        return;
     }
+    fputs(content, fp);
+    fclose(fp);
 }
 
 static void

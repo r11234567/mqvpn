@@ -266,9 +266,9 @@ test_ini_defaults_no_section(void)
     if (path) unlink(path);
 
     ASSERT_EQ_INT(rc, 0, "parse ok");
-    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_OFF, "no section → OFF");
-    ASSERT_EQ_INT(cfg.reorder.max_wait_ms, 30, "no section → default wait");
-    ASSERT_EQ_INT(cfg.reorder.n_rules, 0, "no section → no rules");
+    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_OFF, "no section -> OFF");
+    ASSERT_EQ_INT(cfg.reorder.max_wait_ms, 30, "no section -> default wait");
+    ASSERT_EQ_INT(cfg.reorder.n_rules, 0, "no section -> no rules");
 }
 
 static void
@@ -625,9 +625,9 @@ test_json_reorder_absent(void)
     int rc = mqvpn_config_load_json_filecfg(&cfg, json);
 
     ASSERT_EQ_INT(rc, 0, "json parse ok");
-    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_OFF, "absent → OFF");
-    ASSERT_EQ_INT(cfg.reorder.max_wait_ms, 30, "absent → default wait");
-    ASSERT_EQ_INT(cfg.reorder.n_rules, 0, "absent → no rules");
+    ASSERT_EQ_INT(cfg.reorder.mode, MQVPN_REORDER_OFF, "absent -> OFF");
+    ASSERT_EQ_INT(cfg.reorder.max_wait_ms, 30, "absent -> default wait");
+    ASSERT_EQ_INT(cfg.reorder.n_rules, 0, "absent -> no rules");
 }
 
 /* Regression: a reorder object larger than the old 512-byte stack buffer must
@@ -777,10 +777,15 @@ test_bridge_ini_reaches_libmqvpn_config(void)
     if (path) unlink(path);
     ASSERT_EQ_INT(rc, 0, "parse ok");
 
-    /* Fresh libmqvpn config starts at the OFF default; the bridge must flip it. */
+    /* Seed OFF explicitly. It matches the default today, but the assertion
+     * below only proves the bridge carried the field if the starting value
+     * differs from the one being asserted -- so it must not depend on what the
+     * default happens to be. */
     mqvpn_config_t *lib = mqvpn_config_new();
     ASSERT_TRUE(lib != NULL, "config_new");
-    ASSERT_EQ_INT(lib->reorder.mode, MQVPN_REORDER_OFF, "lib starts OFF");
+    ASSERT_EQ_INT(mqvpn_config_set_reorder_enabled(lib, MQVPN_REORDER_OFF), MQVPN_OK,
+                  "seed lib OFF");
+    ASSERT_EQ_INT(lib->reorder.mode, MQVPN_REORDER_OFF, "lib seeded OFF");
 
     mqvpn_config_apply_reorder(lib, &fc.reorder);
 
@@ -1069,7 +1074,7 @@ test_json_rule_params_and_parity(void)
     ASSERT_EQ_INT(jcfg.reorder.rules[0].explicit_wait_ms, 80, "(a) json rule wait");
     ASSERT_EQ_INT(jcfg.reorder.rules[0].explicit_cap, 2048, "(a) json rule cap");
     ASSERT_EQ_INT(memcmp(&icfg.reorder, &jcfg.reorder, sizeof(icfg.reorder)), 0,
-                  "(a) JSON↔INI per-rule param parity");
+                  "(a) JSON<->INI per-rule param parity");
 }
 
 static void

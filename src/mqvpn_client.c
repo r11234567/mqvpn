@@ -930,7 +930,8 @@ client_init_handle(mqvpn_client_t *c, const mqvpn_config_t *cfg,
                           ? cbs->struct_size
                           : sizeof(*cbs);
     memcpy(&c->cbs, cbs, cbs_size);
-    c->user_ctx = user_ctx; // lgtm[cpp/stack-address-escape]
+    // codeql[cpp/stack-address-escape] user_ctx must outlive c by public API contract
+    c->user_ctx = user_ctx;
     c->log_level = cfg->log_level;
     c->state = MQVPN_STATE_IDLE;
     c->next_path_handle = 1;
@@ -1086,13 +1087,26 @@ cb_xqc_log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *user_d
      * below — the forward map shifts INFO→WARN to suppress xquic's
      * per-packet noise at the engine level; this reverse map keeps
      * incoming severity honest so a real xquic warning is shown as a
-     * warning, not relabelled as INFO. Don't symmetrize the two. */
+     * warning, not relabelled as INFO. Don't symmetrize the two.
+     *
+     * REPORT is numerically the lowest value but it is NOT the most severe:
+     * xquic groups it with STATS as a statistics channel ("XQC_LOG_STATS &
+     * XQC_LOG_REPORT are levels for statistic", xqc_log.c) and routes both to
+     * xqc_log_write_stat, which is this same function. It carries the
+     * end-of-request and end-of-connection summaries -- the
+     * "|stream_id:..|close_msg:..|err:..|rcvd_bdy_sz:..|" line that every
+     * completed request emits. Mapping it to ERROR made ordinary teardown
+     * indistinguishable from failure: a hybrid TCP-lane proxy closes a stream
+     * per client connection, so idle browsing produced a continuous stream of
+     * ERROR lines carrying err:268 (H3_REQUEST_CANCELLED) and -626
+     * (XQC_ESTREAM_RESET) while both paths were healthy. It belongs with
+     * STATS at INFO. */
     mqvpn_log_level_t ml;
     switch (lvl) {
-    case XQC_LOG_REPORT:
     case XQC_LOG_FATAL:
     case XQC_LOG_ERROR: ml = MQVPN_LOG_ERROR; break;
     case XQC_LOG_WARN: ml = MQVPN_LOG_WARN; break;
+    case XQC_LOG_REPORT:
     case XQC_LOG_STATS:
     case XQC_LOG_INFO: ml = MQVPN_LOG_INFO; break;
     case XQC_LOG_DEBUG:
@@ -1403,7 +1417,7 @@ cli_signal_connect_fail(cli_conn_t *conn, mqvpn_error_t reason, int status_for_l
      * cli_report_cert_rejected already logged "TLS certificate verification
      * failed". */
     if (reason != MQVPN_ERR_TLS)
-        LOG_W(c, "CONNECT-IP request failed (status=%d) → tunnel_closed(%d)",
+        LOG_W(c, "CONNECT-IP request failed (status=%d) -> tunnel_closed(%d)",
               status_for_log, (int)reason);
     if (c->cbs.tunnel_closed) c->cbs.tunnel_closed(reason, c->user_ctx);
 }
@@ -3112,8 +3126,11 @@ init_xquic_engine(mqvpn_client_t *c)
     const mqvpn_config_t *cfg = &c->config;
     xqc_engine_ssl_config_t engine_ssl;
     memset(&engine_ssl, 0, sizeof(engine_ssl));
-    engine_ssl.ciphers = XQC_TLS_CIPHERS;
-    engine_ssl.groups = XQC_TLS_GROUPS;
+    /* Prioritize AES-256-GCM for stronger encryption */
+    engine_ssl.ciphers =
+        "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256";
+    /* Enable post-quantum key exchange with X25519MLKEM768 */
+    engine_ssl.groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
 
     xqc_engine_callback_t engine_cbs = {
         .set_event_timer = cb_set_event_timer,

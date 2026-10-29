@@ -107,7 +107,10 @@ Config knobs, by when they take effect:
   is `min(configured, profile ceiling)` — raising it past the ceiling is silent-free but
   ineffective.
 - **BP high/low water (compile-time, `tcp_lane.h`)** — internal constants, not exposed as
-  config. Bound only the relay-stash portion of the uplink queue.
+  config. Bound when the lane grants more lwIP receive credit: the local retry queue must
+  be empty and xquic's shared connection un-sent byte estimate must drain to low water
+  before credit is restored. The xquic term is connection-wide, excludes packets in
+  flight, and is not multiplied by the flow count.
 - **`lwipopts.h` window sizing (compile-time)** — `TCP_WND` + `TCP_SND_BUF`, the dominant
   per-flow cost and the only one requiring a rebuild to change.
 

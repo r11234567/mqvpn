@@ -580,7 +580,7 @@ svr_tcp_egress_abort(mqvpn_server_t *server, svr_tcp_egress_flow_t *ef)
 static void
 svr_tcp_egress_on_relay_error(mqvpn_server_t *server, svr_tcp_egress_flow_t *ef, int err)
 {
-    TLOG_W(server, "connect-tcp: relay I/O error (errno=%d) — closing stream", err);
+    TLOG_W(server, "connect-tcp: relay I/O error (errno=%d) -- closing stream", err);
 
     /* Flush BEFORE the close when the deferred send flush is engaged:
      * xqc_h3_request_close drops still-queued STREAM packets before
@@ -664,11 +664,11 @@ svr_tcp_egress_on_idle_evict(mqvpn_server_t *server, svr_tcp_egress_flow_t *ef,
     if (ef->uplink_withheld) {
         TLOG_W(server,
                "connect-tcp: flow to %s (user %s) parked by client backpressure "
-               "(client stopped reading) for over %u s — closing stream",
+               "(client stopped reading) for over %u s -- closing stream",
                peer, ef->username, idle_timeout_sec);
     } else {
         TLOG_I(server,
-               "connect-tcp: flow to %s (user %s) idle for over %u s — "
+               "connect-tcp: flow to %s (user %s) idle for over %u s -- "
                "closing stream",
                peer, ef->username, idle_timeout_sec);
     }
@@ -1147,7 +1147,7 @@ svr_tcp_egress_start_connect(mqvpn_server_t *server, void *stream,
 
     if (svr_egress_fd_register(server, fd, 0, 1 /* want_write = connect signal */, ef) !=
         0) {
-        TLOG_W(server, "egress_fd_register callback unset — connect-tcp flow will stall "
+        TLOG_W(server, "egress_fd_register callback unset -- connect-tcp flow will stall "
                        "until the connect timeout fires");
     }
     return 0; /* response deferred until connect completes or times out */
@@ -1305,7 +1305,7 @@ svr_tcp_egress_on_relay_ready(mqvpn_server_t *server, svr_tcp_egress_flow_t *ef,
             svr_tcp_egress_try_uplink_fin(server, ef);
             return;
         }
-        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
             svr_tcp_egress_on_relay_error(server, ef, errno);
             return;
         }

@@ -106,6 +106,9 @@ test_defaults(void)
     ASSERT_EQ_STR(cfg.server_addr, "", "default server_addr");
     ASSERT_EQ_STR(cfg.auth_key, "", "default auth_key");
     ASSERT_EQ_STR(cfg.server_auth_key, "", "default server_auth_key");
+    ASSERT_EQ_INT(cfg.proxy_enabled, 0, "default proxy disabled");
+    ASSERT_EQ_INT((int)cfg.proxy_max_connections, 64, "default proxy connections");
+    ASSERT_EQ_INT((int)cfg.proxy_idle_timeout_sec, 60, "default proxy timeout");
 }
 
 static void
@@ -453,7 +456,7 @@ test_mode_detection(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.is_server, 1, "Listen → server mode");
+    ASSERT_EQ_INT(cfg.is_server, 1, "Listen -> server mode");
 
     /* Client: has [Server] Address → is_server=0 */
     const char *ini_client = "[Server]\n"
@@ -463,7 +466,7 @@ test_mode_detection(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.is_server, 0, "Address → client mode");
+    ASSERT_EQ_INT(cfg.is_server, 0, "Address -> client mode");
 }
 
 static void
@@ -685,7 +688,7 @@ test_max_clients_edge_cases(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=0 → default 64");
+    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=0 -> default 64");
 
     /* MaxClients = -1 → should fallback to 64 */
     const char *ini_neg = "[Auth]\n"
@@ -695,7 +698,7 @@ test_max_clients_edge_cases(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=-1 → default 64");
+    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=-1 -> default 64");
 
     /* MaxClients = abc → invalid, fallback to 64 */
     const char *ini_abc = "[Auth]\n"
@@ -705,7 +708,7 @@ test_max_clients_edge_cases(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=abc → default 64");
+    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=abc -> default 64");
 
     /* MaxClients = 128 → valid */
     const char *ini_valid = "[Auth]\n"
@@ -715,7 +718,7 @@ test_max_clients_edge_cases(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.max_clients, 128, "MaxClients=128 → 128");
+    ASSERT_EQ_INT(cfg.max_clients, 128, "MaxClients=128 -> 128");
 }
 
 static void
@@ -752,7 +755,7 @@ test_reinjection_out_of_range_falls_back(void)
     mqvpn_config_load(&cfg, path);
     unlink(path);
     ASSERT_EQ_INT(cfg.reinjection_srtt_factor_pct, 110,
-                  "ReinjectionSrttFactorPct=50 → default 110");
+                  "ReinjectionSrttFactorPct=50 -> default 110");
 
     /* ReinjectionHardDeadlineMs = 0 → below min (1) → fallback to 500 */
     path = write_tmp("[Multipath]\nReinjectionHardDeadlineMs = 0\n");
@@ -760,7 +763,7 @@ test_reinjection_out_of_range_falls_back(void)
     mqvpn_config_load(&cfg, path);
     unlink(path);
     ASSERT_EQ_INT(cfg.reinjection_hard_deadline_ms, 500,
-                  "ReinjectionHardDeadlineMs=0 → default 500");
+                  "ReinjectionHardDeadlineMs=0 -> default 500");
 
     /* ReinjectionDeadlineLowerBoundMs = 999999 → above max (60000) → fallback to 20 */
     path = write_tmp("[Multipath]\nReinjectionDeadlineLowerBoundMs = 999999\n");
@@ -768,7 +771,7 @@ test_reinjection_out_of_range_falls_back(void)
     mqvpn_config_load(&cfg, path);
     unlink(path);
     ASSERT_EQ_INT(cfg.reinjection_deadline_lower_bound_ms, 20,
-                  "ReinjectionDeadlineLowerBoundMs=999999 → default 20");
+                  "ReinjectionDeadlineLowerBoundMs=999999 -> default 20");
 }
 
 static void
@@ -784,7 +787,7 @@ test_empty_value(void)
     mqvpn_config_load(&cfg, path);
     unlink(path);
 
-    ASSERT_EQ_STR(cfg.tun_name, "", "empty value → empty string");
+    ASSERT_EQ_STR(cfg.tun_name, "", "empty value -> empty string");
 }
 
 static void
@@ -1000,7 +1003,7 @@ test_reconnect_interval_invalid(void)
     mqvpn_config_load(&cfg, path);
     unlink(path);
 
-    ASSERT_EQ_INT(cfg.reconnect_interval, 5, "negative interval → default 5");
+    ASSERT_EQ_INT(cfg.reconnect_interval, 5, "negative interval -> default 5");
 }
 
 static void
@@ -1015,7 +1018,7 @@ test_reconnect_interval_invalid_string(void)
     mqvpn_config_load(&cfg, path);
     unlink(path);
 
-    ASSERT_EQ_INT(cfg.reconnect_interval, 5, "invalid interval → default 5");
+    ASSERT_EQ_INT(cfg.reconnect_interval, 5, "invalid interval -> default 5");
 }
 
 /* ================================================================
@@ -1051,7 +1054,7 @@ test_mtu_below_floor_ignored(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.tun_mtu, 0, "MTU < 1280 ignored → stays 0");
+    ASSERT_EQ_INT(cfg.tun_mtu, 0, "MTU < 1280 ignored -> stays 0");
 }
 
 static void
@@ -1063,7 +1066,44 @@ test_mtu_above_ceiling_ignored(void)
     mqvpn_config_defaults(&cfg);
     mqvpn_config_load(&cfg, path);
     unlink(path);
-    ASSERT_EQ_INT(cfg.tun_mtu, 0, "MTU > 9000 ignored → stays 0");
+    ASSERT_EQ_INT(cfg.tun_mtu, 0, "MTU > 9000 ignored -> stays 0");
+}
+
+static void
+test_txqueuelen_default(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    ASSERT_EQ_INT(cfg.tun_txqueuelen, 0, "default tun_txqueuelen is 0 (kernel)");
+    ASSERT_EQ_INT(cfg.tun_read_batch, 0, "default tun_read_batch is 0 (built-in)");
+}
+
+static void
+test_txqueuelen_parse(void)
+{
+    const char *ini = "[Interface]\nTxQueueLen = 4096\nTunReadBatch = 512\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.tun_txqueuelen, 4096, "TxQueueLen 4096 parsed");
+    ASSERT_EQ_INT(cfg.tun_read_batch, 512, "TunReadBatch 512 parsed");
+}
+
+static void
+test_txqueuelen_out_of_range_ignored(void)
+{
+    /* Rejected at parse time rather than clamped, so a typo cannot silently
+     * become a different queue depth than the operator wrote. */
+    const char *ini = "[Interface]\nTxQueueLen = 99\nTunReadBatch = 4097\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.tun_txqueuelen, 0, "TxQueueLen < 100 ignored -> stays 0");
+    ASSERT_EQ_INT(cfg.tun_read_batch, 0, "TunReadBatch > 4096 ignored -> stays 0");
 }
 
 static void
@@ -2149,7 +2189,7 @@ test_advanced_recv_rate_limit(void)
     mqvpn_config_defaults(&cfg);
     ASSERT_EQ_INT(mqvpn_config_load(&cfg, p), 0, "over-max ini warns, load rc 0");
     unlink(p);
-    ASSERT_EQ_INT(cfg.recv_rate_limit == 0, 1, "over-max ini rejected → default 0");
+    ASSERT_EQ_INT(cfg.recv_rate_limit == 0, 1, "over-max ini rejected -> default 0");
 
     snprintf(over, sizeof(over), "[Advanced]\nRecvRateLimit = %llu\n",
              (unsigned long long)MQVPN_RECV_RATE_LIMIT_MAX);
@@ -2166,7 +2206,49 @@ test_advanced_recv_rate_limit(void)
     mqvpn_config_defaults(&cfg);
     ASSERT_EQ_INT(mqvpn_config_load(&cfg, p), 0, "over-max json warns, load rc 0");
     unlink(p);
-    ASSERT_EQ_INT(cfg.recv_rate_limit == 0, 1, "over-max json rejected → default 0");
+    ASSERT_EQ_INT(cfg.recv_rate_limit == 0, 1, "over-max json rejected -> default 0");
+}
+
+static void
+test_proxy_config(void)
+{
+    const char *ini = "[Proxy]\n"
+                      "Enabled = true\n"
+                      "SNI = vpn.example.com,*.edge.example\n"
+                      "QuicFallback = 127.0.0.1:4443\n"
+                      "Http2Backend = 127.0.0.1:8080\n"
+                      "Http2BackendTLS = false\n"
+                      "MaxConnections = 128\n"
+                      "IdleTimeoutSec = 90\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t ini_cfg;
+    mqvpn_config_defaults(&ini_cfg);
+    ASSERT_EQ_INT(mqvpn_config_load(&ini_cfg, path), 0, "proxy ini load");
+    unlink(path);
+
+    mqvpn_file_config_t json_cfg;
+    mqvpn_config_defaults(&json_cfg);
+    ASSERT_EQ_INT(mqvpn_config_load_json_filecfg(
+                      &json_cfg, "{\"proxy\":{"
+                                 "\"enabled\":true,"
+                                 "\"sni\":\"vpn.example.com,*.edge.example\","
+                                 "\"quic_fallback\":\"127.0.0.1:4443\","
+                                 "\"http2_backend\":\"127.0.0.1:8080\","
+                                 "\"http2_backend_tls\":false,"
+                                 "\"max_connections\":128,"
+                                 "\"idle_timeout_sec\":90}}"),
+                  0, "proxy json load");
+
+    ASSERT_EQ_INT(ini_cfg.proxy_enabled, json_cfg.proxy_enabled, "proxy enabled parity");
+    ASSERT_EQ_STR(ini_cfg.proxy_sni, json_cfg.proxy_sni, "proxy SNI parity");
+    ASSERT_EQ_STR(ini_cfg.proxy_quic_fallback, json_cfg.proxy_quic_fallback,
+                  "proxy QUIC endpoint parity");
+    ASSERT_EQ_STR(ini_cfg.proxy_h2_backend, json_cfg.proxy_h2_backend,
+                  "proxy H2 endpoint parity");
+    ASSERT_EQ_INT((int)ini_cfg.proxy_max_connections, (int)json_cfg.proxy_max_connections,
+                  "proxy max parity");
+    ASSERT_EQ_INT((int)ini_cfg.proxy_idle_timeout_sec,
+                  (int)json_cfg.proxy_idle_timeout_sec, "proxy timeout parity");
 }
 
 static void
@@ -2897,6 +2979,9 @@ main(void)
     test_mtu_config_parse();
     test_mtu_below_floor_ignored();
     test_mtu_above_ceiling_ignored();
+    test_txqueuelen_default();
+    test_txqueuelen_parse();
+    test_txqueuelen_out_of_range_ignored();
     test_mtu_invalid_string_ignored();
     test_mtu_json_parse();
     test_path_mtu_parse();
@@ -2945,6 +3030,7 @@ main(void)
     test_hybrid_defaults_when_absent();
     test_hybrid_section_parse();
     test_advanced_recv_rate_limit();
+    test_proxy_config();
     test_advanced_udp_gso();
     test_advanced_udp_gro();
     test_advanced_tun_offload();

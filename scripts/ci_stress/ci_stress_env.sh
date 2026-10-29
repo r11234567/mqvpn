@@ -36,6 +36,9 @@ IP_A_SERVER="10.100.0.1/24"
 IP_B_CLIENT="10.200.0.2/24"
 IP_B_SERVER="10.200.0.1/24"
 IP_A_SERVER_ADDR="10.100.0.1"
+# The client always dials IP_A_SERVER_ADDR, which sits on Path A's subnet.
+# Path B therefore needs an explicit route to reach it — see
+# ci_stress_add_path_b_route(). Same name as ci_bench_env.sh uses.
 IP_A_SUBNET="10.100.0.0/24"
 IP_B_SERVER_ADDR="10.200.0.1"
 TUNNEL_SERVER_IP="10.0.0.1"
@@ -96,11 +99,21 @@ ci_stress_cleanup_stale() {
 # The server (IP_A_SERVER_ADDR) lives on Path A's subnet, so Path B reaches it
 # only through this via-route. Without it a SO_BINDTODEVICE socket on B still
 # sends (the kernel assumes the destination is on-link and the veth peer
-# answers the ARP), but the client's path re-add gate
-# (src/platform/linux/route_check.c, RTM_F_FIB_MATCH) sees no FIB route and
-# defers the re-add forever — B never comes back after its first fault.
-# Same route as the ci_e2e dual-path suites. Any script that faults Path B
-# must call this again on recovery.
+# answers the ARP for its Path A address, default arp_ignore=0), so Path B
+# comes up and validates and the missing route stays invisible.
+#
+# It stops being invisible the moment Path B has to be REBUILT. The re-add
+# gate (iface_has_route_to_server, src/platform/linux/route_check.c) queries
+# RTM_F_FIB_MATCH precisely because the on-link fallback makes a plain lookup
+# useless, so it sees EHOSTUNREACH and correctly refuses to rebuild a path
+# with no route — logging "has a usable address but no route to the server".
+# That is what left ci_stress_failover.sh single-pathed for the rest of the
+# run after its first Path B fault, and every later Path A fault then tore
+# down the whole connection ("abandon the only active path").
+#
+# Same route as the ci_e2e dual-path suites (run_route_gate_test.sh). metric
+# 200 keeps Path A's connected route (metric 0) preferred for unbound
+# traffic. Any script that faults Path B must call this again on recovery.
 #
 # `replace`, not `add`: whether the route survived the fault depends on how
 # the path was broken. An admin down flushes every route through the link,
@@ -154,10 +167,21 @@ ci_stress_setup_netns() {
     # Verify
     ip netns exec "$NS_CLIENT" ping -c 1 -W 1 "$IP_A_SERVER_ADDR" >/dev/null
     ip netns exec "$NS_CLIENT" ping -c 1 -W 1 "$IP_B_SERVER_ADDR" >/dev/null
-    # The exact FIB query the re-add gate performs. A ping via B cannot tell
-    # the difference (the on-link fallback also answers), this can: it fails
-    # with "No route" when only the fallback would carry Path B.
-    ip netns exec "$NS_CLIENT" ip route get "$IP_A_SERVER_ADDR" oif "$VETH_B0" fibmatch >/dev/null
+
+    # Verify Path B the way the re-add gate does, not with a ping. A
+    # device-bound ping through VETH_B0 succeeds even with no route: the
+    # oif-scoped lookup falls back to "assume on link" and the server answers
+    # the ARP for its Path A address (default arp_ignore=0), so connectivity
+    # tells us nothing about the FIB. `fibmatch` is the same query
+    # iface_has_route_to_server() issues (RTM_F_FIB_MATCH) and returns
+    # EHOSTUNREACH when only the fallback exists — so this, and only this,
+    # catches the topology silently losing Path B recovery again.
+    if ! ip netns exec "$NS_CLIENT" ip route get "$IP_A_SERVER_ADDR" \
+            oif "$VETH_B0" fibmatch >/dev/null 2>&1; then
+        echo "ERROR: no FIB route to $IP_A_SERVER_ADDR via $VETH_B0 —" \
+             "mqvpn will refuse to re-add Path B after a fault"
+        return 1
+    fi
 
     echo "OK: netns created"
 }

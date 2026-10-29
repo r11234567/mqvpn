@@ -353,7 +353,7 @@ cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
     return;
 
 fail:
-    win_cleanup_killswitch(p);
+    (void)win_cleanup_killswitch(p);
     if (p->manage_routes) win_cleanup_routes(p);
     win_cleanup_dns(p);
     if (p->tun.adapter) mqvpn_tun_win_destroy(&p->tun);
@@ -690,6 +690,12 @@ win_platform_run_client(const mqvpn_client_cfg_t *cfg)
     ctx.killswitch_enabled = cfg->kill_switch;
     ctx.manage_routes = cfg->manage_routes;
 
+    if (ctx.manage_routes && !ctx.killswitch_enabled) {
+        LOG_WRN("Windows route management does not capture applications bound to a "
+                "physical interface; enable KillSwitch to prevent interface-bound "
+                "traffic leaks");
+    }
+
     if (cfg->n_paths == 0) {
         LOG_ERR("--path is required on Windows: specify at least one adapter "
                 "FriendlyName (e.g. --path \"Ethernet\"). "
@@ -934,7 +940,7 @@ cleanup:
     for (int i = 0; i < ctx.n_paths; i++)
         ctx.paths[i].bind_ctx = NULL; /* finalised by destroy */
 
-    win_cleanup_killswitch(&ctx);
+    if (win_cleanup_killswitch(&ctx) < 0) rc = 1;
     if (ctx.manage_routes) win_cleanup_routes(&ctx);
     win_cleanup_dns(&ctx);
 

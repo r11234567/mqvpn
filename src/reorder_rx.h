@@ -36,7 +36,8 @@ typedef void (*mqvpn_reorder_deliver_fn)(const uint8_t *pkt, size_t len, void *c
 
 /*
  * Create/destroy. cfg is copied; hash_seed seeds the keyed flow hash (§6.2).
- * `deliver` is invoked for every in-order delivery with `deliver_ctx`.
+ * `deliver` is invoked for every in-order delivery with `deliver_ctx`; that
+ * borrowed context must remain valid until mqvpn_reorder_rx_free() returns.
  * Returns NULL on allocation failure or invalid config.
  */
 mqvpn_reorder_rx_t *mqvpn_reorder_rx_new(const mqvpn_reorder_config_t *cfg,

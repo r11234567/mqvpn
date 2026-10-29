@@ -356,19 +356,20 @@ get_dns_servers(const char *service, char *out, size_t outlen)
     char *saveptr = NULL;
     for (char *line = strtok_r(cap, "\r\n", &saveptr); line;
          line = strtok_r(NULL, "\r\n", &saveptr)) {
-        while (*line == ' ' || *line == '\t')
-            line++;
-        if (line[0] == '\0') continue;
+        char *trimmed = line;
+        while (*trimmed == ' ' || *trimmed == '\t')
+            trimmed++;
+        if (trimmed[0] == '\0') continue;
 
         unsigned char scratch[sizeof(struct in6_addr)];
-        if (inet_pton(AF_INET, line, scratch) != 1 &&
-            inet_pton(AF_INET6, line, scratch) != 1) {
+        if (inet_pton(AF_INET, trimmed, scratch) != 1 &&
+            inet_pton(AF_INET6, trimmed, scratch) != 1) {
             all_ip = 0;
             break;
         }
         have_any = 1;
 
-        size_t llen = strlen(line);
+        size_t llen = strlen(trimmed);
         size_t need = used + (used > 0 ? 1 : 0) + llen;
         if (need >= sizeof(joined)) {
             /* Joining would overflow: a truncated snapshot would silently
@@ -382,7 +383,7 @@ get_dns_servers(const char *service, char *out, size_t outlen)
             return -1;
         }
         if (used > 0) joined[used++] = ' ';
-        memcpy(joined + used, line, llen);
+        memcpy(joined + used, trimmed, llen);
         used += llen;
         joined[used] = '\0';
     }
@@ -490,7 +491,7 @@ validate_existing_backup(const mqvpn_dns_t *dns)
          * whole, and the leftover tail must not be misread as a second
          * line. */
         if (!strchr(line, '\n') && !feof(fp)) {
-            LOG_ERR("dns: existing backup %s line %d exceeds %d bytes — it may be the "
+            LOG_ERR("dns: existing backup %s line %d exceeds %d bytes -- it may be the "
                     "only copy of your original DNS settings; inspect or move the file "
                     "manually, then retry",
                     dns->backup_path, lineno, MQVPN_DNS_BACKUP_LINE - 1);
@@ -498,7 +499,7 @@ validate_existing_backup(const mqvpn_dns_t *dns)
             return -1;
         }
         if (mqvpn_dns_backup_parse_line(line, svc, sizeof(svc), srv, sizeof(srv)) < 0) {
-            LOG_ERR("dns: existing backup %s line %d is unparseable — it may be the "
+            LOG_ERR("dns: existing backup %s line %d is unparseable -- it may be the "
                     "only copy of your original DNS settings; inspect or move the file "
                     "manually, then retry",
                     dns->backup_path, lineno);
@@ -1008,7 +1009,7 @@ mqvpn_dns_restore(mqvpn_dns_t *dns)
      * or the lock released, permanently losing the only record of the
      * services that are still dirty. Keep backup + active + lock so a
      * later mqvpn_dns_restore() call can retry. */
-    LOG_ERR("dns: restore incomplete; some service(s) could not be reverted — backup "
+    LOG_ERR("dns: restore incomplete; some service(s) could not be reverted -- backup "
             "retained at %s for retry",
             dns->backup_path);
 }
@@ -1049,7 +1050,7 @@ mqvpn_dns_restore_stale(mqvpn_dns_t *dns)
                 dns->backup_path);
     } else {
         LOG_ERR("dns: stale-backup restore incomplete; some service(s) could not be "
-                "reverted — backup retained at %s for the next attempt",
+                "reverted -- backup retained at %s for the next attempt",
                 dns->backup_path);
     }
 

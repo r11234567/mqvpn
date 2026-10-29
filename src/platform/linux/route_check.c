@@ -96,7 +96,7 @@ iface_has_route_to_server(const char *ifname, const struct sockaddr_storage *ser
                     ret = 0;
                 else
                     LOG_DBG("route_check: RTM_GETROUTE(fibmatch) errno=%d "
-                            "— treating as unknown (fail open)",
+                            "-- treating as unknown (fail open)",
                             err);
             }
         }

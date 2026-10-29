@@ -199,7 +199,8 @@ int
 mqvpn_tun_set_txqueuelen(mqvpn_tun_t *tun, int qlen)
 {
     /* utun has no settable transmit queue length; the concept is a Linux
-     * netdev one. Accepted and ignored rather than failed. */
+     * netdev one. Accepted and ignored rather than failed, so a config that
+     * is right for a Linux server does not break a macOS client. */
     (void)tun;
     (void)qlen;
     return 0;

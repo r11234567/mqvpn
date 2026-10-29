@@ -20,6 +20,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -63,15 +67,6 @@ jobs:
       - name: Verify BoringSSL is an optimized build
         run: bash scripts/ci_check_bssl_optimized.sh third_party/xquic/third_party/boringssl/build
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4.39.1
-        with:
-          languages: c-cpp
-          queries: security-and-quality
-
-      # xquic is third-party; we don't analyze it. Skipping the traced
-      # build on cache hit is fine — only the mqvpn build below needs to
-      # be CodeQL-traced for analysis.
       - name: Cache xquic (Release)
         id: xquic-cache
         uses: actions/cache@v6
@@ -82,9 +77,9 @@ jobs:
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
           # v4: bumped with the BoringSSL cache — libxquic.so absorbs it.
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-v4
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v4
 
-      - name: Build xquic (CodeQL traced)
+      - name: Build xquic dependency
         if: steps.xquic-cache.outputs.cache-hit != 'true'
         run: |
           cd third_party/xquic
@@ -96,12 +91,26 @@ jobs:
                 -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
           make -j$(nproc)
 
-      - name: Build mqvpn (CodeQL traced)
+      # Configure the production build and pre-build vendored lwIP before
+      # CodeQL starts tracing. xquic and lwIP findings belong upstream, while
+      # tests are covered by CI/sanitizers and must not create duplicate
+      # findings when they include production .c files as test seams.
+      - name: Configure mqvpn production build
         run: |
-          mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release \
-                -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
-          make -j$(nproc)
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_TESTING=OFF \
+                -DXQUIC_BUILD_DIR="${GITHUB_WORKSPACE}/third_party/xquic/build"
+          cmake --build build --target lwip_core --parallel "$(nproc)"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4.39.1
+        with:
+          languages: c-cpp
+          queries: security-and-quality
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Build mqvpn (CodeQL traced)
+        run: cmake --build build --parallel "$(nproc)"
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v4.39.1

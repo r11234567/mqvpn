@@ -149,7 +149,7 @@ main(void)
         printf("  ok: GRO verified (%d datagrams in %d receives, %d coalesced)\n",
                datagrams, receives, coalesced);
     } else {
-        printf("  ok (no coalescing on this path): %d datagrams in %d receives — "
+        printf("  ok (no coalescing on this path): %d datagrams in %d receives -- "
                "content/order verified, GRO split NOT exercised\n",
                datagrams, receives);
     }

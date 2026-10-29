@@ -31,6 +31,7 @@ data class DemoSettings(
     val pathEthernet: Boolean = true,
     val autoReconnect: Boolean = true,
     val scheduler: String = SchedulerChoice.DEFAULT.name,
+    val logLevel: String = MqvpnConfig.LogLevel.INFO.name,
 ) {
     enum class SchedulerChoice { DEFAULT, MIN_RTT, WLB }
 
@@ -44,6 +45,10 @@ data class DemoSettings(
     fun hybridTcpModeEnum(): MqvpnConfig.HybridTcpMode =
         MqvpnConfig.HybridTcpMode.entries.firstOrNull { it.name == hybridTcpMode }
             ?: MqvpnConfig.HybridTcpMode.AUTO
+
+    fun logLevelEnum(): MqvpnConfig.LogLevel =
+        MqvpnConfig.LogLevel.entries.firstOrNull { it.name == logLevel }
+            ?: MqvpnConfig.LogLevel.INFO
 
     fun parsedReorderPorts(): List<Int> =
         reorderPorts.split(",")
@@ -91,6 +96,7 @@ data class DemoSettings(
             reorderPorts = parsedReorderPorts(),
             redundantEnabled = redundantEnabled,
             redundantPorts = parsedRedundantPorts(),
+            logLevel = logLevelEnum(),
             hybridEnabled = hybridEnabled,
             hybridTcpMode = hybridTcpModeEnum(),
             bluetoothPathEnabled = bluetoothPathEnabled,

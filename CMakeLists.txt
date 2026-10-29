@@ -21,6 +21,30 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 #   3 -> 4  callback ABI 3: the fd-based path and server socket calls are gone
 set(MQVPN_SOVERSION 4)
 
+# Build identity for anything that is not a tagged release. project(VERSION)
+# only accepts numeric version components, so a snapshot cannot express itself
+# there, and leaving it alone made every main build claim to be the release
+# whose number happened to be checked in. Artifacts, the deb version and
+# mqvpn --version then could not be told apart from the real thing.
+#
+# The release workflow passes the suffix for non-tag builds, e.g.
+# "+snapshot.20260922.g1a2b3c4d5e6f". Keep it to characters a Debian version
+# accepts (alphanumerics and . + ~; never "-", which starts the Debian
+# revision) so CPACK_PACKAGE_VERSION stays valid, and keep the leading "+" so
+# it sorts after the release it is built on top of.
+set(MQVPN_VERSION_SUFFIX "" CACHE STRING
+    "Build-identity suffix appended to the release version (snapshot builds)")
+set(MQVPN_FULL_VERSION "${PROJECT_VERSION}${MQVPN_VERSION_SUFFIX}")
+if(MQVPN_VERSION_SUFFIX)
+    if(NOT MQVPN_VERSION_SUFFIX MATCHES "^[+~][A-Za-z0-9.+~]*$")
+        message(FATAL_ERROR
+            "MQVPN_VERSION_SUFFIX must start with + or ~ and contain only "
+            "Debian-safe version characters: ${MQVPN_VERSION_SUFFIX}")
+    endif()
+    add_compile_definitions(MQVPN_VERSION_SUFFIX_STR="${MQVPN_VERSION_SUFFIX}")
+endif()
+message(STATUS "mqvpn build version: ${MQVPN_FULL_VERSION}")
+
 # ---------- Options ----------
 option(XQUIC_BUILD_DIR "Path to pre-built xquic build directory" "")
 option(ENABLE_SANITIZERS "Enable ASan + UBSan" OFF)
@@ -503,13 +527,31 @@ target_include_directories(mqvpn_lib
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
     PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR} ${BORINGSSL_INCLUDE_DIR}
 )
+if(MQVPN_ENABLE_H2_PROXY)
+    if(NGHTTP2_INCLUDE_DIR)
+        target_include_directories(mqvpn_lib PRIVATE ${NGHTTP2_INCLUDE_DIR})
+    elseif(NGHTTP2_INCLUDE_DIRS)
+        target_include_directories(mqvpn_lib PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+    endif()
+    target_compile_definitions(mqvpn_lib PRIVATE MQVPN_H2_PROXY_ENABLED)
+endif()
 if(ANDROID_CROSS_COMPILE)
     # Android NDK: pthread is in libc, no separate -lpthread
     target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB})
 elseif(WIN32)
-    target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} ws2_32)
+    target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} ws2_32 crypt32)
+elseif(APPLE)
+    target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} pthread
+                          "-framework Security" "-framework CoreFoundation")
 else()
     target_link_libraries(mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} pthread)
+endif()
+if(MQVPN_ENABLE_H2_PROXY)
+    if(NGHTTP2_LIB)
+        target_link_libraries(mqvpn_lib ${NGHTTP2_LIB})
+    elseif(NGHTTP2_LIBRARIES)
+        target_link_libraries(mqvpn_lib ${NGHTTP2_LIBRARIES})
+    endif()
 endif()
 if(MQVPN_HYBRID_TCP_LANE_BUILD)
     target_link_libraries(mqvpn_lib lwip_core)
@@ -518,20 +560,6 @@ endif()
 if(MQVPN_HYBRID_TCP_EGRESS_BUILD)
     target_compile_definitions(mqvpn_lib PRIVATE MQVPN_HYBRID_TCP_EGRESS_ENABLED)
 endif()
-if(MQVPN_ENABLE_H2_PROXY)
-    if(NGHTTP2_INCLUDE_DIR)
-        target_include_directories(mqvpn_lib PRIVATE ${NGHTTP2_INCLUDE_DIR})
-    elseif(NGHTTP2_INCLUDE_DIRS)
-        target_include_directories(mqvpn_lib PRIVATE ${NGHTTP2_INCLUDE_DIRS})
-    endif()
-    target_compile_definitions(mqvpn_lib PRIVATE MQVPN_H2_PROXY_ENABLED)
-    if(NGHTTP2_LIB)
-        target_link_libraries(mqvpn_lib ${NGHTTP2_LIB})
-    elseif(NGHTTP2_LIBRARIES)
-        target_link_libraries(mqvpn_lib ${NGHTTP2_LIBRARIES})
-    endif()
-endif()
-
 # Everything below requires libevent and a platform layer — skip for Android
 if(NOT ANDROID_CROSS_COMPILE)
 
@@ -667,9 +695,22 @@ if(BUILD_TESTING)
     target_include_directories(test_clock_source PRIVATE
         ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME test_clock_source COMMAND test_clock_source)
+    add_executable(test_windows_firewall tests/test_windows_firewall.c src/log.c)
+    target_include_directories(test_windows_firewall PRIVATE
+        ${EVENT_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/platform/windows
+        ${WINTUN_INCLUDE_DIR})
+    target_link_libraries(test_windows_firewall PRIVATE
+        ws2_32 iphlpapi fwpuclnt ole32)
+    if(Libevent_FOUND)
+        target_link_libraries(test_windows_firewall PRIVATE libevent::core)
+    endif()
+    add_test(NAME test_windows_firewall COMMAND test_windows_firewall)
     if(MSVC)
         # same gate as the product build; target-scoped options are not inherited
-        foreach(t test_platform_cert_verify test_cert_identity test_cert_verify_win test_bind_winsock test_path_readd test_path_line test_clock_source)
+        foreach(t test_platform_cert_verify test_cert_identity test_cert_verify_win test_bind_winsock test_path_readd test_path_line test_clock_source test_windows_firewall)
             target_compile_options(${t} PRIVATE /WX /utf-8)
             target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
         endforeach()
@@ -689,6 +730,7 @@ add_executable(mqvpn
     src/main.c
     src/platform/client_config_bridge.c
     src/platform/darwin/platform_darwin.c
+    src/platform/darwin/cert_verify_apple.c
     src/platform/darwin/route_mon.c
     src/platform/posix/netmon_common.c
     src/platform/posix/path_table.c
@@ -721,6 +763,8 @@ target_link_libraries(mqvpn
     dl
     m
     c++ # C++ runtime for BoringSSL; macOS SDKs ship libc++, not libstdc++
+    "-framework Security"
+    "-framework CoreFoundation"
 )
 
 # Compile gate for CI: builds the Darwin platform TUs as a standalone
@@ -729,6 +773,7 @@ target_link_libraries(mqvpn
 add_library(mqvpn_darwin_platform OBJECT
     src/platform/client_config_bridge.c
     src/platform/darwin/platform_darwin.c
+    src/platform/darwin/cert_verify_apple.c
     src/platform/darwin/route_mon.c
     src/platform/posix/netmon_common.c
     src/platform/posix/path_table.c
@@ -768,7 +813,8 @@ target_include_directories(mqvpn_shared
 # Shared lib links shared xquic, same as Linux (static .a is unusable there
 # for -fPIC reasons; kept symmetric here even though clang on Darwin emits
 # PIC by default).
-target_link_libraries(mqvpn_shared xquic ${SSL_LIB} ${CRYPTO_LIB} pthread c++)
+target_link_libraries(mqvpn_shared xquic ${SSL_LIB} ${CRYPTO_LIB} pthread c++
+                      "-framework Security" "-framework CoreFoundation")
 
 # Keep in sync with the Linux twin (the mqvpn_shared lane block in the
 # Linux branch below).
@@ -919,8 +965,23 @@ target_include_directories(mqvpn_shared
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
     PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR} ${BORINGSSL_INCLUDE_DIR}
 )
+if(MQVPN_ENABLE_H2_PROXY)
+    if(NGHTTP2_INCLUDE_DIR)
+        target_include_directories(mqvpn_shared PRIVATE ${NGHTTP2_INCLUDE_DIR})
+    elseif(NGHTTP2_INCLUDE_DIRS)
+        target_include_directories(mqvpn_shared PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+    endif()
+    target_compile_definitions(mqvpn_shared PRIVATE MQVPN_H2_PROXY_ENABLED)
+endif()
 # Shared lib needs shared xquic (static .a lacks -fPIC)
 target_link_libraries(mqvpn_shared xquic ${SSL_LIB} ${CRYPTO_LIB} pthread)
+if(MQVPN_ENABLE_H2_PROXY)
+    if(NGHTTP2_LIB)
+        target_link_libraries(mqvpn_shared ${NGHTTP2_LIB})
+    elseif(NGHTTP2_LIBRARIES)
+        target_link_libraries(mqvpn_shared ${NGHTTP2_LIBRARIES})
+    endif()
+endif()
 if(MQVPN_HYBRID_TCP_LANE_BUILD)
     target_link_libraries(mqvpn_shared lwip_core)
     target_compile_definitions(mqvpn_shared PRIVATE MQVPN_HYBRID_TCP_LANE_ENABLED)
@@ -1154,21 +1215,6 @@ if(BUILD_TESTING)
         add_test(NAME ${t} COMMAND ${t})
     endforeach()
 
-    if(WIN32)
-        add_executable(test_windows_firewall tests/test_windows_firewall.c src/log.c)
-        target_include_directories(test_windows_firewall PRIVATE
-            ${EVENT_INCLUDE_DIR}
-            ${CMAKE_SOURCE_DIR}/include
-            ${CMAKE_SOURCE_DIR}/src
-            ${CMAKE_SOURCE_DIR}/src/platform/windows
-            ${WINTUN_INCLUDE_DIR})
-        target_link_libraries(test_windows_firewall PRIVATE
-            ws2_32 iphlpapi fwpuclnt ole32)
-        if(Libevent_FOUND)
-            target_link_libraries(test_windows_firewall PRIVATE libevent::core)
-        endif()
-        add_test(NAME test_windows_firewall COMMAND test_windows_firewall)
-    endif()
 
     # UDP GSO TX offload (issue #167): pure syscall/mechanics layer, no xquic
     # dependency. MQVPN_OFFLOAD_TEST_SEAM is wired: it swaps sendmsg/sendmmsg
@@ -1598,9 +1644,9 @@ if(DPKG_CMD)
 
     set(CPACK_GENERATOR "DEB")
     set(CPACK_DEBIAN_PACKAGE_NAME "mqvpn")
-    set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+    set(CPACK_PACKAGE_VERSION "${MQVPN_FULL_VERSION}")
     set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "${DPKG_ARCH}")
-    set(CPACK_DEBIAN_FILE_NAME "mqvpn_${PROJECT_VERSION}_${DPKG_ARCH}.deb")
+    set(CPACK_DEBIAN_FILE_NAME "mqvpn_${MQVPN_FULL_VERSION}_${DPKG_ARCH}.deb")
     set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
     set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "Multipath QUIC VPN using MASQUE CONNECT-IP (RFC 9484)")
     set(CPACK_DEBIAN_PACKAGE_MAINTAINER "mp0rta")

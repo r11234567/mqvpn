@@ -109,3 +109,55 @@ Multipath (multiple NICs):
 mqvpn.exe --mode client --server 203.0.113.1:443 --auth-key <key> ^
   --path "Ethernet" --path "Ethernet 3" --scheduler wlb
 ```
+
+## Preventing interface-bound leaks
+
+`ManageRoutes = true` installs split-default routes, but Windows applications
+can deliberately bypass those routes by selecting a physical adapter with
+`IP_UNICAST_IF` or `IPV6_UNICAST_IF`. Tailscale is one example. Route metrics
+cannot prevent this because the socket's interface choice is explicit.
+
+Enable the WFP kill switch when all non-tunnel traffic must be contained:
+
+```ini
+[Interface]
+ManageRoutes = true
+KillSwitch = true
+```
+
+The Windows policy permits loopback, traffic on mqvpn's Wintun interface, and
+only the current `mqvpn.exe` process's UDP traffic to the configured server
+address and port. Its remaining ALE connect rules are unconditional blocks, so
+binding a socket to Wi-Fi or Ethernet does not bypass them. The policy uses a
+dynamic WFP session and explicitly deletes filters before their sublayer on
+normal exit or reconnect.
+
+## Console output encoding
+
+Log messages contain ASCII only, deliberately, and
+`scripts/lint/check_log_string_ascii.py` fails CI if a non-ASCII character
+appears inside a C string literal. Comments are exempt — they never reach a
+console.
+
+The reason is that the Windows console decodes bytes with the system ANSI
+codepage, which is CP936 on a Simplified Chinese install, while the sources are
+UTF-8. A `→` written in a log message is emitted as its three UTF-8 bytes
+`E2 86 92`; CP936 reads `E2 86` as one hanzi and cannot pair the remaining
+`92`, so it prints as a stray character. That is what produced
+
+```
+TUN mqvpn0 addr: 10.203.0.10 鈫?10.203.0.1 /32
+```
+
+Adapter names are not affected, because they arrive from Win32 already encoded
+in the console's codepage — which is why a single log line could show a correct
+`以太网 4` beside a corrupted `→`. Two encodings, one line.
+
+`SetConsoleOutputCP(CP_UTF8)` was considered and rejected: it fixes the console
+and nothing else. Logs are also redirected to files, captured by a GUI, and
+read by other tools, and each of those picks an encoding for itself. Staying
+inside ASCII is the only form that is correct for every consumer, so write
+`->` and `--` rather than `→` and `—`.
+
+See `docs/logging.md` for the rest of the log conventions, including what the
+levels mean and how a path is identified across lines.

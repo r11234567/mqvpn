@@ -399,7 +399,8 @@ test_tx_no_rules_disabled_raw(void)
 {
     mqvpn_reorder_config_t c;
     mqvpn_reorder_config_default(&c);
-    /* mode stays OFF (default). */
+    /* Set, not inherited: the default is ON, and this case is about OFF. */
+    c.mode = MQVPN_REORDER_OFF;
     mqvpn_reorder_tx_t *tx = mqvpn_reorder_tx_new(&c, 0x1);
     uint8_t pkt[256];
     mqvpn_reorder_tx_peek_t p;

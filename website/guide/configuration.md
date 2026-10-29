@@ -187,6 +187,13 @@ sudo mqvpn --config /etc/mqvpn/server.json
 >
 > This is independent of `ManageRoutes`. To stop such applications, set `KillSwitch = true`. Note that they are then **blocked outright rather than routed through the tunnel**.
 
+> **Note: route management does not cover interface-bound applications**
+>
+> mqvpn adds a split default route (`0.0.0.0/1` + `128.0.0.0/1`) instead of replacing the system default route, so the original default route stays in place. Applications that pick a network adapter by looking up the *system default route* — rather than the route to the destination — keep using the physical adapter and bypass the tunnel. Tailscale on Windows does this for its own sockets.
+>
+> This is independent of `ManageRoutes`. To stop such applications, set `KillSwitch = true`. Note that they are then **blocked outright rather than routed through the tunnel**.
+
+
 ### `[TLS]` (server only)
 
 | Key | Description | Default |

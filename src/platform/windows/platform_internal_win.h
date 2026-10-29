@@ -116,9 +116,10 @@ struct platform_win_ctx {
     int n_wfp_filters;
     int killswitch_active;
     int killswitch_enabled;
-    /* FwpmEngineClose0 failed: the dynamic session may still hold its
-     * block-all filters and nothing can address them any more. Only process
-     * exit clears them — see win_cleanup_killswitch(). */
+    /* FwpmEngineClose0 failed: the session is unreachable and may still be
+     * blocking. A WFP engine handle is an RPC context handle, so it must not
+     * be closed twice; the only remedy is process exit, because BFE runs a
+     * dynamic session down with its owner. Blocks a second setup as well. */
     int wfp_close_failed;
 
     /* Shutdown */
@@ -151,7 +152,7 @@ void win_cleanup_routes(platform_win_ctx_t *p);
 
 /* firewall.c */
 int win_setup_killswitch(platform_win_ctx_t *p);
-void win_cleanup_killswitch(platform_win_ctx_t *p);
+int win_cleanup_killswitch(platform_win_ctx_t *p);
 
 /* dns.c */
 int win_setup_dns(platform_win_ctx_t *p);

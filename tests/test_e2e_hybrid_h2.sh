@@ -306,7 +306,44 @@ cleanup_bg_procs() {
     done
 }
 
-trap 'cleanup_bg_procs; cleanup_http_server; bench_cleanup; rm -rf "$HTTP_DOCROOT"; rm -f \
+# Copy every per-test log somewhere the CI step can upload it.
+#
+# This has to run from the EXIT trap, not from the verdict block: the suite is
+# `set -eu`, so any check that fails by RETURNING non-zero (assert_series_floor
+# is the one that bites — it sets fail=1 *and* returns 1) aborts the script
+# before the verdict is ever reached. A collector that only ran there would be
+# missing for exactly the failures that are hardest to reproduce.
+#
+# Collect unconditionally; the workflow step is `if: failure()`, so a passing
+# run just leaves an unread directory behind.
+collect_logs() {
+    [ -n "${GITHUB_WORKSPACE:-}" ] || return 0
+    local dir="${GITHUB_WORKSPACE}/hybrid-e2e-logs" pair
+    mkdir -p "$dir" 2>/dev/null || return 0
+    for pair in "t1-client:$CLIENT_LOG_T1"   "t1-server:$SERVER_LOG_T1" \
+                "t1b-client:$CLIENT_LOG_T1B" "t1b-server:$SERVER_LOG_T1B" \
+                "t1c-client:$CLIENT_LOG_T1C" "t1c-server:$SERVER_LOG_T1C" \
+                "t7a-client:$CLIENT_LOG_T7A" "t7a-server:$SERVER_LOG_T7A" \
+                "t7b-client:$CLIENT_LOG_T7B" "t7b-server:$SERVER_LOG_T7B" \
+                "t2a-client:$CLIENT_LOG_T2A" "t2a-server:$SERVER_LOG_T2A" \
+                "t2b-client:$CLIENT_LOG_T2B" "t2b-server:$SERVER_LOG_T2B" \
+                "t3a-client:$CLIENT_LOG_T3A" "t3a-server:$SERVER_LOG_T3A" \
+                "t3b-client:$CLIENT_LOG_T3B" "t3b-server:$SERVER_LOG_T3B" \
+                "t4-client:$CLIENT_LOG_T4"   "t4-server:$SERVER_LOG_T4" \
+                "t5-client:$CLIENT_LOG_T5"   "t5-server:$SERVER_LOG_T5" \
+                "t6-client:$CLIENT_LOG_T6"   "t6-server:$SERVER_LOG_T6" \
+                "t8-client:$CLIENT_LOG_T8"   "t8-server:$SERVER_LOG_T8"; do
+        # `|| true` on both: this runs from a trap under `set -e`, where a
+        # missing log or a failed chmod would abort the handler and skip the
+        # rest of the cleanup.
+        [ -s "${pair#*:}" ] && cp "${pair#*:}" "${dir}/${pair%%:*}.log" 2>/dev/null || true
+    done
+    # The suite runs under sudo; upload-artifact reads as the runner user.
+    chmod -R a+rX "$dir" 2>/dev/null || true
+    return 0
+}
+
+trap 'collect_logs; cleanup_bg_procs; cleanup_http_server; bench_cleanup; rm -rf "$HTTP_DOCROOT"; rm -f \
     "$CLIENT_LOG_T1" "$SERVER_LOG_T1" "$CLIENT_LOG_T1B" "$SERVER_LOG_T1B" \
     "$CLIENT_LOG_T1C" "$SERVER_LOG_T1C" \
     "$CLIENT_LOG_T7A" "$SERVER_LOG_T7A" \
@@ -324,10 +361,11 @@ trap 'cleanup_bg_procs; cleanup_http_server; bench_cleanup; rm -rf "$HTTP_DOCROO
 fail=0
 
 # ─── Phase filter ─────────────────────────────────────────────────────────
-# "all" (default) runs everything; "perf" runs ONLY Test 2's throughput
-# comparison. CI uses both: a DEBUG build for the functional phases (asserts
-# must stay live — see the NDEBUG note in AGENTS.md) and a RELEASE build for
-# the throughput gate.
+# "all" (default) runs everything; "functional" runs the protocol and
+# lifecycle assertions; "perf" runs the throughput and multipath aggregation
+# measurements. CI uses a DEBUG build for the functional phases (asserts must
+# stay live — see the NDEBUG note in AGENTS.md) and a RELEASE build for the
+# performance phases.
 #
 # The split is not cosmetic. Test 2 gates the RATIO of two code paths, and RAW
 # barely touches this project's own code (classifier + datagram, then the
@@ -347,9 +385,9 @@ fail=0
 # phase treats it as a hard failure.
 HYBRID_H2_PHASES="${HYBRID_H2_PHASES:-all}"
 case "$HYBRID_H2_PHASES" in
-    all | perf) ;;
+    all | functional | perf) ;;
     *)
-        echo "error: HYBRID_H2_PHASES must be 'all' or 'perf' (got '$HYBRID_H2_PHASES')" >&2
+        echo "error: HYBRID_H2_PHASES must be 'all', 'functional', or 'perf' (got '$HYBRID_H2_PHASES')" >&2
         exit 2
         ;;
 esac
@@ -566,6 +604,40 @@ run_byte_identical_transfer() {
 # once; a persistent sub-floor sample fails the owning test.
 IPERF_MIN_MBPS=1.0
 
+# iperf3's default control/data port, used to wait for the one-shot server to
+# actually be listening instead of guessing with a fixed sleep.
+IPERF_PORT=5201
+
+# Explain a sub-floor sample. A bare "0.0 Mbps" cannot distinguish a tunnel
+# that died mid-run from a JSON the parser could not read, and both have
+# shown up in CI — so print whatever the run did leave behind. stderr is
+# captured to its own file (NOT merged into the JSON: any warning iperf3
+# writes there would corrupt the document and silently yield 0.0).
+iperf3_report_bad_sample() {
+    local json="$1" err="$2" label="${3:-iperf3}"
+    echo "  [$label] sub-floor sample — diagnostics:" >&2
+    python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception as e:
+    print('    JSON unparseable: %s' % e)
+    raise SystemExit
+if 'error' in d:
+    print('    iperf3 reported: %s' % d['error'])
+if 'end' not in d:
+    print('    no \"end\" block — the run never completed its summary')
+elif 'sum_received' not in d['end']:
+    print('    \"end\" present without sum_received; keys=%s' % sorted(d['end']))
+print('    intervals recorded: %d' % len(d.get('intervals') or []))
+" "$json" >&2 2>/dev/null || true
+    if [ -s "$err" ]; then
+        echo "    stderr:" >&2
+        head -10 "$err" | sed 's/^/      /' >&2
+    fi
+}
+
 # Single iperf3 TCP measurement (one flow) against $1 for $2 seconds.
 # Mirrors the existing netns iperf3-through-tunnel pattern in
 # benchmarks/bench_aggregate.sh: a one-shot server (`-1`) in NS_SERVER bound
@@ -582,15 +654,49 @@ IPERF_MIN_MBPS=1.0
 run_iperf3_through_tunnel() {
     local target="$1"
     local duration="${2:-6}"
-    local json
+    local json err
     json="$(mktemp)"
+    err="$(mktemp)"
+
+    # Let the previous sample's server finish releasing the port before
+    # binding. Without this the bind below loses the race, dies silently into
+    # &>/dev/null, and the listener check that follows matches the *old*
+    # server instead — so the client connects to a socket that is already
+    # closing and the transfer dies partway with "Broken pipe", which reads
+    # as a broken tunnel rather than the port collision it is.
+    if ! wait_for_port_free "$NS_SERVER" "$IPERF_PORT" 5; then
+        echo "  [iperf3] port ${IPERF_PORT} still busy from the previous sample" >&2
+        rm -f "$json" "$err"
+        echo "0.0"
+        return
+    fi
 
     ip netns exec "$NS_SERVER" iperf3 -s -B "$target" -1 &>/dev/null &
     local ipid=$!
-    sleep 1
 
+    # Wait for the listener instead of sleeping a fixed second: on a loaded
+    # runner `iperf3 -s` can still be binding when the client fires, and the
+    # ECONNREFUSED that follows is indistinguishable from a broken tunnel in
+    # the "0.0" emitted below. Normally this returns in one 0.5s poll, so the
+    # happy path is faster than the sleep it replaces. The 5s cap is
+    # deliberately tight: a bind either succeeds at once or never (a target
+    # address that does not exist in NS_SERVER), and the perf phase can issue
+    # 30 samples, so a generous timeout here would eat its 12-minute budget.
+    # The liveness check pairs with it: a server that lost a bind is gone,
+    # and reporting that beats letting the client draw its own conclusion.
+    if ! wait_for_listening_port "$NS_SERVER" "$IPERF_PORT" 5 \
+        || ! kill -0 "$ipid" 2>/dev/null; then
+        echo "  [iperf3] server never listened on ${IPERF_PORT} (target ${target})" >&2
+        kill "$ipid" 2>/dev/null || true
+        wait "$ipid" 2>/dev/null || true
+        rm -f "$json" "$err"
+        echo "0.0"
+        return
+    fi
+
+    # stderr to its own file, never into "$json" — see iperf3_report_bad_sample.
     ip netns exec "$NS_CLIENT" timeout $((duration + 15)) \
-        iperf3 -c "$target" -t "$duration" -P 1 --json >"$json" 2>&1 || true
+        iperf3 -c "$target" -t "$duration" -P 1 --json >"$json" 2>"$err" || true
 
     kill "$ipid" 2>/dev/null || true
     wait "$ipid" 2>/dev/null || true
@@ -609,7 +715,10 @@ try:
 except Exception:
     print('0.0')
 ")"
-    rm -f "$json"
+    if awk -v m="$mbps" -v f="$IPERF_MIN_MBPS" 'BEGIN{exit !(m<f)}'; then
+        iperf3_report_bad_sample "$json" "$err" "iperf3 v4"
+    fi
+    rm -f "$json" "$err"
     echo "$mbps"
 }
 
@@ -620,15 +729,35 @@ except Exception:
 run_iperf3_v6_through_tunnel() {
     local target="$1"
     local duration="${2:-6}"
-    local json
+    local json err
     json="$(mktemp)"
+    err="$(mktemp)"
+
+    if ! wait_for_port_free "$NS_SERVER" "$IPERF_PORT" 5; then
+        echo "  [iperf3 v6] port ${IPERF_PORT} still busy from the previous sample" >&2
+        rm -f "$json" "$err"
+        echo "0.0"
+        return
+    fi
 
     ip netns exec "$NS_SERVER" iperf3 -s -6 -B "$target" -1 &>/dev/null &
     local ipid=$!
-    sleep 1
+
+    # Same free-port wait, listener wait and stderr separation as the v4 twin
+    # above. `ss -ltn` renders a v6-bound listener as "[fd00:a6::100]:5201",
+    # which the port match handles unchanged.
+    if ! wait_for_listening_port "$NS_SERVER" "$IPERF_PORT" 5 \
+        || ! kill -0 "$ipid" 2>/dev/null; then
+        echo "  [iperf3 v6] server never listened on ${IPERF_PORT} (target ${target})" >&2
+        kill "$ipid" 2>/dev/null || true
+        wait "$ipid" 2>/dev/null || true
+        rm -f "$json" "$err"
+        echo "0.0"
+        return
+    fi
 
     ip netns exec "$NS_CLIENT" timeout $((duration + 15)) \
-        iperf3 -c "$target" -6 -t "$duration" -P 1 --json >"$json" 2>&1 || true
+        iperf3 -c "$target" -6 -t "$duration" -P 1 --json >"$json" 2>"$err" || true
 
     kill "$ipid" 2>/dev/null || true
     wait "$ipid" 2>/dev/null || true
@@ -647,7 +776,10 @@ try:
 except Exception:
     print('0.0')
 ")"
-    rm -f "$json"
+    if awk -v m="$mbps" -v f="$IPERF_MIN_MBPS" 'BEGIN{exit !(m<f)}'; then
+        iperf3_report_bad_sample "$json" "$err" "iperf3 v6"
+    fi
+    rm -f "$json" "$err"
     echo "$mbps"
 }
 
@@ -683,10 +815,17 @@ print(f'{sum(vals) / len(vals):.2f}' if vals else '0.0')
 " "$@"
 }
 
-# Fail the owning test (sets fail=1) if ANY sample in the series ($2..) is
-# below IPERF_MIN_MBPS — a persistent sub-floor sample survived the
-# in-repeat retry, so the measurement is broken and its average must not be
-# trusted as a gate input. $1 is a label for the diagnostic.
+# Fail the owning test if ANY sample in the series ($2..) is below
+# IPERF_MIN_MBPS — a persistent sub-floor sample survived the in-repeat retry,
+# so the measurement is broken and its average must not be trusted as a gate
+# input. $1 is a label for the diagnostic.
+#
+# Note this ABORTS the run, it does not just record: every call site invokes it
+# bare, and the suite is `set -e`, so the `return 1` ends the script there and
+# `fail=1` never gets read. That is the intended outcome (a sub-floor baseline
+# usually means the tunnel is gone, and every later measurement would be a
+# confusing 0.0 too) — but it is why the log collection lives in the EXIT trap
+# rather than in the verdict block, which this path never reaches.
 assert_series_floor() {
     local label="$1"; shift
     local bad
@@ -757,6 +896,24 @@ wait_for_listening_port() {
     return 1
 }
 
+# Inverse of wait_for_listening_port: poll until nothing is listening on $2.
+# The perf phase runs samples back to back on one fixed port, and a listener
+# check alone cannot tell a freshly bound server from the previous sample's
+# one-shot server still tearing its listener down. Whoever is about to bind
+# waits for the port to be genuinely free first, so a later "is it
+# listening?" can only be answering about the server it just started.
+wait_for_port_free() {
+    local ns="$1" port="$2" timeout="${3:-20}"
+    local i
+    for (( i=0; i<timeout*2; i++ )); do
+        if ! ip netns exec "$ns" ss -ltn 2>/dev/null | grep -q ":${port} "; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
 # Poll until $1 exists and is non-empty, or $2 seconds elapse (default 20s).
 # Used by Test 6 to detect "the responder's accept() returned and recorded
 # the peer address" without a fixed sleep.
@@ -793,7 +950,7 @@ time.sleep(${hold})
 # re-indented: it contains python/awk heredocs whose bodies are
 # indentation-sensitive, so re-indenting ~800 lines would risk changing what
 # those scripts do while burying the actual change. The closing `fi` is marked.
-if [ "$HYBRID_H2_PHASES" = all ]; then
+if [ "$HYBRID_H2_PHASES" != perf ]; then
 
 # ─── Test 1: curl body correctness, Enabled=true / Tcp=stream ─────────────
 echo ""
@@ -1029,9 +1186,12 @@ bench_stop_vpn
 
 fi # ← end of functional phases, part 1 (opened before Test 1)
 
+# ─── Performance phases: Tests 2 and 3 ────────────────────────────────────
+# Skipped by the DEBUG functional CI arm. "all" retains its historical
+# diagnostic behavior; "perf" is the RELEASE hard gate.
+if [ "$HYBRID_H2_PHASES" != functional ]; then
+
 # ─── Test 2: single-path throughput, stream lane within 20% of RAW ───────
-# Runs in BOTH phase modes: as diagnostics under "all" (Debug), as the hard
-# gate under "perf" (Release). See the HYBRID_H2_PHASES block near the top.
 echo ""
 echo "=== Test 2: single-path throughput (stream lane vs RAW) ==="
 IPERF_DURATION_T2=6
@@ -1084,10 +1244,6 @@ else
     echo "FAIL: RAW_MBPS=0 — iperf3 RAW baseline measurement failed, cannot compute degradation"
     fail=1
 fi
-
-# ─── Functional phases, part 2 of 2 (Tests 3-6, 8) ────────────────────────
-# Same guard and same non-re-indentation rationale as part 1.
-if [ "$HYBRID_H2_PHASES" = all ]; then
 
 # ─── Test 3: multipath aggregation, stream lane >= 1.5x best single path ──
 echo ""
@@ -1184,6 +1340,14 @@ if len(loads) < 2:
 lo, hi = loads[0], loads[-1]
 share = (lo / hi) if hi else 0.0
 if lo < FLOOR:
+    # See the same branch in Test 8 for why both-under-floor is reported
+    # separately: it is not a load-share verdict, it means no path carried
+    # the burst at all.
+    if hi < FLOOR:
+        print('FAIL no-path-carried-load lo=%d hi=%d (floor=%d) — neither path '
+              'moved the burst; these per-connection counters are not from the '
+              'connection that carried it (tunnel reconnected mid-measurement?)'
+              % (lo, hi, FLOOR)); sys.exit()
     print('FAIL underused lo=%d hi=%d (floor=%d)' % (lo, hi, FLOOR)); sys.exit()
 if lo < 0.2 * hi:
     print('FAIL imbalanced lo=%d hi=%d minshare=%.2f' % (lo, hi, share)); sys.exit()
@@ -1228,6 +1392,12 @@ else
     echo "FAIL: BEST_SINGLE_MBPS=0 — baseline iperf3 measurement failed, cannot compute ratio"
     fail=1
 fi
+
+fi # ← end of performance phases (opened before Test 2)
+
+# ─── Functional phases, part 2 of 2 (Tests 4-6, 8) ─────────────────────────
+# Same guard and same non-re-indentation rationale as part 1.
+if [ "$HYBRID_H2_PHASES" != perf ]; then
 
 # ─── Test 4/5 setup: rebuild single-path topology ─────────────────────────
 # Tests 4 and 5 prove close-mapping correctness, not scheduling — same
@@ -1733,8 +1903,11 @@ fi
 # while the client is still alive.
 assert_stream_lane_used "$CLIENT_LOG_T8" "Test8 v6 stream"
 
-stats_t8="$(bench_query_control "$CTRL_PORT" get_status)"
-agg_check_t8="$(echo "$stats_t8" | python3 -c "
+stats_t8=""
+agg_check_t8=""
+for _ in $(seq 1 15); do
+    stats_t8="$(bench_query_control "$CTRL_PORT" get_status)"
+    agg_check_t8="$(echo "$stats_t8" | python3 -c "
 import sys, json
 # Half of Test 3's 100000 floor: this phase is a single ~6s iperf3 burst,
 # not Test 3's repeated run_iperf3_repeated series, so fewer per-path bytes
@@ -1756,11 +1929,27 @@ if len(loads) < 2:
 lo, hi = loads[0], loads[-1]
 share = (lo / hi) if hi else 0.0
 if lo < FLOOR:
+    # Both paths under the floor is not a load-share verdict at all: no path
+    # carried the burst. These counters are per-QUIC-connection, so that is
+    # what a mid-measurement reconnect looks like from here — the traffic went
+    # to the old connection, the snapshot describes the new one. Seen in CI as
+    # lo=0 hi=602 alongside a 0.0 Mbps sample, against lo=33M hi=53M on a
+    # passing run. Name it instead of blaming path spread.
+    if hi < FLOOR:
+        print('FAIL no-path-carried-load lo=%d hi=%d (floor=%d) — neither path '
+              'moved the burst; these per-connection counters are not from the '
+              'connection that carried it (tunnel reconnected mid-measurement?)'
+              % (lo, hi, FLOOR)); sys.exit()
     print('FAIL underused lo=%d hi=%d (floor=%d)' % (lo, hi, FLOOR)); sys.exit()
 if lo < 0.2 * hi:
     print('FAIL imbalanced lo=%d hi=%d minshare=%.2f' % (lo, hi, share)); sys.exit()
 print('OK lo=%d hi=%d minshare=%.2f' % (lo, hi, share))
 ")"
+    if [ "${agg_check_t8#OK}" != "$agg_check_t8" ]; then
+        break
+    fi
+    sleep 1
+done
 echo "  per-path load (tx+rx) after IPv6 iperf3 burst: ${agg_check_t8}"
 if [ "${agg_check_t8#OK}" != "$agg_check_t8" ]; then
     echo "PASS: both paths carried meaningful load from IPv6 TCP-lane traffic (${agg_check_t8})"
@@ -1825,15 +2014,29 @@ else
         # same RTM_DELLINK-driven drop-path lifecycle production traffic
         # goes through on a real link loss.
         ip netns exec "$NS_CLIENT" ip link set "$(bench_path_veth_client 0)" down
-        sleep 3
 
-        V6_BYTES_AFTER="$(cat "$V6_BYTES_FILE" 2>/dev/null || echo 0)"
-        [ -n "$V6_BYTES_AFTER" ] || V6_BYTES_AFTER=0
+        # Link loss and path re-add are asynchronous. The old fixed three
+        # second sleep sampled exactly as the replacement path was created on
+        # slower runners, so it could report a false stall before the stream
+        # had any opportunity to send on the recovered path. Wait for the
+        # replacement path first, then give the flow a bounded observation
+        # window to demonstrate post-recovery progress.
+        recovered_paths_t8="$(bench_wait_for_n_paths 2 15 "$CTRL_PORT")" || true
+        echo "  IPv6 paths after path 0 down: ${recovered_paths_t8}"
+        V6_BYTES_AFTER="$V6_BYTES_BEFORE"
+        for _ in $(seq 1 10); do
+            V6_BYTES_AFTER="$(cat "$V6_BYTES_FILE" 2>/dev/null || echo 0)"
+            [ -n "$V6_BYTES_AFTER" ] || V6_BYTES_AFTER=0
+            if [ "$V6_BYTES_AFTER" -gt "$V6_BYTES_BEFORE" ]; then
+                break
+            fi
+            sleep 1
+        done
         echo "  IPv6 flow bytes received after path 0 down: ${V6_BYTES_AFTER}"
-        if [ "$V6_BYTES_AFTER" -gt "$V6_BYTES_BEFORE" ]; then
-            echo "PASS: IPv6 TCP-lane flow kept flowing after path 0 was dropped (failover, no stall)"
+        if [ "$recovered_paths_t8" -ge 2 ] 2>/dev/null && [ "$V6_BYTES_AFTER" -gt "$V6_BYTES_BEFORE" ]; then
+            echo "PASS: IPv6 TCP-lane flow kept flowing after path 0 was dropped and path recovery completed"
         else
-            echo "FAIL: IPv6 TCP-lane flow stalled after path 0 was dropped (${V6_BYTES_BEFORE} -> ${V6_BYTES_AFTER})"
+            echo "FAIL: IPv6 TCP-lane flow stalled after path recovery (${V6_BYTES_BEFORE} -> ${V6_BYTES_AFTER}, paths=${recovered_paths_t8})"
             fail=1
         fi
 
@@ -1853,7 +2056,7 @@ V6_SOURCE_PID=""; V6_SINK_PID=""
 
 bench_stop_vpn
 
-fi # ← end of functional phases, part 2 (opened before Test 3)
+fi # ← end of functional phases, part 2 (opened before Test 4)
 
 # ─── Verdict ───────────────────────────────────────────────────────────────
 echo ""
@@ -1881,6 +2084,48 @@ if [ "$fail" -ne 0 ]; then
     echo "--- Server log T6 (last 20) ---"; tail -20 "$SERVER_LOG_T6"
     echo "--- Client log T8 (last 30) ---"; tail -30 "$CLIENT_LOG_T8"
     echo "--- Server log T8 (last 20) ---"; tail -20 "$SERVER_LOG_T8"
+    # Test 8's known flake is the QUIC connection dying during the iperf3
+    # burst: iperf3 then reports 0.0 and the per-path counters describe the
+    # replacement connection. The fixed tails above cannot show it — by the
+    # time the suite finishes, the death and the reconnect have scrolled past
+    # 30 lines. These two filters run over the WHOLE T8 logs, so the next
+    # occurrence carries its own cause instead of needing a re-run.
+    # 220 was too narrow: on an xqc_conn_destroy report line the fields that
+    # say WHY (err:0x.., close_msg:local/remote) sit around column 250-300, so
+    # the cut removed exactly the answer. 460 covers them without dragging in
+    # the per-path blob that follows.
+    echo "--- T8 client: connection lifecycle (whole log, filtered) ---"
+    grep -aE 'connection closed|conn_destroy|close_msg|socket exception|state: |abandon the only|no route to' \
+        "$CLIENT_LOG_T8" | cut -c1-460 | tail -40 || true
+    echo "--- T8 server: session lifecycle (whole log, filtered) ---"
+    grep -aE 'Extended CONNECT|tunnel established|session removed|addr_pool|conn_destroy|path (created|removed)' \
+        "$SERVER_LOG_T8" | cut -c1-460 | tail -30 || true
+    # The close reason on its own line, so it survives any later re-narrowing
+    # of the filters above and is greppable in the raw CI log. Labelled by
+    # role: these are mktemp paths, and "tmp.TErCbFOpnl" tells the reader
+    # nothing about which side raised the error -- which is the whole question.
+    echo "--- T8 close reasons (err + local/remote) ---"
+    for pair in "client:$CLIENT_LOG_T8" "server:$SERVER_LOG_T8"; do
+        grep -ao 'err:0x[0-9a-fA-F]*|close_msg:[^|]*' "${pair#*:}" 2>/dev/null |
+            sort | uniq -c | sed "s|^|  ${pair%%:*} |" || true
+    done
+
+    # Whatever xquic complained about before it tore the connection down. The
+    # close reason says WHICH side rejected a frame; this says WHAT it
+    # rejected, and it is never in the tails above because it happens
+    # mid-run, thousands of lines earlier.
+    echo "--- T8 xquic errors (deduped, both sides) ---"
+    for pair in "client:$CLIENT_LOG_T8" "server:$SERVER_LOG_T8"; do
+        grep -a '\[error\]' "${pair#*:}" 2>/dev/null |
+            sed -E 's/.*\[error\] *//; s/\|scid:[0-9a-f]+//; s/\|conn:[0-9A-Fx]+//' |
+            cut -c1-200 | sort | uniq -c | sort -rn | head -12 |
+            sed "s|^|  ${pair%%:*} |" || true
+    done
+
+    # Full logs come from collect_logs in the EXIT trap, which also covers the
+    # abort paths this block never reaches.
+    [ -n "${GITHUB_WORKSPACE:-}" ] &&
+        echo "--- full logs uploaded as the hybrid-e2e-logs artifact ---" || true
     exit 1
 fi
 echo "RESULT: PASS"

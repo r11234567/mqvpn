@@ -167,8 +167,9 @@ typedef struct mqvpn_tcp_flow {
      * (PENDING_STREAM: nothing may be sent before the gate opens) and
      * EAGAIN/partial-accept retry (ACTIVE: xquic backpressure). FIFO; flushed
      * by the writable notify and by the 2xx transition. uplink_queued_bytes
-     * counts UNSENT bytes only (sum of tot_len - offset), which is the
-     * watermark metric: what xquic has not yet taken from us.
+     * counts UNSENT bytes only (sum of tot_len - offset). Backpressure uses
+     * this together with xquic's connection-wide retained send-queue bytes,
+     * so accepting a body write no longer counts as downstream progress.
      * (An earlier uplink_inflight_bytes field was reserved here; it was never
      * decremented anywhere and its "accepted by xquic" meaning
      * has no completion signal to drive it, so it is replaced by

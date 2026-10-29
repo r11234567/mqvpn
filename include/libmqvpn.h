@@ -726,7 +726,10 @@ MQVPN_API int mqvpn_config_set_pmtud(mqvpn_config_t *cfg, int enable);
  * These mirror the reorder design spec's builder surface. Values are validated
  * (cross-side invariants like cap-power-of-two and ingress < egress) when the
  * config is applied by the library, not by the setters. Calling none of these
- * leaves the shim disabled (mode OFF, the default). */
+ * leaves the shim disabled (mode OFF, the default). The shim only engages once
+ * both peers advertise it (§19.3), so enabling it cannot break an older peer.
+ * Defaulting it ON was tried and reverted: a netsim A/B measured no benefit,
+ * and it costs 8 bytes of inner MTU on every flow. */
 MQVPN_API int mqvpn_config_set_reorder_enabled(mqvpn_config_t *cfg,
                                                mqvpn_reorder_mode_t mode);
 MQVPN_API int mqvpn_config_set_reorder_wait(mqvpn_config_t *cfg, uint32_t max_wait_ms);
@@ -894,6 +897,8 @@ MQVPN_API int mqvpn_config_set_quic_fallback_proxy_protocol(mqvpn_config_t *cfg,
 
 /* ─── Client API ─── */
 
+/* user_ctx is borrowed and must remain valid until mqvpn_client_destroy()
+ * returns. It is passed unchanged to callbacks. */
 MQVPN_API mqvpn_client_t *mqvpn_client_new(const mqvpn_config_t *cfg,
                                            const mqvpn_client_callbacks_t *cbs,
                                            void *user_ctx);
@@ -1095,6 +1100,8 @@ MQVPN_API int mqvpn_client_set_server_addr(mqvpn_client_t *client,
 
 /* ─── Server API ─── */
 
+/* user_ctx is borrowed and must remain valid until mqvpn_server_destroy()
+ * returns. It is passed unchanged to callbacks. */
 MQVPN_API mqvpn_server_t *mqvpn_server_new(const mqvpn_config_t *cfg,
                                            const mqvpn_server_callbacks_t *cbs,
                                            void *user_ctx);
@@ -1153,13 +1160,10 @@ MQVPN_API int mqvpn_server_on_socket_recv(mqvpn_server_t *server, const uint8_t 
 MQVPN_API void mqvpn_server_on_egress_fd_ready(mqvpn_server_t *server, int fd,
                                                void *fd_ctx, int readable, int writable);
 
-/* Upper bound on concurrent egress TCP fds the server will ever open
- * (min(rlimit_nofile - reserve, configured cap)). Computed once at
- * mqvpn_server_new and frozen for the server's lifetime: platforms size
- * their fd->event registries from this, and the server's own admission cap
- * uses the same snapshot, so the two bounds cannot drift (a runtime
- * setrlimit changes neither). Returns 0 on NULL server; a value <= 0 means
- * "treat tcp_egress as disabled — do not allocate a registry". */
+/* Upper bound on concurrent server egress fds across hybrid TCP, SNI QUIC
+ * fallback, and HTTP/2 upstream sockets. Computed once at mqvpn_server_new,
+ * clamped to rlimit headroom, and frozen for the server lifetime so platform
+ * registry capacity and core admission cannot drift. Returns 0 for NULL. */
 MQVPN_API int mqvpn_server_egress_fd_budget(mqvpn_server_t *server);
 
 /* Feed data from platform into the engine. Same accepted-not-sent contract

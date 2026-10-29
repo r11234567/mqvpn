@@ -139,6 +139,7 @@ mqvpn_build_conn_settings(const mqvpn_conn_settings_input_t *in, xqc_conn_settin
     out->so_sndbuf = 8 * 1024 * 1024;
     out->idle_time_out = 120000;
     out->init_idle_time_out = 10000;
+    out->enable_pmtud = 1;
 
     /* --- stream backlog cap ---
      * A stream write frames data as far as the peer's flow-control window

@@ -271,14 +271,19 @@ int mqvpn_tcp_lane_downlink_pump(mqvpn_tcp_lane_t *lane, void *stream);
  * classifier/config/ABI surface.
  *
  * Semantics — these are RECVED-WITHHOLDING hysteresis thresholds, not hard
- * memory caps: bytes lwIP has already delivered to the recv callback were
- * already sequenced and ACKed on the wire, so they can never be dropped and
- * MUST be queued when xquic won't take them. Withholding tcp_recved() only
- * stops the receive window from RE-opening; the peer may still fill whatever
- * window was already advertised, so the true worst-case per-flow queue bound
- * is TCP_WND (512 KiB on the non-iOS profile, lwip_port/lwipopts.h) by TCP
- * mechanics — the memory
- * budget (docs/hybrid_h2_memory_budget.md) must cite TCP_WND, not the
+ * memory caps. They cover both bytes mqvpn has not handed to xquic yet and
+ * xquic's connection-wide un-sent byte estimate. Packets in flight are
+ * deliberately outside that estimate: they are the congestion controller's
+ * budget, and a connection running at its BDP holds a congestion window of
+ * them continuously, so a gate that counted them would stop reopening on
+ * exactly the fast paths it exists to pace. Bytes lwIP has already delivered
+ * to the recv callback were already
+ * sequenced and ACKed on the wire, so they can never be dropped and MUST be
+ * queued when xquic won't take them. Withholding tcp_recved() only stops the
+ * receive window from RE-opening; the peer may still fill whatever window was
+ * already advertised, so the true worst-case per-flow queue bound is TCP_WND
+ * (512 KiB on the non-iOS profile, lwip_port/lwipopts.h) by TCP mechanics — the
+ * memory budget (docs/hybrid_h2_memory_budget.md) must cite TCP_WND, not the
  * high-water mark. */
 #include "lwip_port/mqvpn_lwip_profile.h"
 

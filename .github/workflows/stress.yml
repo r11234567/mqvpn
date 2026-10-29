@@ -21,6 +21,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply xquic patches
+        shell: bash
+        run: bash scripts/apply_xquic_patches.sh
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -63,7 +67,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-stress-v3
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-stress-v3
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'

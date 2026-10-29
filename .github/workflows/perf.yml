@@ -1,9 +1,18 @@
 name: Performance Tests
 
-# Security: only push to main and manual trigger.
-# Never runs on PRs — prevents fork code execution on self-hosted runner.
-# Runner requires: cmake gcc make git libevent-dev golang iptables
-#                  iproute2 iperf3 python3 jq openssl
+# Core benchmark suite, on a GitHub-hosted runner.
+#
+# Why hosted: `runs-on: perf-test` was a self-hosted label with no runner
+# registered in this fork, so this workflow never executed once — 53 runs, 53
+# cancellations, zero results. A noisy number beats no number.
+#
+# How to read the results: shared cloud vCPUs have neighbours, so absolute
+# throughput here is NOT comparable to upstream's dedicated box, and a single
+# run means little on its own. Treat every series as a trend against this
+# repo's own history, and check a metric's coefficient of variation (the
+# dashboard shows it) before reading anything into a movement.
+#
+# Never runs on PRs: fork code must not execute with this workflow's token.
 
 on:
   push:
@@ -13,20 +22,32 @@ on:
 permissions:
   contents: read
 
+# Its own group now. The old shared `perf-test` group existed to serialize two
+# workflows onto one physical box; hosted runs each get a fresh VM, so the only
+# shared resource left is the index.json that publish_to_r2.sh rewrites
+# read-modify-write. perf-weekly writes a different prefix, so this workflow can
+# only race itself — cancel-in-progress holds it to a single writer and drops
+# superseded commits instead of queueing one long job per push.
 concurrency:
-  group: perf-test
+  group: perf-push
   cancel-in-progress: true
 
 jobs:
   perf-test:
-    # Temporary: the perf-test runner is under maintenance. Revert this
-    # change to go back to it.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      # Job-level rather than on the publish step, so the steps below can skip
+      # themselves when R2 is unconfigured: the `secrets` context is not
+      # available in a step `if:`, but `env` is.
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      # Stamped into each result document. publish_to_r2.sh derives the index
+      # entry's commit from git independently, so this is the in-file copy.
+      CI_BENCH_COMMIT: ${{ github.sha }}
     steps:
-      - name: Pre-checkout cleanup (root-owned files)
-        run: sudo rm -rf ci_bench_results bench_results
-
       - uses: actions/checkout@v7
         with:
           submodules: recursive
@@ -43,13 +64,37 @@ jobs:
           sudo ip netns del ci-bench-client 2>/dev/null || true
           sudo pkill -f 'iperf3' || true
 
-      - name: Clean previous build
+      # The self-hosted box had these preinstalled. gcc, make, git, python3, jq
+      # and the AWS CLI already ship on the hosted image; these do not.
+      - name: Install dependencies
         run: |
-          rm -rf third_party/xquic/third_party/boringssl/build
-          rm -rf third_party/xquic/build
-          rm -rf build
+          sudo apt-get update
+          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3 netcat-openbsd \
+            conntrack stress-ng
+
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve BoringSSL pin
+        id: bssl-pin
+        run: echo "sha=$(git -C third_party/xquic/third_party/boringssl rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Caching replaces the old "Clean previous build" step, which wiped a
+      # persistent workspace and would now delete what we just restored. An
+      # ephemeral VM starts clean, so the wipe has nothing left to do — and the
+      # dependency builds are the bulk of the wall time. Keys carry the build
+      # flags, so a tree built for a different configuration can never be
+      # served to this job.
+      - name: Cache BoringSSL (gcc Release, perf)
+        id: bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-${{ steps.bssl-pin.outputs.sha }}-linux-gcc-release-fpic-perf-v1
 
       - name: Build BoringSSL
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
         run: |
           cd third_party/xquic/third_party/boringssl
           mkdir -p build && cd build
@@ -61,10 +106,25 @@ jobs:
                 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
           make -j$(nproc) ssl crypto
 
+      # Deliberately outside the cache-miss guard: this is the guard for the
+      # -O0 trap above, and a poisoned cache entry is exactly the case worth
+      # catching.
       - name: Verify BoringSSL is an optimized build
         run: bash scripts/ci_check_bssl_optimized.sh third_party/xquic/third_party/boringssl/build
 
+      - name: Cache xquic (gcc Release, perf)
+        id: xquic-cache
+        uses: actions/cache@v6
+        with:
+          # See ci.yml's "Cache xquic (Release)" comment re: xqc_configure.h —
+          # it is generated, so it must travel with build/.
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-perf-v1
+
       - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
         run: |
           cd third_party/xquic
           mkdir -p build && cd build
@@ -91,6 +151,14 @@ jobs:
       - name: Aggregation benchmark (WLB + MinRTT)
         run: sudo bash scripts/ci_benchmarks/ci_bench_aggregate.sh build/mqvpn
 
+      # One realistic bad network, on the per-commit path. hetero_extreme
+      # (optimized BGP + junk BGP behind a weak-signal 5G leg) is the
+      # highest-signal single scenario: a scheduler regression shows up in
+      # "does the junk path drag the good one down" before it shows anywhere
+      # else. The full matrix is weekly — see docs/network_emulation_matrix.md.
+      - name: Realistic-network scenario (hetero_extreme)
+        run: sudo -E bash scripts/ci_benchmarks/ci_bench_scenarios.sh percommit build/mqvpn
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
@@ -99,19 +167,15 @@ jobs:
           path: ci_bench_results/*.json
           retention-days: 90
 
-      - name: Verify aws-cli is installed on runner
-        if: success()
-        run: aws --version
-
+      # Skipped rather than failed when R2 is unconfigured: the artifact above
+      # still carries this run's results, so a missing bucket must not turn a
+      # green benchmark run red.
       - name: Publish results to R2
-        if: success()
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        if: ${{ success() && env.R2_ACCOUNT_ID != '' }}
         run: bash scripts/ci_publish/publish_to_r2.sh perf-data push
 
-      - name: Post-job cleanup (root-owned files)
-        if: always()
-        run: sudo rm -rf ci_bench_results
+      - name: Note that R2 publishing was skipped
+        if: ${{ success() && env.R2_ACCOUNT_ID == '' }}
+        run: |
+          echo "::notice::R2_* secrets are not set — results are in this run's" \
+               "artifact only, and the dashboard will not show this commit."

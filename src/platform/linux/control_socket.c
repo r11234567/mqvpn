@@ -620,12 +620,17 @@ ctrl_on_read(evutil_socket_t fd, short what, void *arg)
                 p++;
             if (*p == '{') {
                 int depth = 0, in_str = 0;
+                int escaped = 0;
                 int complete = 0;
                 for (size_t i = (size_t)(p - conn->req); i < conn->req_len; i++) {
                     char c = conn->req[i];
                     if (in_str) {
+                        if (escaped) {
+                            escaped = 0;
+                            continue;
+                        }
                         if (c == '\\') {
-                            i++;
+                            escaped = 1;
                             continue;
                         }
                         if (c == '"') in_str = 0;
@@ -739,7 +744,7 @@ ctrl_socket_create(struct event_base *eb, const char *addr, int port,
 
     /* Warn if exposed beyond loopback — the control API has no auth */
     if (strcmp(addr, "127.0.0.1") != 0 && strcmp(addr, "::1") != 0)
-        LOG_WRN("control API: binding to non-loopback address %s — "
+        LOG_WRN("control API: binding to non-loopback address %s -- "
                 "the control API has no authentication",
                 addr);
 
