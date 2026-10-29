@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
@@ -815,7 +816,7 @@ internal sealed class MainForm : FluentWindow
         btnTest.Margin = new Thickness(0, 0, 8, 0);
         var btnRouting = FluentUi.ActionButton("路由设置", SymbolRegular.Router20, ControlAppearance.Secondary, (_, _) => EditRoutingSettings());
         btnRouting.Margin = new Thickness(0, 0, 8, 0);
-        var btnUpdate = FluentUi.ActionButton("内核更新", SymbolRegular.CloudArrowDown20, ControlAppearance.Secondary, (_, _) => OpenKernelUpdate());
+        var btnUpdate = FluentUi.ActionButton("检查更新", SymbolRegular.CloudArrowDown20, ControlAppearance.Secondary, (_, _) => OpenKernelUpdate());
         btnUpdate.Margin = new Thickness(0, 0, 8, 0);
 
         leftBar.Children.Add(btnAdd);
@@ -872,7 +873,12 @@ internal sealed class MainForm : FluentWindow
         _profilesGrid.MouseDoubleClick += (_, _) =>
         {
             if (SelectedProfile is not null)
-                EditSelectedProfile();
+            {
+                if (_profiles?.State.DoubleClickToActivate == true)
+                    _ = SetSelectedProfileActiveAsync();
+                else
+                    EditSelectedProfile();
+            }
         };
 
         _profilesGrid.PreviewMouseRightButtonDown += OnProfilesGridPreviewMouseRightButtonDown;
@@ -1513,22 +1519,9 @@ internal sealed class MainForm : FluentWindow
         }
     }
 
-    private async void EditRoutingSettings()
+    private void EditRoutingSettings()
     {
-        if (_profiles is null)
-            return;
-        using var editor = new RoutingSettingsForm(_profiles.Routing);
-        if (!editor.ShowModal(this))
-            return;
-        var restartTun = _tunService?.IsRunning == true;
-        if (restartTun)
-            await StopTunAsync();
-        _profiles.ReplaceRouting(editor.Result);
-        GenerateActiveRoutingConfig();
-        RefreshProfilesGrid();
-        RefreshRoutingSelector();
-        if (restartTun)
-            await StartTunAsync();
+        OpenSettings(2);
     }
 
     private void OpenKernelUpdate()
@@ -1539,17 +1532,21 @@ internal sealed class MainForm : FluentWindow
         using var update = new KernelUpdateForm(
             RuntimeDirectory,
             new KernelUpdatePreferences(
+                store.State.GuiUpdateSource,
                 store.State.MqvpnUpdateSource,
                 store.State.XrayUpdateSource,
                 store.State.GeoDataUpdateSource,
+                store.State.GuiIncludePreRelease,
                 store.State.MqvpnIncludePreRelease,
                 store.State.XrayIncludePreRelease),
             StopProxyAsync,
             preferences =>
             {
+                store.State.GuiUpdateSource = preferences.GuiSource;
                 store.State.MqvpnUpdateSource = preferences.MqvpnSource;
                 store.State.XrayUpdateSource = preferences.XraySource;
                 store.State.GeoDataUpdateSource = preferences.GeoDataSource;
+                store.State.GuiIncludePreRelease = preferences.GuiIncludePreRelease;
                 store.State.MqvpnIncludePreRelease = preferences.MqvpnIncludePreRelease;
                 store.State.XrayIncludePreRelease = preferences.XrayIncludePreRelease;
                 store.Save();
@@ -1557,16 +1554,19 @@ internal sealed class MainForm : FluentWindow
         update.ShowModal(this);
     }
 
-    private void OpenSettings()
+    private void OpenSettings(int initialTabIndex = 0)
     {
         if (_profiles is null)
             return;
 
-        using var settings = new SettingsForm(_profiles.State, updatedState =>
+        using var settings = new SettingsForm(_profiles, initialTabIndex, updatedStore =>
         {
             _profiles.Save();
-            _ = Task.Run(async () => await Dispatcher.InvokeAsync(async () => await ApplyLogLevelAsync(updatedState.LogLevel)));
-            QueueLog("GUI", "常规设置已更新并保存");
+            GenerateActiveRoutingConfig();
+            RefreshProfilesGrid();
+            RefreshRoutingSelector();
+            _ = Task.Run(async () => await Dispatcher.InvokeAsync(async () => await ApplyLogLevelAsync(_profiles.State.LogLevel)));
+            QueueLog("GUI", "设置中心已更新并保存");
         });
         settings.ShowModal(this);
     }
@@ -1600,6 +1600,18 @@ internal sealed class MainForm : FluentWindow
             : $"Log level set to {level}");
     }
 
+    private bool IsGlobalMqvpnActive()
+    {
+        if (_profiles is null)
+            return false;
+        var policy = _profiles.GetPolicy(_profiles.ActiveProfile.RoutingPolicyId);
+        if (policy is null)
+            return false;
+        return policy.Id == "global" ||
+               policy.Name.Contains("全局 MQVPN", StringComparison.OrdinalIgnoreCase) ||
+               (policy.FinalOutbound == "MQVPN-TUN" && (policy.Rules == null || policy.Rules.Count == 0 || policy.Rules.All(r => !r.Enabled)));
+    }
+
     private async Task ChangeActiveRoutingAsync()
     {
         if (_updatingRoutingSelector || _profiles is null || _routingSelector.SelectedValue is not string policyId ||
@@ -1612,8 +1624,25 @@ internal sealed class MainForm : FluentWindow
         _profiles.Save();
         GenerateActiveRoutingConfig();
         RefreshProfilesGrid();
-        if (restartTun)
-            await StartTunAsync();
+
+        if (_proxyService?.IsRunning == true)
+        {
+            var isGlobal = IsGlobalMqvpnActive();
+            await EnsureMqvpnRouteAsync();
+            if (isGlobal)
+            {
+                if (restartTun)
+                    await StopTunAsync();
+                QueueLog("GUI", "已切换至全局 MQVPN 模式，直通虚拟网卡，无需开启 Xray TUN");
+                SetTunState(false, "全局直通 (免TUN)", FluentUi.MutedBrush.Color);
+                _tunToggle.Enabled = false;
+            }
+            else
+            {
+                _tunToggle.Enabled = true;
+                await StartTunAsync();
+            }
+        }
     }
 
     private void SelectProfileRow(string id)
@@ -1649,6 +1678,14 @@ internal sealed class MainForm : FluentWindow
         _tunToggle.Busy = true;
         try
         {
+            if (desired && IsGlobalMqvpnActive())
+            {
+                FluentUi.ShowAlert(this, "当前策略为全局 MQVPN，所有流量直接由 MQVPN 虚拟网卡转发，无需开启 Xray 分流 TUN。", "全局直通提示");
+                SetTunState(false, "全局直通 (免TUN)", FluentUi.MutedBrush.Color);
+                _tunToggle.Enabled = false;
+                return;
+            }
+
             if (desired)
                 await StartTunAsync();
             else
@@ -1702,19 +1739,30 @@ internal sealed class MainForm : FluentWindow
         StartLatencyMonitor();
         QueueLog("GUI", "Proxy is ready");
 
-        try
+        if (IsGlobalMqvpnActive())
         {
-            await StartTunAsync();
-        }
-        catch (Exception ex)
-        {
-            QueueLog("GUI", $"[warning] 系统 TUN 自动启动失败: {ex.Message}");
-            SetTunState(false, "启动失败", Red);
-        }
-        finally
-        {
+            QueueLog("GUI", "当前路由策略为【全局 MQVPN】，所有流量直接通过 MQVPN 虚拟网卡传输，无需开启 Xray 分流 TUN。");
+            SetTunState(false, "全局直通 (免TUN)", FluentUi.MutedBrush.Color);
             _tunToggle.Busy = false;
-            _tunToggle.Enabled = true;
+            _tunToggle.Enabled = false;
+            _footerStatus.Text = "全局 MQVPN 代理已连接";
+        }
+        else
+        {
+            try
+            {
+                await StartTunAsync();
+            }
+            catch (Exception ex)
+            {
+                QueueLog("GUI", $"[warning] 系统 TUN 自动启动失败: {ex.Message}");
+                SetTunState(false, "启动失败", Red);
+            }
+            finally
+            {
+                _tunToggle.Busy = false;
+                _tunToggle.Enabled = true;
+            }
         }
     }
 
@@ -1785,6 +1833,13 @@ internal sealed class MainForm : FluentWindow
             throw new InvalidOperationException("请先开启代理");
         if (_tunService?.IsRunning == true)
             return;
+        if (IsGlobalMqvpnActive())
+        {
+            QueueLog("GUI", "当前策略为全局 MQVPN，无需启动 Xray 分流 TUN");
+            SetTunState(false, "全局直通 (免TUN)", FluentUi.MutedBrush.Color);
+            _tunToggle.Enabled = false;
+            return;
+        }
 
         SetTunState(false, "启动中...", Amber);
         await EnsureMqvpnRouteAsync();
@@ -1871,17 +1926,38 @@ internal sealed class MainForm : FluentWindow
     private async Task EnsureMqvpnRouteAsync()
     {
         var adapter = ActiveMqvpnTunName.Replace("'", "''", StringComparison.Ordinal);
+        var isGlobal = IsGlobalMqvpnActive();
+        var metric = isGlobal ? 10 : 9000;
+
+        var serverHost = string.Empty;
+        if (isGlobal && _profiles is not null)
+        {
+            var cfg = _profiles.ReadConfig(_profiles.ActiveProfile);
+            serverHost = ProfileStore.ParseHost(cfg["server_addr"]?.GetValue<string>() ?? string.Empty);
+        }
+
         var script =
+            $"Get-NetRoute -InterfaceAlias '{adapter}' -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object {{$_.RouteMetric -ne {metric}}} | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; " +
+            $"Get-NetRoute -InterfaceAlias '{adapter}' -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | Where-Object {{$_.RouteMetric -ne {metric}}} | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; " +
             $"$v4=Get-NetRoute -InterfaceAlias '{adapter}' -DestinationPrefix '0.0.0.0/0' " +
-            "-ErrorAction SilentlyContinue | Where-Object {$_.RouteMetric -eq 9000}; " +
+            $"-ErrorAction SilentlyContinue | Where-Object {{$_.RouteMetric -eq {metric}}}; " +
             "if(-not $v4){New-NetRoute -DestinationPrefix '0.0.0.0/0' " +
-            $"-InterfaceAlias '{adapter}' -NextHop '0.0.0.0' -RouteMetric 9000 " +
+            $"-InterfaceAlias '{adapter}' -NextHop '0.0.0.0' -RouteMetric {metric} " +
             "-PolicyStore ActiveStore | Out-Null}; " +
             $"$v6=Get-NetRoute -InterfaceAlias '{adapter}' -DestinationPrefix '::/0' " +
-            "-ErrorAction SilentlyContinue | Where-Object {$_.RouteMetric -eq 9000}; " +
+            $"-ErrorAction SilentlyContinue | Where-Object {{$_.RouteMetric -eq {metric}}}; " +
             "if(-not $v6){New-NetRoute -DestinationPrefix '::/0' " +
-            $"-InterfaceAlias '{adapter}' -NextHop '::' -RouteMetric 9000 " +
+            $"-InterfaceAlias '{adapter}' -NextHop '::' -RouteMetric {metric} " +
             "-PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null}";
+
+        if (isGlobal && !string.IsNullOrEmpty(serverHost) && IPAddress.TryParse(serverHost, out var srvIp))
+        {
+            var prefix = srvIp.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? $"{serverHost}/32" : $"{serverHost}/128";
+            script += $"; $srv=Get-NetRoute -DestinationPrefix '{prefix}' -ErrorAction SilentlyContinue | Where-Object {{$_.InterfaceAlias -ne '{adapter}'}}; " +
+                      $"if(-not $srv){{ $def=Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object {{$_.InterfaceAlias -ne '{adapter}'}} | Sort-Object RouteMetric | Select-Object -First 1; " +
+                      $"if($def){{ New-NetRoute -DestinationPrefix '{prefix}' -InterfaceIndex $def.InterfaceIndex -NextHop $def.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null }} }}";
+        }
+
         await RunPowerShellAsync(script);
     }
 
@@ -1890,7 +1966,7 @@ internal sealed class MainForm : FluentWindow
         var adapter = ActiveMqvpnTunName.Replace("'", "''", StringComparison.Ordinal);
         var script =
             $"Get-NetRoute -InterfaceAlias '{adapter}' " +
-            "-ErrorAction SilentlyContinue | Where-Object {$_.RouteMetric -eq 9000} | " +
+            "-ErrorAction SilentlyContinue | Where-Object {$_.RouteMetric -eq 10 -or $_.RouteMetric -eq 9000} | " +
             "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue";
         await RunPowerShellAsync(script, throwOnError: false);
     }

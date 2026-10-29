@@ -1,7 +1,9 @@
+using System.Runtime.InteropServices;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Net.Http.Headers;
 using System.Net;
+using System.Reflection;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
@@ -9,7 +11,7 @@ using System.Xml.Linq;
 namespace TruckersMP.Proxy;
 
 internal sealed record GitHubAsset(string Name, string DownloadUrl, long Size);
-internal sealed record GitHubRelease(string Tag, string Name, IReadOnlyList<GitHubAsset> Assets, bool IsPreRelease);
+internal sealed record GitHubRelease(string Tag, string Name, IReadOnlyList<GitHubAsset> Assets, bool IsPreRelease, string Body = "");
 
 internal static class GitHubReleaseClient
 {
@@ -57,11 +59,13 @@ internal static class GitHubReleaseClient
                 asset.GetProperty("browser_download_url").GetString() ?? string.Empty,
                 asset.GetProperty("size").GetInt64()))
             .ToArray();
+        var body = element.TryGetProperty("body", out var b) ? b.GetString() ?? string.Empty : string.Empty;
         return new GitHubRelease(
             element.GetProperty("tag_name").GetString() ?? "unknown",
             element.GetProperty("name").GetString() ?? string.Empty,
             assets,
-            ReadFlag(element, "prerelease"));
+            ReadFlag(element, "prerelease"),
+            body);
     }
 
     private static bool ReadFlag(JsonElement element, string name) =>
@@ -148,13 +152,31 @@ internal static class GitHubReleaseClient
         }
     }
 
-    public static async Task DownloadAsync(string url, string destination, CancellationToken cancellationToken)
+    public static Task DownloadAsync(string url, string destination, CancellationToken cancellationToken) =>
+        DownloadAsync(url, destination, null, cancellationToken);
+
+    public static async Task DownloadAsync(
+        string url,
+        string destination,
+        IProgress<(long received, long total)>? progress,
+        CancellationToken cancellationToken)
     {
         using var response = await Client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         response.EnsureSuccessStatusCode();
+        var totalBytes = response.Content.Headers.ContentLength ?? -1L;
         await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
-        await using var output = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.None);
-        await input.CopyToAsync(output, cancellationToken);
+        await using var output = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true);
+
+        var buffer = new byte[81920];
+        var totalRead = 0L;
+        int bytesRead;
+
+        while ((bytesRead = await input.ReadAsync(buffer, 0, buffer.Length, cancellationToken)) > 0)
+        {
+            await output.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+            totalRead += bytesRead;
+            progress?.Report((totalRead, totalBytes));
+        }
     }
 
     private static HttpClient CreateClient()
@@ -168,23 +190,114 @@ internal static class GitHubReleaseClient
 
 internal static class KernelInstaller
 {
-    public static GitHubAsset SelectAsset(string kernel, GitHubRelease release)
+    public static GitHubAsset SelectAsset(string kernel, GitHubRelease release, Architecture? arch = null)
     {
-        var candidates = release.Assets.Where(asset => asset.Name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase));
+        var targetArch = arch ?? RuntimeInformation.ProcessArchitecture;
+        var candidates = release.Assets.Where(asset => asset.Name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)).ToList();
         GitHubAsset? selected = kernel switch
         {
-            "mqvpn" => candidates.FirstOrDefault(asset =>
-                asset.Name.Contains("windows", StringComparison.OrdinalIgnoreCase) &&
-                asset.Name.Contains("amd64", StringComparison.OrdinalIgnoreCase)),
-            "xray" => candidates.FirstOrDefault(asset =>
+            "gui" => targetArch == Architecture.Arm64
+                ? candidates.FirstOrDefault(asset =>
+                    asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase) &&
+                    (asset.Name.Contains("mqvpn_windows_gui", StringComparison.OrdinalIgnoreCase) ||
+                     asset.Name.Contains("windows_gui", StringComparison.OrdinalIgnoreCase) ||
+                     asset.Name.Contains("mqvpn", StringComparison.OrdinalIgnoreCase)))
+                  ?? candidates.FirstOrDefault(asset => asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase))
+                : candidates.FirstOrDefault(asset =>
+                    (asset.Name.Contains("x64", StringComparison.OrdinalIgnoreCase) || asset.Name.Contains("amd64", StringComparison.OrdinalIgnoreCase)) &&
+                    (asset.Name.Contains("mqvpn_windows_gui", StringComparison.OrdinalIgnoreCase) ||
+                     asset.Name.Contains("windows_gui", StringComparison.OrdinalIgnoreCase)))
+                  ?? candidates.FirstOrDefault(asset =>
+                    !asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase) &&
+                    (asset.Name.Contains("mqvpn_windows_gui", StringComparison.OrdinalIgnoreCase) ||
+                     asset.Name.Contains("windows_gui", StringComparison.OrdinalIgnoreCase)))
+                  ?? candidates.FirstOrDefault(asset =>
+                    !asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase) &&
+                    asset.Name.Contains("mqvpn", StringComparison.OrdinalIgnoreCase) &&
+                    asset.Name.Contains("gui", StringComparison.OrdinalIgnoreCase)),
+            "mqvpn" => targetArch == Architecture.Arm64
+                ? candidates.FirstOrDefault(asset =>
+                    !asset.Name.Contains("gui", StringComparison.OrdinalIgnoreCase) &&
+                    asset.Name.Contains("windows", StringComparison.OrdinalIgnoreCase) &&
+                    asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase))
+                : candidates.FirstOrDefault(asset =>
+                    !asset.Name.Contains("gui", StringComparison.OrdinalIgnoreCase) &&
+                    asset.Name.Contains("windows", StringComparison.OrdinalIgnoreCase) &&
+                    (asset.Name.Contains("amd64", StringComparison.OrdinalIgnoreCase) ||
+                     asset.Name.Contains("x64", StringComparison.OrdinalIgnoreCase) ||
+                     asset.Name.Contains("x86_64", StringComparison.OrdinalIgnoreCase))),
+            "xray" => targetArch == Architecture.Arm64
+                ? candidates.FirstOrDefault(asset =>
+                    asset.Name.Contains("xray", StringComparison.OrdinalIgnoreCase) &&
+                    asset.Name.Contains("windows", StringComparison.OrdinalIgnoreCase) &&
+                    asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase))
+                  ?? candidates.FirstOrDefault(asset =>
+                    asset.Name.Contains("xray", StringComparison.OrdinalIgnoreCase) &&
+                    asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase))
+                : candidates.FirstOrDefault(asset =>
                     asset.Name.Equals("Xray-windows-64.zip", StringComparison.OrdinalIgnoreCase))
-                ?? candidates.FirstOrDefault(asset =>
+                  ?? candidates.FirstOrDefault(asset =>
+                    asset.Name.Contains("xray", StringComparison.OrdinalIgnoreCase) &&
                     asset.Name.Contains("windows", StringComparison.OrdinalIgnoreCase) &&
                     asset.Name.Contains("64", StringComparison.OrdinalIgnoreCase) &&
                     !asset.Name.Contains("arm", StringComparison.OrdinalIgnoreCase)),
             _ => null,
         };
-        return selected ?? throw new InvalidOperationException($"Release {release.Tag} 中没有兼容的 Windows amd64 ZIP");
+        return selected ?? throw new InvalidOperationException($"Release {release.Tag} 中没有兼容的 Windows {targetArch} ZIP");
+    }
+
+    public static async Task InstallGuiAsync(
+        GitHubAsset asset,
+        IProgress<(long received, long total)>? progress,
+        CancellationToken cancellationToken)
+    {
+        var temporaryRoot = Path.Combine(Path.GetTempPath(), $"mqvpn-gui-update-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(temporaryRoot);
+        var archive = Path.Combine(temporaryRoot, asset.Name);
+
+        try
+        {
+            await GitHubReleaseClient.DownloadAsync(asset.DownloadUrl, archive, progress, cancellationToken);
+
+            var currentExe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName;
+            var appDir = AppDomain.CurrentDomain.BaseDirectory;
+            var exeName = !string.IsNullOrEmpty(currentExe) ? Path.GetFileName(currentExe) : "MQVPN.exe";
+            var currentPid = Environment.ProcessId;
+
+            // 寻找独立更新助手 MqvpnUpgrade.exe
+            var updaterPath = Path.Combine(appDir, "MqvpnUpgrade.exe");
+            if (!File.Exists(updaterPath))
+            {
+                var fallback = Path.Combine(appDir, "..", "updater", "bin", "Debug", "net9.0-windows", "MqvpnUpgrade.exe");
+                if (File.Exists(fallback))
+                    updaterPath = fallback;
+            }
+
+            if (File.Exists(updaterPath))
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = updaterPath,
+                    Arguments = $"\"{archive}\" \"{appDir}\" \"{exeName}\" {currentPid}",
+                    UseShellExecute = true,
+                    WorkingDirectory = appDir
+                };
+                Process.Start(psi);
+                Environment.Exit(0);
+            }
+            else
+            {
+                throw new FileNotFoundException("未找到更新助手 MqvpnUpgrade.exe，无法完成无锁覆盖替换。");
+            }
+        }
+        catch
+        {
+            if (Directory.Exists(temporaryRoot))
+            {
+                try { Directory.Delete(temporaryRoot, true); } catch { }
+            }
+            throw;
+        }
     }
 
     public static IReadOnlyList<GitHubAsset> SelectGeoDataAssets(GitHubRelease release)
@@ -285,6 +398,14 @@ internal static class KernelInstaller
 
     public static async Task<string> GetInstalledVersionAsync(string kernel, string runtimeRoot)
     {
+        if (kernel == "gui")
+        {
+            var asm = typeof(MainForm).Assembly;
+            var ver = asm.GetName().Version;
+            var infoVer = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+            return !string.IsNullOrEmpty(infoVer) ? $"v{infoVer}" : (ver is not null ? $"v{ver.Major}.{ver.Minor}.{ver.Build}" : "v1.2.0");
+        }
+
         if (kernel == "geodata")
         {
             var xrayDirectory = Path.Combine(runtimeRoot, "xray");

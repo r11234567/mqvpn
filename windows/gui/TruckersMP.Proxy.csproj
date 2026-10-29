@@ -13,6 +13,10 @@
     <Product>MQVPN</Product>
     <Description>MQVPN Windows client GUI</Description>
     <RootNamespace>TruckersMP.Proxy</RootNamespace>
+    <Version>1.2.0</Version>
+    <AssemblyVersion>1.2.0.0</AssemblyVersion>
+    <FileVersion>1.2.0.0</FileVersion>
+    <InformationalVersion>1.2.0</InformationalVersion>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
@@ -35,6 +39,8 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="sqlite-net-pcl" Version="1.9.172" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.10" />
     <PackageReference Include="WPF-UI" Version="4.3.0" />
   </ItemGroup>
 </Project>

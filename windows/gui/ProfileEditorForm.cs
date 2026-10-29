@@ -234,7 +234,7 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         ConfigureNumber(_tunQueueLength, 0, 65536, GetInteger("tx_queue_len", 0));
         ConfigureNumber(_tunReadBatch, 0, 4096, GetInteger("tun_read_batch", 0));
 
-        ConfigureCombo(_reinjection, ["off", "deadline", "idle", "dgram"], GetString("reinjection", "off"));
+        ConfigureCombo(_reinjection, ["off", "deadline", "idle"], GetString("reinjection", "off"));
         ConfigureNumber(_reinjectionFactor, 100, 1000, GetInteger("reinjection_srtt_factor_pct", 110));
         ConfigureNumber(_reinjectionHardDeadline, 1, 60000, GetInteger("reinjection_hard_deadline_ms", 500));
         ConfigureNumber(_reinjectionLowerBound, 1, 60000, GetInteger("reinjection_deadline_lower_bound_ms", 20));
@@ -507,7 +507,7 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         hybrid["tcp_connect_timeout_sec"] = decimal.ToUInt32(GetDecimal(_tcpConnectTimeout));
 
         var reorder = GetOrCreateObject("reorder");
-        reorder["enabled"] = _reorderEnabled.IsChecked == true ? "on" : "off";
+        reorder["enabled"] = _reorderEnabled.IsChecked == true;
         SaveReorderOverride(reorder, "max_wait_ms", _reorderCustomWait.IsChecked == true, GetDecimal(_reorderMaxWait));
         SaveReorderOverride(reorder, "cap_packets", _reorderCustomCap.IsChecked == true, GetDecimal(_reorderCapPackets));
         reorder["max_bytes_per_flow"] = decimal.ToUInt64(GetDecimal(_reorderMaxBytesPerFlow));
@@ -635,8 +635,21 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
     private static string GetString(JsonObject? source, string name, string fallback = "") =>
         source?[name]?.GetValue<string>() ?? fallback;
 
-    private static bool GetBoolean(JsonObject? source, string name, bool fallback) =>
-        source?[name] is JsonValue value && value.TryGetValue<bool>(out var result) ? result : fallback;
+    private static bool GetBoolean(JsonObject? source, string name, bool fallback)
+    {
+        if (source?[name] is not JsonValue value)
+            return fallback;
+        if (value.TryGetValue<bool>(out var result))
+            return result;
+        if (value.TryGetValue<string>(out var str))
+        {
+            if (string.Equals(str, "true", StringComparison.OrdinalIgnoreCase) || string.Equals(str, "on", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (string.Equals(str, "false", StringComparison.OrdinalIgnoreCase) || string.Equals(str, "off", StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+        return fallback;
+    }
 
     private static int GetInteger(JsonObject? source, string name, int fallback) =>
         source?[name] is JsonValue value && value.TryGetValue<int>(out var result) ? result : fallback;

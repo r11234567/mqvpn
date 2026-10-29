@@ -28,8 +28,7 @@ internal sealed partial class ProfileEditorForm
     private void InitializeReorderRules(JsonObject reorder)
     {
         _reorderEnabled.Content = "启用 UDP Reorder";
-        _reorderEnabled.IsChecked = string.Equals(
-            GetString(reorder, "enabled", "off"), "on", StringComparison.OrdinalIgnoreCase);
+        _reorderEnabled.IsChecked = GetBoolean(reorder, "enabled", false);
 
         FluentUi.StyleDataGrid(_reorderRules);
         _reorderRules.AutoGenerateColumns = false;

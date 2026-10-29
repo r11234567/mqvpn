@@ -1,31 +1,154 @@
+using System.IO.Compression;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using SQLite;
+using TruckersMP.Proxy.Database;
 
 namespace TruckersMP.Proxy;
 
 internal sealed class AppState
 {
     public string ActiveProfileId { get; set; } = string.Empty;
+    public string GuiUpdateSource { get; set; } = "r11234567/mqvpn";
     public string MqvpnUpdateSource { get; set; } = "r11234567/mqvpn";
     public string XrayUpdateSource { get; set; } = "XTLS/Xray-core";
     public string GeoDataUpdateSource { get; set; } = "Loyalsoldier/v2ray-rules-dat";
+    public bool GuiIncludePreRelease { get; set; }
     public bool MqvpnIncludePreRelease { get; set; }
     public bool XrayIncludePreRelease { get; set; }
+    public bool AutoCheckUpdatesOnStartup { get; set; }
     public string LogLevel { get; set; } = LogLevels.Default;
     public bool StartMinimized { get; set; }
     public bool MinimizeToTrayOnClose { get; set; } = true;
     public string LatencyProbeEndpoint { get; set; } = "1.1.1.1:80";
+    public int SpeedTestTimeoutMs { get; set; } = 3000;
     public string ThemeMode { get; set; } = "system";
+    public bool DoubleClickToActivate { get; set; }
+    public bool AllowLan { get; set; }
+    public bool AutoReconnect { get; set; } = true;
+    public int ReconnectIntervalSec { get; set; } = 5;
+
+    // 高级网络与代理端口
+    public int LocalSocksPort { get; set; } = 10808;
+    public int LocalHttpPort { get; set; } = 10809;
+    public bool EnableUdp { get; set; } = true;
+    public bool EnableSniffing { get; set; } = true;
+    public bool RouteOnly { get; set; } = true;
+    public bool DisplayRealTimeSpeed { get; set; } = true;
+    public bool ConfirmOnExit { get; set; }
+    public string SpeedTestUrl { get; set; } = "http://cachefly.cachefly.net/10mb.test";
+    public int MixedConcurrencyCount { get; set; } = 5;
+
+    // DNS 科学解析设置
+    public string DirectDns { get; set; } = "223.5.5.5, 119.29.29.29, 114.114.114.114";
+    public string RemoteDns { get; set; } = "https://1.1.1.1/dns-query, 8.8.8.8, 1.0.0.1";
+    public string BootstrapDns { get; set; } = "223.5.5.5, 1.1.1.1";
+    public string DomainStrategy { get; set; } = "IPIfNonMatch";
+    public bool FakeDnsEnabled { get; set; }
+    public string FakeDnsRange { get; set; } = "198.18.0.0/15";
+    public bool BlockAAAAQuery { get; set; }
+    public string CustomHosts { get; set; } = string.Empty;
+
     public List<ProxyProfile> Profiles { get; set; } = [];
+
+    public Dictionary<string, string> ToSettingsMap() => new()
+    {
+        [nameof(ActiveProfileId)] = ActiveProfileId ?? string.Empty,
+        [nameof(GuiUpdateSource)] = GuiUpdateSource ?? "r11234567/mqvpn",
+        [nameof(MqvpnUpdateSource)] = MqvpnUpdateSource ?? "r11234567/mqvpn",
+        [nameof(XrayUpdateSource)] = XrayUpdateSource ?? "XTLS/Xray-core",
+        [nameof(GeoDataUpdateSource)] = GeoDataUpdateSource ?? "Loyalsoldier/v2ray-rules-dat",
+        [nameof(GuiIncludePreRelease)] = GuiIncludePreRelease.ToString(),
+        [nameof(MqvpnIncludePreRelease)] = MqvpnIncludePreRelease.ToString(),
+        [nameof(XrayIncludePreRelease)] = XrayIncludePreRelease.ToString(),
+        [nameof(AutoCheckUpdatesOnStartup)] = AutoCheckUpdatesOnStartup.ToString(),
+        [nameof(LogLevel)] = LogLevel ?? LogLevels.Default,
+        [nameof(StartMinimized)] = StartMinimized.ToString(),
+        [nameof(MinimizeToTrayOnClose)] = MinimizeToTrayOnClose.ToString(),
+        [nameof(LatencyProbeEndpoint)] = LatencyProbeEndpoint ?? "1.1.1.1:80",
+        [nameof(SpeedTestTimeoutMs)] = SpeedTestTimeoutMs.ToString(),
+        [nameof(ThemeMode)] = ThemeMode ?? "system",
+        [nameof(DoubleClickToActivate)] = DoubleClickToActivate.ToString(),
+        [nameof(AllowLan)] = AllowLan.ToString(),
+        [nameof(AutoReconnect)] = AutoReconnect.ToString(),
+        [nameof(ReconnectIntervalSec)] = ReconnectIntervalSec.ToString(),
+
+        [nameof(LocalSocksPort)] = LocalSocksPort.ToString(),
+        [nameof(LocalHttpPort)] = LocalHttpPort.ToString(),
+        [nameof(EnableUdp)] = EnableUdp.ToString(),
+        [nameof(EnableSniffing)] = EnableSniffing.ToString(),
+        [nameof(RouteOnly)] = RouteOnly.ToString(),
+        [nameof(DisplayRealTimeSpeed)] = DisplayRealTimeSpeed.ToString(),
+        [nameof(ConfirmOnExit)] = ConfirmOnExit.ToString(),
+        [nameof(SpeedTestUrl)] = SpeedTestUrl ?? "http://cachefly.cachefly.net/10mb.test",
+        [nameof(MixedConcurrencyCount)] = MixedConcurrencyCount.ToString(),
+
+        [nameof(DirectDns)] = DirectDns ?? string.Empty,
+        [nameof(RemoteDns)] = RemoteDns ?? string.Empty,
+        [nameof(BootstrapDns)] = BootstrapDns ?? string.Empty,
+        [nameof(DomainStrategy)] = DomainStrategy ?? "IPIfNonMatch",
+        [nameof(FakeDnsEnabled)] = FakeDnsEnabled.ToString(),
+        [nameof(FakeDnsRange)] = FakeDnsRange ?? "198.18.0.0/15",
+        [nameof(BlockAAAAQuery)] = BlockAAAAQuery.ToString(),
+        [nameof(CustomHosts)] = CustomHosts ?? string.Empty,
+    };
+
+    public void LoadFromSettingsMap(Dictionary<string, string> map)
+    {
+        if (map.TryGetValue(nameof(ActiveProfileId), out var activeId)) ActiveProfileId = activeId;
+        if (map.TryGetValue(nameof(GuiUpdateSource), out var guiSrc)) GuiUpdateSource = guiSrc;
+        if (map.TryGetValue(nameof(MqvpnUpdateSource), out var mqvpnSrc)) MqvpnUpdateSource = mqvpnSrc;
+        if (map.TryGetValue(nameof(XrayUpdateSource), out var xraySrc)) XrayUpdateSource = xraySrc;
+        if (map.TryGetValue(nameof(GeoDataUpdateSource), out var geoSrc)) GeoDataUpdateSource = geoSrc;
+        if (map.TryGetValue(nameof(GuiIncludePreRelease), out var gPre) && bool.TryParse(gPre, out var bgPre)) GuiIncludePreRelease = bgPre;
+        if (map.TryGetValue(nameof(MqvpnIncludePreRelease), out var mPre) && bool.TryParse(mPre, out var bmPre)) MqvpnIncludePreRelease = bmPre;
+        if (map.TryGetValue(nameof(XrayIncludePreRelease), out var xPre) && bool.TryParse(xPre, out var bxPre)) XrayIncludePreRelease = bxPre;
+        if (map.TryGetValue(nameof(AutoCheckUpdatesOnStartup), out var autoUp) && bool.TryParse(autoUp, out var bAutoUp)) AutoCheckUpdatesOnStartup = bAutoUp;
+        if (map.TryGetValue(nameof(LogLevel), out var logLvl)) LogLevel = logLvl;
+        if (map.TryGetValue(nameof(StartMinimized), out var startMin) && bool.TryParse(startMin, out var bStartMin)) StartMinimized = bStartMin;
+        if (map.TryGetValue(nameof(MinimizeToTrayOnClose), out var minTray) && bool.TryParse(minTray, out var bMinTray)) MinimizeToTrayOnClose = bMinTray;
+        if (map.TryGetValue(nameof(LatencyProbeEndpoint), out var probe)) LatencyProbeEndpoint = probe;
+        if (map.TryGetValue(nameof(SpeedTestTimeoutMs), out var spdTo) && int.TryParse(spdTo, out var ispdTo)) SpeedTestTimeoutMs = ispdTo;
+        if (map.TryGetValue(nameof(ThemeMode), out var theme)) ThemeMode = theme;
+        if (map.TryGetValue(nameof(DoubleClickToActivate), out var dblAct) && bool.TryParse(dblAct, out var bdblAct)) DoubleClickToActivate = bdblAct;
+        if (map.TryGetValue(nameof(AllowLan), out var lan) && bool.TryParse(lan, out var blan)) AllowLan = blan;
+        if (map.TryGetValue(nameof(AutoReconnect), out var reconn) && bool.TryParse(reconn, out var breconn)) AutoReconnect = breconn;
+        if (map.TryGetValue(nameof(ReconnectIntervalSec), out var recInt) && int.TryParse(recInt, out var irecInt)) ReconnectIntervalSec = irecInt;
+
+        if (map.TryGetValue(nameof(LocalSocksPort), out var lsp) && int.TryParse(lsp, out var ilsp)) LocalSocksPort = ilsp;
+        if (map.TryGetValue(nameof(LocalHttpPort), out var lhp) && int.TryParse(lhp, out var ilhp)) LocalHttpPort = ilhp;
+        if (map.TryGetValue(nameof(EnableUdp), out var udp) && bool.TryParse(udp, out var budp)) EnableUdp = budp;
+        if (map.TryGetValue(nameof(EnableSniffing), out var snf) && bool.TryParse(snf, out var bsnf)) EnableSniffing = bsnf;
+        if (map.TryGetValue(nameof(RouteOnly), out var ro) && bool.TryParse(ro, out var bro)) RouteOnly = bro;
+        if (map.TryGetValue(nameof(DisplayRealTimeSpeed), out var drts) && bool.TryParse(drts, out var bdrts)) DisplayRealTimeSpeed = bdrts;
+        if (map.TryGetValue(nameof(ConfirmOnExit), out var coe) && bool.TryParse(coe, out var bcoe)) ConfirmOnExit = bcoe;
+        if (map.TryGetValue(nameof(SpeedTestUrl), out var stu)) SpeedTestUrl = stu;
+        if (map.TryGetValue(nameof(MixedConcurrencyCount), out var mcc) && int.TryParse(mcc, out var imcc)) MixedConcurrencyCount = imcc;
+
+        if (map.TryGetValue(nameof(DirectDns), out var ddns)) DirectDns = ddns;
+        if (map.TryGetValue(nameof(RemoteDns), out var rdns)) RemoteDns = rdns;
+        if (map.TryGetValue(nameof(BootstrapDns), out var bdns)) BootstrapDns = bdns;
+        if (map.TryGetValue(nameof(DomainStrategy), out var ds)) DomainStrategy = ds;
+        if (map.TryGetValue(nameof(FakeDnsEnabled), out var fde) && bool.TryParse(fde, out var bfde)) FakeDnsEnabled = bfde;
+        if (map.TryGetValue(nameof(FakeDnsRange), out var fdr)) FakeDnsRange = fdr;
+        if (map.TryGetValue(nameof(BlockAAAAQuery), out var baq) && bool.TryParse(baq, out var bbaq)) BlockAAAAQuery = bbaq;
+        if (map.TryGetValue(nameof(CustomHosts), out var ch)) CustomHosts = ch;
+    }
 }
 
+[Table("Profiles")]
 internal sealed class ProxyProfile
 {
+    [PrimaryKey]
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
+
+    [Indexed]
+    public int SortOrder { get; set; }
+
     public string Name { get; set; } = "MQVPN 配置";
     public string ConfigFile { get; set; } = string.Empty;
     public string RoutingPolicyId { get; set; } = "truckersmp";
@@ -38,6 +161,12 @@ internal sealed class ProxyProfile
     public long TodayUploadBytes { get; set; }
     public long TodayDownloadBytes { get; set; }
     public string TrafficDate { get; set; } = string.Empty;
+
+    public string ServerAddress { get; set; } = string.Empty;
+    public int ServerPort { get; set; }
+    public string Protocol { get; set; } = "mqvpn";
+    public string Remarks { get; set; } = string.Empty;
+    public string? ConfigContent { get; set; }
 }
 
 internal sealed class RoutingDocument
@@ -97,6 +226,9 @@ internal sealed class ProfileStore
         Directory.CreateDirectory(Path.Combine(configDirectory, "profiles"));
         var statePath = Path.Combine(configDirectory, "profiles.json");
         var routingPath = Path.Combine(configDirectory, "routing.json");
+        var dbPath = Path.Combine(configDirectory, "mqvpn.db");
+
+        SQLiteHelper.Instance.Initialize(dbPath);
 
         var state = File.Exists(statePath)
             ? JsonSerializer.Deserialize<AppState>(File.ReadAllText(statePath), JsonOptions) ?? new AppState()
@@ -105,8 +237,54 @@ internal sealed class ProfileStore
             ? JsonSerializer.Deserialize<RoutingDocument>(File.ReadAllText(routingPath), JsonOptions) ?? CreateDefaultRouting()
             : CreateDefaultRouting();
 
-        if (state.Profiles.Count == 0)
-            state = CreateInitialState(configDirectory);
+        // 优先从 SQLite 数据库同步配置节点
+        var dbProfiles = SQLiteHelper.Instance.GetAllProfiles();
+        if (dbProfiles.Count > 0)
+        {
+            state.Profiles = dbProfiles;
+        }
+        else
+        {
+            // 首次从 JSON 迁移到 SQLite 数据库
+            if (state.Profiles.Count == 0)
+                state = CreateInitialState(configDirectory);
+
+            for (var i = 0; i < state.Profiles.Count; i++)
+            {
+                var profile = state.Profiles[i];
+                profile.SortOrder = i;
+                try
+                {
+                    var cfgPath = Path.Combine(configDirectory, profile.ConfigFile);
+                    if (File.Exists(cfgPath))
+                    {
+                        var cfg = JsonNode.Parse(ReadMqvpnConfigFile(cfgPath))?.AsObject();
+                        var (addr, port) = ParseServerEndpoint(cfg);
+                        profile.ServerAddress = addr;
+                        profile.ServerPort = port;
+                        profile.ConfigContent = cfg?.ToJsonString(JsonOptions);
+                    }
+                }
+                catch
+                {
+                    // 忽略单项解析容错
+                }
+            }
+            SQLiteHelper.Instance.SaveProfiles(state.Profiles);
+        }
+
+        // 优先从 SQLite 数据库同步 App 全局设置
+        var dbSettings = SQLiteHelper.Instance.GetAllSettings();
+        if (dbSettings.Count > 0)
+        {
+            state.LoadFromSettingsMap(dbSettings);
+        }
+        else
+        {
+            // 首次将 JSON 中的设置迁移至 SQLite
+            SQLiteHelper.Instance.SaveAllSettings(state.ToSettingsMap());
+        }
+
         if (!state.Profiles.Any(profile => profile.Id == state.ActiveProfileId))
             state.ActiveProfileId = state.Profiles[0].Id;
         if (routing.Policies.Count == 0)
@@ -118,6 +296,23 @@ internal sealed class ProfileStore
         store.NormalizeConfigEncoding();
         store.Save();
         return store;
+    }
+
+    public static (string address, int port) ParseServerEndpoint(JsonObject? config)
+    {
+        if (config is null) return (string.Empty, 0);
+        if (config.TryGetPropertyValue("server_addr", out var node) && node is not null)
+        {
+            var raw = node.ToString().Trim();
+            var colonIndex = raw.LastIndexOf(':');
+            if (colonIndex > 0 && int.TryParse(raw[(colonIndex + 1)..], out var port))
+            {
+                var host = raw[..colonIndex].Trim('[', ']');
+                return (host, port);
+            }
+            return (raw, 0);
+        }
+        return (string.Empty, 0);
     }
 
     public string GetConfigPath(ProxyProfile profile)
@@ -137,7 +332,12 @@ internal sealed class ProfileStore
 
     public void SaveConfig(ProxyProfile profile, JsonObject config)
     {
+        var (addr, port) = ParseServerEndpoint(config);
+        profile.ServerAddress = addr;
+        profile.ServerPort = port;
+        profile.ConfigContent = config.ToJsonString(JsonOptions);
         WriteMqvpnConfigFile(GetConfigPath(profile), config);
+        SQLiteHelper.Instance.SaveProfile(profile);
     }
 
     public static void WriteMqvpnConfigFile(string path, JsonObject config) =>
@@ -172,22 +372,32 @@ internal sealed class ProfileStore
     {
         foreach (var profile in State.Profiles)
         {
-            var config = ReadConfig(profile);
-            // Re-serialize every profile so legacy \uXXXX output becomes UTF-8 text.
-            SaveConfig(profile, config);
+            var path = GetConfigPath(profile);
+            if (File.Exists(path))
+            {
+                var config = ReadConfig(profile);
+                // Re-serialize every profile so legacy \uXXXX output becomes UTF-8 text.
+                SaveConfig(profile, config);
+            }
         }
     }
 
     public ProxyProfile Add(string name, JsonObject config, string routingPolicyId)
     {
+        var (addr, port) = ParseServerEndpoint(config);
         var profile = new ProxyProfile
         {
             Name = name,
             RoutingPolicyId = routingPolicyId,
+            SortOrder = State.Profiles.Count,
+            ServerAddress = addr,
+            ServerPort = port,
+            ConfigContent = config.ToJsonString(JsonOptions),
         };
         profile.ConfigFile = Path.Combine("profiles", $"{profile.Id}.json");
         State.Profiles.Add(profile);
         SaveConfig(profile, config);
+        SQLiteHelper.Instance.SaveProfile(profile);
         Save();
         return profile;
     }
@@ -199,6 +409,7 @@ internal sealed class ProfileStore
         clone.UseDefaultPath = source.UseDefaultPath;
         clone.LastLatencyMs = source.LastLatencyMs;
         clone.LastTestUtc = source.LastTestUtc;
+        SQLiteHelper.Instance.SaveProfile(clone);
         Save();
         return clone;
     }
@@ -214,6 +425,7 @@ internal sealed class ProfileStore
         var path = GetConfigPath(profile);
         if (!Path.GetFileName(path).Equals("client-windows.json", StringComparison.OrdinalIgnoreCase))
             File.Delete(path);
+        SQLiteHelper.Instance.DeleteProfile(profile.Id);
         Save();
     }
 
@@ -239,6 +451,12 @@ internal sealed class ProfileStore
 
     public void Save()
     {
+        for (var i = 0; i < State.Profiles.Count; i++)
+        {
+            State.Profiles[i].SortOrder = i;
+        }
+        SQLiteHelper.Instance.SaveProfiles(State.Profiles);
+        SQLiteHelper.Instance.SaveAllSettings(State.ToSettingsMap());
         File.WriteAllText(_statePath, JsonSerializer.Serialize(State, JsonOptions));
         File.WriteAllText(_routingPath, JsonSerializer.Serialize(Routing, JsonOptions));
     }
@@ -248,6 +466,127 @@ internal sealed class ProfileStore
         Routing.Policies.Clear();
         Routing.Policies.AddRange(routing.Policies);
         NormalizeProfilePolicies();
+        Save();
+    }
+
+    public string ConfigDirectory => _configDirectory;
+
+    public bool ExportBackup(string destinationZipPath)
+    {
+        try
+        {
+            Save();
+            var dir = Path.GetDirectoryName(destinationZipPath);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+
+            if (File.Exists(destinationZipPath))
+                File.Delete(destinationZipPath);
+
+            var tempDir = Path.Combine(Path.GetTempPath(), $"mqvpn-backup-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tempDir);
+            try
+            {
+                var filesToCopy = Directory.GetFiles(_configDirectory, "*.*", SearchOption.AllDirectories);
+                foreach (var file in filesToCopy)
+                {
+                    if (file.Contains(Path.DirectorySeparatorChar + "backups" + Path.DirectorySeparatorChar))
+                        continue;
+
+                    var rel = Path.GetRelativePath(_configDirectory, file);
+                    var dest = Path.Combine(tempDir, rel);
+                    var d = Path.GetDirectoryName(dest);
+                    if (!string.IsNullOrEmpty(d)) Directory.CreateDirectory(d);
+                    File.Copy(file, dest, true);
+                }
+                ZipFile.CreateFromDirectory(tempDir, destinationZipPath, CompressionLevel.Optimal, false);
+                return true;
+            }
+            finally
+            {
+                if (Directory.Exists(tempDir))
+                    try { Directory.Delete(tempDir, true); } catch { }
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public bool ImportBackup(string sourceZipPath)
+    {
+        try
+        {
+            if (!File.Exists(sourceZipPath))
+                return false;
+
+            using (var archive = ZipFile.OpenRead(sourceZipPath))
+            {
+                var hasValidEntries = archive.Entries.Any(e =>
+                    e.FullName.EndsWith("mqvpn.db", StringComparison.OrdinalIgnoreCase) ||
+                    e.FullName.EndsWith("profiles.json", StringComparison.OrdinalIgnoreCase) ||
+                    e.FullName.EndsWith("routing.json", StringComparison.OrdinalIgnoreCase));
+                if (!hasValidEntries)
+                    return false;
+            }
+
+            var backupDir = Path.Combine(_configDirectory, "backups");
+            Directory.CreateDirectory(backupDir);
+            var safetyZip = Path.Combine(backupDir, $"backup_before_restore_{DateTime.Now:yyyyMMdd_HHmmss}.zip");
+            ExportBackup(safetyZip);
+
+            SQLiteHelper.Instance.Dispose();
+
+            using (var archive = ZipFile.OpenRead(sourceZipPath))
+            {
+                foreach (var entry in archive.Entries)
+                {
+                    if (entry.Length == 0 && (entry.FullName.EndsWith('/') || entry.FullName.EndsWith('\\')))
+                        continue;
+                    var destPath = Path.Combine(_configDirectory, entry.FullName);
+                    var d = Path.GetDirectoryName(destPath);
+                    if (!string.IsNullOrEmpty(d)) Directory.CreateDirectory(d);
+                    entry.ExtractToFile(destPath, true);
+                }
+            }
+
+            var dbPath = Path.Combine(_configDirectory, "mqvpn.db");
+            SQLiteHelper.Instance.Initialize(dbPath);
+
+            var reloaded = Load(_configDirectory);
+            State.Profiles = reloaded.State.Profiles;
+            State.ActiveProfileId = reloaded.State.ActiveProfileId;
+            State.LoadFromSettingsMap(reloaded.State.ToSettingsMap());
+            Routing.Policies.Clear();
+            Routing.Policies.AddRange(reloaded.Routing.Policies);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public void ResetToFactoryDefaults()
+    {
+        var backupDir = Path.Combine(_configDirectory, "backups");
+        Directory.CreateDirectory(backupDir);
+        var safetyZip = Path.Combine(backupDir, $"backup_before_reset_{DateTime.Now:yyyyMMdd_HHmmss}.zip");
+        ExportBackup(safetyZip);
+
+        var freshState = CreateInitialState(_configDirectory);
+        var freshRouting = CreateDefaultRouting();
+
+        State.Profiles = freshState.Profiles;
+        State.ActiveProfileId = freshState.ActiveProfileId;
+        State.LoadFromSettingsMap(new AppState().ToSettingsMap());
+
+        Routing.Policies.Clear();
+        Routing.Policies.AddRange(freshRouting.Policies);
+
+        SQLiteHelper.Instance.SaveProfiles(State.Profiles);
+        SQLiteHelper.Instance.SaveAllSettings(State.ToSettingsMap());
         Save();
     }
 
@@ -404,36 +743,132 @@ internal sealed class ProfileStore
             ["ruleTag"] = "最终规则",
         });
 
+        var inbounds = new JsonArray
+        {
+            new JsonObject
+            {
+                ["tag"] = "tun",
+                ["protocol"] = "tun",
+                ["settings"] = new JsonObject
+                {
+                    ["name"] = "xray-tmp",
+                    ["desc"] = "MQVPN Routing",
+                    ["mtu"] = 9000,
+                    ["gateway"] = new JsonArray("172.28.247.1/30", "fd28:247::1/126"),
+                    ["dns"] = BuildTunDnsServers(State),
+                    ["autoSystemRoutingTable"] = new JsonArray("0.0.0.0/0", "::/0"),
+                    ["autoOutboundsInterface"] = "auto",
+                },
+                ["sniffing"] = new JsonObject
+                {
+                    ["enabled"] = State.EnableSniffing,
+                    ["destOverride"] = new JsonArray("http", "tls", "quic"),
+                    ["routeOnly"] = State.RouteOnly,
+                },
+            },
+        };
+
+        if (State.LocalSocksPort > 0)
+        {
+            inbounds.Add(new JsonObject
+            {
+                ["tag"] = "socks-in",
+                ["port"] = State.LocalSocksPort,
+                ["listen"] = State.AllowLan ? "0.0.0.0" : "127.0.0.1",
+                ["protocol"] = "socks",
+                ["settings"] = new JsonObject
+                {
+                    ["auth"] = "noauth",
+                    ["udp"] = State.EnableUdp,
+                },
+                ["sniffing"] = new JsonObject
+                {
+                    ["enabled"] = State.EnableSniffing,
+                    ["destOverride"] = new JsonArray("http", "tls", "quic"),
+                    ["routeOnly"] = State.RouteOnly,
+                },
+            });
+        }
+
+        if (State.LocalHttpPort > 0)
+        {
+            inbounds.Add(new JsonObject
+            {
+                ["tag"] = "http-in",
+                ["port"] = State.LocalHttpPort,
+                ["listen"] = State.AllowLan ? "0.0.0.0" : "127.0.0.1",
+                ["protocol"] = "http",
+                ["sniffing"] = new JsonObject
+                {
+                    ["enabled"] = State.EnableSniffing,
+                    ["destOverride"] = new JsonArray("http", "tls", "quic"),
+                    ["routeOnly"] = State.RouteOnly,
+                },
+            });
+        }
+
+        var dnsObject = new JsonObject();
+        var dnsServers = new JsonArray();
+        if (!string.IsNullOrWhiteSpace(State.RemoteDns))
+        {
+            foreach (var s in State.RemoteDns.Split(new[] { ',', ';', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                dnsServers.Add(s);
+            }
+        }
+        else
+        {
+            dnsServers.Add("https://1.1.1.1/dns-query");
+            dnsServers.Add("8.8.8.8");
+        }
+
+        if (!string.IsNullOrWhiteSpace(State.DirectDns))
+        {
+            var directList = State.DirectDns.Split(new[] { ',', ';', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (directList.Length > 0)
+            {
+                dnsServers.Add(new JsonObject
+                {
+                    ["address"] = directList[0],
+                    ["domains"] = new JsonArray("geosite:cn"),
+                    ["expectIPs"] = new JsonArray("geoip:cn"),
+                });
+            }
+        }
+
+        dnsObject["servers"] = dnsServers;
+        if (State.BlockAAAAQuery)
+        {
+            dnsObject["queryStrategy"] = "UseIPv4";
+        }
+
+        if (!string.IsNullOrWhiteSpace(State.CustomHosts))
+        {
+            var hostsObj = new JsonObject();
+            var lines = State.CustomHosts.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var line in lines)
+            {
+                var parts = line.Split(new[] { ' ', '\t', ',' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                if (parts.Length >= 2)
+                {
+                    if (IPAddress.TryParse(parts[0], out _))
+                        hostsObj[parts[1]] = parts[0];
+                    else
+                        hostsObj[parts[0]] = parts[1];
+                }
+            }
+            if (hostsObj.Count > 0)
+                dnsObject["hosts"] = hostsObj;
+        }
+
         var root = new JsonObject
         {
             ["log"] = new JsonObject
             {
                 ["loglevel"] = LogLevels.ToXray(State.LogLevel),
             },
-            ["inbounds"] = new JsonArray
-            {
-                new JsonObject
-                {
-                    ["tag"] = "tun",
-                    ["protocol"] = "tun",
-                    ["settings"] = new JsonObject
-                    {
-                        ["name"] = "xray-tmp",
-                        ["desc"] = "MQVPN Routing",
-                        ["mtu"] = 9000,
-                        ["gateway"] = new JsonArray("172.28.247.1/30", "fd28:247::1/126"),
-                        ["dns"] = new JsonArray("1.1.1.1", "2606:4700:4700::1111"),
-                        ["autoSystemRoutingTable"] = new JsonArray("0.0.0.0/0", "::/0"),
-                        ["autoOutboundsInterface"] = "auto",
-                    },
-                    ["sniffing"] = new JsonObject
-                    {
-                        ["enabled"] = true,
-                        ["destOverride"] = new JsonArray("http", "tls", "quic"),
-                        ["routeOnly"] = true,
-                    },
-                },
-            },
+            ["dns"] = dnsObject,
+            ["inbounds"] = inbounds,
             ["outbounds"] = new JsonArray
             {
                 CreateFreedomOutbound("PHYSICAL-DIRECT", physicalInterface),
@@ -446,13 +881,36 @@ internal sealed class ProfileStore
             },
             ["routing"] = new JsonObject
             {
-                ["domainStrategy"] = "IPIfNonMatch",
+                ["domainStrategy"] = string.IsNullOrWhiteSpace(State.DomainStrategy) ? "IPIfNonMatch" : State.DomainStrategy,
                 ["rules"] = rules,
             },
         };
 
         File.WriteAllText(outputPath, root.ToJsonString(JsonOptions), new UTF8Encoding(false));
         return outputPath;
+    }
+
+    private static JsonArray BuildTunDnsServers(AppState state)
+    {
+        var array = new JsonArray();
+        if (!string.IsNullOrWhiteSpace(state.RemoteDns))
+        {
+            var items = state.RemoteDns.Split(new[] { ',', ';', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var item in items)
+            {
+                if (IPAddress.TryParse(item, out var ip))
+                {
+                    array.Add(ip.ToString());
+                    if (array.Count >= 2) break;
+                }
+            }
+        }
+        if (array.Count == 0)
+        {
+            array.Add("1.1.1.1");
+            array.Add("2606:4700:4700::1111");
+        }
+        return array;
     }
 
     private static string GetDefaultPhysicalInterface()
@@ -558,7 +1016,7 @@ internal sealed class ProfileStore
         },
         ["reorder"] = new JsonObject
         {
-            ["enabled"] = "off",
+            ["enabled"] = false,
             ["max_bytes_per_flow"] = 1572864,
             ["classify_window"] = 64,
             ["ack_demote_max_large"] = 3,
@@ -578,7 +1036,7 @@ internal sealed class ProfileStore
         },
     };
 
-    private static RoutingDocument CreateDefaultRouting()
+    public static RoutingDocument CreateDefaultRouting()
     {
         var routing = new RoutingDocument();
         routing.Policies.AddRange(
@@ -711,7 +1169,7 @@ internal sealed class ProfileStore
         }
     }
 
-    private static string ParseHost(string serverAddress)
+    public static string ParseHost(string serverAddress)
     {
         if (serverAddress.StartsWith('['))
         {
