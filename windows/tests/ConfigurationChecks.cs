@@ -313,6 +313,21 @@ internal static class ConfigurationChecks
             Check(restoredStore.State.DirectDns == "1.2.4.8, 210.2.4.8", "DirectDns restored from ZIP", "DirectDns not restored");
             Check(restoredStore.State.LocalSocksPort == 20808, "LocalSocksPort restored from ZIP", "LocalSocksPort not restored");
 
+            // 验证 Zip Slip 路径穿越防御
+            var zipSlipFile = Path.Combine(tempDir, "zipslip_probe.txt");
+            if (File.Exists(zipSlipFile)) File.Delete(zipSlipFile);
+            var zipSlipZip = Path.Combine(tempDir, "zipslip.zip");
+            using (var zipStream = new FileStream(zipSlipZip, FileMode.Create))
+            using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Create))
+            {
+                archive.CreateEntry("mqvpn.db"); // 让 hasValidEntries 为 true
+                var evilEntry = archive.CreateEntry("../zipslip_probe.txt");
+                using var writer = new StreamWriter(evilEntry.Open());
+                writer.Write("pwned");
+            }
+            restoredStore.ImportBackup(zipSlipZip);
+            Check(!File.Exists(zipSlipFile), "Zip Slip directory traversal attack mitigated", "Zip Slip file escaped sandbox!");
+
             // 验证出厂重置
             restoredStore.ResetToFactoryDefaults();
             var resetStore = ProfileStore.Load(restoreDir);

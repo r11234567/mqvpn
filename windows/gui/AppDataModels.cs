@@ -540,11 +540,14 @@ internal sealed class ProfileStore
 
             using (var archive = ZipFile.OpenRead(sourceZipPath))
             {
+                var canonicalBase = Path.GetFullPath(_configDirectory) + Path.DirectorySeparatorChar;
                 foreach (var entry in archive.Entries)
                 {
                     if (entry.Length == 0 && (entry.FullName.EndsWith('/') || entry.FullName.EndsWith('\\')))
                         continue;
-                    var destPath = Path.Combine(_configDirectory, entry.FullName);
+                    var destPath = Path.GetFullPath(Path.Combine(_configDirectory, entry.FullName));
+                    if (!destPath.StartsWith(canonicalBase, StringComparison.OrdinalIgnoreCase))
+                        continue; // Zip Slip path traversal protection
                     var d = Path.GetDirectoryName(destPath);
                     if (!string.IsNullOrEmpty(d)) Directory.CreateDirectory(d);
                     entry.ExtractToFile(destPath, true);
