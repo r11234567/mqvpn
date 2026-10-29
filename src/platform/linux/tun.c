@@ -296,6 +296,32 @@ mqvpn_tun_set_mtu(mqvpn_tun_t *tun, int mtu)
 }
 
 int
+mqvpn_tun_set_txqueuelen(mqvpn_tun_t *tun, int qlen)
+{
+    if (qlen <= 0) {
+        return 0; /* 0 means "leave the kernel default alone" */
+    }
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return -1;
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, tun->name, IFNAMSIZ - 1);
+    ifr.ifr_qlen = qlen;
+
+    if (ioctl(sock, SIOCSIFTXQLEN, &ifr) < 0) {
+        LOG_WRN("ioctl SIOCSIFTXQLEN(%d): %s", qlen, strerror(errno));
+        close(sock);
+        return -1;
+    }
+
+    close(sock);
+    LOG_INF("TUN %s: txqueuelen=%d", tun->name, qlen);
+    return 0;
+}
+
+int
 mqvpn_tun_up(mqvpn_tun_t *tun)
 {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);

@@ -37,6 +37,8 @@ typedef struct mqvpn_server_cfg_s {
     int tun_mtu;               /* 0=auto (1382 at startup), >0=override (floor 1280) */
     int path_mtu;              /* 0=default packet size, >0=underlay MTU */
     int pmtud;                 /* 1=discover the path MTU, path_mtu is the cap */
+    int tun_txqueuelen;        /* 0=kernel default (500), >0=TUN tx ring depth */
+    int tun_read_batch;        /* 0=built-in default (64), >0=TUN reads per wakeup */
     int cc;                    /* mqvpn_cc_t: congestion control algorithm */
     int reinjection;           /* mqvpn_reinjection_t; 0=off (default) */
     int reinj_srtt_factor_pct; /* deadline mode; percent, e.g. 110 = 1.10x srtt */
@@ -45,6 +47,15 @@ typedef struct mqvpn_server_cfg_s {
     mqvpn_reorder_config_t
         reorder;                  /* INI [Reorder]/[ReorderRule] (mode OFF by default) */
     mqvpn_hybrid_config_t hybrid; /* INI [Hybrid] (disabled by default) */
+    int proxy_enabled;
+    const char *proxy_sni;
+    const char *proxy_quic_fallback;
+    int proxy_quic_fallback_proxy_protocol;
+    const char *proxy_h2_backend;
+    int proxy_h2_backend_tls;
+    int proxy_h2_backend_proxy_protocol;
+    uint32_t proxy_max_connections;
+    uint32_t proxy_idle_timeout_sec;
     int udp_gso;                  /* [Advanced] UdpGso; default 1 */
     int udp_gro;                  /* [Advanced] UdpGro; default 1 */
     int tun_offload;              /* [Advanced] TunOffload; default 1 */

@@ -110,6 +110,7 @@ cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
 
     if (mqvpn_tun_set_addr(&p->tun, local_ip, peer_ip, 32) < 0) goto fail;
     if (mqvpn_tun_set_mtu(&p->tun, info->mtu) < 0) goto fail;
+    mqvpn_tun_set_txqueuelen(&p->tun, p->tun_txqueuelen);
     if (mqvpn_tun_up(&p->tun) < 0) goto fail;
 
     /* Set IPv6 address if available */
@@ -407,9 +408,10 @@ on_tun_read(evutil_socket_t fd, short what, void *arg)
     platform_ctx_t *p = (platform_ctx_t *)arg;
     uint8_t buf[TUN_BUF_SIZE];
 
+    int batch = p->tun_read_batch > 0 ? p->tun_read_batch : BULK_READ_COUNT;
     /* Finish the segments of a super-packet already split off the kernel
      * read, even past the budget: they are not in the fd any more. */
-    for (int i = 0; i < BULK_READ_COUNT || mqvpn_tun_has_pending(&p->tun); i++) {
+    for (int i = 0; i < batch || mqvpn_tun_has_pending(&p->tun); i++) {
         int n = mqvpn_tun_read(&p->tun, buf, sizeof(buf));
         if (n <= 0) break;
 
@@ -499,6 +501,8 @@ linux_platform_run_client(const mqvpn_client_cfg_t *cfg)
     ctx.server_port = cfg->server_port;
     ctx.killswitch_enabled = cfg->kill_switch;
     ctx.manage_routes = cfg->manage_routes;
+    ctx.tun_txqueuelen = cfg->tun_txqueuelen;
+    ctx.tun_read_batch = cfg->tun_read_batch;
     ctx.pmtud = cfg->pmtud;
     ctx.udp_gro = cfg->udp_gro;
     ctx.udp_gso = cfg->udp_gso;
@@ -780,6 +784,8 @@ typedef struct server_platform_ctx_s {
     int tun_up;
     int tun_offload; /* [Advanced] TunOffload */
     int tun_gro;     /* [Advanced] TunGro */
+    int tun_txqueuelen;
+    int tun_read_batch;
     int udp_fd;
     /* mqvpn_bind_posix server transport over udp_fd; owned by the library
      * after set_transport (finalised inside mqvpn_server_destroy). */
@@ -871,6 +877,7 @@ svr_cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
 
     if (mqvpn_tun_set_addr(&sp->tun, srv_ip, base_ip, info->assigned_prefix) < 0) return;
     if (mqvpn_tun_set_mtu(&sp->tun, info->mtu) < 0) return;
+    mqvpn_tun_set_txqueuelen(&sp->tun, sp->tun_txqueuelen);
     if (mqvpn_tun_up(&sp->tun) < 0) return;
 
     /* IPv6 if available */
@@ -911,7 +918,8 @@ svr_on_tun_read(evutil_socket_t fd, short what, void *arg)
     server_platform_ctx_t *sp = (server_platform_ctx_t *)arg;
     uint8_t buf[TUN_BUF_SIZE];
 
-    for (int i = 0; i < BULK_READ_COUNT || mqvpn_tun_has_pending(&sp->tun); i++) {
+    int batch = sp->tun_read_batch > 0 ? sp->tun_read_batch : BULK_READ_COUNT;
+    for (int i = 0; i < batch || mqvpn_tun_has_pending(&sp->tun); i++) {
         int n = mqvpn_tun_read(&sp->tun, buf, sizeof(buf));
         if (n <= 0) break;
 
@@ -1148,6 +1156,8 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
     sp.udp_fd = -1;
     sp.tun_offload = cfg->tun_offload;
     sp.tun_gro = cfg->tun_gro;
+    sp.tun_txqueuelen = cfg->tun_txqueuelen;
+    sp.tun_read_batch = cfg->tun_read_batch;
 
     if (cfg->tun_name) snprintf(sp.tun.name, sizeof(sp.tun.name), "%s", cfg->tun_name);
 
@@ -1186,6 +1196,28 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
                                                  cfg->reinj_deadline_lower_bound_ms);
     mqvpn_config_set_init_max_path_id(lib_cfg, cfg->init_max_path_id);
     mqvpn_config_set_tun_mtu(lib_cfg, cfg->tun_mtu);
+    mqvpn_config_set_tun_txqueuelen(lib_cfg, cfg->tun_txqueuelen);
+    mqvpn_config_set_tun_read_batch(lib_cfg, cfg->tun_read_batch);
+    if (mqvpn_config_set_proxy(lib_cfg, cfg->proxy_enabled, cfg->proxy_sni,
+                               cfg->proxy_quic_fallback, cfg->proxy_h2_backend,
+                               cfg->proxy_h2_backend_tls, cfg->proxy_max_connections,
+                               cfg->proxy_idle_timeout_sec) != MQVPN_OK) {
+        LOG_ERR("invalid [Proxy] configuration");
+        mqvpn_config_free(lib_cfg);
+        return 1;
+    }
+    if (mqvpn_config_set_proxy_protocol(lib_cfg, cfg->proxy_h2_backend_proxy_protocol) !=
+        MQVPN_OK) {
+        LOG_ERR("invalid [Proxy] Http2BackendProxyProtocol setting");
+        mqvpn_config_free(lib_cfg);
+        return 1;
+    }
+    if (mqvpn_config_set_quic_fallback_proxy_protocol(
+            lib_cfg, cfg->proxy_quic_fallback_proxy_protocol) != MQVPN_OK) {
+        LOG_ERR("invalid [Proxy] QuicFallbackProxyProtocol setting");
+        mqvpn_config_free(lib_cfg);
+        return 1;
+    }
     mqvpn_config_set_path_mtu(lib_cfg, cfg->path_mtu);
     mqvpn_config_set_pmtud(lib_cfg, cfg->pmtud);
     mqvpn_config_apply_reorder(lib_cfg,

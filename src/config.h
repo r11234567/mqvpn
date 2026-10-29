@@ -90,6 +90,8 @@ typedef struct mqvpn_file_config_s {
     int tun_mtu;  /* [Interface] MTU — 0=auto, >0=cap (floor 1280) */
     int path_mtu; /* [Interface] PathMTU — 0=default packet size */
     int pmtud;    /* [Interface] PMTUD — discover the path MTU, PathMTU is the cap */
+    int tun_txqueuelen; /* [Interface] TxQueueLen — 0=kernel default (500) */
+    int tun_read_batch; /* [Interface] TunReadBatch — 0=built-in default (64) */
 
     /* [Reorder] / repeated [ReorderRule] — flow-aware reorder shim (§16.1).
      * Seeded with mqvpn_reorder_config_default() in mqvpn_config_defaults(). */
@@ -98,6 +100,17 @@ typedef struct mqvpn_file_config_s {
     /* [Hybrid] — hybrid-mode ingress classifier policy (H1).
      * Seeded with mqvpn_hybrid_config_default() in mqvpn_config_defaults(). */
     mqvpn_hybrid_config_t hybrid;
+
+    /* [Proxy] — server-side QUIC SNI routing and H3-to-H2 fallback. */
+    int proxy_enabled;
+    char proxy_sni[280];
+    char proxy_quic_fallback[280];
+    int proxy_quic_fallback_proxy_protocol;
+    char proxy_h2_backend[280];
+    int proxy_h2_backend_tls;
+    int proxy_h2_backend_proxy_protocol;
+    uint32_t proxy_max_connections;
+    uint32_t proxy_idle_timeout_sec;
 
     /* [Advanced] — cross-cutting QUIC transport knobs. recv_rate_limit:
      * conn-level receive-rate cap in bytes/sec, 0 = library default (off).

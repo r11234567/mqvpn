@@ -95,6 +95,7 @@ enum {
     SEC_REORDER,
     SEC_REORDER_RULE,
     SEC_HYBRID,
+    SEC_PROXY,
     SEC_ADVANCED,
 };
 
@@ -110,6 +111,7 @@ parse_section(const char *name)
     if (strcasecmp(name, "Reorder") == 0) return SEC_REORDER;
     if (strcasecmp(name, "ReorderRule") == 0) return SEC_REORDER_RULE;
     if (strcasecmp(name, "Hybrid") == 0) return SEC_HYBRID;
+    if (strcasecmp(name, "Proxy") == 0) return SEC_PROXY;
     if (strcasecmp(name, "Advanced") == 0) return SEC_ADVANCED;
     return -1;
 }
@@ -127,6 +129,7 @@ section_name(int section)
     case SEC_REORDER: return "Reorder";
     case SEC_REORDER_RULE: return "ReorderRule";
     case SEC_HYBRID: return "Hybrid";
+    case SEC_PROXY: return "Proxy";
     case SEC_ADVANCED: return "Advanced";
     default: return "?";
     }
@@ -456,6 +459,18 @@ cfgk_int_mtu(int v)
 }
 
 static int
+cfgk_int_txqueuelen(int v)
+{
+    return v == 0 || (v >= 100 && v <= 65536);
+}
+
+static int
+cfgk_int_tun_read_batch(int v)
+{
+    return v == 0 || (v >= 1 && v <= 4096);
+}
+
+static int
 cfgk_int_reinj_factor_pct(int v)
 {
     return v >= 100 && v <= 1000;
@@ -562,6 +577,8 @@ static const cfg_key_desc_t cfg_keys[] = {
     CFG_INT(SEC_INTERFACE, "MTU", "mtu", tun_mtu, cfgk_int_mtu),
     CFG_INT(SEC_INTERFACE, "PathMTU", "path_mtu", path_mtu, cfgk_int_mtu),
     CFG_BOOL(SEC_INTERFACE, "PMTUD", "pmtud", pmtud),
+    CFG_INT(SEC_INTERFACE, "TxQueueLen", "tx_queue_len", tun_txqueuelen, cfgk_int_txqueuelen),
+    CFG_INT(SEC_INTERFACE, "TunReadBatch", "tun_read_batch", tun_read_batch, cfgk_int_tun_read_batch),
     /* [Server] */
     CFG_STR(SEC_SERVER, "Address", "server_addr", server_addr),
     CFG_STR(SEC_SERVER, "ServerName", "tls_server_name", tls_server_name),
@@ -630,6 +647,28 @@ static const cfg_key_desc_t cfg_keys[] = {
             hybrid.tcp_connect_timeout_sec),
     CFG_U32(SEC_HYBRID, "TcpMaxGlobalFlows", "tcp_max_global_flows",
             hybrid.tcp_max_global_flows),
+    /* [Proxy] */
+    CFG_BOOL(SEC_PROXY, "Enabled", "enabled", proxy_enabled),
+    CFG_STR(SEC_PROXY, "SNI", "sni", proxy_sni),
+    CFG_STR(SEC_PROXY, "QuicFallback", "quic_fallback", proxy_quic_fallback),
+    CFG_BOOL(SEC_PROXY, "QuicFallbackProxyProtocol", "quic_fallback_proxy_protocol",
+             proxy_quic_fallback_proxy_protocol),
+    CFG_STR(SEC_PROXY, "Http2Backend", "h2_backend", proxy_h2_backend),
+    CFG_BOOL(SEC_PROXY, "Http2BackendTLS", "h2_backend_tls", proxy_h2_backend_tls),
+    CFG_BOOL(SEC_PROXY, "Http2BackendProxyProtocol", "h2_backend_proxy_protocol",
+             proxy_h2_backend_proxy_protocol),
+    CFG_U32(SEC_PROXY, "MaxConnections", "max_connections", proxy_max_connections),
+    CFG_U32(SEC_PROXY, "IdleTimeoutSec", "idle_timeout_sec", proxy_idle_timeout_sec),
+    /* Flat JSON aliases */
+    CFG_BOOL(SEC_NONE, NULL, "proxy_enabled", proxy_enabled),
+    CFG_STR(SEC_NONE, NULL, "proxy_sni", proxy_sni),
+    CFG_STR(SEC_NONE, NULL, "proxy_quic_fallback", proxy_quic_fallback),
+    CFG_BOOL(SEC_NONE, NULL, "proxy_quic_fallback_proxy_protocol", proxy_quic_fallback_proxy_protocol),
+    CFG_STR(SEC_NONE, NULL, "proxy_h2_backend", proxy_h2_backend),
+    CFG_BOOL(SEC_NONE, NULL, "proxy_h2_backend_tls", proxy_h2_backend_tls),
+    CFG_BOOL(SEC_NONE, NULL, "proxy_h2_backend_proxy_protocol", proxy_h2_backend_proxy_protocol),
+    CFG_U32(SEC_NONE, NULL, "proxy_max_connections", proxy_max_connections),
+    CFG_U32(SEC_NONE, NULL, "proxy_idle_timeout_sec", proxy_idle_timeout_sec),
     /* [Advanced] — JSON side lives inside the bounded "advanced" object.
      * Max mirrors the public setter: above it, xquic's rate x srtt(us)
      * u64 window product overflows (see MQVPN_RECV_RATE_LIMIT_MAX). */
@@ -765,7 +804,7 @@ cfg_key_apply_ini(mqvpn_file_config_t *cfg, int section, const char *key, const 
  * 0 otherwise. */
 static int
 cfg_key_apply_json(mqvpn_file_config_t *cfg, yyjson_val *root, yyjson_val *ro,
-                   yyjson_val *hy, yyjson_val *adv)
+                   yyjson_val *hy, yyjson_val *px, yyjson_val *adv)
 {
     /* Must cover the largest CFGK_STR destination (listen/server_addr/
      * control_listen, all char[280]) or JSON strings would truncate
@@ -778,6 +817,7 @@ cfg_key_apply_json(mqvpn_file_config_t *cfg, yyjson_val *root, yyjson_val *ro,
 
         yyjson_val *obj = d->section == SEC_REORDER    ? ro
                           : d->section == SEC_HYBRID   ? hy
+                          : d->section == SEC_PROXY    ? px
                           : d->section == SEC_ADVANCED ? adv
                                                        : root;
         const char *scope = d->section == SEC_REORDER    ? "reorder "
@@ -1131,8 +1171,13 @@ mqvpn_config_load_json_filecfg(mqvpn_file_config_t *cfg, const char *json_text)
     yyjson_val *adv = yyjson_obj_get(root, "advanced");
     if (!yyjson_is_obj(adv)) adv = NULL;
 
+    /* [Proxy] equivalent: a "proxy" object holding the same flat
+     * scalar knobs as the INI section (snake_case). Non-object is absent. */
+    yyjson_val *px = yyjson_obj_get(root, "proxy");
+    if (!yyjson_is_obj(px)) px = NULL;
+
     /* All scalar keys — one walk of the shared descriptor table. */
-    if (cfg_key_apply_json(cfg, root, ro, hy, adv) < 0) goto out;
+    if (cfg_key_apply_json(cfg, root, ro, hy, px, adv) < 0) goto out;
 
     /* [Hybrid] EgressAllow/EgressDeny — hand-coded like "users" below,
      * looked up in the "hybrid" object like every other hybrid key. */
@@ -1290,6 +1335,10 @@ mqvpn_config_defaults(mqvpn_file_config_t *cfg)
     cfg->tun_gro = 1;
     mqvpn_reorder_config_default(&cfg->reorder); /* §16: reorder defaults (mode OFF) */
     mqvpn_hybrid_config_default(&cfg->hybrid);   /* H1: hybrid defaults (disabled) */
+    cfg->proxy_max_connections = 64;
+    cfg->proxy_idle_timeout_sec = 60;
+    cfg->proxy_quic_fallback_proxy_protocol = 1;
+    cfg->proxy_h2_backend_proxy_protocol = 1;
 }
 
 int

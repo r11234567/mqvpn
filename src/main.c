@@ -590,6 +590,8 @@ main(int argc, char *argv[])
             .tun_mtu = eff_tun_mtu,
             .path_mtu = eff_path_mtu,
             .pmtud = eff_pmtud,
+            .tun_txqueuelen = file_cfg.tun_txqueuelen,
+            .tun_read_batch = file_cfg.tun_read_batch,
             .cc = cc,
             .reinjection = reinjection,
             .reinj_srtt_factor_pct = file_cfg.reinjection_srtt_factor_pct,
@@ -664,6 +666,8 @@ main(int argc, char *argv[])
             .tun_mtu = eff_tun_mtu,
             .path_mtu = eff_path_mtu,
             .pmtud = eff_pmtud,
+            .tun_txqueuelen = file_cfg.tun_txqueuelen,
+            .tun_read_batch = file_cfg.tun_read_batch,
             .cc = cc,
             .reinjection = reinjection,
             .reinj_srtt_factor_pct = file_cfg.reinjection_srtt_factor_pct,
@@ -675,6 +679,17 @@ main(int argc, char *argv[])
             /* INI [Hybrid]; always valid (mqvpn_config_defaults seeds the
              * disabled defaults even with no [Hybrid] section). */
             .hybrid = file_cfg.hybrid,
+            .proxy_enabled = file_cfg.proxy_enabled,
+            .proxy_sni = file_cfg.proxy_sni,
+            .proxy_quic_fallback = file_cfg.proxy_quic_fallback,
+            .proxy_quic_fallback_proxy_protocol =
+                file_cfg.proxy_quic_fallback_proxy_protocol,
+            .proxy_h2_backend = file_cfg.proxy_h2_backend,
+            .proxy_h2_backend_tls = file_cfg.proxy_h2_backend_tls,
+            .proxy_h2_backend_proxy_protocol =
+                file_cfg.proxy_h2_backend_proxy_protocol,
+            .proxy_max_connections = file_cfg.proxy_max_connections,
+            .proxy_idle_timeout_sec = file_cfg.proxy_idle_timeout_sec,
             /* [Advanced] UdpGso; default 1. Applies to client and server. */
             .udp_gso = file_cfg.udp_gso,
             /* [Advanced] UdpGro; default 1. Applies to client and server. */
