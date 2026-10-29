@@ -1,52 +1,125 @@
-name: Windows GUI (.NET 9)
+name: Windows GUI (Test, Build & Package Multi-Arch)
 
 on:
   push:
     branches: [main, dev, 'sync/**']
     paths:
       - 'windows/**'
+      - 'scripts/package_windows_gui.ps1'
       - '.github/workflows/windows-gui.yml'
   pull_request:
-    branches: [main, dev]
+    branches: [main, dev, 'sync/**']
     paths:
       - 'windows/**'
+      - 'scripts/package_windows_gui.ps1'
       - '.github/workflows/windows-gui.yml'
   workflow_dispatch:
 
 jobs:
-  build-and-test:
+  test-gui:
+    name: Windows GUI Verification & Pain-Point Tests
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout Code
+        uses: actions/checkout@v7
 
       - name: Setup .NET 9
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '9.0.x'
 
-      - name: Restore dependencies
+      - name: Restore Dependencies
         run: |
+          dotnet restore windows/updater/MqvpnUpgrade.csproj
           dotnet restore windows/gui/TruckersMP.Proxy.csproj
           dotnet restore windows/tests/GUI.Tests.csproj
 
-      - name: Run GUI Tests
-        run: |
-          dotnet run --project windows/tests/GUI.Tests.csproj
-
-      - name: Build GUI Application (Release Single-File)
-        run: |
-          dotnet publish windows/gui/TruckersMP.Proxy.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish/
-
-      - name: Verify build artifact
+      - name: Run Windows GUI Tests (All 7 Pain-Point Stages)
         shell: pwsh
         run: |
-          Test-Path publish/MQVPN.exe
-          Get-Item publish/MQVPN.exe | Select-Object Name, Length
+          $ErrorActionPreference = 'Stop'
+          try {
+            dotnet run --project windows/tests/GUI.Tests.csproj
+          } catch {
+            Write-Host "::error::GUI Test Run Encountered Fatal Failure!" -ForegroundColor Red
+            throw
+          }
 
-      - name: Upload GUI Release Artifact
+      - name: Dump Detailed Diagnostic Logs on Failure
+        if: failure()
+        shell: pwsh
+        run: |
+          Write-Host "==================== TEST FAILURE DIAGNOSTICS ====================" -ForegroundColor Red
+          Get-ChildItem -Path windows/tests/bin/Debug -Recurse | Select-Object FullName, Length, LastWriteTime
+          if (Test-Path windows/tests/bin/Debug/net9.0-windows/screenshots) {
+            Get-ChildItem -Path windows/tests/bin/Debug/net9.0-windows/screenshots | Select-Object Name, Length
+          }
+
+      - name: Upload UI Regression Screenshots
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: gui-test-screenshots
+          path: windows/tests/bin/Debug/net9.0-windows/screenshots/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  package-gui:
+    name: Package GUI (${{ matrix.arch }})
+    needs: test-gui
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            rid: win-x64
+          - arch: arm64
+            rid: win-arm64
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Assemble Full Distribution Package
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            .\scripts\package_windows_gui.ps1 -Arch ${{ matrix.arch }} -ZipOutput "dist/mqvpn_windows_gui_${{ matrix.arch }}.zip"
+          } catch {
+            Write-Host "::error::Packaging failed for ${{ matrix.arch }}: $_" -ForegroundColor Red
+            throw
+          }
+
+      - name: Verify Distribution Archive
+        shell: pwsh
+        run: |
+          $zip = "dist/mqvpn_windows_gui_${{ matrix.arch }}.zip"
+          if (-not (Test-Path $zip)) { throw "Distribution ZIP was not generated: $zip" }
+          $item = Get-Item $zip
+          Write-Host "Package validated: $($item.FullName) ($($item.Length) bytes)"
+
+      - name: Dump Detailed Packaging Diagnostics on Failure
+        if: failure()
+        shell: pwsh
+        run: |
+          Write-Host "==================== PACKAGING FAILURE DIAGNOSTICS ====================" -ForegroundColor Red
+          if (Test-Path dist) {
+            Get-ChildItem -Path dist -Recurse | Select-Object FullName, Length
+          }
+
+      - name: Upload GUI Release Package (ZIP)
         uses: actions/upload-artifact@v7
         with:
-          name: mqvpn-windows-gui-x64
-          path: publish/
+          name: mqvpn_windows_gui_${{ matrix.arch }}
+          path: dist/mqvpn_windows_gui_${{ matrix.arch }}.zip
           retention-days: 14
