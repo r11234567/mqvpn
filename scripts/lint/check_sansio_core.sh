@@ -20,10 +20,12 @@
 #       * an #include of a bind header (udp_offload.h, bind/posix_offload.h,
 #         mqvpn_bind_posix.h, mqvpn_bind_winsock.h) in either delimiter,
 #         "..." or <...> - the core is bind-agnostic
-#     Exclusions, these two and no others:
+#     Exclusions:
 #       src/bind/*                the bundled transport implementations
 #       src/hybrid/tcp_egress.c   the server egress lane owns its TCP sockets
 #                                 (out of scope by design; see AGENTS.md)
+#       src/sni_router.c          the server proxy fallback owns raw UDP sockets
+#       src/h2_proxy.c            the server proxy fallback owns TCP sockets
 #     The other hybrid files are NOT excluded, so a regression there is caught.
 #     A listed source that is missing, or an entry with a stray CR, is itself
 #     a failure: the list has to describe the tree it is scanned against.
@@ -192,7 +194,8 @@ while IFS= read -r src || [ -n "$src" ]; do
     # Both spellings of every exclusion: `rel` is repo-relative when the
     # strip above succeeded, and still absolute when it could not.
     case "$rel" in
-        src/bind/* | */src/bind/* | src/hybrid/tcp_egress.c | */src/hybrid/tcp_egress.c)
+        src/bind/* | */src/bind/* | src/hybrid/tcp_egress.c | */src/hybrid/tcp_egress.c | \
+        src/sni_router.c | */src/sni_router.c | src/h2_proxy.c | */src/h2_proxy.c)
             excluded=$((excluded + 1))
             continue
             ;;
