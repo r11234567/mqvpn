@@ -10,7 +10,7 @@ namespace TruckersMP.Proxy;
 internal sealed class ReorderRuleRow
 {
     public string Port { get; set; } = string.Empty;
-    public string Profile { get; set; } = "quic_bulk";
+    public string Profile { get; set; } = "cellular_bond";
     public string MaxWaitMs { get; set; } = string.Empty;
     public string CapPackets { get; set; } = string.Empty;
     public JsonObject? OriginalTag { get; set; }
@@ -114,7 +114,7 @@ internal sealed partial class ProfileEditorForm
             var added = new ReorderRuleRow
             {
                 Port = nextPort.ToString(),
-                Profile = "quic_bulk",
+                Profile = "cellular_bond",
             };
             _reorderRuleRows.Add(added);
             _reorderRules.SelectedItem = added;

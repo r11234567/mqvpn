@@ -654,6 +654,9 @@ internal static class FluentUi
         ShowModalDialog(owner, title, message, isConfirm: false, isError: isError);
     }
 
+    public static bool SuppressDialogsForTesting { get; set; }
+    public static string? LastDialogMessage { get; set; }
+
     public static bool Confirm(Window? owner, string message, string title)
     {
         return ShowModalDialog(owner, title, message, isConfirm: true, isError: false);
@@ -661,6 +664,9 @@ internal static class FluentUi
 
     private static bool ShowModalDialog(Window? owner, string title, string message, bool isConfirm, bool isError)
     {
+        LastDialogMessage = message;
+        if (SuppressDialogsForTesting)
+            return true;
         var dialog = new FluentWindow
         {
             WindowStartupLocation = owner is { IsVisible: true } ? WindowStartupLocation.CenterOwner : WindowStartupLocation.CenterScreen,

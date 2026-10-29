@@ -997,15 +997,20 @@ internal sealed class ProfileStore
         ["reconnect"] = true,
         ["reconnect_interval"] = 5,
         ["scheduler"] = "wlb",
+        ["request_server_scheduler"] = false,
         ["cc"] = "bbr2",
         ["init_max_path_id"] = 0,
         ["paths"] = new JsonArray(),
+        ["pmtud"] = false,
+        ["path_mtu"] = 0,
         ["tx_queue_len"] = 0,
         ["tun_read_batch"] = 0,
         ["reinjection"] = "off",
         ["reinjection_srtt_factor_pct"] = 110,
         ["reinjection_hard_deadline_ms"] = 500,
         ["reinjection_deadline_lower_bound_ms"] = 20,
+        ["redundant"] = false,
+        ["redundant_ports"] = string.Empty,
         ["hybrid"] = new JsonObject
         {
             ["enabled"] = false,
@@ -1033,6 +1038,8 @@ internal sealed class ProfileStore
             ["recv_rate_limit"] = 0,
             ["udp_gso"] = true,
             ["udp_gro"] = true,
+            ["tun_offload"] = true,
+            ["tun_gro"] = true,
         },
     };
 

@@ -23,6 +23,9 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
     private readonly NumberBox _initMaxPathId = new();
     private readonly CheckBox _allowInsecure = new();
     private readonly CheckBox _reconnect = new();
+    private readonly CheckBox _requestServerScheduler = new();
+    private readonly CheckBox _redundant = new();
+    private readonly Wpf.Ui.Controls.TextBox _redundantPorts = new() { PlaceholderText = "例如：4200,9000 (留空表示复制全部 UDP)" };
 
     private readonly Wpf.Ui.Controls.TextBox _tunName = new();
     private readonly ComboBox _logLevel = new();
@@ -30,6 +33,8 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
     private readonly CheckBox _killSwitch = new();
     private readonly CheckBox _automaticMtu = new();
     private readonly NumberBox _mtu = new();
+    private readonly CheckBox _pmtud = new();
+    private readonly NumberBox _pathMtu = new();
     private readonly NumberBox _tunQueueLength = new();
     private readonly NumberBox _tunReadBatch = new();
     private readonly ComboBox _reinjection = new();
@@ -60,6 +65,8 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
     private readonly NumberBox _recvRateLimit = new();
     private readonly CheckBox _udpGso = new();
     private readonly CheckBox _udpGro = new();
+    private readonly CheckBox _tunOffload = new();
+    private readonly CheckBox _tunGro = new();
     private readonly CheckBox _autoConnect = new();
     private readonly TabControl _tabs = new();
     private readonly JsonObject _config;
@@ -200,6 +207,8 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         }
 
         ConfigureCombo(_scheduler, ["wlb", "minrtt", "wlb_udp_pin", "backup_fec"], GetString("scheduler", "wlb"));
+        _requestServerScheduler.Content = "请求服务端对齐调度器 (RequestServerScheduler)";
+        _requestServerScheduler.IsChecked = GetBoolean("request_server_scheduler", false);
         ConfigureCombo(_congestion, ["bbr2", "bbr", "cubic", "none"], GetString("cc", "bbr2"));
         ConfigureNumber(_initMaxPathId, 0, uint.MaxValue, GetLong("init_max_path_id", 0));
 
@@ -231,6 +240,11 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         _automaticMtu.Checked += (_, _) => _mtu.IsEnabled = false;
         _automaticMtu.Unchecked += (_, _) => _mtu.IsEnabled = true;
         _mtu.IsEnabled = _automaticMtu.IsChecked != true;
+
+        _pmtud.Content = "启用路径 MTU 动态发现 (PMTUD)";
+        _pmtud.IsChecked = GetBoolean("pmtud", false);
+        ConfigureNumber(_pathMtu, 0, 65535, GetInteger("path_mtu", 0));
+
         ConfigureNumber(_tunQueueLength, 0, 65536, GetInteger("tx_queue_len", 0));
         ConfigureNumber(_tunReadBatch, 0, 4096, GetInteger("tun_read_batch", 0));
 
@@ -239,6 +253,17 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         ConfigureNumber(_reinjectionHardDeadline, 1, 60000, GetInteger("reinjection_hard_deadline_ms", 500));
         ConfigureNumber(_reinjectionLowerBound, 1, 60000, GetInteger("reinjection_deadline_lower_bound_ms", 20));
         _reinjection.SelectionChanged += (_, _) => UpdateDependentControls();
+
+        _redundant.Content = "启用 Redundant 冗余模式（实时多路径发送复制包）";
+        _redundant.IsChecked = GetBoolean("redundant", false);
+        _redundantPorts.Text = GetString("redundant_ports");
+        _redundant.Checked += (_, _) =>
+        {
+            UpdateDependentControls();
+            if (string.Equals(_congestion.SelectedItem?.ToString(), "bbr2", StringComparison.OrdinalIgnoreCase))
+                _congestion.SelectedItem = "bbr";
+        };
+        _redundant.Unchecked += (_, _) => UpdateDependentControls();
 
         var hybrid = GetObject("hybrid");
         _hybridEnabled.Content = "启用 Hybrid TCP lane";
@@ -273,6 +298,10 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         _udpGso.IsChecked = GetBoolean(advanced, "udp_gso", true);
         _udpGro.Content = "UDP GRO 合并接收";
         _udpGro.IsChecked = GetBoolean(advanced, "udp_gro", true);
+        _tunOffload.Content = "TUN 批量读取卸载 (TunOffload)";
+        _tunOffload.IsChecked = GetBoolean(advanced, "tun_offload", true);
+        _tunGro.Content = "TUN 接收合并 (TunGro)";
+        _tunGro.IsChecked = GetBoolean(advanced, "tun_gro", true);
 
         _autoConnect.Content = "GUI 启动后自动连接此配置";
         _autoConnect.IsChecked = autoConnect;
@@ -306,7 +335,8 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         pathsBorder.SetResourceReference(Border.BorderBrushProperty, "ControlElevationBorderBrush");
         stack.Children.Add(FluentUi.SettingCard("多路径物理网卡 (Paths)", pathsBorder, "可同时勾选多张网卡聚合加速；不勾选时由内核自动绑定默认物理路由。"));
         stack.Children.Add(FluentUi.SettingCard("多路径调度器", _scheduler));
-        stack.Children.Add(FluentUi.SettingCard("拥塞控制算法 (CC)", _congestion, "CC 与多路径调度器相互独立。"));
+        stack.Children.Add(FluentUi.SettingCard("请求服务端对齐调度器", _requestServerScheduler, "向服务端协商使用本客户端的调度器算法作为下行流量调度策略。"));
+        stack.Children.Add(FluentUi.SettingCard("拥塞控制算法 (CC)", _congestion, "CC 与多路径调度器相互独立。Redundant 模式下推荐使用 bbr。"));
         stack.Children.Add(FluentUi.SettingCard("初始最大 Path ID", _initMaxPathId, "InitMaxPathId：0 使用 xquic 默认值 8；非零范围 1-4294967295。"));
         stack.Children.Add(FluentUi.SettingCard("路由分流策略", _routing));
         stack.Children.Add(FluentUi.SettingCard("DNS 服务器", _dns, "每行或用逗号分隔，最多 4 个 IPv4/IPv6 DNS 地址。"));
@@ -318,8 +348,12 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
     private TabItem BuildTransportPage()
     {
         var page = CreatePage("传输增强", out var stack);
+        stack.Children.Add(FluentUi.SectionHeader("Redundant 冗余模式 (0.19.0 新增)", SymbolRegular.Stream20));
+        stack.Children.Add(FluentUi.SettingCard("冗余模式开关", _redundant, "在多个活动路径上同时复制发送 UDP 数据包，保障 SRT 等直播流在链路瞬断时不中断。"));
+        stack.Children.Add(FluentUi.SettingCard("复制 UDP 目的端口", _redundantPorts, "逗号分隔的端口列表（最多 16 个），留空表示复制全部 UDP。启用时推荐拥塞控制使用 bbr。"));
+
         stack.Children.Add(FluentUi.SectionHeader("Reinjection 重注入", SymbolRegular.Flash20));
-        stack.Children.Add(FluentUi.SettingCard("重注入模式", _reinjection, "off：关闭；deadline：按时限复制未确认包；idle：路径空闲时重注入；dgram：数据报重注入。"));
+        stack.Children.Add(FluentUi.SettingCard("重注入模式", _reinjection, "off：关闭；deadline：按时限复制未确认包；idle：路径空闲时重注入。旧版 dgram 已由 Redundant 冗余模式替代。"));
         stack.Children.Add(FluentUi.SettingCard("SRTT 系数（%）", _reinjectionFactor, "仅 deadline 模式生效，范围 100-1000，默认 110。"));
         stack.Children.Add(FluentUi.SettingCard("硬截止时间（ms）", _reinjectionHardDeadline, "仅 deadline 模式生效，默认 500 ms。"));
         stack.Children.Add(FluentUi.SettingCard("截止下限（ms）", _reinjectionLowerBound, "仅 deadline 模式生效，默认 20 ms。"));
@@ -331,9 +365,11 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         stack.Children.Add(FluentUi.SettingCard("TCP 空闲超时（秒）", _tcpIdleTimeout, "0 表示不按空闲时间回收。"));
         stack.Children.Add(FluentUi.SettingCard("TCP 连接超时（秒）", _tcpConnectTimeout, "服务端 Hybrid 出站 connect() 超时；超时后客户端收到 HTTP 504。默认 10 秒。"));
 
-        stack.Children.Add(FluentUi.SectionHeader("mqvpn 0.16 Linux UDP 卸载", SymbolRegular.TopSpeed20));
+        stack.Children.Add(FluentUi.SectionHeader("Linux 内核网络与虚拟网卡卸载", SymbolRegular.TopSpeed20));
         stack.Children.Add(FluentUi.SettingCard("UDP GSO", _udpGso, "0.16 新增，默认开启。仅 Linux 生效；不支持分段的路径会自动回退到 sendmmsg。"));
         stack.Children.Add(FluentUi.SettingCard("UDP GRO", _udpGro, "0.16 新增，默认开启。仅 Linux 生效；Windows 客户端保留此配置但不会使用。"));
+        stack.Children.Add(FluentUi.SettingCard("TUN Offload", _tunOffload, "0.19 新增，默认开启。仅 Linux 生效；批量读取 TUN 报文提升高吞吐效率。"));
+        stack.Children.Add(FluentUi.SettingCard("TUN GRO", _tunGro, "0.19 新增，默认开启。仅 Linux 生效；Linux 6.2+ 内核合并写入 TUN。"));
         return page;
     }
 
@@ -347,6 +383,8 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         stack.Children.Add(FluentUi.SettingCard("断线保护 (Kill Switch)", _killSwitch));
         stack.Children.Add(FluentUi.SettingCard("MTU 协商模式", _automaticMtu));
         stack.Children.Add(FluentUi.SettingCard("自定义 MTU 上限", _mtu, "范围 1280-9000。客户端值仅作为协商 MTU 的上限。"));
+        stack.Children.Add(FluentUi.SettingCard("路径 MTU 动态发现 (PMTUD)", _pmtud, "0.19.0 新增。动态探测端到端网络路径支持的最大报文大小，避免分片。需两端同时开启。"));
+        stack.Children.Add(FluentUi.SettingCard("固定路径 MTU (PathMTU)", _pathMtu, "0.19.0 新增。固定路径 MTU 大小（1280-9000，0 表示默认 1400 字节）。开启 PMTUD 时作为探测上限。"));
         stack.Children.Add(FluentUi.SettingCard("TUN 队列深度", _tunQueueLength, "TxQueueLen：0 使用内核默认值 500；非零范围 100-65536。仅 Linux 生效。"));
         stack.Children.Add(FluentUi.SettingCard("TUN 读取批量", _tunReadBatch, "TunReadBatch：0 使用内置默认值 64；非零范围 1-4096。仅 Linux 生效。"));
 
@@ -381,6 +419,8 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         _reinjectionFactor.IsEnabled = deadline;
         _reinjectionHardDeadline.IsEnabled = deadline;
         _reinjectionLowerBound.IsEnabled = deadline;
+
+        _redundantPorts.IsEnabled = _redundant.IsChecked == true;
 
         var hybridOn = _hybridEnabled.IsChecked == true;
         _hybridTcp.IsEnabled = hybridOn;
@@ -431,6 +471,31 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
             return;
         }
 
+        if (_redundant.IsChecked == true && !string.IsNullOrWhiteSpace(_redundantPorts.Text))
+        {
+            var ports = _redundantPorts.Text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (ports.Length > 16)
+            {
+                ShowValidation("RedundantPorts 最多只能指定 16 个目的端口。");
+                return;
+            }
+            foreach (var p in ports)
+            {
+                if (!ushort.TryParse(p, out var portVal) || portVal == 0)
+                {
+                    ShowValidation($"RedundantPorts 包含无效端口: {p}（必须是 1-65535 的整数）。");
+                    return;
+                }
+            }
+        }
+
+        var pathMtuVal = decimal.ToInt32(GetDecimal(_pathMtu));
+        if (pathMtuVal != 0 && (pathMtuVal < 1280 || pathMtuVal > 9000))
+        {
+            ShowValidation("PathMTU 必须为 0，或 1280-9000 之间的整数。");
+            return;
+        }
+
         var tunQueueLen = GetDecimal(_tunQueueLength);
         if (tunQueueLen is > 0 and < 100)
         {
@@ -477,6 +542,7 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         _config["reconnect"] = _reconnect.IsChecked == true;
         _config["reconnect_interval"] = decimal.ToInt32(GetDecimal(_reconnectInterval));
         _config["scheduler"] = _scheduler.SelectedItem?.ToString() ?? "wlb";
+        _config["request_server_scheduler"] = _requestServerScheduler.IsChecked == true;
         _config["cc"] = _congestion.SelectedItem?.ToString() ?? "bbr2";
         _config["init_max_path_id"] = decimal.ToUInt32(GetDecimal(_initMaxPathId));
 
@@ -498,6 +564,10 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         _config["reinjection_srtt_factor_pct"] = decimal.ToInt32(GetDecimal(_reinjectionFactor));
         _config["reinjection_hard_deadline_ms"] = decimal.ToInt32(GetDecimal(_reinjectionHardDeadline));
         _config["reinjection_deadline_lower_bound_ms"] = decimal.ToInt32(GetDecimal(_reinjectionLowerBound));
+        _config["redundant"] = _redundant.IsChecked == true;
+        _config["redundant_ports"] = _redundantPorts.Text.Trim();
+        _config["pmtud"] = _pmtud.IsChecked == true;
+        _config["path_mtu"] = pathMtuVal;
 
         var hybrid = GetOrCreateObject("hybrid");
         hybrid["enabled"] = _hybridEnabled.IsChecked == true;
@@ -526,6 +596,8 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         advanced["recv_rate_limit"] = decimal.ToInt64(GetDecimal(_recvRateLimit));
         advanced["udp_gso"] = _udpGso.IsChecked == true;
         advanced["udp_gro"] = _udpGro.IsChecked == true;
+        advanced["tun_offload"] = _tunOffload.IsChecked == true;
+        advanced["tun_gro"] = _tunGro.IsChecked == true;
 
         if (IsLoaded)
         {

@@ -32,6 +32,7 @@ internal static class ConfigurationChecks
         try
         {
             FluentUi.EnsureApplication();
+            FluentUi.SuppressDialogsForTesting = true;
 
             // -------------------------------------------------------------------------
             // 痛点 1: 0.19.0-beta-1 严格布尔配置与参数迁移测试
@@ -67,12 +68,31 @@ internal static class ConfigurationChecks
                 SetNumber(form, "_tunQueueLength", 2048);
                 SetNumber(form, "_tunReadBatch", 512);
                 SetNumber(form, "_initMaxPathId", uint.MaxValue);
+
+                // 0.19.0-beta-1 Multipath, PMTUD and Redundant mode checks
+                Field<CheckBox>(form, "_requestServerScheduler").IsChecked = true;
+                Field<CheckBox>(form, "_redundant").IsChecked = true;
+                Check(Field<ComboBox>(form, "_congestion").SelectedItem?.ToString() == "bbr",
+                    "redundant mode auto-recommends CC = bbr", "CC was not switched to bbr");
+                Field<Wpf.Ui.Controls.TextBox>(form, "_redundantPorts").Text = "4200,9000";
+                Field<CheckBox>(form, "_pmtud").IsChecked = true;
+                SetNumber(form, "_pathMtu", 1492);
+                Field<CheckBox>(form, "_tunOffload").IsChecked = true;
+                Field<CheckBox>(form, "_tunGro").IsChecked = true;
+
                 Save(form);
 
                 var saved = form.ResultConfig;
                 Check(saved["mtu"]!.GetValue<int>() == 1400 && !saved.ContainsKey("tun_mtu"), "MTU CLI key migration", "Expected mtu migrated and tun_mtu removed");
                 Check(saved["tx_queue_len"]!.GetValue<int>() == 2048 && saved["tun_read_batch"]!.GetValue<int>() == 512, "TUN tuning saved", "TUN queue/batch mismatch");
                 Check(saved["init_max_path_id"]!.GetValue<uint>() == uint.MaxValue, "32-bit unsigned Path ID", "Path ID mismatch");
+                Check(saved["request_server_scheduler"]!.GetValue<bool>() == true, "0.19.0-beta-1 request_server_scheduler saved", "request_server_scheduler mismatch");
+                Check(saved["redundant"]!.GetValue<bool>() == true, "0.19.0-beta-1 redundant saved", "redundant mismatch");
+                Check(saved["redundant_ports"]!.GetValue<string>() == "4200,9000", "0.19.0-beta-1 redundant_ports saved", "redundant_ports mismatch");
+                Check(saved["pmtud"]!.GetValue<bool>() == true, "0.19.0-beta-1 pmtud saved", "pmtud mismatch");
+                Check(saved["path_mtu"]!.GetValue<int>() == 1492, "0.19.0-beta-1 path_mtu saved", "path_mtu mismatch");
+                Check(saved["advanced"]!["tun_offload"]!.GetValue<bool>() == true && saved["advanced"]!["tun_gro"]!.GetValue<bool>() == true,
+                    "0.19.0-beta-1 tun_offload and tun_gro saved", "advanced offload mismatch");
 
                 // 重点痛点：0.19.0-beta-1 严格要求保存出的 JSON 属性必须是原生 JSON 布尔值 (true / false)，字符串 "on"/"off" 会导致内核崩溃
                 var reorderNode = saved["reorder"]!["enabled"];
@@ -92,6 +112,13 @@ internal static class ConfigurationChecks
 
                 using var reopened = Create(JsonNode.Parse(saved.ToJsonString())!.AsObject());
                 Check(Field<NumberBox>(reopened, "_initMaxPathId").Value == uint.MaxValue, "saved config reopens cleanly", "InitMaxPathId mismatch upon reopening");
+                Check(Field<CheckBox>(reopened, "_requestServerScheduler").IsChecked == true, "reopened request_server_scheduler true", "request_server_scheduler false");
+                Check(Field<CheckBox>(reopened, "_redundant").IsChecked == true, "reopened redundant true", "redundant false");
+                Check(Field<Wpf.Ui.Controls.TextBox>(reopened, "_redundantPorts").Text == "4200,9000", "reopened redundant_ports 4200,9000", "redundant_ports mismatch");
+                Check(Field<CheckBox>(reopened, "_pmtud").IsChecked == true, "reopened pmtud true", "pmtud false");
+                Check(Field<NumberBox>(reopened, "_pathMtu").Value == 1492, "reopened path_mtu 1492", "path_mtu mismatch");
+                Check(Field<CheckBox>(reopened, "_tunOffload").IsChecked == true && Field<CheckBox>(reopened, "_tunGro").IsChecked == true,
+                    "reopened tun_offload/tun_gro true", "tun_offload/tun_gro mismatch");
             }
 
             using (var form = Create(config))
@@ -113,9 +140,50 @@ internal static class ConfigurationChecks
             }
 
             // -------------------------------------------------------------------------
-            // 痛点 2: Reorder 参数上下限与合法性强校验
+            // 痛点 2: 0.19.0-beta-1 新增参数校验（RedundantPorts、PathMTU）与 Reorder 参数上下限
             // -------------------------------------------------------------------------
-            Console.WriteLine("\n--- [Stage 2] Reorder Bounds & Invariant Validation ---");
+            Console.WriteLine("\n--- [Stage 2] 0.19.0-beta-1 Bounds & Invariant Validation ---");
+            using (var form = Create(config))
+            {
+                // 校验 RedundantPorts 端口合法性与上限 16 端口
+                Field<CheckBox>(form, "_redundant").IsChecked = true;
+                FluentUi.LastDialogMessage = null;
+                Field<Wpf.Ui.Controls.TextBox>(form, "_redundantPorts").Text = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17";
+                Save(form);
+                Check(FluentUi.LastDialogMessage != null && FluentUi.LastDialogMessage.Contains("16"),
+                    "RedundantPorts exceeding 16 ports rejected", "Should reject >16 ports");
+
+                FluentUi.LastDialogMessage = null;
+                Field<Wpf.Ui.Controls.TextBox>(form, "_redundantPorts").Text = "4200,70000";
+                Save(form);
+                Check(FluentUi.LastDialogMessage != null && FluentUi.LastDialogMessage.Contains("70000"),
+                    "RedundantPorts out of range (>65535) rejected", "Should reject port 70000");
+
+                FluentUi.LastDialogMessage = null;
+                Field<Wpf.Ui.Controls.TextBox>(form, "_redundantPorts").Text = "4200,0";
+                Save(form);
+                Check(FluentUi.LastDialogMessage != null && FluentUi.LastDialogMessage.Contains("0"),
+                    "RedundantPorts port 0 rejected", "Should reject port 0");
+
+                FluentUi.LastDialogMessage = null;
+                Field<Wpf.Ui.Controls.TextBox>(form, "_redundantPorts").Text = "4200, 9000";
+                SetNumber(form, "_pathMtu", 1000); // PathMTU must be 0 or 1280..9000
+                Save(form);
+                Check(FluentUi.LastDialogMessage != null && FluentUi.LastDialogMessage.Contains("PathMTU"),
+                    "PathMTU < 1280 (non-zero) rejected", "Should reject path mtu 1000");
+
+                FluentUi.LastDialogMessage = null;
+                SetNumber(form, "_pathMtu", 9500);
+                Save(form);
+                Check(FluentUi.LastDialogMessage != null && FluentUi.LastDialogMessage.Contains("PathMTU"),
+                    "PathMTU > 9000 rejected", "Should reject path mtu 9500");
+
+                FluentUi.LastDialogMessage = null;
+                SetNumber(form, "_pathMtu", 1500);
+                Save(form);
+                Check(FluentUi.LastDialogMessage == null && form.ResultConfig["path_mtu"]!.GetValue<int>() == 1500,
+                    "Valid 0.19.0-beta-1 parameters accepted", "Valid parameters unexpectedly rejected");
+            }
             using (var form = Create(config))
             {
                 var rows = form.ReorderRuleRows;
