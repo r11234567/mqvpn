@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
+using TruckersMP.Proxy.Packaging;
 
 namespace TruckersMP.Proxy;
 
@@ -80,10 +81,12 @@ internal static class GitHubReleaseClient
         var entries = await ReadReleaseFeedAsync(owner, repository, cancellationToken);
         // The feed lists pre-releases without marking them, so the stable tag comes from the redirect.
         var stableTag = await TryResolveLatestStableTagAsync(owner, repository, cancellationToken);
+        if (!includePreRelease && stableTag is null)
+            throw new HttpRequestException("无法确认稳定版本，未选择可能为预发布的更新。");
         var selected = includePreRelease
             ? entries[0]
             : entries.FirstOrDefault(entry => string.Equals(entry.Tag, stableTag, StringComparison.Ordinal))
-                ?? entries[0];
+                ?? new ReleaseFeedEntry(stableTag!, stableTag!);
         var isPreRelease = stableTag is not null &&
             !string.Equals(selected.Tag, stableTag, StringComparison.Ordinal);
 
@@ -193,63 +196,32 @@ internal static class KernelInstaller
     public static GitHubAsset SelectAsset(string kernel, GitHubRelease release, Architecture? arch = null)
     {
         var targetArch = arch ?? RuntimeInformation.ProcessArchitecture;
-        var candidates = release.Assets.Where(asset => asset.Name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)).ToList();
-        GitHubAsset? selected = kernel switch
+        var archToken = targetArch switch
         {
-            "gui" => targetArch == Architecture.Arm64
-                ? candidates.FirstOrDefault(asset =>
-                    asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase) &&
-                    (asset.Name.Contains("mqvpn_windows_gui", StringComparison.OrdinalIgnoreCase) ||
-                     asset.Name.Contains("windows_gui", StringComparison.OrdinalIgnoreCase) ||
-                     asset.Name.Contains("mqvpn", StringComparison.OrdinalIgnoreCase)))
-                  ?? candidates.FirstOrDefault(asset => asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase))
-                : candidates.FirstOrDefault(asset =>
-                    (asset.Name.Contains("x64", StringComparison.OrdinalIgnoreCase) || asset.Name.Contains("amd64", StringComparison.OrdinalIgnoreCase)) &&
-                    (asset.Name.Contains("mqvpn_windows_gui", StringComparison.OrdinalIgnoreCase) ||
-                     asset.Name.Contains("windows_gui", StringComparison.OrdinalIgnoreCase)))
-                  ?? candidates.FirstOrDefault(asset =>
-                    !asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase) &&
-                    (asset.Name.Contains("mqvpn_windows_gui", StringComparison.OrdinalIgnoreCase) ||
-                     asset.Name.Contains("windows_gui", StringComparison.OrdinalIgnoreCase)))
-                  ?? candidates.FirstOrDefault(asset =>
-                    !asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase) &&
-                    asset.Name.Contains("mqvpn", StringComparison.OrdinalIgnoreCase) &&
-                    asset.Name.Contains("gui", StringComparison.OrdinalIgnoreCase)),
-            "mqvpn" => targetArch == Architecture.Arm64
-                ? candidates.FirstOrDefault(asset =>
-                    !asset.Name.Contains("gui", StringComparison.OrdinalIgnoreCase) &&
-                    asset.Name.Contains("windows", StringComparison.OrdinalIgnoreCase) &&
-                    asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase))
-                : candidates.FirstOrDefault(asset =>
-                    !asset.Name.Contains("gui", StringComparison.OrdinalIgnoreCase) &&
-                    asset.Name.Contains("windows", StringComparison.OrdinalIgnoreCase) &&
-                    (asset.Name.Contains("amd64", StringComparison.OrdinalIgnoreCase) ||
-                     asset.Name.Contains("x64", StringComparison.OrdinalIgnoreCase) ||
-                     asset.Name.Contains("x86_64", StringComparison.OrdinalIgnoreCase))),
-            "xray" => targetArch == Architecture.Arm64
-                ? candidates.FirstOrDefault(asset =>
-                    asset.Name.Contains("xray", StringComparison.OrdinalIgnoreCase) &&
-                    asset.Name.Contains("windows", StringComparison.OrdinalIgnoreCase) &&
-                    asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase))
-                  ?? candidates.FirstOrDefault(asset =>
-                    asset.Name.Contains("xray", StringComparison.OrdinalIgnoreCase) &&
-                    asset.Name.Contains("arm64", StringComparison.OrdinalIgnoreCase))
-                : candidates.FirstOrDefault(asset =>
-                    asset.Name.Equals("Xray-windows-64.zip", StringComparison.OrdinalIgnoreCase))
-                  ?? candidates.FirstOrDefault(asset =>
-                    asset.Name.Contains("xray", StringComparison.OrdinalIgnoreCase) &&
-                    asset.Name.Contains("windows", StringComparison.OrdinalIgnoreCase) &&
-                    asset.Name.Contains("64", StringComparison.OrdinalIgnoreCase) &&
-                    !asset.Name.Contains("arm", StringComparison.OrdinalIgnoreCase)),
-            _ => null,
+            Architecture.X64 => @"(?:x64|amd64|x86_64)",
+            Architecture.Arm64 => @"arm64",
+            _ => throw new PlatformNotSupportedException("仅支持 Windows x64/ARM64"),
         };
-        return selected ?? throw new InvalidOperationException($"Release {release.Tag} 中没有兼容的 Windows {targetArch} ZIP");
+        var candidates = release.Assets.Where(a => a.Name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase));
+        var selected = candidates.Where(a => kernel switch
+        {
+            "gui" => Regex.IsMatch(a.Name, @"windows[-_]gui[-_]" + archToken + @"\.zip$", RegexOptions.IgnoreCase),
+            "mqvpn" => !a.Name.Contains("gui", StringComparison.OrdinalIgnoreCase) &&
+                       Regex.IsMatch(a.Name, @"windows[-_]" + archToken + @"\.zip$", RegexOptions.IgnoreCase),
+            "xray" => targetArch == Architecture.X64
+                ? a.Name.Equals("Xray-windows-64.zip", StringComparison.OrdinalIgnoreCase)
+                : a.Name.Equals("Xray-windows-arm64-v8a.zip", StringComparison.OrdinalIgnoreCase),
+            _ => false,
+        }).ToArray();
+        return selected.Length == 1 ? selected[0] : throw new InvalidOperationException(
+            $"Release {release.Tag} 中没有唯一兼容的 Windows {targetArch} {kernel} ZIP");
     }
 
     public static async Task InstallGuiAsync(
         GitHubAsset asset,
         IProgress<(long received, long total)>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<Task> stopServices)
     {
         var temporaryRoot = Path.Combine(Path.GetTempPath(), $"mqvpn-gui-update-{Guid.NewGuid():N}");
         Directory.CreateDirectory(temporaryRoot);
@@ -259,6 +231,12 @@ internal static class KernelInstaller
         {
             await GitHubReleaseClient.DownloadAsync(asset.DownloadUrl, archive, progress, cancellationToken);
 
+            var validationRoot = Path.Combine(temporaryRoot, "validated");
+            ZipFile.ExtractToDirectory(archive, validationRoot);
+            var manifests = Directory.GetFiles(validationRoot, "package-manifest.json", SearchOption.AllDirectories);
+            if (manifests.Length != 1) throw new InvalidDataException("更新包必须包含唯一发行清单");
+            PackageContract.Validate(Path.GetDirectoryName(manifests[0])!, PackageContract.CurrentArchitecture);
+
             var currentExe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName;
             var appDir = AppDomain.CurrentDomain.BaseDirectory;
             var exeName = !string.IsNullOrEmpty(currentExe) ? Path.GetFileName(currentExe) : "MQVPN.exe";
@@ -266,23 +244,18 @@ internal static class KernelInstaller
 
             // 寻找独立更新助手 MqvpnUpgrade.exe
             var updaterPath = Path.Combine(appDir, "MqvpnUpgrade.exe");
-            if (!File.Exists(updaterPath))
-            {
-                var fallback = Path.Combine(appDir, "..", "updater", "bin", "Debug", "net9.0-windows", "MqvpnUpgrade.exe");
-                if (File.Exists(fallback))
-                    updaterPath = fallback;
-            }
-
             if (File.Exists(updaterPath))
             {
+                await stopServices();
                 var psi = new ProcessStartInfo
                 {
                     FileName = updaterPath,
-                    Arguments = $"\"{archive}\" \"{appDir}\" \"{exeName}\" {currentPid}",
-                    UseShellExecute = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
                     WorkingDirectory = appDir
                 };
-                Process.Start(psi);
+                foreach (var arg in new[] { archive, appDir, exeName, currentPid.ToString() }) psi.ArgumentList.Add(arg);
+                _ = Process.Start(psi) ?? throw new IOException("无法启动更新助手");
                 Environment.Exit(0);
             }
             else
@@ -314,7 +287,8 @@ internal static class KernelInstaller
         string kernel,
         GitHubAsset asset,
         string runtimeRoot,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? localArchive = null)
     {
         var temporaryRoot = Path.Combine(Path.GetTempPath(), $"mqvpn-update-{Guid.NewGuid():N}");
         var volumeStage = Path.Combine(runtimeRoot, $".{kernel}-stage-{Guid.NewGuid():N}");
@@ -326,7 +300,10 @@ internal static class KernelInstaller
 
         try
         {
-            await GitHubReleaseClient.DownloadAsync(asset.DownloadUrl, archive, cancellationToken);
+            if (localArchive is null)
+                await GitHubReleaseClient.DownloadAsync(asset.DownloadUrl, archive, cancellationToken);
+            else
+                File.Copy(localArchive, archive);
             ZipFile.ExtractToDirectory(archive, extracted);
             var executableName = kernel switch
             {
@@ -355,28 +332,35 @@ internal static class KernelInstaller
             }
             else
             {
-                foreach (var required in new[] { "mqvpn.exe", "xquic.dll", "wintun.dll" })
+                foreach (var required in new[] { "mqvpn.exe" })
                 {
                     if (!File.Exists(Path.Combine(staged, required)))
                         throw new InvalidDataException($"mqvpn 更新包缺少 {required}");
                 }
             }
 
+            var oldRuntime = Path.Combine(runtimeRoot, kernel);
+            foreach (var retained in kernel == "xray" ? new[] { "geoip.dat", "geosite.dat" } : new[] { "wintun.dll" })
+            {
+                var dest = Path.Combine(staged, retained);
+                if ((kernel == "xray" || !File.Exists(dest)) && File.Exists(Path.Combine(oldRuntime, retained)))
+                    File.Copy(Path.Combine(oldRuntime, retained), dest, true);
+            }
+            if (!File.Exists(Path.Combine(staged, "wintun.dll"))) throw new InvalidDataException("更新缺少 Wintun 驱动");
+            foreach (var binary in Directory.GetFiles(staged, "*", SearchOption.AllDirectories)
+                         .Where(f => f.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)))
+                PackageContract.ValidatePortableExecutable(binary, PackageContract.CurrentArchitecture);
             await ValidateKernelAsync(kernel, staged, cancellationToken);
             CopyDirectory(staged, volumeStage);
             await ValidateKernelAsync(kernel, volumeStage, cancellationToken);
             var target = Path.Combine(runtimeRoot, kernel);
-            var backup = Path.Combine(runtimeRoot, $".{kernel}-backup");
-            if (Directory.Exists(backup))
-                Directory.Delete(backup, true);
+            var backup = Path.Combine(runtimeRoot, $".{kernel}-backup-{Guid.NewGuid():N}");
             if (Directory.Exists(target))
                 Directory.Move(target, backup);
             try
             {
                 Directory.Move(volumeStage, target);
                 await ValidateKernelAsync(kernel, target, cancellationToken);
-                if (Directory.Exists(backup))
-                    Directory.Delete(backup, true);
             }
             catch
             {
@@ -386,6 +370,8 @@ internal static class KernelInstaller
                     Directory.Move(backup, target);
                 throw;
             }
+            if (Directory.Exists(backup))
+                try { Directory.Delete(backup, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
         }
         finally
         {
@@ -527,6 +513,14 @@ internal static class KernelInstaller
         var output = await RunVersionAsync(executable, kernel == "mqvpn" ? "--version" : "version", cancellationToken);
         if (string.IsNullOrWhiteSpace(output))
             throw new InvalidDataException("内核版本检查没有输出");
+        if (kernel == "mqvpn") EnsureMqvpnVersionCompatible(output);
+    }
+
+    internal static void EnsureMqvpnVersionCompatible(string output)
+    {
+        var version = Regex.Match(output, @"\bmqvpn\s+(\d+)\.(\d+)\.", RegexOptions.IgnoreCase);
+        if (!version.Success || version.Groups[1].Value != "0" || version.Groups[2].Value != "19")
+            throw new InvalidDataException("当前 GUI 的配置接口要求 MQVPN 0.19.x；请使用兼容内核或先更新 GUI。");
     }
 
     private static async Task<string> RunVersionAsync(string executable, string argument, CancellationToken cancellationToken)
@@ -542,7 +536,11 @@ internal static class KernelInstaller
         using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动内核版本检查");
         var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
         var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
-        await process.WaitForExitAsync(cancellationToken);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(15));
+        try { await process.WaitForExitAsync(timeout.Token); }
+        catch { if (!process.HasExited) process.Kill(true); throw; }
+        if (process.ExitCode != 0) throw new InvalidDataException($"内核版本检查失败: {process.ExitCode}");
         var output = (await outputTask).Trim();
         var error = (await errorTask).Trim();
         var reported = output.Length > 0 ? output : error;

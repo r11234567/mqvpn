@@ -200,6 +200,8 @@ internal sealed class MainForm : FluentWindow
     private bool _exitRequested;
 
     private ManagedService? _proxyService;
+    private readonly AsyncOperation _connectionOperation = new();
+    private JsonObject? _runtimeConfig;
     private ManagedService? _tunService;
     private bool _closing;
     private bool _allowClose;
@@ -233,9 +235,7 @@ internal sealed class MainForm : FluentWindow
     private string ConfigDirectory => System.IO.Path.Combine(BasePath, "config");
     private string RuntimeDirectory => System.IO.Path.Combine(BasePath, "runtime");
     private string MqvpnExecutable => System.IO.Path.Combine(BasePath, "runtime", "mqvpn", "mqvpn.exe");
-    private string MqvpnConfig => _profiles is null
-        ? System.IO.Path.Combine(ConfigDirectory, "client-windows.json")
-        : _profiles.GetConfigPath(_profiles.ActiveProfile);
+    private string MqvpnConfig => System.IO.Path.Combine(ConfigDirectory, "active-mqvpn.json");
     private string ActiveMqvpnTunName => _activeTunName ??=
         _profiles?.ReadConfig(_profiles.ActiveProfile)["tun_name"]?.GetValue<string>() ?? "mqvpn0";
     private string XrayExecutable => System.IO.Path.Combine(BasePath, "runtime", "xray", "xray.exe");
@@ -1274,17 +1274,20 @@ internal sealed class MainForm : FluentWindow
         try
         {
             _profiles = ProfileStore.Load(ConfigDirectory);
+            foreach (var warning in _profiles.LoadWarnings)
+                QueueLog("GUI", $"[error] {warning}");
             FluentUi.SetThemeMode(_profiles.State.ThemeMode);
             foreach (var profile in _profiles.State.Profiles)
                 ResetDailyTrafficIfNeeded(profile);
             _minimumLogSeverity = LogLevels.ToSeverity(_profiles.State.LogLevel);
             _profiles.Save();
-            GenerateActiveRoutingConfig();
             RefreshProfilesGrid();
             RefreshRoutingSelector();
             UpdateActiveProfileCaption();
+            try { GenerateActiveRoutingConfig(); }
+            catch (Exception ex) { QueueLog("GUI", $"[error] 当前节点无法生成路由: {ex.Message}"); }
             RenderConnectionStatus();
-            QueueLog("GUI", "Package and profile validation completed");
+            QueueLog("GUI", "Profile metadata loaded; configuration warnings are listed above");
             if (_profiles.State.StartMinimized)
             {
                 WindowState = WindowState.Minimized;
@@ -1314,8 +1317,7 @@ internal sealed class MainForm : FluentWindow
 
         foreach (var profile in _profiles.State.Profiles)
         {
-            var config = _profiles.ReadConfig(profile);
-            var server = config["server_addr"]?.GetValue<string>() ?? string.Empty;
+            var server = string.IsNullOrEmpty(profile.ServerAddress) ? string.Empty : $"{profile.ServerAddress}:{profile.ServerPort}";
             var policy = _profiles.GetPolicy(profile.RoutingPolicyId);
             var latency = profile.LastLatencyMs is { } value ? $"{value} ms" : "--";
             var isActive = profile.Id == _profiles.State.ActiveProfileId;
@@ -1355,10 +1357,16 @@ internal sealed class MainForm : FluentWindow
     {
         if (_profiles is null)
             return;
-        var config = _profiles.ReadConfig(_profiles.ActiveProfile);
+        _activeProfileTitle.Text = _profiles.ActiveProfile.Name;
+        JsonObject config;
+        try { config = _profiles.ReadConfig(_profiles.ActiveProfile); }
+        catch (Exception ex)
+        {
+            _subtitle.Text = $"当前节点配置读取失败：{ex.Message}";
+            return;
+        }
         var server = config["server_addr"]?.GetValue<string>() ?? string.Empty;
         var adapter = (config["paths"] as JsonArray)?.FirstOrDefault()?.GetValue<string>() ?? "默认路由";
-        _activeProfileTitle.Text = _profiles.ActiveProfile.Name;
         _subtitle.Text = $"服务器: {server}   ·   绑定网卡: {adapter}";
         StartRegionLookup(server);
     }
@@ -1367,7 +1375,8 @@ internal sealed class MainForm : FluentWindow
     {
         if (_profiles is null)
             throw new InvalidOperationException("配置列表尚未初始化");
-        _profiles.GenerateXrayConfig(_profiles.ActiveProfile, XrayConfig);
+        _profiles.GenerateXrayConfig(_profiles.ActiveProfile, XrayConfig,
+            _proxyService?.IsRunning == true ? _runtimeConfig : null);
     }
 
     private void AddProfile()
@@ -1498,7 +1507,7 @@ internal sealed class MainForm : FluentWindow
             {
                 latency = await ProfileLatencyTester.TestAsync(
                     MqvpnExecutable,
-                    _profiles.ReadConfig(profile),
+                    _profiles.GetRuntimeConfig(profile),
                     CancellationToken.None);
             }
             profile.LastLatencyMs = latency;
@@ -1561,17 +1570,20 @@ internal sealed class MainForm : FluentWindow
 
         using var settings = new SettingsForm(_profiles, initialTabIndex, updatedStore =>
         {
+            _activeTunName = null;
             _profiles.Save();
             GenerateActiveRoutingConfig();
             RefreshProfilesGrid();
             RefreshRoutingSelector();
             _ = Task.Run(async () => await Dispatcher.InvokeAsync(async () => await ApplyLogLevelAsync(_profiles.State.LogLevel)));
             QueueLog("GUI", "设置中心已更新并保存");
-        });
+        }, StopProxyAsync);
         settings.ShowModal(this);
     }
 
-    private async Task ApplyLogLevelAsync(string newLevel)
+    private Task ApplyLogLevelAsync(string newLevel) => _connectionOperation.RunAsync(() => ApplyLogLevelCoreAsync(newLevel));
+
+    private async Task ApplyLogLevelCoreAsync(string newLevel)
     {
         if (_profiles is null)
             return;
@@ -1605,16 +1617,23 @@ internal sealed class MainForm : FluentWindow
         if (_profiles is null)
             return false;
         var policy = _profiles.GetPolicy(_profiles.ActiveProfile.RoutingPolicyId);
-        if (policy is null)
-            return false;
-        return policy.Id == "global" ||
-               policy.Name.Contains("全局 MQVPN", StringComparison.OrdinalIgnoreCase) ||
-               (policy.FinalOutbound == "MQVPN-TUN" && (policy.Rules == null || policy.Rules.Count == 0 || policy.Rules.All(r => !r.Enabled)));
+        return RoutingSemantics.IsGlobalMqvpn(policy);
     }
 
-    private async Task ChangeActiveRoutingAsync()
+    private Task ChangeActiveRoutingAsync() => _connectionOperation.RunAsync(async () =>
     {
-        if (_updatingRoutingSelector || _profiles is null || _routingSelector.SelectedValue is not string policyId ||
+        try { await ChangeActiveRoutingCoreAsync(); }
+        catch (Exception ex)
+        {
+            QueueLog("GUI", $"[error] 策略切换失败: {ex.Message}");
+            await StopProxyCoreAsync();
+            RefreshRoutingSelector();
+        }
+    });
+
+    private async Task ChangeActiveRoutingCoreAsync()
+    {
+        if (_closing || _updatingRoutingSelector || _profiles is null || _routingSelector.SelectedValue is not string policyId ||
             policyId == _profiles.ActiveProfile.RoutingPolicyId)
             return;
         var restartTun = _tunService?.IsRunning == true;
@@ -1654,6 +1673,7 @@ internal sealed class MainForm : FluentWindow
 
     private async Task HandleProxyToggleAsync(bool desired)
     {
+        if (_closing || _proxyToggle.Busy) return;
         _proxyToggle.Busy = true;
         try
         {
@@ -1673,8 +1693,11 @@ internal sealed class MainForm : FluentWindow
         }
     }
 
-    private async Task HandleTunToggleAsync(bool desired)
+    private Task HandleTunToggleAsync(bool desired) => _connectionOperation.RunAsync(() => HandleTunToggleCoreAsync(desired));
+
+    private async Task HandleTunToggleCoreAsync(bool desired)
     {
+        if (_closing) return;
         _tunToggle.Busy = true;
         try
         {
@@ -1702,13 +1725,20 @@ internal sealed class MainForm : FluentWindow
         }
     }
 
-    private async Task StartProxyAsync()
+    private Task StartProxyAsync() => _connectionOperation.RunAsync(() =>
+        _closing ? Task.CompletedTask : StartProxyCoreAsync());
+
+    private async Task StartProxyCoreAsync()
     {
         if (_proxyService?.IsRunning == true)
             return;
 
         _activeTunName = null;
-        ValidateConfiguredPaths();
+        _runtimeConfig = _profiles?.GetRuntimeConfig(_profiles.ActiveProfile)
+            ?? throw new InvalidOperationException("配置列表尚未初始化");
+        ValidateConfiguredPaths(_runtimeConfig);
+        ProfileStore.WriteMqvpnConfigFile(MqvpnConfig, _runtimeConfig);
+        _profiles.GenerateXrayConfig(_profiles.ActiveProfile, XrayConfig, _runtimeConfig);
 
         SetProxyState(false, "连接中...", Amber);
         var service = new ManagedService(
@@ -1717,60 +1747,66 @@ internal sealed class MainForm : FluentWindow
             System.IO.Path.GetDirectoryName(MqvpnExecutable)!,
             new[] { "--config", MqvpnConfig, "--log-level", CurrentLogLevel },
             QueueLog);
-        service.Exited += (code, expected) => OnServiceExited("proxy", code, expected);
+        service.Exited += (code, expected) => OnServiceExited("proxy", service, code, expected);
         _proxyService = service;
-        service.Start();
-        QueueLog("GUI", $"mqvpn started (log level {CurrentLogLevel})");
-
-        if (!await WaitForAdapterAsync(ActiveMqvpnTunName, service, TimeSpan.FromSeconds(18)))
+        try
         {
-            await service.StopAsync();
-            _proxyService = null;
-            throw new InvalidOperationException($"{ActiveMqvpnTunName} 未在 18 秒内就绪");
-        }
+            service.Start();
+            QueueLog("GUI", $"mqvpn started (log level {CurrentLogLevel})");
 
-        SetProxyState(true, "已连接", Green);
-        _tunToggle.Enabled = false;
-        _tunToggle.Busy = true;
-        _footerStatus.Text = "代理已连接";
-        _footerDot.Fill = FluentUi.GreenBrush;
-        await EnsureMqvpnRouteAsync();
-        StartTrafficMonitor();
-        StartLatencyMonitor();
-        QueueLog("GUI", "Proxy is ready");
+            if (!await WaitForAdapterAsync(ActiveMqvpnTunName, service, TimeSpan.FromSeconds(18)))
+            {
+                await service.StopAsync();
+                _proxyService = null;
+                throw new InvalidOperationException($"{ActiveMqvpnTunName} 未在 18 秒内就绪");
+            }
 
-        if (IsGlobalMqvpnActive())
-        {
-            QueueLog("GUI", "当前路由策略为【全局 MQVPN】，所有流量直接通过 MQVPN 虚拟网卡传输，无需开启 Xray 分流 TUN。");
-            SetTunState(false, "全局直通 (免TUN)", FluentUi.MutedBrush.Color);
-            _tunToggle.Busy = false;
             _tunToggle.Enabled = false;
-            _footerStatus.Text = "全局 MQVPN 代理已连接";
-        }
-        else
-        {
-            try
+            _tunToggle.Busy = true;
+            _footerStatus.Text = "代理已连接";
+            _footerDot.Fill = FluentUi.GreenBrush;
+            await EnsureMqvpnRouteAsync();
+            if (!service.IsRunning) throw new InvalidOperationException("MQVPN 在路由设置期间退出");
+            SetProxyState(true, "已连接", Green);
+            StartTrafficMonitor();
+            StartLatencyMonitor();
+            QueueLog("GUI", "Proxy is ready");
+
+            if (IsGlobalMqvpnActive())
             {
-                await StartTunAsync();
-            }
-            catch (Exception ex)
-            {
-                QueueLog("GUI", $"[warning] 系统 TUN 自动启动失败: {ex.Message}");
-                SetTunState(false, "启动失败", Red);
-            }
-            finally
-            {
+                QueueLog("GUI", "当前路由策略为【全局 MQVPN】，所有流量直接通过 MQVPN 虚拟网卡传输，无需开启 Xray 分流 TUN。");
+                SetTunState(false, "全局直通 (免TUN)", FluentUi.MutedBrush.Color);
                 _tunToggle.Busy = false;
-                _tunToggle.Enabled = true;
+                _tunToggle.Enabled = false;
+                _footerStatus.Text = "全局 MQVPN 代理已连接";
             }
+            else
+            {
+                try
+                {
+                    await StartTunAsync();
+                }
+                catch (Exception ex)
+                {
+                    QueueLog("GUI", $"[warning] 系统 TUN 自动启动失败: {ex.Message}");
+                    SetTunState(false, "启动失败", Red);
+                }
+                finally
+                {
+                    _tunToggle.Busy = false;
+                    _tunToggle.Enabled = true;
+                }
+            }
+        }
+        catch
+        {
+            await StopProxyCoreAsync();
+            throw;
         }
     }
 
-    private void ValidateConfiguredPaths()
+    private static void ValidateConfiguredPaths(JsonObject config)
     {
-        if (_profiles is null)
-            return;
-        var config = _profiles.ReadConfig(_profiles.ActiveProfile);
         var paths = (config["paths"] as JsonArray)?
             .Select(node => node?.GetValue<string>())
             .Where(value => !string.IsNullOrWhiteSpace(value))
@@ -1790,8 +1826,11 @@ internal sealed class MainForm : FluentWindow
         }
     }
 
-    private async Task StopProxyAsync()
+    private Task StopProxyAsync() => _connectionOperation.RunAsync(StopProxyCoreAsync);
+
+    private async Task StopProxyCoreAsync()
     {
+        _tunToggle.Busy = false;
         StopLatencyMonitor();
         if (_tunService?.IsRunning == true || _tunToggle.IsOn)
             await StopTunAsync();
@@ -1805,7 +1844,10 @@ internal sealed class MainForm : FluentWindow
             _proxyService = null;
         }
 
-        await RemoveMqvpnRouteAsync();
+        if (_activeTunName is not null)
+            await RemoveMqvpnRouteAsync();
+        _activeTunName = null;
+        _runtimeConfig = null;
         SetProxyState(false, "已关闭", Muted);
         _tunToggle.Enabled = false;
         _footerStatus.Text = "MQVPN 就绪";
@@ -1850,7 +1892,7 @@ internal sealed class MainForm : FluentWindow
             System.IO.Path.GetDirectoryName(XrayExecutable)!,
             new[] { "run", "-c", XrayConfig },
             QueueLog);
-        service.Exited += (code, expected) => OnServiceExited("tun", code, expected);
+        service.Exited += (code, expected) => OnServiceExited("tun", service, code, expected);
         _tunService = service;
         service.Start();
         QueueLog("GUI", "xray started");
@@ -2001,35 +2043,44 @@ internal sealed class MainForm : FluentWindow
             throw new InvalidOperationException($"路由操作失败，退出码 {process.ExitCode}");
     }
 
-    private void OnServiceExited(string serviceName, int exitCode, bool expected)
+    private void OnServiceExited(string serviceName, ManagedService source, int exitCode, bool expected)
     {
         if (IsDisposed)
             return;
 
         _ = Dispatcher.BeginInvoke(async () =>
         {
-            if (_closing)
-                return;
+            try
+            {
+                await _connectionOperation.RunAsync(async () =>
+                {
+                    if (_closing)
+                        return;
 
-            if (serviceName == "proxy" && !expected)
-            {
-                StopLatencyMonitor();
-                await StopTrafficMonitorAsync();
-                QueueLog("GUI", $"[error] mqvpn 意外退出，退出码 {exitCode}");
-                if (_tunService?.IsRunning == true)
-                    await StopTunAsync();
-                await RemoveMqvpnRouteAsync();
-                _proxyService = null;
-                SetProxyState(false, "已中断", Red);
-                _tunToggle.Enabled = false;
-                _footerDot.Fill = FluentUi.RedBrush;
+                    if (serviceName == "proxy" && !expected && ReferenceEquals(_proxyService, source))
+                    {
+                        QueueLog("GUI", $"[error] mqvpn 意外退出，退出码 {exitCode}");
+                        await StopProxyCoreAsync();
+                        SetProxyState(false, "已中断", Red);
+                        _tunToggle.Enabled = false;
+                        _footerDot.Fill = FluentUi.RedBrush;
+                    }
+                    else if (serviceName == "tun" && !expected && ReferenceEquals(_tunService, source))
+                    {
+                        QueueLog("GUI", $"[error] Xray 意外退出，退出码 {exitCode}");
+                        await StopTunAsync();
+                        SetTunState(false, "已中断", Red);
+                        _footerDot.Fill = FluentUi.AmberBrush;
+                    }
+                });
             }
-            else if (serviceName == "tun" && !expected)
+            catch (Exception ex)
             {
-                QueueLog("GUI", $"[error] Xray 意外退出，退出码 {exitCode}");
-                _tunService = null;
-                SetTunState(false, "已中断", Red);
-                _footerDot.Fill = FluentUi.AmberBrush;
+                QueueLog("GUI", $"[error] {serviceName} 退出后的清理失败: {ex.Message}");
+                if (serviceName == "proxy") SetProxyState(false, "清理失败", Red);
+                else SetTunState(false, "清理失败", Red);
+                _footerStatus.Text = "进程已退出，清理失败，请检查日志";
+                _footerDot.Fill = FluentUi.RedBrush;
             }
         });
     }
@@ -2601,7 +2652,6 @@ internal sealed class MainForm : FluentWindow
 
         try
         {
-            await StopTunAsync();
             await StopProxyAsync();
         }
         catch (Exception ex)

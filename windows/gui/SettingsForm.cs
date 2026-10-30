@@ -20,6 +20,7 @@ internal sealed class SettingsForm : FluentWindow, IDisposable
     private readonly ProfileStore? _store;
     private readonly AppState _state;
     private readonly Action<ProfileStore>? _storeCallback;
+    private readonly Func<Task>? _beforeRestore;
     private readonly Action<AppState>? _stateCallback;
     private readonly RoutingDocument _routing;
 
@@ -96,9 +97,10 @@ internal sealed class SettingsForm : FluentWindow, IDisposable
     {
     }
 
-    public SettingsForm(ProfileStore store, int initialTabIndex = 0, Action<ProfileStore>? onSaved = null)
+    public SettingsForm(ProfileStore store, int initialTabIndex = 0, Action<ProfileStore>? onSaved = null, Func<Task>? beforeRestore = null)
         : this(store, initialTabIndex, onSaved, store.State, null)
     {
+        _beforeRestore = beforeRestore;
     }
 
     private SettingsForm(
@@ -570,11 +572,11 @@ internal sealed class SettingsForm : FluentWindow, IDisposable
         stack.Children.Add(FluentUi.SettingCard("导出 ZIP 备份", btnExport, "将节点配置、SQLite 数据库 (mqvpn.db)、分流路由规则打包压缩为标准 .zip 文件。"));
 
         stack.Children.Add(FluentUi.SectionHeader("配置本地还原 (Local Restore)", SymbolRegular.ArrowUpload20));
-        var btnImport = FluentUi.ActionButton("从备份文件还原 (ZIP)...", SymbolRegular.ArrowUpload20, ControlAppearance.Secondary, (_, _) => ImportBackup());
+        var btnImport = FluentUi.ActionButton("从备份文件还原 (ZIP)...", SymbolRegular.ArrowUpload20, ControlAppearance.Secondary, async (_, _) => await ImportBackupAsync());
         stack.Children.Add(FluentUi.SettingCard("导入 ZIP 还原", btnImport, "从已有的 ZIP 备份恢复所有节点与配置。覆盖前系统将自动生成紧急安全快照。"));
 
         stack.Children.Add(FluentUi.SectionHeader("危险操作与重置", SymbolRegular.Warning20));
-        var btnReset = FluentUi.ActionButton("恢复出厂默认设置", SymbolRegular.ArrowReset20, ControlAppearance.Danger, (_, _) => ResetFactoryDefaults());
+        var btnReset = FluentUi.ActionButton("恢复出厂默认设置", SymbolRegular.ArrowReset20, ControlAppearance.Danger, async (_, _) => await ResetFactoryDefaultsAsync());
         stack.Children.Add(FluentUi.SettingCard("恢复出厂初始", btnReset, "清空所有自定义节点与规则，将客户端与数据库重置为出厂预设状态（重置前自动创建快照）。"));
 
         _txtBackupStatus.Margin = new Thickness(4, 16, 4, 0);
@@ -613,7 +615,7 @@ internal sealed class SettingsForm : FluentWindow, IDisposable
         }
     }
 
-    private void ImportBackup()
+    private async Task ImportBackupAsync()
     {
         if (_store is null)
         {
@@ -632,19 +634,29 @@ internal sealed class SettingsForm : FluentWindow, IDisposable
         if (!FluentUi.Confirm(this, $"确定要从以下备份文件还原配置吗？\n{ofd.FileName}\n\n还原操作将覆盖当前节点与数据库设置（还原前系统将自动生成紧急安全备份）。", "确认配置还原"))
             return;
 
-        if (_store.ImportBackup(ofd.FileName))
+        try
         {
-            _txtBackupStatus.Text = $"✅ 成功从备份还原: {Path.GetFileName(ofd.FileName)}";
-            FluentUi.ShowAlert(this, "配置已成功还原！页面参数与路由设置已重新载入。", "还原成功");
-            ReloadFromStore();
+            if (_beforeRestore is not null) await _beforeRestore();
+            if (_store.ImportBackup(ofd.FileName))
+            {
+                _txtBackupStatus.Text = $"✅ 成功从备份还原: {Path.GetFileName(ofd.FileName)}";
+                FluentUi.ShowAlert(this, "配置已成功还原！页面参数与路由设置已重新载入。", "还原成功");
+                ReloadFromStore();
+                _storeCallback?.Invoke(_store);
+                Close();
+            }
+            else
+            {
+                FluentUi.ShowAlert(this, "还原备份失败，备份文件可能已损坏或格式不兼容。", "还原失败", isError: true);
+            }
         }
-        else
+        catch (Exception ex)
         {
-            FluentUi.ShowAlert(this, "还原备份失败，备份文件可能已损坏或格式不兼容。", "还原失败", isError: true);
+            FluentUi.ShowAlert(this, ex.Message, "还原失败", isError: true);
         }
     }
 
-    private void ResetFactoryDefaults()
+    private async Task ResetFactoryDefaultsAsync()
     {
         if (_store is null)
         {
@@ -655,10 +667,21 @@ internal sealed class SettingsForm : FluentWindow, IDisposable
         if (!FluentUi.Confirm(this, "⚠️ 确定要将所有节点配置、分流路由规则与全局设置恢复为出厂默认状态吗？\n\n此操作不可逆，但系统在执行前会自动在 config/backups 下生成安全快照。", "确认恢复出厂设置"))
             return;
 
-        _store.ResetToFactoryDefaults();
+        try
+        {
+            if (_beforeRestore is not null) await _beforeRestore();
+            _store.ResetToFactoryDefaults();
+        }
+        catch (Exception ex)
+        {
+            FluentUi.ShowAlert(this, ex.Message, "重置失败", isError: true);
+            return;
+        }
         _txtBackupStatus.Text = "⚠️ 已成功恢复出厂默认设置。";
         FluentUi.ShowAlert(this, "已成功恢复出厂预设！", "重置完成");
         ReloadFromStore();
+        _storeCallback?.Invoke(_store);
+        Close();
     }
 
     private void ReloadFromStore()

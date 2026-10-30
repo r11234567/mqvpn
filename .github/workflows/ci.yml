@@ -7,11 +7,41 @@ on:
     branches: [main, dev]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  gui-changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      gui: ${{ steps.paths.outputs.gui }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Select GUI-relevant source changes
+        id: paths
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            git diff --name-only "$BASE_SHA" HEAD > /tmp/mqvpn-gui-paths
+          else
+            git ls-files > /tmp/mqvpn-gui-paths
+          fi
+          if grep -Eq '^(windows/|src/|include/|cmake/|third_party/|CMakeLists\.txt$|scripts/(package_windows_gui|resolve_windows_gui_deps|verify_windows_gui_package|write_windows_core_manifest)\.ps1$|\.github/workflows/(ci|windows-gui)\.yml$)' /tmp/mqvpn-gui-paths; then
+            echo 'gui=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'gui=false' >> "$GITHUB_OUTPUT"
+          fi
+
   format-check:
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -1111,15 +1141,17 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
 
   windows:
-    # Pinned to windows-2022 (VS 2022). windows-latest migrated to VS 2026 in
-    # June 2026, where the hardcoded `-G "Visual Studio 17 2022"` generator finds
-    # no VS instance. Revisit (bump generator / Ninja) before windows-2022 retires.
-    runs-on: windows-2022
-    timeout-minutes: 20
+    needs: gui-changes
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.gui-changes.outputs.gui == 'true' && '{"include":[{"arch":"x64","runner":"windows-2022","vs":"Visual Studio 17 2022","cmake_arch":"x64"},{"arch":"arm64","runner":"windows-11-arm","vs":"Visual Studio 18 2026","cmake_arch":"ARM64"}]}' || '{"include":[{"arch":"x64","runner":"windows-2022","vs":"Visual Studio 17 2022","cmake_arch":"x64"}]}') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Verify pinned xquic source
         shell: bash
@@ -1128,9 +1160,10 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: x64
+          arch: ${{ matrix.arch }}
 
       - name: Install NASM
+        if: matrix.arch == 'x64'
         uses: ilammy/setup-nasm@v1
 
       - name: Setup Go
@@ -1139,7 +1172,7 @@ jobs:
           go-version: 'stable'
 
       - name: Install libevent via vcpkg
-        run: vcpkg install libevent:x64-windows-static
+        run: vcpkg install libevent:${{ matrix.arch }}-windows-static
 
       - name: Compute xquic SHA
         id: xqsha
@@ -1157,8 +1190,8 @@ jobs:
           path: third_party/xquic/third_party/boringssl
           # v2: configure now passes CMAKE_BUILD_TYPE=Release (drops the
           # dispatch-test instrumentation); the xquic key below moves with it
-          # because xquic.dll links BoringSSL statically.
-          key: bssl-${{ steps.bssl-pin.outputs.sha }}-windows-msvc-v2
+          # because xquic links BoringSSL statically; all components use /MT.
+          key: bssl-${{ steps.bssl-pin.outputs.sha }}-windows-${{ matrix.arch }}-msvc-mt-v3
 
       - name: Build BoringSSL
         if: steps.bssl-cache.outputs.cache-hit != 'true'
@@ -1168,13 +1201,16 @@ jobs:
           cd build
           # See release.yml re: why CMAKE_BUILD_TYPE is passed to a
           # multi-config generator (BoringSSL's dispatch-test guard reads it).
-          cmake -G "Visual Studio 17 2022" -A x64 -DBUILD_SHARED_LIBS=0 `
-            -DCMAKE_BUILD_TYPE=Release ..
+          cmake -G "${{ matrix.vs }}" -A ${{ matrix.cmake_arch }} -DBUILD_SHARED_LIBS=0 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            ${{ matrix.arch == 'arm64' && '-DOPENSSL_NO_ASM=1' || '' }} ..
           cmake --build . --target ssl --config Release
           cmake --build . --target crypto --config Release
 
       # Deliberately not gated on the cache miss (see the linux-build job).
       - name: Verify BoringSSL is an optimized build
+        if: matrix.arch == 'x64'
         shell: bash
         run: |
           NM="$(command -v llvm-nm || command -v nm || true)"
@@ -1192,7 +1228,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-windows-msvc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-v5
+          key: xquic-${{ steps.xqsha.outputs.sha }}-windows-${{ matrix.arch }}-msvc-mt-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-v6
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -1204,9 +1240,10 @@ jobs:
           # _Static_assert (C11), and xquic upstream targets gnu11. Without
           # /std:c11 cl.exe falls back to its pre-C11 dialect and the
           # _Static_assert lines fail to compile.
-          cmake -G "Visual Studio 17 2022" -A x64 `
+          cmake -G "${{ matrix.vs }}" -A ${{ matrix.cmake_arch }} `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_STANDARD=11 `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
             -DSSL_TYPE=boringssl `
             -DSSL_PATH="${{ github.workspace }}/third_party/xquic/third_party/boringssl" `
             -DXQC_ENABLE_BBR2=ON `
@@ -1225,13 +1262,14 @@ jobs:
           mkdir build
           cd build
           # Same C11 reasoning as the xquic build, kept consistent.
-          cmake -G "Visual Studio 17 2022" -A x64 `
+          cmake -G "${{ matrix.vs }}" -A ${{ matrix.cmake_arch }} `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_STANDARD=11 `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
             -DXQUIC_BUILD_DIR="${{ github.workspace }}/third_party/xquic/build/Release" `
             -DBORINGSSL_BUILD_DIR="${{ github.workspace }}/third_party/xquic/third_party/boringssl/build/Release" `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.arch }}-windows-static `
             -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON ..
           cmake --build . --config Release
 
@@ -1284,14 +1322,27 @@ jobs:
           ctest --test-dir build -C Release --output-on-failure
           -R 'test_(platform_cert_verify|cert_identity|cert_verify_win|windows_firewall)'
 
-      # For on-machine checks the runner cannot do (real certificate stores,
-      # a real server). Needs wintun.dll next to it: take it from a release zip.
-      - name: Upload mqvpn.exe
+      - name: Record exact core provenance and licenses
+        shell: pwsh
+        run: |
+          ./scripts/write_windows_core_manifest.ps1 -Arch ${{ matrix.arch }} -OutputDirectory build/core-artifact -LibeventLicense "$env:VCPKG_INSTALLATION_ROOT/installed/${{ matrix.arch }}-windows-static/share/libevent/copyright"
+
+      - name: Upload verified native core
         uses: actions/upload-artifact@v7
         with:
-          name: mqvpn-windows-x64
-          path: build/Release/mqvpn.exe
+          name: mqvpn-windows-${{ matrix.arch }}
+          path: build/core-artifact/
+          if-no-files-found: error
           retention-days: 7
+
+  windows-gui:
+    needs: [gui-changes, windows]
+    if: needs.gui-changes.outputs.gui == 'true'
+    uses: ./.github/workflows/windows-gui.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+    permissions:
+      contents: read
 
   android:
     runs-on: ubuntu-24.04

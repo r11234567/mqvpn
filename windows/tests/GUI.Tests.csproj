@@ -16,6 +16,7 @@
     <Using Remove="System.Windows.Forms" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="../shared/**/*.cs" />
     <Compile Include="../gui/**/*.cs" Exclude="../gui/bin/**;../gui/obj/**" />
   </ItemGroup>
   <ItemGroup>

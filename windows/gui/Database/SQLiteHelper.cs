@@ -90,6 +90,25 @@ internal sealed class SQLiteHelper : IDisposable
         }
     }
 
+    public void SaveState(IEnumerable<ProxyProfile> profiles, Dictionary<string, string> settings, bool replace = false)
+    {
+        lock (_lock)
+        {
+            var conn = GetConnection();
+            conn.RunInTransaction(() =>
+            {
+                if (replace)
+                {
+                    conn.DeleteAll<ProxyProfile>();
+                    conn.DeleteAll<AppSettingItem>();
+                }
+                foreach (var profile in profiles) conn.InsertOrReplace(profile);
+                foreach (var item in settings)
+                    conn.InsertOrReplace(new AppSettingItem { Key = item.Key, Value = item.Value });
+            });
+        }
+    }
+
     public void SaveProfile(ProxyProfile profile)
     {
         lock (_lock)

@@ -204,7 +204,8 @@ internal sealed class ProfileStore
     private readonly string _configDirectory;
     private readonly string _statePath;
     private readonly string _routingPath;
-    private static readonly Encoding MqvpnConfigEncoding = CreateMqvpnConfigEncoding();
+    private static readonly Encoding LegacyConfigEncoding = CreateLegacyConfigEncoding();
+    private readonly List<string> _loadWarnings = [];
 
     private ProfileStore(string configDirectory, AppState state, RoutingDocument routing)
     {
@@ -217,6 +218,7 @@ internal sealed class ProfileStore
 
     public AppState State { get; }
     public RoutingDocument Routing { get; }
+    public IReadOnlyList<string> LoadWarnings => _loadWarnings;
     public ProxyProfile ActiveProfile =>
         State.Profiles.First(profile => profile.Id == State.ActiveProfileId);
 
@@ -230,48 +232,18 @@ internal sealed class ProfileStore
 
         SQLiteHelper.Instance.Initialize(dbPath);
 
-        var state = File.Exists(statePath)
+        // SQLite owns node metadata/settings. JSON is a compatibility export and
+        // first-run import; each node's file owns its configuration contents.
+        var dbProfiles = SQLiteHelper.Instance.GetAllProfiles();
+        var state = dbProfiles.Count > 0 ? new AppState { Profiles = dbProfiles } : File.Exists(statePath)
             ? JsonSerializer.Deserialize<AppState>(File.ReadAllText(statePath), JsonOptions) ?? new AppState()
             : CreateInitialState(configDirectory);
         var routing = File.Exists(routingPath)
             ? JsonSerializer.Deserialize<RoutingDocument>(File.ReadAllText(routingPath), JsonOptions) ?? CreateDefaultRouting()
             : CreateDefaultRouting();
 
-        // 优先从 SQLite 数据库同步配置节点
-        var dbProfiles = SQLiteHelper.Instance.GetAllProfiles();
-        if (dbProfiles.Count > 0)
-        {
-            state.Profiles = dbProfiles;
-        }
-        else
-        {
-            // 首次从 JSON 迁移到 SQLite 数据库
-            if (state.Profiles.Count == 0)
-                state = CreateInitialState(configDirectory);
-
-            for (var i = 0; i < state.Profiles.Count; i++)
-            {
-                var profile = state.Profiles[i];
-                profile.SortOrder = i;
-                try
-                {
-                    var cfgPath = Path.Combine(configDirectory, profile.ConfigFile);
-                    if (File.Exists(cfgPath))
-                    {
-                        var cfg = JsonNode.Parse(ReadMqvpnConfigFile(cfgPath))?.AsObject();
-                        var (addr, port) = ParseServerEndpoint(cfg);
-                        profile.ServerAddress = addr;
-                        profile.ServerPort = port;
-                        profile.ConfigContent = cfg?.ToJsonString(JsonOptions);
-                    }
-                }
-                catch
-                {
-                    // 忽略单项解析容错
-                }
-            }
-            SQLiteHelper.Instance.SaveProfiles(state.Profiles);
-        }
+        if (state.Profiles.Count == 0)
+            state = CreateInitialState(configDirectory);
 
         // 优先从 SQLite 数据库同步 App 全局设置
         var dbSettings = SQLiteHelper.Instance.GetAllSettings();
@@ -293,7 +265,7 @@ internal sealed class ProfileStore
 
         var store = new ProfileStore(configDirectory, state, routing);
         store.NormalizeProfilePolicies();
-        store.NormalizeConfigEncoding();
+        store.LoadConfigurations();
         store.Save();
         return store;
     }
@@ -332,34 +304,66 @@ internal sealed class ProfileStore
 
     public void SaveConfig(ProxyProfile profile, JsonObject config)
     {
+        var path = GetConfigPath(profile);
+        RecoverConfigSave(profile);
+        var content = config.ToJsonString(JsonOptions);
+        var oldContent = profile.ConfigContent;
+        var oldAddress = profile.ServerAddress;
+        var oldPort = profile.ServerPort;
+        // A durable recovery point bridges the file replacement and SQLite
+        // commit. They are deliberately not treated as one atomic transaction.
+        var recovery = new ConfigSaveRecovery(content,
+            File.Exists(path) ? Convert.ToBase64String(File.ReadAllBytes(path)) : null);
+        var recoveryPath = path + ".pending-save";
+        AtomicFile.WriteText(recoveryPath, JsonSerializer.Serialize(recovery));
         var (addr, port) = ParseServerEndpoint(config);
-        profile.ServerAddress = addr;
-        profile.ServerPort = port;
-        profile.ConfigContent = config.ToJsonString(JsonOptions);
-        WriteMqvpnConfigFile(GetConfigPath(profile), config);
-        SQLiteHelper.Instance.SaveProfile(profile);
+        try
+        {
+            AtomicFile.WriteText(path, content);
+            profile.ServerAddress = addr;
+            profile.ServerPort = port;
+            profile.ConfigContent = content;
+            SQLiteHelper.Instance.SaveProfile(profile);
+        }
+        catch
+        {
+            profile.ServerAddress = oldAddress;
+            profile.ServerPort = oldPort;
+            profile.ConfigContent = oldContent;
+            RestoreConfig(path, recovery);
+            File.Delete(recoveryPath);
+            throw;
+        }
+        // Once committed, an interrupted cleanup is completed during Load.
+        File.Delete(recoveryPath);
     }
 
     public static void WriteMqvpnConfigFile(string path, JsonObject config) =>
-        File.WriteAllText(path, config.ToJsonString(JsonOptions), MqvpnConfigEncoding);
+        AtomicFile.WriteText(path, config.ToJsonString(JsonOptions));
 
-    private static string ReadMqvpnConfigFile(string path)
+    private static string ReadMqvpnConfigFile(string path) => ReadMqvpnConfigFile(path, out _);
+
+    private static string ReadMqvpnConfigFile(string path, out bool legacy)
     {
         var bytes = File.ReadAllBytes(path);
+        legacy = false;
         try
         {
-            return new UTF8Encoding(false, true).GetString(bytes);
+            var offset = bytes.AsSpan().StartsWith(new byte[] { 0xef, 0xbb, 0xbf }) ? 3 : 0;
+            return AtomicFile.Utf8.GetString(bytes, offset, bytes.Length - offset);
         }
         catch (DecoderFallbackException)
         {
-            return MqvpnConfigEncoding.GetString(bytes);
+            legacy = true;
+            return LegacyConfigEncoding.GetString(bytes);
         }
     }
 
-    private static Encoding CreateMqvpnConfigEncoding()
+    private static Encoding CreateLegacyConfigEncoding()
     {
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
-        return Encoding.GetEncoding((int)NativeMethods.GetACP());
+        return Encoding.GetEncoding((int)NativeMethods.GetACP(),
+            EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback);
     }
 
     private static class NativeMethods
@@ -368,16 +372,54 @@ internal sealed class ProfileStore
         internal static extern uint GetACP();
     }
 
-    private void NormalizeConfigEncoding()
+    private sealed record ConfigSaveRecovery(string NewContent, string? PreviousBytes);
+
+    private static void RestoreConfig(string path, ConfigSaveRecovery recovery)
+    {
+        if (recovery.PreviousBytes is null) File.Delete(path);
+        else AtomicFile.WriteBytes(path, Convert.FromBase64String(recovery.PreviousBytes));
+    }
+
+    private void RecoverConfigSave(ProxyProfile profile)
+    {
+        var path = GetConfigPath(profile);
+        var recoveryPath = path + ".pending-save";
+        if (!File.Exists(recoveryPath)) return;
+        var recovery = JsonSerializer.Deserialize<ConfigSaveRecovery>(File.ReadAllText(recoveryPath))
+            ?? throw new InvalidDataException($"配置 {profile.Name} 的保存恢复记录无效");
+        if (profile.ConfigContent != recovery.NewContent)
+            RestoreConfig(path, recovery);
+        File.Delete(recoveryPath);
+    }
+
+    private void LoadConfigurations()
     {
         foreach (var profile in State.Profiles)
         {
-            var path = GetConfigPath(profile);
-            if (File.Exists(path))
+            try
             {
-                var config = ReadConfig(profile);
-                // Re-serialize every profile so legacy \uXXXX output becomes UTF-8 text.
-                SaveConfig(profile, config);
+                RecoverConfigSave(profile);
+                var path = GetConfigPath(profile);
+                var text = ReadMqvpnConfigFile(path, out var legacy);
+                var config = JsonNode.Parse(text) as JsonObject
+                    ?? throw new InvalidDataException("根节点必须是 JSON 对象");
+                if (legacy)
+                {
+                    // Keep the exact original bytes, including characters the
+                    // old writer may already have lost; never overwrite backup.
+                    File.Copy(path, path + $".legacy-{Guid.NewGuid():N}.bak");
+                    SaveConfig(profile, config);
+                }
+                else
+                {
+                    (profile.ServerAddress, profile.ServerPort) = ParseServerEndpoint(config);
+                    profile.ConfigContent = config.ToJsonString(JsonOptions);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or
+                                       JsonException or DecoderFallbackException or InvalidOperationException or FormatException)
+            {
+                _loadWarnings.Add($"节点“{profile.Name}” ({profile.ConfigFile}): {ex.Message}；原文件保留，请修正后重试。");
             }
         }
     }
@@ -395,9 +437,8 @@ internal sealed class ProfileStore
             ConfigContent = config.ToJsonString(JsonOptions),
         };
         profile.ConfigFile = Path.Combine("profiles", $"{profile.Id}.json");
-        State.Profiles.Add(profile);
         SaveConfig(profile, config);
-        SQLiteHelper.Instance.SaveProfile(profile);
+        State.Profiles.Add(profile);
         Save();
         return profile;
     }
@@ -455,10 +496,9 @@ internal sealed class ProfileStore
         {
             State.Profiles[i].SortOrder = i;
         }
-        SQLiteHelper.Instance.SaveProfiles(State.Profiles);
-        SQLiteHelper.Instance.SaveAllSettings(State.ToSettingsMap());
-        File.WriteAllText(_statePath, JsonSerializer.Serialize(State, JsonOptions));
-        File.WriteAllText(_routingPath, JsonSerializer.Serialize(Routing, JsonOptions));
+        SQLiteHelper.Instance.SaveState(State.Profiles, State.ToSettingsMap());
+        AtomicFile.WriteText(_statePath, JsonSerializer.Serialize(State, JsonOptions));
+        AtomicFile.WriteText(_routingPath, JsonSerializer.Serialize(Routing, JsonOptions));
     }
 
     public void ReplaceRouting(RoutingDocument routing)
@@ -534,7 +574,7 @@ internal sealed class ProfileStore
             var backupDir = Path.Combine(_configDirectory, "backups");
             Directory.CreateDirectory(backupDir);
             var safetyZip = Path.Combine(backupDir, $"backup_before_restore_{DateTime.Now:yyyyMMdd_HHmmss}.zip");
-            ExportBackup(safetyZip);
+            if (!ExportBackup(safetyZip)) return false;
 
             SQLiteHelper.Instance.Dispose();
 
@@ -575,30 +615,53 @@ internal sealed class ProfileStore
     {
         var backupDir = Path.Combine(_configDirectory, "backups");
         Directory.CreateDirectory(backupDir);
-        var safetyZip = Path.Combine(backupDir, $"backup_before_reset_{DateTime.Now:yyyyMMdd_HHmmss}.zip");
-        ExportBackup(safetyZip);
+        var safetyZip = Path.Combine(backupDir, $"backup_before_reset_{DateTime.Now:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}.zip");
+        if (!ExportBackup(safetyZip))
+            throw new IOException("重置前备份失败，未执行重置。");
 
+        var defaultPath = Path.Combine(_configDirectory, "client-windows.json");
+        var previousDefault = File.Exists(defaultPath) ? File.ReadAllBytes(defaultPath) : null;
         var freshState = CreateInitialState(_configDirectory);
         var freshRouting = CreateDefaultRouting();
+        var freshConfig = CreateDefaultMqvpnConfig();
+        freshState.Profiles[0].ConfigContent = freshConfig.ToJsonString(JsonOptions);
+        try
+        {
+            WriteMqvpnConfigFile(defaultPath, freshConfig);
+            SQLiteHelper.Instance.SaveState(freshState.Profiles, freshState.ToSettingsMap(), replace: true);
+        }
+        catch (Exception ex)
+        {
+            if (previousDefault is not null) AtomicFile.WriteBytes(defaultPath, previousDefault);
+            else File.Delete(defaultPath);
+            throw new IOException($"重置失败，原配置已保留。恢复备份: {safetyZip}", ex);
+        }
 
         State.Profiles = freshState.Profiles;
-        State.ActiveProfileId = freshState.ActiveProfileId;
-        State.LoadFromSettingsMap(new AppState().ToSettingsMap());
+        State.LoadFromSettingsMap(freshState.ToSettingsMap());
 
         Routing.Policies.Clear();
         Routing.Policies.AddRange(freshRouting.Policies);
 
-        SQLiteHelper.Instance.SaveProfiles(State.Profiles);
-        SQLiteHelper.Instance.SaveAllSettings(State.ToSettingsMap());
         Save();
     }
 
     public RoutingPolicy GetPolicy(string id) =>
         Routing.Policies.FirstOrDefault(policy => policy.Id == id) ?? Routing.Policies[0];
 
-    public string GenerateXrayConfig(ProxyProfile profile, string outputPath)
+    public JsonObject GetRuntimeConfig(ProxyProfile profile, Func<string>? resolveDefault = null)
     {
         var config = ReadConfig(profile);
+        if (profile.UseDefaultPath)
+            config["paths"] = new JsonArray((resolveDefault ?? GetDefaultPhysicalInterface)());
+        if (config["paths"] is not JsonArray { Count: > 0 })
+            throw new InvalidOperationException("Windows 连接需要至少一张物理网卡，请在节点设置中选择网卡或启用默认网卡模式。");
+        return config;
+    }
+
+    public string GenerateXrayConfig(ProxyProfile profile, string outputPath, JsonObject? runtimeConfig = null)
+    {
+        var config = runtimeConfig ?? ReadConfig(profile);
         var serverAddress = config["server_addr"]?.GetValue<string>() ?? string.Empty;
         var serverHost = ParseHost(serverAddress);
         var physicalInterface = (config["paths"] as JsonArray)?.FirstOrDefault()?.GetValue<string>()
@@ -916,7 +979,7 @@ internal sealed class ProfileStore
         return array;
     }
 
-    private static string GetDefaultPhysicalInterface()
+    internal static string GetDefaultPhysicalInterface()
     {
         return System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
             .Where(adapter => adapter.OperationalStatus == System.Net.NetworkInformation.OperationalStatus.Up &&

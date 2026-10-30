@@ -50,8 +50,10 @@ internal static partial class NativeProcessHost
     {
         try
         {
-            HostNativeMethods.AttachConsole(AttachParentProcess);
+            if (!HostNativeMethods.AttachConsole(AttachParentProcess))
+                HiddenConsole.Initialize();
             HostNativeMethods.SetConsoleCtrlHandler(IntPtr.Zero, true);
+            Console.OutputEncoding = new UTF8Encoding(false);
 
             ParseArguments(args, out var executable, out var workingDirectory, out var childArgs);
             return RunChild(executable, workingDirectory, childArgs);
@@ -60,6 +62,10 @@ internal static partial class NativeProcessHost
         {
             Console.Error.WriteLine($"[host][error] {ex.Message}");
             return 1;
+        }
+        finally
+        {
+            HiddenConsole.Shutdown();
         }
     }
 

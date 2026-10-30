@@ -319,7 +319,7 @@ internal sealed class KernelUpdateForm : FluentWindow, IDisposable
                     }
                 });
 
-                await KernelInstaller.InstallGuiAsync(asset, progress, CancellationToken.None);
+                await KernelInstaller.InstallGuiAsync(asset, progress, CancellationToken.None, _stopServices);
                 return;
             }
 
@@ -346,7 +346,7 @@ internal sealed class KernelUpdateForm : FluentWindow, IDisposable
         }
         catch (Exception ex)
         {
-            row.SetStatus("更新失败，已自动回滚：" + ex.Message);
+            row.SetStatus("更新失败（原版本或恢复信息已保留）：" + ex.Message);
         }
         finally
         {

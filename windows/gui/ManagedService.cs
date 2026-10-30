@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 
 namespace TruckersMP.Proxy;
 
@@ -47,7 +48,9 @@ internal sealed class ManagedService : IAsyncDisposable
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
-            CreateNoWindow = false,
+            CreateNoWindow = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
             WorkingDirectory = AppContext.BaseDirectory,
         };
 
@@ -65,33 +68,36 @@ internal sealed class ManagedService : IAsyncDisposable
             StartInfo = startInfo,
             EnableRaisingEvents = true,
         };
-        _exitSource = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var exitSource = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _exitSource = exitSource;
         host.OutputDataReceived += (_, eventArgs) => Forward(eventArgs.Data);
         host.ErrorDataReceived += (_, eventArgs) => Forward(eventArgs.Data);
         host.Exited += (_, _) =>
         {
             var code = host.ExitCode;
-            _exitSource.TrySetResult(code);
+            exitSource.TrySetResult(code);
             Exited?.Invoke(code, _stopRequested);
         };
 
-        if (!host.Start())
-            throw new InvalidOperationException($"Cannot start {_name}");
-
+        var started = false;
         try
         {
+            started = host.Start();
+            if (!started)
+                throw new InvalidOperationException($"Cannot start {_name}");
             ServiceHosts.Add(host);
+            _host = host;
+            host.BeginOutputReadLine();
+            host.BeginErrorReadLine();
         }
         catch
         {
-            host.Kill(true);
+            if (started && !host.HasExited) host.Kill(true);
+            _host = null;
+            _exitSource = null;
             host.Dispose();
             throw;
         }
-
-        _host = host;
-        host.BeginOutputReadLine();
-        host.BeginErrorReadLine();
     }
 
     public async Task StopAsync()

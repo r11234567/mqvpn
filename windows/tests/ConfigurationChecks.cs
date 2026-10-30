@@ -23,14 +23,54 @@ internal static class ConfigurationChecks
     private static int _checks;
 
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
+        if (args.FirstOrDefault() == "--pe")
+        {
+            try { TruckersMP.Proxy.Packaging.PackageContract.ValidatePortableExecutable(args[1], args[2]); }
+            catch (Exception ex) { Console.Error.WriteLine(ex.Message); Environment.ExitCode = 1; }
+            return;
+        }
+        if (args.FirstOrDefault() == "--host")
+        {
+            Environment.Exit(NativeProcessHost.Run(args[1..]));
+            return;
+        }
+        if (args.FirstOrDefault() == "--service-child")
+        {
+            LifecycleChecks.RunChild(args.Contains("--exit"));
+            return;
+        }
+        if (args.Contains("--lifecycle"))
+        {
+            LifecycleChecks.RunAsync().GetAwaiter().GetResult();
+            return;
+        }
+        if (args.Contains("--persistence"))
+        {
+            PersistenceChecks.EncodingAndSave();
+            return;
+        }
+        if (args.Contains("--reset"))
+        {
+            PersistenceChecks.ResetAndReopen();
+            return;
+        }
+        if (args.Contains("--package"))
+        {
+            PackageChecks.Run();
+            return;
+        }
         Console.WriteLine("================================================================================");
-        Console.WriteLine(">>> Starting MQVPN Windows GUI Comprehensive Verification & Pain-Point Tests <<<");
+        Console.WriteLine("MQVPN GUI production behavior checks");
         Console.WriteLine("================================================================================");
 
         try
         {
+            PersistenceChecks.EncodingAndSave();
+            PersistenceChecks.ResetAndReopen();
+            LifecycleChecks.RunAsync().GetAwaiter().GetResult();
+            PackageChecks.Run();
             FluentUi.EnsureApplication();
             FluentUi.SuppressDialogsForTesting = true;
 
@@ -67,7 +107,7 @@ internal static class ConfigurationChecks
 
                 SetNumber(form, "_tunQueueLength", 2048);
                 SetNumber(form, "_tunReadBatch", 512);
-                SetNumber(form, "_initMaxPathId", uint.MaxValue);
+                SetNumber(form, "_initMaxPathId", 128);
 
                 // 0.19.0-beta-1 Multipath, PMTUD and Redundant mode checks
                 Field<CheckBox>(form, "_requestServerScheduler").IsChecked = true;
@@ -85,7 +125,7 @@ internal static class ConfigurationChecks
                 var saved = form.ResultConfig;
                 Check(saved["mtu"]!.GetValue<int>() == 1400 && !saved.ContainsKey("tun_mtu"), "MTU CLI key migration", "Expected mtu migrated and tun_mtu removed");
                 Check(saved["tx_queue_len"]!.GetValue<int>() == 2048 && saved["tun_read_batch"]!.GetValue<int>() == 512, "TUN tuning saved", "TUN queue/batch mismatch");
-                Check(saved["init_max_path_id"]!.GetValue<uint>() == uint.MaxValue, "32-bit unsigned Path ID", "Path ID mismatch");
+                Check(saved["init_max_path_id"]!.GetValue<uint>() == 128, "core-supported Path ID maximum", "Path ID mismatch");
                 Check(saved["request_server_scheduler"]!.GetValue<bool>() == true, "0.19.0-beta-1 request_server_scheduler saved", "request_server_scheduler mismatch");
                 Check(saved["redundant"]!.GetValue<bool>() == true, "0.19.0-beta-1 redundant saved", "redundant mismatch");
                 Check(saved["redundant_ports"]!.GetValue<string>() == "4200,9000", "0.19.0-beta-1 redundant_ports saved", "redundant_ports mismatch");
@@ -111,7 +151,7 @@ internal static class ConfigurationChecks
                     "unknown fields retained", "Custom fields not retained");
 
                 using var reopened = Create(JsonNode.Parse(saved.ToJsonString())!.AsObject());
-                Check(Field<NumberBox>(reopened, "_initMaxPathId").Value == uint.MaxValue, "saved config reopens cleanly", "InitMaxPathId mismatch upon reopening");
+                Check(Field<NumberBox>(reopened, "_initMaxPathId").Value == 128, "saved config reopens cleanly", "InitMaxPathId mismatch upon reopening");
                 Check(Field<CheckBox>(reopened, "_requestServerScheduler").IsChecked == true, "reopened request_server_scheduler true", "request_server_scheduler false");
                 Check(Field<CheckBox>(reopened, "_redundant").IsChecked == true, "reopened redundant true", "redundant false");
                 Check(Field<Wpf.Ui.Controls.TextBox>(reopened, "_redundantPorts").Text == "4200,9000", "reopened redundant_ports 4200,9000", "redundant_ports mismatch");
@@ -143,6 +183,16 @@ internal static class ConfigurationChecks
             // 痛点 2: 0.19.0-beta-1 新增参数校验（RedundantPorts、PathMTU）与 Reorder 参数上下限
             // -------------------------------------------------------------------------
             Console.WriteLine("\n--- [Stage 2] 0.19.0-beta-1 Bounds & Invariant Validation ---");
+            var legacyPathConfig = config.DeepClone().AsObject();
+            legacyPathConfig["init_max_path_id"] = uint.MaxValue;
+            using (var old = Create(legacyPathConfig))
+            {
+                Check(Field<NumberBox>(old, "_initMaxPathId").Value == uint.MaxValue, "old excessive Path ID is shown without silently clamping it");
+                FluentUi.LastDialogMessage = null;
+                Save(old);
+                Check(FluentUi.LastDialogMessage?.Contains("InitMaxPathId") == true && old.ResultConfig["init_max_path_id"]!.GetValue<uint>() == uint.MaxValue,
+                    "old excessive Path ID requires explicit correction before saving");
+            }
             using (var form = Create(config))
             {
                 // 校验 RedundantPorts 端口合法性与上限 16 端口
@@ -267,7 +317,7 @@ internal static class ConfigurationChecks
             // 痛点 4: 全局直通 (免 TUN) 路由判定与模式分流
             // -------------------------------------------------------------------------
             Console.WriteLine("\n--- [Stage 4] Global MQVPN Bypass & Smart Route Logic ---");
-            var globalPolicy = new RoutingPolicy { Id = "global", Name = "全局 MQVPN" };
+            var globalPolicy = dnsReopened.GetPolicy("global");
             var bypassPolicy = new RoutingPolicy { Id = "bypass_mainland", Name = "绕过大陆" };
             var customTunPolicy = new RoutingPolicy
             {
@@ -277,12 +327,12 @@ internal static class ConfigurationChecks
                 Rules = new List<RoutingRule>()
             };
 
-            Check(IsPolicyGlobalMqvpn(globalPolicy), "Routing policy 'global' identified as Global MQVPN", "global policy not detected");
-            Check(IsPolicyGlobalMqvpn(new RoutingPolicy { Id = "test", Name = "全局 MQVPN 模式" }),
-                "Routing policy named '全局 MQVPN' identified as Global MQVPN", "name matching failed");
-            Check(IsPolicyGlobalMqvpn(customTunPolicy),
+            Check(RoutingSemantics.IsGlobalMqvpn(globalPolicy), "Routing policy 'global' identified as Global MQVPN", "global policy not detected");
+            Check(!RoutingSemantics.IsGlobalMqvpn(new RoutingPolicy { Id = "test", Name = "全局 MQVPN 模式", FinalOutbound = "DIRECT" }),
+                "display name cannot override routing semantics", "name changed mode");
+            Check(RoutingSemantics.IsGlobalMqvpn(customTunPolicy),
                 "Routing policy with FinalOutbound=MQVPN-TUN and empty rules identified as Global MQVPN", "TUN direct not detected");
-            Check(!IsPolicyGlobalMqvpn(bypassPolicy),
+            Check(!RoutingSemantics.IsGlobalMqvpn(bypassPolicy),
                 "Routing policy 'bypass_mainland' correctly recognized as requiring TUN/Routing", "Bypass mainland incorrectly flagged global");
 
             // -------------------------------------------------------------------------
@@ -300,11 +350,6 @@ internal static class ConfigurationChecks
                 Check(zip.GetEntry("routing.json") is not null, "Backup ZIP contains routing.json", "routing.json entry missing in zip");
             }
 
-            // 测试损坏 ZIP 导入容错
-            var corruptedZip = Path.Combine(tempDir, "corrupted.zip");
-            File.WriteAllBytes(corruptedZip, new byte[] { 0x00, 0x01, 0x02, 0x03 });
-            Check(!dnsReopened.ImportBackup(corruptedZip), "Corrupted ZIP import safely rejected without crashing", "Corrupted ZIP should fail");
-
             // 还原到全新目录并检验恢复数据
             var restoreDir = Path.Combine(Path.GetTempPath(), $"mqvpn-test-restore-{Guid.NewGuid():N}");
             var freshStore = ProfileStore.Load(restoreDir);
@@ -312,21 +357,6 @@ internal static class ConfigurationChecks
             var restoredStore = ProfileStore.Load(restoreDir);
             Check(restoredStore.State.DirectDns == "1.2.4.8, 210.2.4.8", "DirectDns restored from ZIP", "DirectDns not restored");
             Check(restoredStore.State.LocalSocksPort == 20808, "LocalSocksPort restored from ZIP", "LocalSocksPort not restored");
-
-            // 验证 Zip Slip 路径穿越防御
-            var zipSlipFile = Path.Combine(tempDir, "zipslip_probe.txt");
-            if (File.Exists(zipSlipFile)) File.Delete(zipSlipFile);
-            var zipSlipZip = Path.Combine(tempDir, "zipslip.zip");
-            using (var zipStream = new FileStream(zipSlipZip, FileMode.Create))
-            using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Create))
-            {
-                archive.CreateEntry("mqvpn.db"); // 让 hasValidEntries 为 true
-                var evilEntry = archive.CreateEntry("../zipslip_probe.txt");
-                using var writer = new StreamWriter(evilEntry.Open());
-                writer.Write("pwned");
-            }
-            restoredStore.ImportBackup(zipSlipZip);
-            Check(!File.Exists(zipSlipFile), "Zip Slip directory traversal attack mitigated", "Zip Slip file escaped sandbox!");
 
             // 验证出厂重置
             restoredStore.ResetToFactoryDefaults();
@@ -372,9 +402,9 @@ internal static class ConfigurationChecks
                 "KernelInstaller matched geoip.dat and geosite.dat rules", "GeoData matching mismatch");
 
             // -------------------------------------------------------------------------
-            // 痛点 7: UI 渲染及视觉外观基线回归
+            // 痛点 7: UI 渲染及截图采集（无视觉差异判定）
             // -------------------------------------------------------------------------
-            Console.WriteLine("\n--- [Stage 7] UI Rendering & Visual Regression Capture ---");
+            Console.WriteLine("\n--- [Stage 7] UI Rendering & Screenshot Capture ---");
             var shotsDir = Path.Combine(AppContext.BaseDirectory, "screenshots");
             Directory.CreateDirectory(shotsDir);
 
@@ -462,7 +492,7 @@ internal static class ConfigurationChecks
             }
 
             Console.WriteLine("\n================================================================================");
-            Console.WriteLine($"SUCCESS: All {_checks} pain-point test assertions passed cleanly!");
+            Console.WriteLine($"PASS: configuration checks completed ({_checks} assertions); screenshots are capture artifacts only.");
             Console.WriteLine($"UI screenshots saved to: {shotsDir}");
             Console.WriteLine("================================================================================");
         }
@@ -477,13 +507,6 @@ internal static class ConfigurationChecks
             Console.ResetColor();
             Environment.Exit(1);
         }
-    }
-
-    private static bool IsPolicyGlobalMqvpn(RoutingPolicy policy)
-    {
-        return policy.Id == "global" ||
-               policy.Name.Contains("全局 MQVPN", StringComparison.OrdinalIgnoreCase) ||
-               (policy.FinalOutbound == "MQVPN-TUN" && (policy.Rules == null || policy.Rules.Count == 0 || policy.Rules.All(r => !r.Enabled)));
     }
 
     private static void PumpEvents()

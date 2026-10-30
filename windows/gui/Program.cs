@@ -5,6 +5,8 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        if (args.FirstOrDefault() is "--package-check" or "--runtime-check")
+            return PackageSelfCheck.Run(args);
         if (args.Length > 0 && args[0] == "--host")
             return NativeProcessHost.Run(args[1..]);
 

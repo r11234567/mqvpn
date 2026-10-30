@@ -1,129 +1,92 @@
-name: Windows GUI (Test, Build & Package Multi-Arch)
+name: Windows GUI native verification and packages
 
 on:
-  push:
-    branches: [main, dev]
-    paths:
-      - 'windows/**'
-      - 'scripts/package_windows_gui.ps1'
-      - '.github/workflows/windows-gui.yml'
-  pull_request:
-    branches: [main, dev, 'sync/**']
-    paths:
-      - 'windows/**'
-      - 'scripts/package_windows_gui.ps1'
-      - '.github/workflows/windows-gui.yml'
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      source-sha:
+        type: string
+        required: true
 
-concurrency:
-  group: windows-gui-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: read
 
 jobs:
-  test-gui:
-    name: Windows GUI Verification & Pain-Point Tests
-    runs-on: windows-latest
-    timeout-minutes: 15
+  dependencies:
+    runs-on: windows-2022
+    timeout-minutes: 5
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v7
-
-      - name: Setup .NET 9
-        uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v7
         with:
-          dotnet-version: '9.0.x'
-
-      - name: Restore Dependencies
-        run: |
-          dotnet restore windows/updater/MqvpnUpgrade.csproj
-          dotnet restore windows/gui/TruckersMP.Proxy.csproj
-          dotnet restore windows/tests/GUI.Tests.csproj
-
-      - name: Run Windows GUI Tests (All 7 Pain-Point Stages)
+          ref: ${{ inputs.source-sha }}
+      - name: Resolve third-party releases once for both architectures
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          try {
-            dotnet run --project windows/tests/GUI.Tests.csproj
-          } catch {
-            Write-Host "::error::GUI Test Run Encountered Fatal Failure!" -ForegroundColor Red
-            throw
-          }
-
-      - name: Dump Detailed Diagnostic Logs on Failure
-        if: failure()
-        shell: pwsh
-        run: |
-          Write-Host "==================== TEST FAILURE DIAGNOSTICS ====================" -ForegroundColor Red
-          Get-ChildItem -Path windows/tests/bin/Debug -Recurse | Select-Object FullName, Length, LastWriteTime
-          if (Test-Path windows/tests/bin/Debug/net9.0-windows/screenshots) {
-            Get-ChildItem -Path windows/tests/bin/Debug/net9.0-windows/screenshots | Select-Object Name, Length
-          }
-
-      - name: Upload UI Regression Screenshots
-        uses: actions/upload-artifact@v7
-        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./scripts/resolve_windows_gui_deps.ps1 -LockFile build/dependency-lock.json
+      - uses: actions/upload-artifact@v7
         with:
-          name: gui-test-screenshots
-          path: windows/tests/bin/Debug/net9.0-windows/screenshots/
-          retention-days: 7
-          if-no-files-found: ignore
+          name: windows-gui-dependency-lock
+          path: build/dependency-lock.json
+          if-no-files-found: error
 
-  package-gui:
-    name: Package GUI (${{ matrix.arch }})
-    needs: test-gui
-    runs-on: windows-latest
-    timeout-minutes: 20
+  verify-package:
+    name: Native GUI and package (${{ matrix.arch }})
+    needs: dependencies
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x64
-            rid: win-x64
+            runner: windows-2022
           - arch: arm64
-            rid: win-arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v7
-
-      - name: Setup .NET 9
-        uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source-sha }}
+      - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '9.0.x'
-
-      - name: Assemble Full Distribution Package
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          try {
-            .\scripts\package_windows_gui.ps1 -Arch ${{ matrix.arch }} -ZipOutput "dist/mqvpn_windows_gui_${{ matrix.arch }}.zip"
-          } catch {
-            Write-Host "::error::Packaging failed for ${{ matrix.arch }}: $_" -ForegroundColor Red
-            throw
-          }
-
-      - name: Verify Distribution Archive
+      - uses: actions/download-artifact@v8
+        with:
+          name: mqvpn-windows-${{ matrix.arch }}
+          path: build/core-artifact
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-gui-dependency-lock
+          path: build/gui-deps
+      - name: Build and run production GUI checks natively
         shell: pwsh
         run: |
-          $zip = "dist/mqvpn_windows_gui_${{ matrix.arch }}.zip"
-          if (-not (Test-Path $zip)) { throw "Distribution ZIP was not generated: $zip" }
-          $item = Get-Item $zip
-          Write-Host "Package validated: $($item.FullName) ($($item.Length) bytes)"
-
-      - name: Dump Detailed Packaging Diagnostics on Failure
-        if: failure()
+          dotnet build windows/tests/GUI.Tests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { throw 'GUI test build failed' }
+          & ./windows/tests/bin/Release/net9.0-windows/GUI.Tests.exe
+          if ($LASTEXITCODE -ne 0) { throw 'GUI behavior checks failed' }
+      - name: Publish self-contained GUI and package the same-run core
         shell: pwsh
         run: |
-          Write-Host "==================== PACKAGING FAILURE DIAGNOSTICS ====================" -ForegroundColor Red
-          if (Test-Path dist) {
-            Get-ChildItem -Path dist -Recurse | Select-Object FullName, Length
-          }
-
-      - name: Upload GUI Release Package (ZIP)
+          ./scripts/package_windows_gui.ps1 -Arch ${{ matrix.arch }} -CoreDirectory build/core-artifact -DependencyLock build/gui-deps/dependency-lock.json
+      - name: Unpack final ZIP and verify offline native runtime
+        shell: pwsh
+        run: |
+          ./scripts/verify_windows_gui_package.ps1 -Arch ${{ matrix.arch }} -SourceSha '${{ inputs.source-sha }}' -ZipPath dist/mqvpn_windows_gui_${{ matrix.arch }}.zip -ReportDirectory build/package-reports
+      - name: Upload screenshots and package verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gui-evidence-${{ matrix.arch }}
+          path: |
+            windows/tests/bin/Release/net9.0-windows/screenshots/
+            build/package-reports/
+            dist/mqvpn_windows_gui_${{ matrix.arch }}/package-manifest.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload verified distribution ZIP
         uses: actions/upload-artifact@v7
         with:
           name: mqvpn_windows_gui_${{ matrix.arch }}
           path: dist/mqvpn_windows_gui_${{ matrix.arch }}.zip
+          if-no-files-found: error
           retention-days: 14

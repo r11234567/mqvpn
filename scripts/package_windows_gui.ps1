@@ -1,217 +1,151 @@
-<#
-.SYNOPSIS
-    Packages the complete MQVPN Windows GUI distribution for x64 or arm64.
-.DESCRIPTION
-    Builds single-file MQVPN.exe and MqvpnUpgrade.exe, bundles the matching mqvpn core,
-    downloads the latest Xray pre-release core, downloads latest GeoData rules (geoip/geosite),
-    and embeds matching Wintun driver DLLs.
-#>
+#requires -Version 7.2
+<# Packages only an explicitly supplied, current-source Windows core artifact. #>
 [CmdletBinding()]
 param(
-    [ValidateSet('x64', 'arm64')]
-    [string]$Arch = 'x64',
-
-    [string]$OutputDir = '',
-    [string]$ZipOutput = '',
-    [string]$CoreMqvpnExe = '',
-    [string]$CoreMqvpnZip = '',
-    [string]$GitHubToken = $env:GITHUB_TOKEN
+    [ValidateSet('x64','arm64')][string]$Arch = 'x64',
+    [Parameter(Mandatory)][string]$CoreDirectory,
+    [Parameter(Mandatory)][string]$DependencyLock,
+    [string]$OutputDir = '', [string]$ZipOutput = ''
 )
-
 $ErrorActionPreference = 'Stop'
-
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$repoRoot = (Resolve-Path (Join-Path $scriptDir '..')).Path
-
-$rid = if ($Arch -eq 'arm64') { 'win-arm64' } else { 'win-x64' }
-$wintunArch = if ($Arch -eq 'arm64') { 'arm64' } else { 'amd64' }
-
-if (-not $OutputDir) {
-    $OutputDir = Join-Path $repoRoot "dist\mqvpn_windows_gui_$Arch"
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$rid = "win-$Arch"
+$CoreDirectory = (Resolve-Path -LiteralPath $CoreDirectory).Path
+$DependencyLock = (Resolve-Path -LiteralPath $DependencyLock).Path
+if (-not $OutputDir) { $OutputDir = Join-Path $repoRoot "dist/mqvpn_windows_gui_$Arch" }
+if (-not $ZipOutput) { $ZipOutput = Join-Path $repoRoot "dist/mqvpn_windows_gui_$Arch.zip" }
+$OutputDir = [IO.Path]::GetFullPath($OutputDir)
+$ZipOutput = [IO.Path]::GetFullPath($ZipOutput)
+# Never recursively delete a caller-supplied path. CI uses a fresh output.
+if (Test-Path -LiteralPath $OutputDir) { throw "Output already exists; choose a fresh output directory: $OutputDir" }
+if (Test-Path -LiteralPath $ZipOutput) { throw "Archive already exists: $ZipOutput" }
+$sourceSha = (& git -c "safe.directory=$($repoRoot.Replace('\','/'))" -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve current source SHA' }
+$core = Get-Content -LiteralPath (Join-Path $CoreDirectory 'core-build.json') -Raw | ConvertFrom-Json
+if ($core.schema -ne 1 -or $core.architecture -ne $Arch -or $core.sourceSha -ne $sourceSha) { throw 'Core artifact is not for this source SHA and architecture' }
+$xquicSha = (& git -c "safe.directory=$($repoRoot.Replace('\','/'))" -C $repoRoot rev-parse HEAD:third_party/xquic).Trim()
+if ($LASTEXITCODE -ne 0 -or $core.xquicSha -ne $xquicSha) { throw 'Core artifact xquic pin mismatch' }
+foreach ($entry in $core.files) {
+    $file = Join-Path $CoreDirectory $entry.path
+    if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $entry.sha256) { throw "Core artifact checksum mismatch: $($entry.path)" }
 }
-if (-not $ZipOutput) {
-    $ZipOutput = Join-Path $repoRoot "dist\mqvpn_windows_gui_$Arch.zip"
+$lock = Get-Content -LiteralPath $DependencyLock -Raw | ConvertFrom-Json
+if ($lock.schema -ne 1) { throw 'Unsupported dependency lock' }
+$workParent = [IO.Path]::GetFullPath((Join-Path $repoRoot 'build/gui-packaging'))
+$work = Join-Path $workParent ([Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $work | Out-Null
+New-Item -ItemType Directory -Path $OutputDir | Out-Null
+foreach ($relative in @('runtime/mqvpn','runtime/xray','third-party')) { New-Item -ItemType Directory -Path (Join-Path $OutputDir $relative) -Force | Out-Null }
+$downloaded = [Collections.Generic.List[object]]::new()
+function Download-Plain([string]$Url, [string]$Destination, [string]$Digest = '') {
+    # No API credentials or authenticated headers are used for asset downloads.
+    Invoke-WebRequest -Uri $Url -OutFile $Destination -UserAgent 'MQVPN-Packaging'
+    $hash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($Digest -and $hash -ne ($Digest -replace '^sha256:', '')) { throw "Download checksum mismatch: $Url" }
+    $downloaded.Add(@{ url = $Url; sha256 = $hash })
 }
-
-Write-Host "================================================================================" -ForegroundColor Cyan
-Write-Host ">>> Assembling Full MQVPN Windows GUI Distribution Package ($Arch) <<<" -ForegroundColor Cyan
-Write-Host " Target RID:       $rid"
-Write-Host " Output Directory: $OutputDir"
-Write-Host " Zip Output:       $ZipOutput"
-Write-Host "================================================================================" -ForegroundColor Cyan
-
-if (Test-Path $OutputDir) {
-    Remove-Item -Recurse -Force $OutputDir
+function Publish-SelfContained([string]$Project) {
+    & dotnet publish (Join-Path $repoRoot $Project) -c Release -r $rid --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:PublishTrimmed=false -o $OutputDir
+    if ($LASTEXITCODE -ne 0) { throw "Publish failed: $Project" }
 }
-New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $OutputDir "runtime\mqvpn") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $OutputDir "runtime\xray") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $OutputDir "config") | Out-Null
-
-$headers = @{ 'User-Agent' = 'MQVPN-Packaging-Script' }
-if ($GitHubToken) {
-    $headers['Authorization'] = "token $GitHubToken"
+function Export-NuGetLicenses {
+    $assets = Get-Content -LiteralPath (Join-Path $repoRoot 'windows/gui/obj/project.assets.json') -Raw | ConvertFrom-Json -AsHashtable
+    $lines = [Collections.Generic.List[string]]::new()
+    foreach ($item in $assets.libraries.GetEnumerator() | Sort-Object Key) {
+        if ($item.Value.type -ne 'package') { continue }
+        $packageRoot = $null
+        foreach ($folder in $assets.packageFolders.Keys) {
+            $candidate = Join-Path $folder $item.Value.path
+            if (Test-Path -LiteralPath $candidate) { $packageRoot = $candidate; break }
+        }
+        if (-not $packageRoot) { throw "Missing restored package: $($item.Key)" }
+        $nuspec = @(Get-ChildItem -LiteralPath $packageRoot -Filter '*.nuspec' -File)[0]
+        [xml]$metadata = Get-Content -LiteralPath $nuspec.FullName -Raw
+        $license = $metadata.package.metadata.license
+        $name = $item.Key.Replace('/','-')
+        $destination = Join-Path $OutputDir "third-party/nuget-$name.txt"
+        $includedLicense = @(Get-ChildItem -LiteralPath $packageRoot -File | Where-Object Name -match '^LICENSE(\.(txt|md))?$')[0]
+        if ($license.type -eq 'file') {
+            Copy-Item -LiteralPath (Join-Path $packageRoot $license.InnerText) -Destination $destination
+        } elseif ($includedLicense) {
+            Copy-Item -LiteralPath $includedLicense.FullName -Destination $destination
+        } elseif ($license.type -eq 'expression') {
+            Download-Plain "https://licenses.nuget.org/$([uri]::EscapeDataString($license.InnerText))" $destination
+        } elseif ($metadata.package.metadata.licenseUrl) {
+            Download-Plain $metadata.package.metadata.licenseUrl $destination
+        } else { throw "Package does not declare a license: $($item.Key)" }
+        $notices = @(Get-ChildItem -LiteralPath $packageRoot -File | Where-Object Name -match '^(THIRD-PARTY-NOTICES|ThirdPartyNotices)\.txt$')[0]
+        if ($notices) { Copy-Item -LiteralPath $notices.FullName -Destination (Join-Path $OutputDir "third-party/nuget-$name-notices.txt") }
+        $lines.Add("$($item.Key): $($license.InnerText) $($metadata.package.metadata.licenseUrl)")
+    }
+    $lines | Set-Content -LiteralPath (Join-Path $OutputDir 'third-party/nuget-licenses.txt') -Encoding utf8NoBOM
+    $framework = @($assets.project.frameworks.Values)[0]
+    $runtimeDependency = @($framework.downloadDependencies | Where-Object name -eq "Microsoft.NETCore.App.Runtime.$rid")
+    if ($runtimeDependency.Count -ne 1) { throw 'Cannot resolve exact restored .NET runtime version' }
+    $runtimeVersion = $runtimeDependency[0].version.Trim('[',']').Split(',')[0].Trim()
+    $version = Join-Path (@($assets.packageFolders.Keys)[0]) "microsoft.netcore.app.runtime.$rid/$runtimeVersion"
+    foreach ($name in @('LICENSE.txt','ThirdPartyNotices.txt')) {
+        $pattern = if ($name -eq 'LICENSE.txt') { '^LICENSE\.(txt|md)$' } else { '^(THIRD-PARTY-NOTICES|ThirdPartyNotices)\.txt$' }
+        $source = @(Get-ChildItem -LiteralPath $version -File | Where-Object Name -match $pattern)[0]
+        if (-not $source) { throw "Runtime license missing: $name" }
+        Copy-Item -LiteralPath $source.FullName -Destination (Join-Path $OutputDir "third-party/dotnet-$name")
+    }
+    $desktop = @($framework.downloadDependencies | Where-Object name -eq "Microsoft.WindowsDesktop.App.Runtime.$rid")
+    if ($desktop.Count -ne 1) { throw 'Cannot resolve exact Windows Desktop runtime license' }
+    $desktopVersion = $desktop[0].version.Trim('[',']').Split(',')[0].Trim()
+    $desktopRoot = Join-Path (@($assets.packageFolders.Keys)[0]) "microsoft.windowsdesktop.app.runtime.$rid/$desktopVersion"
+    $desktopLicense = @(Get-ChildItem -LiteralPath $desktopRoot -File | Where-Object Name -match '^LICENSE(\.(txt|md))?$')[0]
+    if (-not $desktopLicense) { throw 'Windows Desktop runtime license missing' }
+    Copy-Item -LiteralPath $desktopLicense.FullName -Destination (Join-Path $OutputDir 'third-party/desktop-LICENSE.txt')
 }
-
-# 1. Publish .NET 9 Single-File GUI & Updater
-Write-Host "`n[1/5] Publishing MQVPN.exe and MqvpnUpgrade.exe for $rid..." -ForegroundColor Yellow
-$guiProj = Join-Path $repoRoot "windows\gui\TruckersMP.Proxy.csproj"
-$updaterProj = Join-Path $repoRoot "windows\updater\MqvpnUpgrade.csproj"
-
-dotnet publish $guiProj -c Release -r $rid --self-contained false -p:PublishSingleFile=true -o $OutputDir
-if ($LASTEXITCODE -ne 0) { throw "Failed to publish MQVPN GUI" }
-
-dotnet publish $updaterProj -c Release -r $rid --self-contained false -p:PublishSingleFile=true -o $OutputDir
-if ($LASTEXITCODE -ne 0) { throw "Failed to publish MqvpnUpgrade" }
-
-# 2. Download and Extract Wintun Driver DLL (matching arch)
-Write-Host "`n[2/5] Downloading and bundling Wintun driver ($wintunArch)..." -ForegroundColor Yellow
-$wintunTemp = Join-Path ([System.IO.Path]::GetTempPath()) "wintun-$([Guid]::NewGuid().ToString('N'))"
-New-Item -ItemType Directory -Force -Path $wintunTemp | Out-Null
-$wintunZip = Join-Path $wintunTemp "wintun.zip"
-
 try {
-    Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile $wintunZip -Headers $headers
-    Expand-Archive -Path $wintunZip -DestinationPath $wintunTemp -Force
-    $wintunDll = Join-Path $wintunTemp "wintun\bin\$wintunArch\wintun.dll"
-    if (-not (Test-Path $wintunDll)) {
-        throw "wintun.dll not found at $wintunDll"
+    Publish-SelfContained 'windows/gui/TruckersMP.Proxy.csproj'
+    Publish-SelfContained 'windows/updater/MqvpnUpgrade.csproj'
+    foreach ($binary in Get-ChildItem -LiteralPath $CoreDirectory -File | Where-Object Extension -in @('.exe','.dll')) {
+        Copy-Item -LiteralPath $binary.FullName -Destination (Join-Path $OutputDir 'runtime/mqvpn')
     }
-    Copy-Item $wintunDll (Join-Path $OutputDir "runtime\mqvpn\wintun.dll") -Force
-    Copy-Item $wintunDll (Join-Path $OutputDir "runtime\xray\wintun.dll") -Force
-    Write-Host "  Bundled wintun.dll ($wintunArch) successfully" -ForegroundColor Green
+    Copy-Item -LiteralPath (Join-Path $CoreDirectory 'core-build.json') -Destination (Join-Path $OutputDir 'core-build.json')
+    Copy-Item -Path (Join-Path $CoreDirectory 'third-party/*') -Destination (Join-Path $OutputDir 'third-party')
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE'),(Join-Path $repoRoot 'NOTICE') -Destination $OutputDir
+    Copy-Item -LiteralPath $DependencyLock -Destination (Join-Path $OutputDir 'dependency-lock.json')
+    $wintunZip = Join-Path $work 'wintun.zip'
+    Download-Plain $lock.wintun.url $wintunZip $lock.wintun.sha256
+    $wintunDir = Join-Path $work 'wintun'
+    Expand-Archive -LiteralPath $wintunZip -DestinationPath $wintunDir
+    $wintunArch = if ($Arch -eq 'x64') { 'amd64' } else { 'arm64' }
+    $wintun = Join-Path $wintunDir "wintun/bin/$wintunArch/wintun.dll"
+    foreach ($kernel in @('mqvpn','xray')) { Copy-Item -LiteralPath $wintun -Destination (Join-Path $OutputDir "runtime/$kernel/wintun.dll") }
+    $wintunLicense = @(Get-ChildItem -LiteralPath (Join-Path $wintunDir 'wintun') -File | Where-Object Name -match '^(COPYING|LICENSE)(\.txt)?$')[0]
+    if (-not $wintunLicense) { throw 'Wintun license missing' }
+    Copy-Item -LiteralPath $wintunLicense.FullName -Destination (Join-Path $OutputDir 'third-party/wintun.txt')
+    $xrayName = if ($Arch -eq 'x64') { 'Xray-windows-64.zip' } else { 'Xray-windows-arm64-v8a.zip' }
+    $asset = @($lock.xray.assets | Where-Object name -eq $xrayName)
+    if ($asset.Count -ne 1) { throw "No exact $xrayName in dependency lock" }
+    $xrayZip = Join-Path $work 'xray.zip'
+    Download-Plain $asset[0].url $xrayZip $asset[0].digest
+    Expand-Archive -LiteralPath $xrayZip -DestinationPath (Join-Path $work 'xray')
+    Copy-Item -LiteralPath (Join-Path $work 'xray/xray.exe') -Destination (Join-Path $OutputDir 'runtime/xray/xray.exe')
+    Download-Plain $lock.xray.licenseUrl (Join-Path $OutputDir 'third-party/xray.txt')
+    Download-Plain $lock.geodata.licenseUrl (Join-Path $OutputDir 'third-party/geodata.txt')
+    foreach ($name in @('geoip.dat','geosite.dat')) {
+        $asset = @($lock.geodata.assets | Where-Object name -eq $name)
+        if ($asset.Count -ne 1) { throw "No exact $name in dependency lock" }
+        Download-Plain $asset[0].url (Join-Path $OutputDir "runtime/xray/$name") $asset[0].digest
+    }
+    Export-NuGetLicenses
+    $files = @(Get-ChildItem -LiteralPath $OutputDir -File -Recurse | Sort-Object FullName | ForEach-Object {
+        @{ path = [IO.Path]::GetRelativePath($OutputDir,$_.FullName).Replace('\','/'); sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+    })
+    @{ schema = 1; architecture = $Arch; rid = $rid; sourceSha = $core.sourceSha; xquicSha = $core.xquicSha; boringSslSha = $core.boringSslSha
+       dependencies = $lock; downloads = $downloaded.ToArray(); files = $files; selfContained = $true } |
+        ConvertTo-Json -Depth 15 | Set-Content -LiteralPath (Join-Path $OutputDir 'package-manifest.json') -Encoding utf8NoBOM
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ZipOutput) | Out-Null
+    Compress-Archive -Path (Join-Path $OutputDir '*') -DestinationPath $ZipOutput -CompressionLevel Optimal
+    Write-Host "Created $ZipOutput for $sourceSha ($rid). Native package verification is a separate required CI step."
 } finally {
-    Remove-Item -Recurse -Force $wintunTemp -ErrorAction SilentlyContinue
-}
-
-# 3. Bundle Core mqvpn.exe
-Write-Host "`n[3/5] Bundling core mqvpn.exe..." -ForegroundColor Yellow
-$targetCoreExe = Join-Path $OutputDir "runtime\mqvpn\mqvpn.exe"
-
-if ($CoreMqvpnExe -and (Test-Path $CoreMqvpnExe)) {
-    Write-Host "  Using provided core executable: $CoreMqvpnExe"
-    Copy-Item $CoreMqvpnExe $targetCoreExe -Force
-} elseif ($CoreMqvpnZip -and (Test-Path $CoreMqvpnZip)) {
-    Write-Host "  Extracting core from archive: $CoreMqvpnZip"
-    $coreExtractTemp = Join-Path ([System.IO.Path]::GetTempPath()) "mqvpn-core-$([Guid]::NewGuid().ToString('N'))"
-    Expand-Archive -Path $CoreMqvpnZip -DestinationPath $coreExtractTemp -Force
-    $foundExe = Get-ChildItem -Path $coreExtractTemp -Filter "mqvpn.exe" -Recurse | Select-Object -First 1
-    if (-not $foundExe) { throw "mqvpn.exe not found in archive $CoreMqvpnZip" }
-    Copy-Item $foundExe.FullName $targetCoreExe -Force
-    # If xquic.dll exists, copy it too
-    $foundXquic = Get-ChildItem -Path $coreExtractTemp -Filter "xquic.dll" -Recurse | Select-Object -First 1
-    if ($foundXquic) {
-        Copy-Item $foundXquic.FullName (Join-Path $OutputDir "runtime\mqvpn\xquic.dll") -Force
-    }
-    Remove-Item -Recurse -Force $coreExtractTemp -ErrorAction SilentlyContinue
-} else {
-    Write-Host "  Querying latest mqvpn core release from GitHub..."
-    $mqvpnReleases = Invoke-RestMethod -Uri "https://api.github.com/repos/mp0rta/mqvpn/releases" -Headers $headers
-    $targetRelease = $mqvpnReleases | Where-Object { -not $_.draft } | Select-Object -First 1
-    $pattern = if ($Arch -eq 'arm64') { '*windows*arm64*.zip' } else { '*windows*amd64*.zip' }
-    $asset = $targetRelease.assets | Where-Object { $_.name -like $pattern -and $_.name -notlike '*gui*' } | Select-Object -First 1
-    if (-not $asset) {
-        # Fallback to general windows zip
-        $asset = $targetRelease.assets | Where-Object { $_.name -like '*windows*.zip' -and $_.name -notlike '*gui*' } | Select-Object -First 1
-    }
-    if (-not $asset) {
-        throw "Could not find compatible mqvpn core release asset for $Arch"
-    }
-    Write-Host "  Downloading $($asset.name) ($($asset.browser_download_url))..."
-    $coreTemp = Join-Path ([System.IO.Path]::GetTempPath()) "mqvpn-core-$([Guid]::NewGuid().ToString('N'))"
-    New-Item -ItemType Directory -Force -Path $coreTemp | Out-Null
-    $coreZip = Join-Path $coreTemp $asset.name
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $coreZip -Headers $headers
-    Expand-Archive -Path $coreZip -DestinationPath $coreTemp -Force
-    $found = Get-ChildItem -Path $coreTemp -Filter "mqvpn.exe" -Recurse | Select-Object -First 1
-    if (-not $found) { throw "mqvpn.exe not found in downloaded package" }
-    Copy-Item $found.FullName $targetCoreExe -Force
-    $foundXquic = Get-ChildItem -Path $coreTemp -Filter "xquic.dll" -Recurse | Select-Object -First 1
-    if ($foundXquic) {
-        Copy-Item $foundXquic.FullName (Join-Path $OutputDir "runtime\mqvpn\xquic.dll") -Force
-    }
-    Remove-Item -Recurse -Force $coreTemp -ErrorAction SilentlyContinue
-}
-Write-Host "  Core mqvpn.exe bundled successfully" -ForegroundColor Green
-
-# 4. Download and Bundle Latest Xray Pre-Release
-Write-Host "`n[4/5] Downloading latest Xray-core pre-release..." -ForegroundColor Yellow
-$xrayReleases = Invoke-RestMethod -Uri "https://api.github.com/repos/XTLS/Xray-core/releases" -Headers $headers
-$latestXray = $xrayReleases | Where-Object { -not $_.draft } | Select-Object -First 1
-Write-Host "  Target Xray Release: $($latestXray.tag_name) (Pre-release: $($latestXray.prerelease))"
-
-$xrayAssetPattern = if ($Arch -eq 'arm64') { '*windows-arm64*' } else { 'Xray-windows-64.zip' }
-$xrayAsset = $latestXray.assets | Where-Object { $_.name -like $xrayAssetPattern } | Select-Object -First 1
-if (-not $xrayAsset) {
-    throw "Xray asset matching '$xrayAssetPattern' not found in release $($latestXray.tag_name)"
-}
-
-Write-Host "  Downloading $($xrayAsset.name)..."
-$xrayTemp = Join-Path ([System.IO.Path]::GetTempPath()) "xray-$([Guid]::NewGuid().ToString('N'))"
-New-Item -ItemType Directory -Force -Path $xrayTemp | Out-Null
-$xrayZip = Join-Path $xrayTemp $xrayAsset.name
-Invoke-WebRequest -Uri $xrayAsset.browser_download_url -OutFile $xrayZip -Headers $headers
-Expand-Archive -Path $xrayZip -DestinationPath $xrayTemp -Force
-$foundXray = Get-ChildItem -Path $xrayTemp -Filter "xray.exe" -Recurse | Select-Object -First 1
-if (-not $foundXray) { throw "xray.exe not found in downloaded Xray package" }
-Copy-Item $foundXray.FullName (Join-Path $OutputDir "runtime\xray\xray.exe") -Force
-Remove-Item -Recurse -Force $xrayTemp -ErrorAction SilentlyContinue
-Write-Host "  Xray core bundled successfully ($($latestXray.tag_name))" -ForegroundColor Green
-
-# 5. Download and Bundle Latest GeoData (geoip.dat & geosite.dat)
-Write-Host "`n[5/5] Downloading latest GeoData rules..." -ForegroundColor Yellow
-$geoRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest" -Headers $headers
-$geoipAsset = $geoRelease.assets | Where-Object { $_.name -eq 'geoip.dat' } | Select-Object -First 1
-$geositeAsset = $geoRelease.assets | Where-Object { $_.name -eq 'geosite.dat' } | Select-Object -First 1
-
-if (-not $geoipAsset -or -not $geositeAsset) {
-    throw "geoip.dat or geosite.dat not found in latest release"
-}
-
-Write-Host "  Downloading geoip.dat..."
-Invoke-WebRequest -Uri $geoipAsset.browser_download_url -OutFile (Join-Path $OutputDir "runtime\xray\geoip.dat") -Headers $headers
-Write-Host "  Downloading geosite.dat..."
-Invoke-WebRequest -Uri $geositeAsset.browser_download_url -OutFile (Join-Path $OutputDir "runtime\xray\geosite.dat") -Headers $headers
-Write-Host "  GeoData rules bundled successfully" -ForegroundColor Green
-
-# Verification of all mandatory modules
-Write-Host "`n--- Verification of Distribution Package Components ---" -ForegroundColor Cyan
-$requiredFiles = @(
-    "MQVPN.exe",
-    "MqvpnUpgrade.exe",
-    "runtime\mqvpn\mqvpn.exe",
-    "runtime\mqvpn\wintun.dll",
-    "runtime\xray\xray.exe",
-    "runtime\xray\wintun.dll",
-    "runtime\xray\geoip.dat",
-    "runtime\xray\geosite.dat"
-)
-
-foreach ($rel in $requiredFiles) {
-    $full = Join-Path $OutputDir $rel
-    if (-not (Test-Path $full)) {
-        throw "VERIFICATION FAILED: Mandatory component missing: $rel"
-    }
-    $info = Get-Item $full
-    if ($info.Length -le 0) {
-        throw "VERIFICATION FAILED: File is empty (0 bytes): $rel"
-    }
-    Write-Host ("  [OK] {0,-30} ({1,10:N0} bytes)" -f $rel, $info.Length) -ForegroundColor Green
-}
-
-# Compress to ZIP
-if ($ZipOutput) {
-    $zipParent = Split-Path -Parent $ZipOutput
-    if ($zipParent -and -not (Test-Path $zipParent)) {
-        New-Item -ItemType Directory -Force -Path $zipParent | Out-Null
-    }
-    if (Test-Path $ZipOutput) {
-        Remove-Item -Force $ZipOutput
-    }
-    Write-Host "`nCompressing package to $ZipOutput..." -ForegroundColor Yellow
-    Compress-Archive -Path "$OutputDir\*" -DestinationPath $ZipOutput -CompressionLevel Optimal
-    $zipSize = (Get-Item $ZipOutput).Length
-    Write-Host "================================================================================" -ForegroundColor Cyan
-    Write-Host ("SUCCESS: Distribution ZIP created at {0} ({1:N0} bytes)" -f $ZipOutput, $zipSize) -ForegroundColor Green
-    Write-Host "================================================================================" -ForegroundColor Cyan
+    # Verify the resolved, unique build staging target before recursive cleanup.
+    $resolvedWork = [IO.Path]::GetFullPath($work)
+    $prefix = $workParent.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if (-not $resolvedWork.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe staging cleanup target' }
+    Remove-Item -LiteralPath $resolvedWork -Recurse -Force
 }

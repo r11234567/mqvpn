@@ -210,7 +210,20 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         _requestServerScheduler.Content = "请求服务端对齐调度器 (RequestServerScheduler)";
         _requestServerScheduler.IsChecked = GetBoolean("request_server_scheduler", false);
         ConfigureCombo(_congestion, ["bbr2", "bbr", "cubic", "none"], GetString("cc", "bbr2"));
-        ConfigureNumber(_initMaxPathId, 0, uint.MaxValue, GetLong("init_max_path_id", 0));
+        var initialPathId = GetLong("init_max_path_id", 0);
+        ConfigureNumber(_initMaxPathId, Math.Min(0, initialPathId), Math.Max(128, initialPathId), initialPathId);
+        if (initialPathId is < 0 or > 128)
+        {
+            _initMaxPathId.ToolTip = $"旧配置值 {initialPathId} 已不受支持，请明确填写 0–128；不会自动截断。";
+            _initMaxPathId.ValueChanged += (_, _) =>
+            {
+                if (_initMaxPathId.Value is >= 0 and <= 128)
+                {
+                    _initMaxPathId.Minimum = 0;
+                    _initMaxPathId.Maximum = 128;
+                }
+            };
+        }
 
         _routing.DisplayMemberPath = nameof(RoutingPolicy.Name);
         _routing.SelectedValuePath = nameof(RoutingPolicy.Id);
@@ -337,7 +350,7 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         stack.Children.Add(FluentUi.SettingCard("多路径调度器", _scheduler));
         stack.Children.Add(FluentUi.SettingCard("请求服务端对齐调度器", _requestServerScheduler, "向服务端协商使用本客户端的调度器算法作为下行流量调度策略。"));
         stack.Children.Add(FluentUi.SettingCard("拥塞控制算法 (CC)", _congestion, "CC 与多路径调度器相互独立。Redundant 模式下推荐使用 bbr。"));
-        stack.Children.Add(FluentUi.SettingCard("初始最大 Path ID", _initMaxPathId, "InitMaxPathId：0 使用 xquic 默认值 8；非零范围 1-4294967295。"));
+        stack.Children.Add(FluentUi.SettingCard("初始最大 Path ID", _initMaxPathId, "InitMaxPathId：0 使用 xquic 默认值 8；非零范围 1–128。旧超限值必须明确修正。"));
         stack.Children.Add(FluentUi.SettingCard("路由分流策略", _routing));
         stack.Children.Add(FluentUi.SettingCard("DNS 服务器", _dns, "每行或用逗号分隔，最多 4 个 IPv4/IPv6 DNS 地址。"));
         stack.Children.Add(FluentUi.SettingCard("自动重连", _reconnect, "启用后按基础间隔重试，并由内核指数退避到最多 60 秒。"));
@@ -461,6 +474,13 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         if (dns.Count > 4 || dns.Any(value => !IPAddress.TryParse(value, out _)))
         {
             ShowValidation("DNS 最多填写 4 个有效的 IPv4/IPv6 地址。");
+            return;
+        }
+
+        if (_initMaxPathId.Value is not double initialPathId || !double.IsFinite(initialPathId) ||
+            initialPathId < 0 || initialPathId > 128 || initialPathId != Math.Truncate(initialPathId))
+        {
+            ShowValidation("InitMaxPathId 必须为 0（默认 8），或 1–128 的整数。请修正旧配置中的超限值。");
             return;
         }
 
@@ -665,18 +685,7 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         return (decimal)Math.Round(Math.Clamp(val, control.Minimum, control.Maximum));
     }
 
-    private static string ResolveDefaultPhysicalInterface()
-    {
-        return NetworkInterface.GetAllNetworkInterfaces()
-            .Where(adapter => adapter.OperationalStatus == OperationalStatus.Up &&
-                              adapter.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
-                              !adapter.Name.StartsWith("mqvpn", StringComparison.OrdinalIgnoreCase) &&
-                              !adapter.Name.StartsWith("xray", StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(adapter => adapter.GetIPProperties().GatewayAddresses.Count > 0)
-            .Select(adapter => adapter.Name)
-            .FirstOrDefault()
-            ?? throw new InvalidOperationException("未找到可用的默认物理网卡");
-    }
+    private static string ResolveDefaultPhysicalInterface() => ProfileStore.GetDefaultPhysicalInterface();
 
     private string GetString(string name, string fallback = "") =>
         _config[name]?.GetValue<string>() ?? fallback;
@@ -726,8 +735,13 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
     private static int GetInteger(JsonObject? source, string name, int fallback) =>
         source?[name] is JsonValue value && value.TryGetValue<int>(out var result) ? result : fallback;
 
-    private static long GetLong(JsonObject? source, string name, long fallback) =>
-        source?[name] is JsonValue value && value.TryGetValue<long>(out var result) ? result : fallback;
+    private static long GetLong(JsonObject? source, string name, long fallback)
+    {
+        if (source?[name] is not JsonValue value) return fallback;
+        if (value.TryGetValue<long>(out var result)) return result;
+        if (value.TryGetValue<uint>(out var unsigned)) return unsigned;
+        return value.TryGetValue<int>(out var integer) ? integer : fallback;
+    }
 
     private long GetLong(string name, long fallback) => GetLong(_config, name, fallback);
 
