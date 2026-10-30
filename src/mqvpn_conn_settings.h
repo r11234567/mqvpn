@@ -15,14 +15,24 @@
 #include <stdint.h>
 #include <xquic/xquic.h>
 
+/* Packets a connection may hold framed but unsent before a stream write
+ * gets -XQC_EAGAIN (xqc_conn_settings_t.max_stream_unsent_packets);
+ * mqvpn_conn_settings.c explains the number. */
+#define MQVPN_STREAM_UNSENT_PACKETS 1024
+
 /* Caller-driven inputs. The bools are parameterised (not a single
  * `is_server` flag) so each call site documents its intent. */
 typedef struct {
     bool is_server;
     bool enable_multipath; /* server callers pass true */
     mqvpn_scheduler_t scheduler;
-    mqvpn_cc_t cc;                    /* congestion control algorithm */
-    uint64_t init_max_path_id;        /* 0 = leave xquic default */
+    mqvpn_cc_t cc;             /* congestion control algorithm */
+    uint64_t init_max_path_id; /* 0 = leave xquic default */
+    int path_mtu;              /* 0 = MQVPN_MAX_PKT_OUT_SIZE, see mqvpn_pkt_out_size() */
+    bool pmtud;                /* discover the path MTU, path_mtu sizes the cap */
+    /* local reorder on: the PMTUD start size leaves room for its header
+     * (MQVPN_REORDER_HDR_LEN), so IPv6 still gets 1280 */
+    bool reorder;
     uint64_t recv_rate_bytes_per_sec; /* 0 = no cap. Client-only: the
         builder hard-zeroes it for servers (a server-side conn-level cap
         would throttle client uplink). */
@@ -63,25 +73,15 @@ MQVPN_INTERNAL void mqvpn_build_conn_settings(const mqvpn_conn_settings_input_t 
 /* One definition of the batched-send registration for both endpoints (it is
  * the engine-create half of the decision defer_send_flush mirrors above, so
  * it lives in this header with it). When mqvpn_tx_batch_enabled(udp_gso)
- * holds, probes the kernel for UDP_SEGMENT into *gso_available, registers
- * `cb` as tcbs->write_mmsg_ex, sets xconfig->sendmmsg_on and returns 1;
- * otherwise touches nothing and returns 0. The callback stays a caller
- * parameter because each TU registers its own static cb_write_mmsg_ex.
- * Callers record the result (tx_batch), feed that same stored flag to
- * conn_settings.defer_send_flush, and log exactly one marker line:
- *
- *   LOG_I(x, "%s", gso_available ? MQVPN_UDP_GSO_MARKER_ENABLED
- *                                : MQVPN_UDP_GSO_MARKER_UNAVAILABLE);
- *
- * The "udp-gso: " wording is grepped by scripts/ci_e2e/
- * run_udp_gso_config_test.sh as a presence/absence invariant; sharing the
- * strings here keeps the client and server lines byte-identical. */
+ * holds, registers `cb` as tcbs->write_mmsg_ex, sets xconfig->sendmmsg_on
+ * and returns 1; otherwise touches nothing and returns 0. The callback stays
+ * a caller parameter because each TU registers its own static
+ * cb_write_mmsg_ex. Callers record the result (tx_batch) and feed that same
+ * stored flag to conn_settings.defer_send_flush. The kernel probe and the
+ * `udp-gso: ` marker are the POSIX bind's job. */
 MQVPN_INTERNAL int mqvpn_tx_batch_register(int udp_gso, xqc_send_mmsg_ex_pt cb,
                                            xqc_transport_callbacks_t *tcbs,
-                                           xqc_config_t *xconfig, int *gso_available);
-
-#  define MQVPN_UDP_GSO_MARKER_ENABLED     "udp-gso: GSO enabled"
-#  define MQVPN_UDP_GSO_MARKER_UNAVAILABLE "udp-gso: GSO unavailable, using sendmmsg"
+                                           xqc_config_t *xconfig);
 #endif
 
 #endif /* MQVPN_CONN_SETTINGS_H */

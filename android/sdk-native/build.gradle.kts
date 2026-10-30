@@ -34,7 +34,7 @@ android {
 
         ndk {
             // Only ABIs with prebuilt .a files (build_android.sh output).
-            // Default stays arm64-v8a (release output unchanged). The
+            // Default stays arm64-v8a (release / F-Droid unchanged). The
             // emulator CI job overrides with -PmqvpnAbiFilters=x86_64 after
             // building x86_64 prebuilts, so connectedAndroidTest can run on
             // a GitHub-hosted x86_64 emulator.
@@ -138,7 +138,7 @@ androidComponents.onVariants { v ->
 }
 
 dependencies {
-    implementation("androidx.annotation:annotation:1.9.1")
+    implementation("androidx.annotation:annotation:1.11.0")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test:runner:1.7.0")

@@ -126,15 +126,17 @@
 #     (both paths must carry real load, lighter path >=20% of the heavier —
 #     the direct proof against a scheduler that pinned traffic on one path;
 #     the absolute byte floor differs from Test 3's, see the check below).
-#     Like Test 3 this phase runs under netem, and for a reason that is a
-#     property of the scheduler rather than a convenience: TCP-lane traffic
-#     rides QUIC STREAM packets, which carry po_flow_hash == 0, so the WLB
+#     This phase uses two equal, lossless, rate-limited netem legs and also
+#     requires throughput above either leg's capacity. Test 3 retains the
+#     asymmetric loss/jitter profile. Shaping follows from the scheduler's
+#     design: TCP-lane traffic rides QUIC STREAM packets, which carry
+#     po_flow_hash == 0, so the WLB
 #     scheduler routes them through its MinRTT fallback rather than the
 #     WRR/flow-pinning path used for datagrams. That fallback only ever
 #     reaches for a second path when the lowest-SRTT one is cwnd-blocked, so
 #     on an UNSHAPED pair — where one veth absorbs the whole offered load —
 #     a 100%-on-one-path result is correct behaviour, not a regression. See
-#     the netem call in the Test 8 body for the measurements that settled it.
+#     the netem call in the Test 8 body for the controlled workload.
 #     A separate long-lived v6 TCP-lane flow then proves failover: path 0's
 #     client-side link is dropped mid-flow and the flow must keep making
 #     progress on the surviving path, the same technique
@@ -239,8 +241,11 @@ CLIENT_LOG_T2B="$(mktemp)"
 SERVER_LOG_T2B="$(mktemp)"
 CLIENT_LOG_T3A="$(mktemp)"
 SERVER_LOG_T3A="$(mktemp)"
+CLIENT_LOG_T3_BASE_B="$(mktemp)"
+SERVER_LOG_T3_BASE_B="$(mktemp)"
 CLIENT_LOG_T3B="$(mktemp)"
 SERVER_LOG_T3B="$(mktemp)"
+IPERF_EVIDENCE="$(mktemp -d)"
 CLIENT_LOG_T4="$(mktemp)"
 SERVER_LOG_T4="$(mktemp)"
 CLIENT_LOG_T5="$(mktemp)"
@@ -314,11 +319,13 @@ cleanup_bg_procs() {
 # before the verdict is ever reached. A collector that only ran there would be
 # missing for exactly the failures that are hardest to reproduce.
 #
-# Collect unconditionally; the workflow step is `if: failure()`, so a passing
-# run just leaves an unread directory behind.
+# Collect unconditionally, including healthy samples for comparison with a
+# later failed sample. CI uploads both phases after success or failure.
 collect_logs() {
-    [ -n "${GITHUB_WORKSPACE:-}" ] || return 0
-    local dir="${GITHUB_WORKSPACE}/hybrid-e2e-logs" pair
+    # Keep functional and perf evidence separate, including on an early exit.
+    # Both phases run in the same workspace and previously overwrote each other.
+    local root="${HYBRID_H2_LOG_DIR:-${GITHUB_WORKSPACE:-${SCRIPT_DIR}/../build}/hybrid-e2e-logs}"
+    local dir="${root}/${HYBRID_H2_PHASES:-all}" pair
     mkdir -p "$dir" 2>/dev/null || return 0
     for pair in "t1-client:$CLIENT_LOG_T1"   "t1-server:$SERVER_LOG_T1" \
                 "t1b-client:$CLIENT_LOG_T1B" "t1b-server:$SERVER_LOG_T1B" \
@@ -328,6 +335,7 @@ collect_logs() {
                 "t2a-client:$CLIENT_LOG_T2A" "t2a-server:$SERVER_LOG_T2A" \
                 "t2b-client:$CLIENT_LOG_T2B" "t2b-server:$SERVER_LOG_T2B" \
                 "t3a-client:$CLIENT_LOG_T3A" "t3a-server:$SERVER_LOG_T3A" \
+                "t3-baseline-b-client:$CLIENT_LOG_T3_BASE_B" "t3-baseline-b-server:$SERVER_LOG_T3_BASE_B" \
                 "t3b-client:$CLIENT_LOG_T3B" "t3b-server:$SERVER_LOG_T3B" \
                 "t4-client:$CLIENT_LOG_T4"   "t4-server:$SERVER_LOG_T4" \
                 "t5-client:$CLIENT_LOG_T5"   "t5-server:$SERVER_LOG_T5" \
@@ -338,6 +346,7 @@ collect_logs() {
         # rest of the cleanup.
         [ -s "${pair#*:}" ] && cp "${pair#*:}" "${dir}/${pair%%:*}.log" 2>/dev/null || true
     done
+    cp -R "$IPERF_EVIDENCE" "${dir}/measurements" 2>/dev/null || true
     # The suite runs under sudo; upload-artifact reads as the runner user.
     chmod -R a+rX "$dir" 2>/dev/null || true
     return 0
@@ -350,13 +359,14 @@ trap 'collect_logs; cleanup_bg_procs; cleanup_http_server; bench_cleanup; rm -rf
     "$CLIENT_LOG_T7B" "$SERVER_LOG_T7B" \
     "$CLIENT_LOG_T2A" "$SERVER_LOG_T2A" "$CLIENT_LOG_T2B" "$SERVER_LOG_T2B" \
     "$CLIENT_LOG_T3A" "$SERVER_LOG_T3A" "$CLIENT_LOG_T3B" "$SERVER_LOG_T3B" \
+    "$CLIENT_LOG_T3_BASE_B" "$SERVER_LOG_T3_BASE_B" \
     "$CLIENT_LOG_T4" "$SERVER_LOG_T4" "$CLIENT_LOG_T5" "$SERVER_LOG_T5" \
     "$CLIENT_LOG_T6" "$SERVER_LOG_T6" "$CLIENT_LOG_T8" "$SERVER_LOG_T8" \
     "$RST_CLIENT_OUT" \
     "$INI_T1" "$INI_T1B" "$INI_T1C" "$INI_T7A" "$INI_T7B" "$INI_T2A" "$INI_STREAM" "$INI_T6" "$INI_T8" \
     "$CURL_OUT" "$SENT_FILE_A" "$RECV_FILE_A" "$SENT_FILE_B" "$RECV_FILE_B" \
     "$LANE_PEER_A_FILE" "$LANE_BYTES_A_FILE" "$LANE_PEER_B_FILE" "$LANE_BYTES_B_FILE" \
-    "$V6_BYTES_FILE"' EXIT
+    "$V6_BYTES_FILE"; rm -rf "$IPERF_EVIDENCE"' EXIT
 
 fail=0
 
@@ -395,6 +405,18 @@ echo "[hybrid-h2] phases=${HYBRID_H2_PHASES}"
 
 echo "[hybrid-h2] N=$N_PATHS binary=$MQVPN inner-tcp-port=$INNER_TCP_PORT http-target=${HTTP_TARGET_IP}:${HTTP_TARGET_PORT}"
 bench_check_test_deps nc curl python3 jq iperf3 ss
+
+{
+    date -u '+%FT%T.%NZ'
+    uname -a
+    printf 'phase=%s\nscheduler=%s\nlog_level=%s\n' "$HYBRID_H2_PHASES" "$BENCH_SCHEDULER" "$BENCH_LOG_LEVEL"
+    sha256sum "$MQVPN"
+    "$MQVPN" --version
+    iperf3 --version
+    tc -V
+    git -C "${SCRIPT_DIR}/.." rev-parse HEAD
+    git -C "${SCRIPT_DIR}/.." submodule status third_party/xquic
+} >"${IPERF_EVIDENCE}/environment.txt" 2>&1 || true
 
 # ── Phase INIs. Keys cross-checked against src/config.c cfg_keys[] and the
 #    hand-coded [Hybrid] EgressAllow parser (src/config.c ~line 1063):
@@ -608,6 +630,53 @@ IPERF_MIN_MBPS=1.0
 # actually be listening instead of guessing with a fixed sleep.
 IPERF_PORT=5201
 
+# Read state only outside the timed transfer. Do not enable packet-level debug
+# logging or add background polling that would change the throughput being gated.
+# Commands are bounded and best-effort: evidence failure must not hide the test
+# result. Deliberately omit command lines/environment (the VPN argv contains PSK).
+iperf3_snapshot() {
+    local output="$1" detail="${2:-brief}" pid ns command
+    {
+        date -u '+%FT%T.%NZ'
+        echo "vpn_client_pid=${_BENCH_CLIENT_PID:-} vpn_server_pid=${_BENCH_SERVER_PID:-}"
+        for pid in "${_BENCH_CLIENT_PID:-}" "${_BENCH_SERVER_PID:-}"; do
+            [ -n "$pid" ] || continue
+            for command in stat schedstat status io; do
+                echo "--- /proc/$pid/$command ---"
+                cat "/proc/$pid/$command" 2>&1 || true
+            done
+        done
+        for command in loadavg stat pressure/cpu pressure/memory pressure/io; do
+            echo "--- /proc/$command ---"
+            cat "/proc/$command" 2>&1 || true
+        done
+        if [ "$detail" = full ]; then
+            for ns in "$NS_CLIENT" "$NS_SERVER"; do
+                echo "--- $ns links ---"
+                timeout 2 ip netns exec "$ns" ip -s link 2>&1 || true
+                echo "--- $ns qdisc ---"
+                timeout 2 ip netns exec "$ns" tc -s qdisc show 2>&1 || true
+                echo "--- $ns TCP sockets ---"
+                timeout 2 ip netns exec "$ns" ss -tinm 2>&1 || true
+                echo "--- $ns UDP sockets ---"
+                timeout 2 ip netns exec "$ns" ss -unam 2>&1 || true
+                echo "--- $ns network counters ---"
+                timeout 2 ip netns exec "$ns" cat /proc/net/snmp /proc/net/netstat 2>&1 || true
+            done
+            for command in get_status get_stats; do
+                echo "--- server control $command ---"
+                bench_query_control "$CTRL_PORT" "$command" || true
+                echo
+            done
+        fi
+    } >"$output" 2>&1 || true
+}
+
+iperf3_sample_directory() {
+    local label="${1:-sample}"
+    mktemp -d "${IPERF_EVIDENCE}/${label}.XXXXXX"
+}
+
 # Explain a sub-floor sample. A bare "0.0 Mbps" cannot distinguish a tunnel
 # that died mid-run from a JSON the parser could not read, and both have
 # shown up in CI — so print whatever the run did leave behind. stderr is
@@ -631,6 +700,14 @@ if 'end' not in d:
 elif 'sum_received' not in d['end']:
     print('    \"end\" present without sum_received; keys=%s' % sorted(d['end']))
 print('    intervals recorded: %d' % len(d.get('intervals') or []))
+for interval in d.get('intervals') or []:
+    s = interval.get('sum') or {}
+    streams = interval.get('streams') or []
+    print('    interval %.3f..%.3f: bytes=%s Mbps=%.3f retransmits=%s cwnd=%s rtt_us=%s' % (
+        s.get('start', 0), s.get('end', 0), s.get('bytes'), s.get('bits_per_second', 0) / 1e6,
+        s.get('retransmits'), [x.get('snd_cwnd') for x in streams], [x.get('rtt') for x in streams]))
+for name in ('sum_sent', 'sum_received'):
+    print('    end.%s: %s' % (name, (d.get('end') or {}).get(name)))
 " "$json" >&2 2>/dev/null || true
     if [ -s "$err" ]; then
         echo "    stderr:" >&2
@@ -654,9 +731,11 @@ print('    intervals recorded: %d' % len(d.get('intervals') or []))
 run_iperf3_through_tunnel() {
     local target="$1"
     local duration="${2:-6}"
-    local json err
-    json="$(mktemp)"
-    err="$(mktemp)"
+    local evidence json err client_rc server_rc server_alive mbps
+    evidence="$(iperf3_sample_directory "${3:-v4}")"
+    json="${evidence}/client.json"
+    err="${evidence}/client.stderr"
+    printf 'target=%s\nduration=%s\nfamily=IPv4\n' "$target" "$duration" >"${evidence}/metadata.txt"
 
     # Let the previous sample's server finish releasing the port before
     # binding. Without this the bind below loses the race, dies silently into
@@ -666,12 +745,13 @@ run_iperf3_through_tunnel() {
     # as a broken tunnel rather than the port collision it is.
     if ! wait_for_port_free "$NS_SERVER" "$IPERF_PORT" 5; then
         echo "  [iperf3] port ${IPERF_PORT} still busy from the previous sample" >&2
-        rm -f "$json" "$err"
+        echo 'setup=port-busy' >>"${evidence}/metadata.txt"
+        iperf3_snapshot "${evidence}/setup-failed.txt" full
         echo "0.0"
         return
     fi
 
-    ip netns exec "$NS_SERVER" iperf3 -s -B "$target" -1 &>/dev/null &
+    ip netns exec "$NS_SERVER" iperf3 -s -B "$target" -1 --json >"${evidence}/server.json" 2>"${evidence}/server.stderr" &
     local ipid=$!
 
     # Wait for the listener instead of sleeping a fixed second: on a loaded
@@ -689,19 +769,24 @@ run_iperf3_through_tunnel() {
         echo "  [iperf3] server never listened on ${IPERF_PORT} (target ${target})" >&2
         kill "$ipid" 2>/dev/null || true
         wait "$ipid" 2>/dev/null || true
-        rm -f "$json" "$err"
+        echo 'setup=listener-failed' >>"${evidence}/metadata.txt"
+        iperf3_snapshot "${evidence}/setup-failed.txt" full
         echo "0.0"
         return
     fi
 
     # stderr to its own file, never into "$json" — see iperf3_report_bad_sample.
-    ip netns exec "$NS_CLIENT" timeout $((duration + 15)) \
-        iperf3 -c "$target" -t "$duration" -P 1 --json >"$json" 2>"$err" || true
+    iperf3_snapshot "${evidence}/before.txt"
+    if ip netns exec "$NS_CLIENT" timeout $((duration + 15)) \
+        iperf3 -c "$target" -t "$duration" -P 1 --json >"$json" 2>"$err"; then
+        client_rc=0
+    else
+        client_rc=$?
+    fi
+    server_alive=0
+    if kill -0 "$ipid" 2>/dev/null; then server_alive=1; fi
+    printf 'client_exit=%s\nserver_alive_after_client=%s\n' "$client_rc" "$server_alive" >>"${evidence}/metadata.txt"
 
-    kill "$ipid" 2>/dev/null || true
-    wait "$ipid" 2>/dev/null || true
-
-    local mbps
     mbps="$(python3 -c "
 import json
 try:
@@ -715,10 +800,18 @@ try:
 except Exception:
     print('0.0')
 ")"
+    # A partial JSON summary cannot turn a failed client process into a pass.
+    if [ "$client_rc" -ne 0 ]; then mbps=0.0; fi
     if awk -v m="$mbps" -v f="$IPERF_MIN_MBPS" 'BEGIN{exit !(m<f)}'; then
         iperf3_report_bad_sample "$json" "$err" "iperf3 v4"
+        iperf3_snapshot "${evidence}/after.txt" full
+        echo "    client exit=$client_rc; server alive=$server_alive; evidence: measurements/$(basename "$evidence")" >&2
+    else
+        iperf3_snapshot "${evidence}/after.txt"
     fi
-    rm -f "$json" "$err"
+    kill "$ipid" 2>/dev/null || true
+    if wait "$ipid" 2>/dev/null; then server_rc=0; else server_rc=$?; fi
+    printf 'server_wait_exit=%s\nmbps=%s\n' "$server_rc" "$mbps" >>"${evidence}/metadata.txt"
     echo "$mbps"
 }
 
@@ -729,18 +822,21 @@ except Exception:
 run_iperf3_v6_through_tunnel() {
     local target="$1"
     local duration="${2:-6}"
-    local json err
-    json="$(mktemp)"
-    err="$(mktemp)"
+    local evidence json err client_rc server_rc server_alive mbps
+    evidence="$(iperf3_sample_directory v6)"
+    json="${evidence}/client.json"
+    err="${evidence}/client.stderr"
+    printf 'target=%s\nduration=%s\nfamily=IPv6\n' "$target" "$duration" >"${evidence}/metadata.txt"
 
     if ! wait_for_port_free "$NS_SERVER" "$IPERF_PORT" 5; then
         echo "  [iperf3 v6] port ${IPERF_PORT} still busy from the previous sample" >&2
-        rm -f "$json" "$err"
+        echo 'setup=port-busy' >>"${evidence}/metadata.txt"
+        iperf3_snapshot "${evidence}/setup-failed.txt" full
         echo "0.0"
         return
     fi
 
-    ip netns exec "$NS_SERVER" iperf3 -s -6 -B "$target" -1 &>/dev/null &
+    ip netns exec "$NS_SERVER" iperf3 -s -6 -B "$target" -1 --json >"${evidence}/server.json" 2>"${evidence}/server.stderr" &
     local ipid=$!
 
     # Same free-port wait, listener wait and stderr separation as the v4 twin
@@ -751,18 +847,23 @@ run_iperf3_v6_through_tunnel() {
         echo "  [iperf3 v6] server never listened on ${IPERF_PORT} (target ${target})" >&2
         kill "$ipid" 2>/dev/null || true
         wait "$ipid" 2>/dev/null || true
-        rm -f "$json" "$err"
+        echo 'setup=listener-failed' >>"${evidence}/metadata.txt"
+        iperf3_snapshot "${evidence}/setup-failed.txt" full
         echo "0.0"
         return
     fi
 
-    ip netns exec "$NS_CLIENT" timeout $((duration + 15)) \
-        iperf3 -c "$target" -6 -t "$duration" -P 1 --json >"$json" 2>"$err" || true
+    iperf3_snapshot "${evidence}/before.txt"
+    if ip netns exec "$NS_CLIENT" timeout $((duration + 15)) \
+        iperf3 -c "$target" -6 -t "$duration" -P 1 --json >"$json" 2>"$err"; then
+        client_rc=0
+    else
+        client_rc=$?
+    fi
+    server_alive=0
+    if kill -0 "$ipid" 2>/dev/null; then server_alive=1; fi
+    printf 'client_exit=%s\nserver_alive_after_client=%s\n' "$client_rc" "$server_alive" >>"${evidence}/metadata.txt"
 
-    kill "$ipid" 2>/dev/null || true
-    wait "$ipid" 2>/dev/null || true
-
-    local mbps
     mbps="$(python3 -c "
 import json
 try:
@@ -776,10 +877,17 @@ try:
 except Exception:
     print('0.0')
 ")"
+    if [ "$client_rc" -ne 0 ]; then mbps=0.0; fi
     if awk -v m="$mbps" -v f="$IPERF_MIN_MBPS" 'BEGIN{exit !(m<f)}'; then
         iperf3_report_bad_sample "$json" "$err" "iperf3 v6"
+        iperf3_snapshot "${evidence}/after.txt" full
+        echo "    client exit=$client_rc; server alive=$server_alive; evidence: measurements/$(basename "$evidence")" >&2
+    else
+        iperf3_snapshot "${evidence}/after.txt"
     fi
-    rm -f "$json" "$err"
+    kill "$ipid" 2>/dev/null || true
+    if wait "$ipid" 2>/dev/null; then server_rc=0; else server_rc=$?; fi
+    printf 'server_wait_exit=%s\nmbps=%s\n' "$server_rc" "$mbps" >>"${evidence}/metadata.txt"
     echo "$mbps"
 }
 
@@ -795,10 +903,10 @@ run_iperf3_repeated() {
     local i mbps
     local results=()
     for (( i=0; i<repeats; i++ )); do
-        mbps="$(run_iperf3_through_tunnel "$target" "$duration")"
+        mbps="$(run_iperf3_through_tunnel "$target" "$duration" "${label}.run-$((i + 1)).attempt-1")"
         if awk -v m="$mbps" -v f="$IPERF_MIN_MBPS" 'BEGIN{exit !(m<f)}'; then
             echo "    [$label] run $((i + 1))/${repeats}: ${mbps} Mbps (below floor ${IPERF_MIN_MBPS}, retrying once)" >&2
-            mbps="$(run_iperf3_through_tunnel "$target" "$duration")"
+            mbps="$(run_iperf3_through_tunnel "$target" "$duration" "${label}.run-$((i + 1)).attempt-2")"
         fi
         echo "    [$label] run $((i + 1))/${repeats}: ${mbps} Mbps" >&2
         results+=("$mbps")
@@ -1287,7 +1395,7 @@ echo "  BASE_A_MBPS: avg=${BASE_A_MBPS} samples=(${BASE_A_RESULTS[*]})"
 
 echo "-- Baseline leg B: single path under Path B netem --"
 apply_path_netem 0 "$NETEM_B"
-hybrid_run "$INI_STREAM" "$SERVER_LOG_T3A" "$CLIENT_LOG_T3A"
+hybrid_run "$INI_STREAM" "$SERVER_LOG_T3_BASE_B" "$CLIENT_LOG_T3_BASE_B"
 BASE_B_RESULTS=($(run_iperf3_repeated "$HTTP_TARGET_IP" "$IPERF_DURATION_T3" "$IPERF_REPEATS_T3" BASE-B))
 bench_stop_vpn
 assert_series_floor BASE-B "${BASE_B_RESULTS[@]}"
@@ -1826,28 +1934,18 @@ ip netns exec "$NS_CLIENT" sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null
 # addressing note above).
 ip netns exec "$NS_SERVER" ip -6 addr add "${V6_EGRESS_IP}/128" dev lo
 
-# Shape both legs before the tunnel comes up. WITHOUT this the load-share
-# assertion below is not a scheduler check but a coin flip: stream-lane
-# packets take WLB's MinRTT fallback (po_flow_hash == 0), which spills onto a
-# second path only while the lowest-SRTT one is cwnd-blocked, and an unshaped
-# veth pair is fast enough that one path never blocks. Measured on the same
-# binary, 2 runs each: unshaped gave minshare 0.00 / 0.00 (and 0.05 / 0.39 on
-# a build with a larger lwIP window — i.e. the outcome tracked an unrelated
-# buffer size, which is precisely what a load-share gate must NOT do), while
-# this shaped topology gave 0.72 / 0.78 / 0.81 / 0.86 across both builds —
-# a 3.6x margin over the >=0.2 threshold with no window sensitivity left.
-# Shaping also caps the burst at 40+100 mbit, so a slow CI runner measures
-# the same region a fast one does.
-#
-# Ordering: bench_setup_netns_n recreates the namespaces (and with them the
-# qdiscs), so netem MUST be applied after the topology, before the tunnel.
-# The profile is re-derived here rather than reusing Test 3's NETEM_A/NETEM_B
-# for the same reason this phase keeps its own copy of the load-share check:
-# Test 8 must not break silently if Test 3 is reordered or dropped.
-NETEM_PROFILE_T8="lte_starlink"
-NETEM_SPEC_T8="${BENCH_ENV_NETEM[$NETEM_PROFILE_T8]}"
-echo "  profile=${NETEM_PROFILE_T8} pathA='${NETEM_SPEC_T8%%|*}' pathB='${NETEM_SPEC_T8#*|}'"
-bench_apply_netem "${NETEM_SPEC_T8%%|*}" "${NETEM_SPEC_T8#*|}"
+# STREAM uses MinRTT (DD §7), not equal-share WRR. The old 40/100 mbit,
+# random-loss/jitter profile need not saturate both paths in a short Debug
+# burst: CI measured 40.1 Mbps with both paths carrying MBs but share=0.17.
+# Use equal lossless legs below the Debug sender's capacity for this
+# functional aggregation check; Test 3 keeps the asymmetric stress profile.
+# Retain the >=0.2 share gate and additionally demand >1.5x ONE leg's rate:
+# merely selecting one path cannot satisfy that capacity check.
+# Apply after recreating namespaces, before starting the tunnel.
+PATH_RATE_MBPS_T8=10
+NETEM_T8="delay 20ms rate ${PATH_RATE_MBPS_T8}mbit"
+echo "  IPv6 controlled profile: each path '${NETEM_T8}'"
+bench_apply_netem "$NETEM_T8" "$NETEM_T8"
 
 N_PATHS=2
 hybrid_run "$INI_T8" "$SERVER_LOG_T8" "$CLIENT_LOG_T8"
@@ -1886,37 +1984,25 @@ fi
 #    carry real load, lighter path >=20% of the heavier) — the direct proof
 #    against a scheduler that pinned all traffic on one path. A fresh copy
 #    of the check (not a shared function with Test 3) so this phase cannot
-#    perturb Test 3's already-verified logic. The absolute byte floor is
-#    HALF of Test 3's (see the FLOOR clause below) — same shape, different
-#    threshold, deliberately not tracking Test 3's value. ──
+#    perturb Test 3's logic. The absolute byte floor remains 50 KB. ──
 IPERF_DURATION_T8=6
 V6_IPERF_MBPS="$(run_iperf3_v6_through_tunnel "$V6_EGRESS_IP" "$IPERF_DURATION_T8")"
 echo "  IPv6 iperf3 (both paths active): ${V6_IPERF_MBPS} Mbps"
-if awk -v m="$V6_IPERF_MBPS" 'BEGIN{exit !(m>0)}'; then
-    echo "OK: IPv6 iperf3 measurement produced a nonzero sample"
+if awk -v m="$V6_IPERF_MBPS" -v r="$PATH_RATE_MBPS_T8" 'BEGIN{exit !(m>1.5*r)}'; then
+    echo "PASS: IPv6 throughput exceeds 1.5x one ${PATH_RATE_MBPS_T8} Mbps leg's capacity"
 else
-    echo "FAIL: IPv6 iperf3 measurement returned 0.0 Mbps — measurement broken"
+    echo "FAIL: IPv6 throughput ${V6_IPERF_MBPS} Mbps does not exceed 1.5x one ${PATH_RATE_MBPS_T8} Mbps leg's capacity"
+    iperf3_snapshot "${IPERF_EVIDENCE}/t8-capacity-failed.txt" full
     fail=1
 fi
 
-# Prove the stream lane carried this traffic (not a silent raw fallthrough)
-# while the client is still alive.
-assert_stream_lane_used "$CLIENT_LOG_T8" "Test8 v6 stream"
-
-stats_t8=""
-agg_check_t8=""
-for _ in $(seq 1 15); do
-    stats_t8="$(bench_query_control "$CTRL_PORT" get_status)"
-    agg_check_t8="$(echo "$stats_t8" | python3 -c "
+# Snapshot immediately after the burst. Polling these cumulative counters
+# after the sender has exited adds no new load and cannot repair a bad share.
+stats_t8="$(bench_query_control "$CTRL_PORT" get_status)"
+printf '%s\n' "$stats_t8" >"${IPERF_EVIDENCE}/t8-path-status.json"
+agg_check_t8="$(echo "$stats_t8" | python3 -c "
 import sys, json
-# Half of Test 3's 100000 floor: this phase is a single ~6s iperf3 burst,
-# not Test 3's repeated run_iperf3_repeated series, so fewer per-path bytes
-# accumulate before the get_status snapshot — while still being far above
-# handshake/probe noise (an idle path can't reach 50 KB on control frames).
-# Measured under the netem profile applied above: the LIGHTER path carried
-# 31.9-33.5 MB across 4 runs, so the floor sits ~640x below the observed
-# value and is doing what it is meant to do (catch a dead path), not
-# gatekeeping throughput.
+# Far above handshake/probe noise; unchanged from the original Test 8 gate.
 FLOOR = 50000
 try:
     d = json.load(sys.stdin)
@@ -1945,19 +2031,19 @@ if lo < 0.2 * hi:
     print('FAIL imbalanced lo=%d hi=%d minshare=%.2f' % (lo, hi, share)); sys.exit()
 print('OK lo=%d hi=%d minshare=%.2f' % (lo, hi, share))
 ")"
-    if [ "${agg_check_t8#OK}" != "$agg_check_t8" ]; then
-        break
-    fi
-    sleep 1
-done
 echo "  per-path load (tx+rx) after IPv6 iperf3 burst: ${agg_check_t8}"
 if [ "${agg_check_t8#OK}" != "$agg_check_t8" ]; then
     echo "PASS: both paths carried meaningful load from IPv6 TCP-lane traffic (${agg_check_t8})"
 else
     echo "FAIL: per-path utilization check failed for IPv6 traffic (${agg_check_t8})"
     echo "      raw get_status: $stats_t8"
+    iperf3_snapshot "${IPERF_EVIDENCE}/t8-share-failed.txt" full
     fail=1
 fi
+
+# Prove the stream lane carried this traffic (not a silent raw fallthrough)
+# while the client is still alive; its periodic log may take up to 40s.
+assert_stream_lane_used "$CLIENT_LOG_T8" "Test8 v6 stream"
 
 # ── Failover: a long-lived v6 TCP-lane flow, then bring one path down and
 #    confirm it keeps flowing on the survivor — same technique
