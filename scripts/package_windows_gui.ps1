@@ -107,6 +107,12 @@ try {
     Copy-Item -LiteralPath (Join-Path $CoreDirectory 'core-build.json') -Destination (Join-Path $OutputDir 'core-build.json')
     Copy-Item -Path (Join-Path $CoreDirectory 'third-party/*') -Destination (Join-Path $OutputDir 'third-party')
     Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE'),(Join-Path $repoRoot 'NOTICE') -Destination $OutputDir
+    $guiReadme = (Get-Content -LiteralPath (Join-Path $repoRoot 'windows/README.md') -Raw).
+        Replace('(../README.md#', "(https://github.com/r11234567/mqvpn/blob/$sourceSha/README.md#").
+        Replace('(PHASE_B_REVIEW.md)', "(https://github.com/r11234567/mqvpn/blob/$sourceSha/windows/PHASE_B_REVIEW.md)")
+    [IO.File]::WriteAllText((Join-Path $OutputDir 'README-GUI.md'), $guiReadme, [Text.UTF8Encoding]::new($false))
+    New-Item -ItemType Directory -Path (Join-Path $OutputDir 'examples') -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'windows/examples/client.json') -Destination (Join-Path $OutputDir 'examples/client.json')
     Copy-Item -LiteralPath $DependencyLock -Destination (Join-Path $OutputDir 'dependency-lock.json')
     $wintunZip = Join-Path $work 'wintun.zip'
     Download-Plain $lock.wintun.url $wintunZip $lock.wintun.sha256

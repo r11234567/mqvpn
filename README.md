@@ -517,6 +517,17 @@ sudo dpkg -i mqvpn_*.deb
 
 ### Windows client
 
+This fork also provides a Windows WPF GUI testing package for x64/ARM64 in
+the current PR's CI artifacts. See the [GUI setup and configuration guide](windows/README.md)
+and the [Windows GUI client JSON](windows/examples/client.json), paired with
+the [server example below](#this-fork-paired-server-and-client-examples).
+Import the JSON through the node list's **导入 JSON 为新节点** menu, replace
+the endpoint/SNI/PSK, and review the routing policy before connecting.
+The example uses `manage_routes: false` because the GUI manages routing;
+empty `paths` selects runtime default-adapter mode in the GUI. A direct
+Windows CLI invocation still requires at least one adapter. PR artifacts
+are testing packages and do not imply a signed stable GUI release.
+
 Pre-built binaries are shipped for Windows amd64 and arm64. Download `mqvpn_<VERSION>_windows_<ARCH>.zip` from [Releases](https://github.com/mp0rta/mqvpn/releases/latest), extract, and follow the bundled `README.txt` (admin PowerShell required).
 
 ### macOS client

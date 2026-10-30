@@ -53,6 +53,8 @@ internal static class LifecycleChecks
         {
             var store = ProfileStore.Load(root);
             var config = ProfileStore.CreateDefaultMqvpnConfig();
+            config["server_addr"] = "vpn.example:443";
+            config["auth_key"] = "test-only-key";
             config["paths"] = new JsonArray("previous adapter");
             store.SaveConfig(store.ActiveProfile, config);
             store.ActiveProfile.UseDefaultPath = true;

@@ -38,8 +38,12 @@ jobs:
         include:
           - arch: x64
             runner: windows-2022
+            vs: Visual Studio 17 2022
+            cmake_arch: x64
           - arch: arm64
             runner: windows-11-arm
+            vs: Visual Studio 18 2026
+            cmake_arch: ARM64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     steps:
@@ -60,6 +64,12 @@ jobs:
       - name: Build and run production GUI checks natively
         shell: pwsh
         run: |
+          cmake -S windows/tests/config-contract -B build/gui-config-contract -G '${{ matrix.vs }}' -A ${{ matrix.cmake_arch }}
+          if ($LASTEXITCODE -ne 0) { throw 'C configuration contract configure failed' }
+          cmake --build build/gui-config-contract --config Debug
+          if ($LASTEXITCODE -ne 0) { throw 'C configuration contract build failed' }
+          $env:MQVPN_CONFIG_CONTRACT_EXE = (Resolve-Path build/gui-config-contract/Debug/config_contract.exe).Path
+          $env:MQVPN_CONFIG_EVIDENCE = (Join-Path $PWD 'build/config-fixtures')
           dotnet build windows/tests/GUI.Tests.csproj -c Release
           if ($LASTEXITCODE -ne 0) { throw 'GUI test build failed' }
           & ./windows/tests/bin/Release/net9.0-windows/GUI.Tests.exe
@@ -80,6 +90,7 @@ jobs:
           path: |
             windows/tests/bin/Release/net9.0-windows/screenshots/
             build/package-reports/
+            build/config-fixtures/
             dist/mqvpn_windows_gui_${{ matrix.arch }}/package-manifest.json
           if-no-files-found: warn
           retention-days: 7

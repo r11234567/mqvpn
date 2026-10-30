@@ -19,7 +19,7 @@ internal sealed class ReorderRuleRow
 internal sealed partial class ProfileEditorForm
 {
     private static readonly string[] ReorderProfiles =
-        ["cellular_bond", "fiber_lte", "quic_bulk", "low_latency", "default_udp"];
+        MqvpnProfileConfiguration.ReorderProfiles;
 
     private readonly ObservableCollection<ReorderRuleRow> _reorderRuleRows = [];
 
@@ -98,7 +98,7 @@ internal sealed partial class ProfileEditorForm
         var page = CreatePage("UDP 重排", out var stack);
         stack.Children.Add(FluentUi.SectionHeader("UDP Reorder 策略与规则", SymbolRegular.Server20));
         stack.Children.Add(FluentUi.SettingCard("UDP Reorder 状态", _reorderEnabled,
-            "只处理规则匹配的内层 UDP 流量；未匹配流量直接通过。会以延迟换取吞吐，应按实际链路启用。"));
+            "有规则时只处理匹配流量；零规则是核心支持的全流量匹配模式（包括内层 TCP）。会引入等待，默认关闭；建议显式限定 UDP 端口。"));
 
         var rulesContainer = new StackPanel();
         var ruleToolbar = new StackPanel
@@ -157,10 +157,14 @@ internal sealed partial class ProfileEditorForm
 
     private bool TryReadReorderRules(out JsonArray rules, out string error)
     {
-        _reorderRules.CommitEdit(DataGridEditingUnit.Cell, true);
-        _reorderRules.CommitEdit(DataGridEditingUnit.Row, true);
         rules = new JsonArray();
         error = string.Empty;
+        if (!_reorderRules.CommitEdit(DataGridEditingUnit.Cell, true) ||
+            !_reorderRules.CommitEdit(DataGridEditingUnit.Row, true))
+        {
+            error = "请先完成或取消当前规则单元格的编辑。";
+            return false;
+        }
         var ports = new HashSet<int>();
         foreach (var row in _reorderRuleRows)
         {
@@ -193,27 +197,29 @@ internal sealed partial class ProfileEditorForm
                 return false;
             }
             var rule = row.OriginalTag?.DeepClone().AsObject() ?? new JsonObject();
-            rule["proto"] = "udp";
-            rule["port"] = port;
-            rule["profile"] = profile;
-            if (maxWait.HasValue)
-                rule["max_wait_ms"] = maxWait.Value;
-            else
-                rule.Remove("max_wait_ms");
-            if (capPackets.HasValue)
-                rule["cap_packets"] = capPackets.Value;
-            else
-                rule.Remove("cap_packets");
+            if (rule.ContainsKey("proto") && GetString(rule, "proto") != "udp")
+            {
+                error = "规则 proto 必须是 udp；不支持的导入规则请删除后重新添加。";
+                return false;
+            }
+            if (row.OriginalTag is null) rule["proto"] = "udp";
+            if (row.OriginalTag is null || GetInteger(rule, "port", 0) != port) rule["port"] = port;
+            if (row.OriginalTag is null || GetString(rule, "profile", "quic_bulk") != profile) rule["profile"] = profile;
+            if ((row.MaxWaitMs?.Trim() ?? "") != GetOptionalUnsignedText(rule, "max_wait_ms"))
+            {
+                if (maxWait.HasValue) rule["max_wait_ms"] = maxWait.Value;
+                else rule.Remove("max_wait_ms");
+            }
+            if ((row.CapPackets?.Trim() ?? "") != GetOptionalUnsignedText(rule, "cap_packets"))
+            {
+                if (capPackets.HasValue) rule["cap_packets"] = capPackets.Value;
+                else rule.Remove("cap_packets");
+            }
             rules.Add(rule);
         }
         if (rules.Count > 16)
         {
             error = "UDP Reorder 最多支持 16 条端口规则。";
-            return false;
-        }
-        if (_reorderEnabled.IsChecked == true && rules.Count == 0)
-        {
-            error = "启用 UDP Reorder 后至少需要添加一条端口规则。";
             return false;
         }
         return true;

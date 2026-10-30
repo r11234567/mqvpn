@@ -898,6 +898,7 @@ internal sealed class MainForm : FluentWindow
         _profileContextMenu.Items.Add(_menuItemTest);
         _profileContextMenu.Items.Add(_menuItemActivate);
         _profileContextMenu.Items.Add(_menuItemClone);
+        _profileContextMenu.Items.Add(FluentUi.CreateMenuItem("导入 JSON 为新节点", SymbolRegular.DocumentAdd20, (_, _) => ImportProfile()));
         _profileContextMenu.Items.Add(_menuItemEdit);
         _profileContextMenu.Items.Add(_menuItemMoveUp);
         _profileContextMenu.Items.Add(_menuItemMoveDown);
@@ -1377,6 +1378,28 @@ internal sealed class MainForm : FluentWindow
             throw new InvalidOperationException("配置列表尚未初始化");
         _profiles.GenerateXrayConfig(_profiles.ActiveProfile, XrayConfig,
             _proxyService?.IsRunning == true ? _runtimeConfig : null);
+    }
+
+    private void ImportProfile()
+    {
+        if (_profiles is null) return;
+        var dialog = new Microsoft.Win32.OpenFileDialog { Title = "导入 MQVPN 客户端 JSON", Filter = "MQVPN JSON (*.json)|*.json" };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            var config = ProfileStore.ReadConfigForImport(dialog.FileName);
+            var defaultPath = config["paths"] is not JsonArray { Count: > 0 };
+            using var editor = new ProfileEditorForm("导入配置", System.IO.Path.GetFileNameWithoutExtension(dialog.FileName), config,
+                _profiles.Routing.Policies, _profiles.ActiveProfile.RoutingPolicyId, useDefaultPath: defaultPath);
+            if (!editor.ShowModal(this)) return;
+            var profile = _profiles.Add(editor.ProfileName, editor.ResultConfig, editor.RoutingPolicyId);
+            profile.AutoConnect = editor.AutoConnect;
+            profile.UseDefaultPath = editor.UseDefaultPath;
+            _profiles.Save();
+            RefreshProfilesGrid();
+            SelectProfileRow(profile.Id);
+        }
+        catch (Exception ex) { FluentUi.ShowAlert(this, ex.Message, "导入配置失败", isError: true); }
     }
 
     private void AddProfile()

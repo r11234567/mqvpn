@@ -19,8 +19,8 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
     private readonly ComboBox _scheduler = new();
     private readonly ComboBox _congestion = new();
     private readonly ComboBox _routing = new();
-    private readonly NumberBox _reconnectInterval = new();
-    private readonly NumberBox _initMaxPathId = new();
+    private readonly IntegerInput _reconnectInterval = new();
+    private readonly IntegerInput _initMaxPathId = new();
     private readonly CheckBox _allowInsecure = new();
     private readonly CheckBox _reconnect = new();
     private readonly CheckBox _requestServerScheduler = new();
@@ -32,44 +32,39 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
     private readonly CheckBox _manageRoutes = new();
     private readonly CheckBox _killSwitch = new();
     private readonly CheckBox _automaticMtu = new();
-    private readonly NumberBox _mtu = new();
+    private readonly IntegerInput _mtu = new();
     private readonly CheckBox _pmtud = new();
-    private readonly NumberBox _pathMtu = new();
-    private readonly NumberBox _tunQueueLength = new();
-    private readonly NumberBox _tunReadBatch = new();
+    private readonly IntegerInput _pathMtu = new();
     private readonly ComboBox _reinjection = new();
-    private readonly NumberBox _reinjectionFactor = new();
-    private readonly NumberBox _reinjectionHardDeadline = new();
-    private readonly NumberBox _reinjectionLowerBound = new();
+    private readonly IntegerInput _reinjectionFactor = new();
+    private readonly IntegerInput _reinjectionHardDeadline = new();
+    private readonly IntegerInput _reinjectionLowerBound = new();
     private readonly CheckBox _hybridEnabled = new();
     private readonly ComboBox _hybridTcp = new();
-    private readonly NumberBox _tcpMaxFlows = new();
-    private readonly NumberBox _tcpIdleTimeout = new();
-    private readonly NumberBox _tcpConnectTimeout = new();
+    private readonly IntegerInput _tcpMaxFlows = new();
+    private readonly IntegerInput _tcpIdleTimeout = new();
     private readonly CheckBox _reorderEnabled = new();
     private readonly Wpf.Ui.Controls.DataGrid _reorderRules = new();
     private readonly CheckBox _reorderCustomWait = new();
     private readonly CheckBox _reorderCustomCap = new();
-    private readonly NumberBox _reorderMaxWait = new();
-    private readonly NumberBox _reorderCapPackets = new();
-    private readonly NumberBox _reorderMaxBytesPerFlow = new();
-    private readonly NumberBox _reorderClassifyWindow = new();
-    private readonly NumberBox _reorderAckDemoteMaxLarge = new();
-    private readonly NumberBox _reorderSmallPacketThreshold = new();
-    private readonly NumberBox _reorderResetMarkPackets = new();
-    private readonly NumberBox _reorderResetIdleGrace = new();
-    private readonly NumberBox _reorderMaxFlows = new();
-    private readonly NumberBox _reorderGlobalMaxBytes = new();
-    private readonly NumberBox _reorderIngressIdle = new();
-    private readonly NumberBox _reorderEgressIdle = new();
-    private readonly NumberBox _recvRateLimit = new();
-    private readonly CheckBox _udpGso = new();
-    private readonly CheckBox _udpGro = new();
-    private readonly CheckBox _tunOffload = new();
-    private readonly CheckBox _tunGro = new();
+    private readonly IntegerInput _reorderMaxWait = new();
+    private readonly IntegerInput _reorderCapPackets = new();
+    private readonly IntegerInput _reorderMaxBytesPerFlow = new();
+    private readonly IntegerInput _reorderClassifyWindow = new();
+    private readonly IntegerInput _reorderAckDemoteMaxLarge = new();
+    private readonly IntegerInput _reorderSmallPacketThreshold = new();
+    private readonly IntegerInput _reorderResetMarkPackets = new();
+    private readonly IntegerInput _reorderResetIdleGrace = new();
+    private readonly IntegerInput _reorderMaxFlows = new();
+    private readonly IntegerInput _reorderGlobalMaxBytes = new();
+    private readonly IntegerInput _reorderIngressIdle = new();
+    private readonly IntegerInput _reorderEgressIdle = new();
+    private readonly IntegerInput _recvRateLimit = new();
     private readonly CheckBox _autoConnect = new();
     private readonly TabControl _tabs = new();
-    private readonly JsonObject _config;
+    private JsonObject _config;
+    private readonly Dictionary<string, (Func<JsonNode?> Read, JsonNode? Initial)> _bindings = [];
+    private readonly Dictionary<string, IntegerInput> _numbers = [];
 
     public ProfileEditorForm(
         string title,
@@ -206,24 +201,11 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
             _pathsPanel.Children.Add(cb);
         }
 
-        ConfigureCombo(_scheduler, ["wlb", "minrtt", "wlb_udp_pin", "backup_fec"], GetString("scheduler", "wlb"));
+        ConfigureCombo(_scheduler, "scheduler");
         _requestServerScheduler.Content = "请求服务端对齐调度器 (RequestServerScheduler)";
         _requestServerScheduler.IsChecked = GetBoolean("request_server_scheduler", false);
-        ConfigureCombo(_congestion, ["bbr2", "bbr", "cubic", "none"], GetString("cc", "bbr2"));
-        var initialPathId = GetLong("init_max_path_id", 0);
-        ConfigureNumber(_initMaxPathId, Math.Min(0, initialPathId), Math.Max(128, initialPathId), initialPathId);
-        if (initialPathId is < 0 or > 128)
-        {
-            _initMaxPathId.ToolTip = $"旧配置值 {initialPathId} 已不受支持，请明确填写 0–128；不会自动截断。";
-            _initMaxPathId.ValueChanged += (_, _) =>
-            {
-                if (_initMaxPathId.Value is >= 0 and <= 128)
-                {
-                    _initMaxPathId.Minimum = 0;
-                    _initMaxPathId.Maximum = 128;
-                }
-            };
-        }
+        ConfigureCombo(_congestion, "cc");
+        ConfigureNumber(_initMaxPathId, "init_max_path_id");
 
         _routing.DisplayMemberPath = nameof(RoutingPolicy.Name);
         _routing.SelectedValuePath = nameof(RoutingPolicy.Id);
@@ -234,91 +216,72 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
 
         _reconnect.IsChecked = GetBoolean("reconnect", true);
         _reconnect.Content = "断线自动重连";
-        ConfigureNumber(_reconnectInterval, 1, int.MaxValue, GetInteger("reconnect_interval", 5));
+        ConfigureNumber(_reconnectInterval, "reconnect_interval");
         _reconnect.Checked += (_, _) => _reconnectInterval.IsEnabled = true;
         _reconnect.Unchecked += (_, _) => _reconnectInterval.IsEnabled = false;
         _reconnectInterval.IsEnabled = _reconnect.IsChecked == true;
 
         _tunName.Text = GetString("tun_name", "mqvpn0");
-        ConfigureCombo(_logLevel, LogLevels.All, GetString("log_level", LogLevels.Default));
+        ConfigureCombo(_logLevel, "log_level");
         _manageRoutes.Content = "由 MQVPN 管理系统路由";
-        _manageRoutes.IsChecked = GetBoolean("manage_routes", false);
+        _manageRoutes.IsChecked = GetBoolean("manage_routes", true);
         _killSwitch.Content = "Kill Switch（断线时阻止流量绕过 VPN）";
         _killSwitch.IsChecked = GetBoolean("kill_switch", false);
 
         var configuredMtu = GetInteger("mtu", GetInteger("tun_mtu", 0));
         _automaticMtu.Content = "自动协商 MTU（推荐）";
         _automaticMtu.IsChecked = configuredMtu == 0;
-        ConfigureNumber(_mtu, 1280, 9000, configuredMtu == 0 ? 1382 : configuredMtu);
+        ConfigureNumber(_mtu, "mtu");
         _automaticMtu.Checked += (_, _) => _mtu.IsEnabled = false;
         _automaticMtu.Unchecked += (_, _) => _mtu.IsEnabled = true;
         _mtu.IsEnabled = _automaticMtu.IsChecked != true;
 
         _pmtud.Content = "启用路径 MTU 动态发现 (PMTUD)";
         _pmtud.IsChecked = GetBoolean("pmtud", false);
-        ConfigureNumber(_pathMtu, 0, 65535, GetInteger("path_mtu", 0));
+        ConfigureNumber(_pathMtu, "path_mtu");
 
-        ConfigureNumber(_tunQueueLength, 0, 65536, GetInteger("tx_queue_len", 0));
-        ConfigureNumber(_tunReadBatch, 0, 4096, GetInteger("tun_read_batch", 0));
-
-        ConfigureCombo(_reinjection, ["off", "deadline", "idle"], GetString("reinjection", "off"));
-        ConfigureNumber(_reinjectionFactor, 100, 1000, GetInteger("reinjection_srtt_factor_pct", 110));
-        ConfigureNumber(_reinjectionHardDeadline, 1, 60000, GetInteger("reinjection_hard_deadline_ms", 500));
-        ConfigureNumber(_reinjectionLowerBound, 1, 60000, GetInteger("reinjection_deadline_lower_bound_ms", 20));
+        ConfigureCombo(_reinjection, "reinjection");
+        ConfigureNumber(_reinjectionFactor, "reinjection_srtt_factor_pct");
+        ConfigureNumber(_reinjectionHardDeadline, "reinjection_hard_deadline_ms");
+        ConfigureNumber(_reinjectionLowerBound, "reinjection_deadline_lower_bound_ms");
         _reinjection.SelectionChanged += (_, _) => UpdateDependentControls();
 
         _redundant.Content = "启用 Redundant 冗余模式（实时多路径发送复制包）";
         _redundant.IsChecked = GetBoolean("redundant", false);
         _redundantPorts.Text = GetString("redundant_ports");
-        _redundant.Checked += (_, _) =>
-        {
-            UpdateDependentControls();
-            if (string.Equals(_congestion.SelectedItem?.ToString(), "bbr2", StringComparison.OrdinalIgnoreCase))
-                _congestion.SelectedItem = "bbr";
-        };
+        _redundant.Checked += (_, _) => UpdateDependentControls();
         _redundant.Unchecked += (_, _) => UpdateDependentControls();
 
         var hybrid = GetObject("hybrid");
         _hybridEnabled.Content = "启用 Hybrid TCP lane";
         _hybridEnabled.IsChecked = GetBoolean(hybrid, "enabled", false);
-        ConfigureCombo(_hybridTcp, ["auto", "stream", "raw"], GetString(hybrid, "tcp", "auto"));
-        ConfigureNumber(_tcpMaxFlows, 1, 4096, GetInteger(hybrid, "tcp_max_flows", 256));
-        ConfigureNumber(_tcpIdleTimeout, 0, uint.MaxValue, GetLong(hybrid, "tcp_idle_timeout_sec", 300));
-        ConfigureNumber(_tcpConnectTimeout, 1, uint.MaxValue, GetLong(hybrid, "tcp_connect_timeout_sec", 10));
+        ConfigureCombo(_hybridTcp, "hybrid.tcp");
+        ConfigureNumber(_tcpMaxFlows, "hybrid.tcp_max_flows");
+        ConfigureNumber(_tcpIdleTimeout, "hybrid.tcp_idle_timeout_sec");
         _hybridEnabled.Checked += (_, _) => UpdateDependentControls();
         _hybridEnabled.Unchecked += (_, _) => UpdateDependentControls();
 
         var reorder = GetObject("reorder");
         InitializeReorderRules(reorder);
-        ConfigureNumber(_reorderMaxWait, 0, uint.MaxValue, GetLong(reorder, "max_wait_ms", 30));
-        ConfigureNumber(_reorderCapPackets, 1, uint.MaxValue, GetLong(reorder, "cap_packets", 1024));
-        ConfigureNumber(_reorderMaxBytesPerFlow, 0, ulong.MaxValue, GetUnsignedLong(reorder, "max_bytes_per_flow", 1572864));
-        ConfigureNumber(_reorderClassifyWindow, 0, ushort.MaxValue, GetLong(reorder, "classify_window", 64));
-        ConfigureNumber(_reorderAckDemoteMaxLarge, 0, ushort.MaxValue, GetLong(reorder, "ack_demote_max_large", 3));
-        ConfigureNumber(_reorderSmallPacketThreshold, 0, uint.MaxValue, GetLong(reorder, "small_packet_threshold", 200));
-        ConfigureNumber(_reorderResetMarkPackets, 0, uint.MaxValue, GetLong(reorder, "reset_mark_packets", 8));
-        ConfigureNumber(_reorderResetIdleGrace, 0, uint.MaxValue, GetLong(reorder, "reset_idle_grace_ms", 10000));
-        ConfigureNumber(_reorderMaxFlows, 0, uint.MaxValue, GetLong(reorder, "max_flows", 65536));
-        ConfigureNumber(_reorderGlobalMaxBytes, 0, ulong.MaxValue, GetUnsignedLong(reorder, "global_max_bytes", 67108864));
-        ConfigureNumber(_reorderIngressIdle, 0, uint.MaxValue, GetLong(reorder, "ingress_idle_sec", 30));
-        ConfigureNumber(_reorderEgressIdle, 0, uint.MaxValue, GetLong(reorder, "egress_idle_sec", 300));
+        ConfigureNumber(_reorderMaxWait, "reorder.max_wait_ms");
+        ConfigureNumber(_reorderCapPackets, "reorder.cap_packets");
+        ConfigureNumber(_reorderMaxBytesPerFlow, "reorder.max_bytes_per_flow");
+        ConfigureNumber(_reorderClassifyWindow, "reorder.classify_window");
+        ConfigureNumber(_reorderAckDemoteMaxLarge, "reorder.ack_demote_max_large");
+        ConfigureNumber(_reorderSmallPacketThreshold, "reorder.small_packet_threshold");
+        ConfigureNumber(_reorderResetMarkPackets, "reorder.reset_mark_packets");
+        ConfigureNumber(_reorderResetIdleGrace, "reorder.reset_idle_grace_ms");
+        ConfigureNumber(_reorderMaxFlows, "reorder.max_flows");
+        ConfigureNumber(_reorderGlobalMaxBytes, "reorder.global_max_bytes");
+        ConfigureNumber(_reorderIngressIdle, "reorder.ingress_idle_sec");
+        ConfigureNumber(_reorderEgressIdle, "reorder.egress_idle_sec");
 
-        var advanced = GetObject("advanced");
-        ConfigureNumber(_recvRateLimit, 0, 10_000_000_000d, GetLong(advanced, "recv_rate_limit", 0));
-        _recvRateLimit.SmallChange = 1_000_000;
-
-        _udpGso.Content = "UDP GSO 批量发送";
-        _udpGso.IsChecked = GetBoolean(advanced, "udp_gso", true);
-        _udpGro.Content = "UDP GRO 合并接收";
-        _udpGro.IsChecked = GetBoolean(advanced, "udp_gro", true);
-        _tunOffload.Content = "TUN 批量读取卸载 (TunOffload)";
-        _tunOffload.IsChecked = GetBoolean(advanced, "tun_offload", true);
-        _tunGro.Content = "TUN 接收合并 (TunGro)";
-        _tunGro.IsChecked = GetBoolean(advanced, "tun_gro", true);
+        ConfigureNumber(_recvRateLimit, "advanced.recv_rate_limit");
 
         _autoConnect.Content = "GUI 启动后自动连接此配置";
         _autoConnect.IsChecked = autoConnect;
         UpdateDependentControls();
+        InitializeBindings();
     }
 
     private TabItem BuildBasicPage()
@@ -329,7 +292,7 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         stack.Children.Add(FluentUi.SettingCard("服务器地址", _server, "格式为 HOST:PORT；IPv6 使用 [地址]:端口。"));
         stack.Children.Add(FluentUi.SettingCard("TLS 服务器名称 (SNI)", _sni, "可留空；留空时使用服务器地址中的主机名验证证书。"));
         stack.Children.Add(FluentUi.SettingCard("认证密钥 (PSK)", _auth));
-        stack.Children.Add(FluentUi.SettingCard("TLS 证书校验", _allowInsecure, "默认关闭不安全模式。仅自签名证书需要开启。"));
+        stack.Children.Add(FluentUi.SettingCard("TLS 证书校验", _allowInsecure, "默认验证证书。通常使用 Windows 信任库；SSL_CERT_FILE/SSL_CERT_DIR 环境变量可改用 CA bundle/目录；自签名证书应先配置信任，不必关闭验证。"));
 
         stack.Children.Add(FluentUi.SectionHeader("多路径与选路策略", SymbolRegular.Router20));
         var pathsBorder = new Border
@@ -346,8 +309,8 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         };
         pathsBorder.SetResourceReference(Border.BackgroundProperty, "ControlFillColorDefaultBrush");
         pathsBorder.SetResourceReference(Border.BorderBrushProperty, "ControlElevationBorderBrush");
-        stack.Children.Add(FluentUi.SettingCard("多路径物理网卡 (Paths)", pathsBorder, "可同时勾选多张网卡聚合加速；不勾选时由内核自动绑定默认物理路由。"));
-        stack.Children.Add(FluentUi.SettingCard("多路径调度器", _scheduler));
+        stack.Children.Add(FluentUi.SettingCard("多路径物理网卡 (Paths)", pathsBorder, "最多 8 张，每个名称最多 31 个 UTF-8 字节。不勾选表示默认网卡模式：GUI 在每次连接时解析当前默认物理网卡。"));
+        stack.Children.Add(FluentUi.SettingCard("多路径调度器", _scheduler, "影响 DATAGRAM；Hybrid STREAM 固定使用 MinRTT。随包核心启用 WLB、BBR2、FEC/XOR；自换核心需匹配构建能力。"));
         stack.Children.Add(FluentUi.SettingCard("请求服务端对齐调度器", _requestServerScheduler, "向服务端协商使用本客户端的调度器算法作为下行流量调度策略。"));
         stack.Children.Add(FluentUi.SettingCard("拥塞控制算法 (CC)", _congestion, "CC 与多路径调度器相互独立。Redundant 模式下推荐使用 bbr。"));
         stack.Children.Add(FluentUi.SettingCard("初始最大 Path ID", _initMaxPathId, "InitMaxPathId：0 使用 xquic 默认值 8；非零范围 1–128。旧超限值必须明确修正。"));
@@ -362,7 +325,7 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
     {
         var page = CreatePage("传输增强", out var stack);
         stack.Children.Add(FluentUi.SectionHeader("Redundant 冗余模式 (0.19.0 新增)", SymbolRegular.Stream20));
-        stack.Children.Add(FluentUi.SettingCard("冗余模式开关", _redundant, "在多个活动路径上同时复制发送 UDP 数据包，保障 SRT 等直播流在链路瞬断时不中断。"));
+        stack.Children.Add(FluentUi.SettingCard("冗余模式开关", _redundant, "在多个活动路径上复制 UDP 数据包；适合需要冗余的场景，效果仍受链路可用性影响。"));
         stack.Children.Add(FluentUi.SettingCard("复制 UDP 目的端口", _redundantPorts, "逗号分隔的端口列表（最多 16 个），留空表示复制全部 UDP。启用时推荐拥塞控制使用 bbr。"));
 
         stack.Children.Add(FluentUi.SectionHeader("Reinjection 重注入", SymbolRegular.Flash20));
@@ -376,13 +339,9 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         stack.Children.Add(FluentUi.SettingCard("TCP 传输模式", _hybridTcp, "auto：多路径时使用 stream；stream：始终使用 TCP lane；raw：始终走原始 CONNECT-IP 数据报。"));
         stack.Children.Add(FluentUi.SettingCard("最大 TCP 流", _tcpMaxFlows, "Windows/桌面构建上限 4096；默认 256。服务端也应配置足够的会话流上限。"));
         stack.Children.Add(FluentUi.SettingCard("TCP 空闲超时（秒）", _tcpIdleTimeout, "0 表示不按空闲时间回收。"));
-        stack.Children.Add(FluentUi.SettingCard("TCP 连接超时（秒）", _tcpConnectTimeout, "服务端 Hybrid 出站 connect() 超时；超时后客户端收到 HTTP 504。默认 10 秒。"));
 
-        stack.Children.Add(FluentUi.SectionHeader("Linux 内核网络与虚拟网卡卸载", SymbolRegular.TopSpeed20));
-        stack.Children.Add(FluentUi.SettingCard("UDP GSO", _udpGso, "0.16 新增，默认开启。仅 Linux 生效；不支持分段的路径会自动回退到 sendmmsg。"));
-        stack.Children.Add(FluentUi.SettingCard("UDP GRO", _udpGro, "0.16 新增，默认开启。仅 Linux 生效；Windows 客户端保留此配置但不会使用。"));
-        stack.Children.Add(FluentUi.SettingCard("TUN Offload", _tunOffload, "0.19 新增，默认开启。仅 Linux 生效；批量读取 TUN 报文提升高吞吐效率。"));
-        stack.Children.Add(FluentUi.SettingCard("TUN GRO", _tunGro, "0.19 新增，默认开启。仅 Linux 生效；Linux 6.2+ 内核合并写入 TUN。"));
+        stack.Children.Add(FluentUi.SectionHeader("平台限制", SymbolRegular.Info20));
+        stack.Children.Add(new System.Windows.Controls.TextBlock { Text = "Linux 的 tx_queue_len、tun_read_batch、UDP/TUN offload，以及 Hybrid 服务端连接超时、全局流数和 ACL 在 Windows 客户端不生效。导入的这些字段会原样保留。", TextWrapping = TextWrapping.Wrap });
         return page;
     }
 
@@ -390,16 +349,14 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
     {
         var page = CreatePage("高级设置", out var stack);
         stack.Children.Add(FluentUi.SectionHeader("虚拟网卡与安全", SymbolRegular.Shield20));
-        stack.Children.Add(FluentUi.SettingCard("TUN 网卡名称", _tunName));
+        stack.Children.Add(FluentUi.SettingCard("TUN 网卡名称", _tunName, "非空，最多 31 个 UTF-8 字节（中文通常每字 3 字节），可含空格。"));
         stack.Children.Add(FluentUi.SettingCard("默认日志等级", _logLevel, "写入配置文件的默认等级；启动时主界面的“日志级别”会覆盖它。"));
-        stack.Children.Add(FluentUi.SettingCard("系统路由管理", _manageRoutes, "分流模式通常保持关闭；它与 Kill Switch 是两个独立开关。"));
-        stack.Children.Add(FluentUi.SettingCard("断线保护 (Kill Switch)", _killSwitch));
+        stack.Children.Add(FluentUi.SettingCard("系统路由管理", _manageRoutes, "GUI 管理全局/分流路由，建议关闭。核心 manage_routes 会接管系统路由，不能与 GUI 分流策略同时使用；不会自动改变 Kill Switch。"));
+        stack.Children.Add(FluentUi.SettingCard("断线保护 (Kill Switch)", _killSwitch, "核心 WFP 规则阻止绕过隧道的流量，可能影响分流中的直连流量；它不决定 GUI 的全局/分流模式。"));
         stack.Children.Add(FluentUi.SettingCard("MTU 协商模式", _automaticMtu));
         stack.Children.Add(FluentUi.SettingCard("自定义 MTU 上限", _mtu, "范围 1280-9000。客户端值仅作为协商 MTU 的上限。"));
-        stack.Children.Add(FluentUi.SettingCard("路径 MTU 动态发现 (PMTUD)", _pmtud, "0.19.0 新增。动态探测端到端网络路径支持的最大报文大小，避免分片。需两端同时开启。"));
-        stack.Children.Add(FluentUi.SettingCard("固定路径 MTU (PathMTU)", _pathMtu, "0.19.0 新增。固定路径 MTU 大小（1280-9000，0 表示默认 1400 字节）。开启 PMTUD 时作为探测上限。"));
-        stack.Children.Add(FluentUi.SettingCard("TUN 队列深度", _tunQueueLength, "TxQueueLen：0 使用内核默认值 500；非零范围 100-65536。仅 Linux 生效。"));
-        stack.Children.Add(FluentUi.SettingCard("TUN 读取批量", _tunReadBatch, "TunReadBatch：0 使用内置默认值 64；非零范围 1-4096。仅 Linux 生效。"));
+        stack.Children.Add(FluentUi.SettingCard("路径 MTU 动态发现 (PMTUD)", _pmtud, "0.19.0 新增。动态探测端到端网络路径支持的最大报文大小，避免分片。默认关闭，按需在各端启用并验证网络支持。"));
+        stack.Children.Add(FluentUi.SettingCard("固定路径 MTU (PathMTU)", _pathMtu, "0.19.0 新增。固定路径 MTU 大小（1280-9000，0 使用核心默认报文大小）。开启 PMTUD 时作为探测上限。"));
 
         stack.Children.Add(FluentUi.SectionHeader("客户端行为与限流", SymbolRegular.Settings20));
         stack.Children.Add(FluentUi.SettingCard("接收窗口上限", _recvRateLimit, "RecvRateLimit，单位 bytes/s；0 表示关闭。它用于约束接收窗口和内存，不是精确限速器。"));
@@ -439,7 +396,6 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         _hybridTcp.IsEnabled = hybridOn;
         _tcpMaxFlows.IsEnabled = hybridOn;
         _tcpIdleTimeout.IsEnabled = hybridOn;
-        _tcpConnectTimeout.IsEnabled = hybridOn;
 
         var reorderEnabled = _reorderEnabled.IsChecked == true;
         _reorderRules.IsEnabled = reorderEnabled;
@@ -461,164 +417,17 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
 
     private void SaveAndClose()
     {
-        if (string.IsNullOrWhiteSpace(_name.Text) ||
-            string.IsNullOrWhiteSpace(_server.Text) ||
-            !_server.Text.Contains(':') ||
-            string.IsNullOrWhiteSpace(_auth.Password))
+        if (!TryBuildConfiguration(out var result, out var error))
         {
-            ShowValidation("请完整填写配置名称、服务器地址和认证密钥。TLS 服务器名称和网络路径可以留空。");
+            ShowValidation(error);
             return;
         }
-
-        var dns = SplitValues(_dns.Text);
-        if (dns.Count > 4 || dns.Any(value => !IPAddress.TryParse(value, out _)))
-        {
-            ShowValidation("DNS 最多填写 4 个有效的 IPv4/IPv6 地址。");
-            return;
-        }
-
-        if (_initMaxPathId.Value is not double initialPathId || !double.IsFinite(initialPathId) ||
-            initialPathId < 0 || initialPathId > 128 || initialPathId != Math.Truncate(initialPathId))
-        {
-            ShowValidation("InitMaxPathId 必须为 0（默认 8），或 1–128 的整数。请修正旧配置中的超限值。");
-            return;
-        }
-
-        var tunName = _tunName.Text.Trim();
-        if (tunName.Length is < 1 or > 64 || tunName.Any(character => !(char.IsLetterOrDigit(character) || character is '-' or '_' or '.')))
-        {
-            ShowValidation("TUN 名称只能包含字母、数字、点、短横线和下划线，长度为 1-64。");
-            return;
-        }
-
-        if (_redundant.IsChecked == true && !string.IsNullOrWhiteSpace(_redundantPorts.Text))
-        {
-            var ports = _redundantPorts.Text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            if (ports.Length > 16)
-            {
-                ShowValidation("RedundantPorts 最多只能指定 16 个目的端口。");
-                return;
-            }
-            foreach (var p in ports)
-            {
-                if (!ushort.TryParse(p, out var portVal) || portVal == 0)
-                {
-                    ShowValidation($"RedundantPorts 包含无效端口: {p}（必须是 1-65535 的整数）。");
-                    return;
-                }
-            }
-        }
-
-        var pathMtuVal = decimal.ToInt32(GetDecimal(_pathMtu));
-        if (pathMtuVal != 0 && (pathMtuVal < 1280 || pathMtuVal > 9000))
-        {
-            ShowValidation("PathMTU 必须为 0，或 1280-9000 之间的整数。");
-            return;
-        }
-
-        var tunQueueLen = GetDecimal(_tunQueueLength);
-        if (tunQueueLen is > 0 and < 100)
-        {
-            ShowValidation("TUN 发送队列深度只能为 0，或 100-65536。");
-            return;
-        }
-        if (GetDecimal(_reinjectionLowerBound) > GetDecimal(_reinjectionHardDeadline))
-        {
-            ShowValidation("Reinjection 截止下限不能大于硬截止时间。");
-            return;
-        }
-        if (_reorderCustomCap.IsChecked == true && !IsPowerOfTwo(GetDecimal(_reorderCapPackets)))
-        {
-            ShowValidation("UDP Reorder 的缓存包数必须是非零的 2 的幂。");
-            return;
-        }
-        if (GetDecimal(_reorderIngressIdle) >= GetDecimal(_reorderEgressIdle))
-        {
-            ShowValidation("UDP Reorder 的接收流空闲回收时间必须小于发送流空闲回收时间。");
-            return;
-        }
-        if (!TryReadReorderRules(out var rules, out var ruleError))
-        {
-            ShowValidation(ruleError);
-            return;
-        }
-
+        _config = result;
+        InitializeBindings();
         ProfileName = _name.Text.Trim();
         RoutingPolicyId = _routing.SelectedValue?.ToString() ?? "truckersmp";
         AutoConnect = _autoConnect.IsChecked == true;
-        var checkedPaths = _pathBoxes.Where(cb => cb.IsChecked == true).Select(cb => cb.Tag?.ToString() ?? string.Empty).Where(s => s.Length > 0).ToArray();
-        UseDefaultPath = checkedPaths.Length == 0;
-
-        _config["mode"] = "client";
-        _config["server_addr"] = _server.Text.Trim();
-        SetOptionalString("tls_server_name", _sni.Text);
-        _config["auth_key"] = _auth.Password;
-        _config["insecure"] = _allowInsecure.IsChecked == true;
-        _config["dns"] = new JsonArray(dns.Select(value => (JsonNode?)JsonValue.Create(value)).ToArray());
-        _config["tun_name"] = tunName;
-        _config["log_level"] = LogLevels.Normalize(_logLevel.SelectedItem?.ToString());
-        _config["manage_routes"] = _manageRoutes.IsChecked == true;
-        _config["kill_switch"] = _killSwitch.IsChecked == true;
-        _config["reconnect"] = _reconnect.IsChecked == true;
-        _config["reconnect_interval"] = decimal.ToInt32(GetDecimal(_reconnectInterval));
-        _config["scheduler"] = _scheduler.SelectedItem?.ToString() ?? "wlb";
-        _config["request_server_scheduler"] = _requestServerScheduler.IsChecked == true;
-        _config["cc"] = _congestion.SelectedItem?.ToString() ?? "bbr2";
-        _config["init_max_path_id"] = decimal.ToUInt32(GetDecimal(_initMaxPathId));
-
-        var selectedPaths = checkedPaths;
-        if (selectedPaths.Length == 0)
-            selectedPaths = [ResolveDefaultPhysicalInterface()];
-        _config["paths"] = new JsonArray(selectedPaths
-            .Select(value => (JsonNode?)JsonValue.Create(value)).ToArray());
-
-        if (_automaticMtu.IsChecked == true)
-            _config.Remove("mtu");
-        else
-            _config["mtu"] = decimal.ToInt32(GetDecimal(_mtu));
-        _config.Remove("tun_mtu");
-        _config["tx_queue_len"] = decimal.ToInt32(tunQueueLen);
-        _config["tun_read_batch"] = decimal.ToInt32(GetDecimal(_tunReadBatch));
-
-        _config["reinjection"] = _reinjection.SelectedItem?.ToString() ?? "off";
-        _config["reinjection_srtt_factor_pct"] = decimal.ToInt32(GetDecimal(_reinjectionFactor));
-        _config["reinjection_hard_deadline_ms"] = decimal.ToInt32(GetDecimal(_reinjectionHardDeadline));
-        _config["reinjection_deadline_lower_bound_ms"] = decimal.ToInt32(GetDecimal(_reinjectionLowerBound));
-        _config["redundant"] = _redundant.IsChecked == true;
-        _config["redundant_ports"] = _redundantPorts.Text.Trim();
-        _config["pmtud"] = _pmtud.IsChecked == true;
-        _config["path_mtu"] = pathMtuVal;
-
-        var hybrid = GetOrCreateObject("hybrid");
-        hybrid["enabled"] = _hybridEnabled.IsChecked == true;
-        hybrid["tcp"] = _hybridTcp.SelectedItem?.ToString() ?? "auto";
-        hybrid["tcp_max_flows"] = decimal.ToInt32(GetDecimal(_tcpMaxFlows));
-        hybrid["tcp_idle_timeout_sec"] = decimal.ToUInt32(GetDecimal(_tcpIdleTimeout));
-        hybrid["tcp_connect_timeout_sec"] = decimal.ToUInt32(GetDecimal(_tcpConnectTimeout));
-
-        var reorder = GetOrCreateObject("reorder");
-        reorder["enabled"] = _reorderEnabled.IsChecked == true;
-        SaveReorderOverride(reorder, "max_wait_ms", _reorderCustomWait.IsChecked == true, GetDecimal(_reorderMaxWait));
-        SaveReorderOverride(reorder, "cap_packets", _reorderCustomCap.IsChecked == true, GetDecimal(_reorderCapPackets));
-        reorder["max_bytes_per_flow"] = decimal.ToUInt64(GetDecimal(_reorderMaxBytesPerFlow));
-        reorder["classify_window"] = decimal.ToUInt16(GetDecimal(_reorderClassifyWindow));
-        reorder["ack_demote_max_large"] = decimal.ToUInt16(GetDecimal(_reorderAckDemoteMaxLarge));
-        reorder["small_packet_threshold"] = decimal.ToUInt32(GetDecimal(_reorderSmallPacketThreshold));
-        reorder["reset_mark_packets"] = decimal.ToUInt32(GetDecimal(_reorderResetMarkPackets));
-        reorder["reset_idle_grace_ms"] = decimal.ToUInt32(GetDecimal(_reorderResetIdleGrace));
-        reorder["max_flows"] = decimal.ToUInt32(GetDecimal(_reorderMaxFlows));
-        reorder["global_max_bytes"] = decimal.ToUInt64(GetDecimal(_reorderGlobalMaxBytes));
-        reorder["ingress_idle_sec"] = decimal.ToUInt32(GetDecimal(_reorderIngressIdle));
-        reorder["egress_idle_sec"] = decimal.ToUInt32(GetDecimal(_reorderEgressIdle));
-        _config["reorder_rules"] = rules;
-
-        var advanced = GetOrCreateObject("advanced");
-        advanced["recv_rate_limit"] = decimal.ToInt64(GetDecimal(_recvRateLimit));
-        advanced["udp_gso"] = _udpGso.IsChecked == true;
-        advanced["udp_gro"] = _udpGro.IsChecked == true;
-        advanced["tun_offload"] = _tunOffload.IsChecked == true;
-        advanced["tun_gro"] = _tunGro.IsChecked == true;
-
+        UseDefaultPath = _pathBoxes.All(cb => cb.IsChecked != true);
         if (IsLoaded)
         {
             DialogResult = true;
@@ -626,95 +435,145 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
         }
     }
 
+    // This is the same path used by the Save button and the contract tests.
+    internal bool TryBuildConfiguration(out JsonObject result, out string error)
+    {
+        result = _config.DeepClone().AsObject();
+        error = string.Empty;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_name.Text))
+                throw new InvalidDataException("请填写配置名称。");
+            foreach (var (path, control) in _numbers)
+            {
+                if ((path == "mtu" && _automaticMtu.IsChecked == true && !_config.ContainsKey("tun_mtu")) ||
+                    (path == "reorder.max_wait_ms" && _reorderCustomWait.IsChecked != true) ||
+                    (path == "reorder.cap_packets" && _reorderCustomCap.IsChecked != true)) continue;
+                if (!control.TryRead(out _))
+                    throw new InvalidDataException($"{path} / {(path == "init_max_path_id" ? "InitMaxPathId" : path == "path_mtu" ? "PathMTU" : path)} 必须是 {control.Minimum}–{control.Maximum} 的整数，不能包含小数或指数。");
+            }
+            foreach (var (path, binding) in _bindings)
+            {
+                var current = binding.Read();
+                var original = MqvpnProfileConfiguration.Get(_config, path);
+                // Preserve missing defaults and unedited JSON, but migrate recognized
+                // legacy boolean spellings to actual JSON booleans.
+                var legacyBool = current is JsonValue boolean && boolean.TryGetValue<bool>(out _) &&
+                    original is JsonValue legacy && legacy.TryGetValue<string>(out var text) &&
+                    new[] { "on", "off", "true", "false" }.Contains(text, StringComparer.OrdinalIgnoreCase);
+                if (legacyBool || !JsonNode.DeepEquals(current, binding.Initial))
+                    MqvpnProfileConfiguration.Set(result, path, current);
+            }
+            // Canonicalize only the supported legacy MTU alias, preserving its value.
+            if (_config.ContainsKey("tun_mtu"))
+            {
+                if (!result.ContainsKey("mtu") && _automaticMtu.IsChecked != true)
+                    result["mtu"] = decimal.ToUInt64(_mtu.Value!.Value);
+                result.Remove("tun_mtu");
+            }
+            if (!TryReadReorderRules(out var rules, out error)) return false;
+            if (!JsonNode.DeepEquals(rules, _initialRules)) result["reorder_rules"] = rules;
+            MqvpnProfileConfiguration.Validate(result);
+            if (_routing.SelectedItem is RoutingPolicy policy)
+                RoutingSemantics.ValidateCoreRouteManagement(result, policy);
+            return true;
+        }
+        catch (Exception ex) when (ex is InvalidDataException or FormatException or OverflowException or InvalidOperationException)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    private JsonArray _initialRules = new();
+
+    private void Bind(string path, Func<JsonNode?> read) =>
+        _bindings[path] = (read, read()?.DeepClone());
+
+    private void InitializeBindings()
+    {
+        foreach (var (path, control) in _numbers)
+            Bind(path, () => control.Value is decimal n ? JsonValue.Create(decimal.ToUInt64(n)) : JsonValue.Create(control.Text));
+        Bind("mtu", () => _automaticMtu.IsChecked == true ? null : _mtu.Value is decimal n ? JsonValue.Create(decimal.ToUInt64(n)) : JsonValue.Create(_mtu.Text));
+        Bind("server_addr", () => JsonValue.Create(_server.Text.Trim()));
+        Bind("tls_server_name", () => JsonValue.Create(_sni.Text.Trim()));
+        Bind("auth_key", () => JsonValue.Create(_auth.Password));
+        Bind("tun_name", () => JsonValue.Create(_tunName.Text.Trim()));
+        Bind("redundant_ports", () => JsonValue.Create(_redundantPorts.Text.Trim()));
+        foreach (var (path, box) in new (string, CheckBox)[]
+        {
+            ("insecure", _allowInsecure), ("reconnect", _reconnect), ("manage_routes", _manageRoutes),
+            ("kill_switch", _killSwitch), ("request_server_scheduler", _requestServerScheduler),
+            ("redundant", _redundant), ("pmtud", _pmtud), ("hybrid.enabled", _hybridEnabled), ("reorder.enabled", _reorderEnabled)
+        }) Bind(path, () => JsonValue.Create(box.IsChecked == true));
+        foreach (var (path, combo) in new (string, ComboBox)[]
+        {
+            ("scheduler", _scheduler), ("cc", _congestion), ("reinjection", _reinjection),
+            ("log_level", _logLevel), ("hybrid.tcp", _hybridTcp)
+        }) Bind(path, () => JsonValue.Create(combo.SelectedItem?.ToString() ?? ""));
+        Bind("reorder.max_wait_ms", () => _reorderCustomWait.IsChecked == true ? JsonValue.Create(decimal.ToUInt32(_reorderMaxWait.Value ?? 0)) : null);
+        Bind("reorder.cap_packets", () => _reorderCustomCap.IsChecked == true ? JsonValue.Create(decimal.ToUInt32(_reorderCapPackets.Value ?? 0)) : null);
+        Bind("dns", () => new JsonArray(SplitValues(_dns.Text).Select(s => (JsonNode?)JsonValue.Create(s)).ToArray()));
+        Bind("paths", () => new JsonArray(_pathBoxes.Where(cb => cb.IsChecked == true).Select(cb => (JsonNode?)JsonValue.Create(cb.Tag?.ToString())).ToArray()));
+        if (TryReadReorderRules(out var rules, out _)) _initialRules = rules;
+    }
+
     private void ShowValidation(string message) =>
         FluentUi.ShowAlert(this, message, "配置不完整", isError: true);
 
-    private void SetOptionalString(string name, string value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            _config.Remove(name);
-        else
-            _config[name] = value.Trim();
-    }
-
     private static List<string> SplitValues(string value) =>
-        value.Split([',', ';', '\r', '\n', '\t', ' '], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        value.Split([',', ';', '\r', '\n', '\t', ' '], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
 
-    private static bool IsPowerOfTwo(decimal value)
-    {
-        if (value <= 0 || value > uint.MaxValue)
-            return false;
-        var number = decimal.ToUInt32(value);
-        return (number & (number - 1)) == 0;
-    }
+    private static bool IsPowerOfTwo(decimal value) => MqvpnProfileConfiguration.IsPowerOfTwo(value);
 
-    private static void SaveReorderOverride(JsonObject target, string name, bool enabled, decimal value)
+    private void ConfigureCombo(ComboBox combo, string path)
     {
-        if (!enabled)
-            target.Remove(name);
-        else
-            target[name] = decimal.ToUInt32(value);
-    }
-
-    private static void ConfigureCombo(ComboBox combo, string[] values, string selected)
-    {
+        var field = MqvpnProfileConfiguration.Field(path);
+        var values = field.Choices!;
+        var selected = (MqvpnProfileConfiguration.Get(_config, path) as JsonValue)?.ToString() ?? (string)field.DefaultValue;
         combo.Items.Clear();
         foreach (var item in values)
             combo.Items.Add(item);
         combo.SelectedItem = selected;
-        if (combo.SelectedIndex < 0 && combo.Items.Count > 0)
-            combo.SelectedIndex = 0;
+        if (combo.SelectedIndex < 0)
+        {
+            combo.Items.Add(selected);
+            combo.SelectedItem = selected;
+        }
     }
 
-    private static void ConfigureNumber(NumberBox control, double minimum, double maximum, double value)
+    private void ConfigureNumber(IntegerInput control, string path)
     {
-        control.Minimum = minimum;
-        control.Maximum = maximum;
-        control.MaxDecimalPlaces = 0;
-        control.SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline;
-        control.Value = Math.Clamp(value, minimum, maximum);
+        var field = MqvpnProfileConfiguration.Field(path);
+        control.Minimum = field.Minimum;
+        control.Maximum = field.Maximum;
+        var node = MqvpnProfileConfiguration.Get(_config, path);
+        if (path == "mtu") node ??= _config["tun_mtu"];
+        control.Text = path == "mtu" && _config.ContainsKey("tun_mtu") && _config["tun_mtu"] is null
+            ? "null" : (node ?? field.DefaultNode).ToJsonString();
+        control.ToolTip = $"{path}: {field.Minimum}–{field.Maximum}；默认 {field.DefaultValue}";
+        _numbers[path] = control;
     }
-
-    private static decimal GetDecimal(NumberBox control)
-    {
-        var val = control.Value ?? control.Minimum;
-        if (double.IsNaN(val) || double.IsInfinity(val))
-            val = control.Minimum;
-        return (decimal)Math.Round(Math.Clamp(val, control.Minimum, control.Maximum));
-    }
-
-    private static string ResolveDefaultPhysicalInterface() => ProfileStore.GetDefaultPhysicalInterface();
 
     private string GetString(string name, string fallback = "") =>
-        _config[name]?.GetValue<string>() ?? fallback;
+        GetString(_config, name, MqvpnProfileConfiguration.Fields.FirstOrDefault(f => f.Path == name)?.DefaultValue as string ?? fallback);
 
     private bool GetBoolean(string name, bool fallback) =>
-        GetBoolean(_config, name, fallback);
+        GetBoolean(_config, name, MqvpnProfileConfiguration.Fields.FirstOrDefault(f => f.Path == name)?.DefaultValue is bool value ? value : fallback);
 
     private int GetInteger(string name, int fallback) =>
         GetInteger(_config, name, fallback);
 
     private IReadOnlyList<string> GetStringArray(string name) =>
-        (_config[name] as JsonArray)?.Select(node => node?.GetValue<string>())
+        (_config[name] as JsonArray)?.Select(node => node is JsonValue v && v.TryGetValue<string>(out var text) ? text : null)
             .Where(value => !string.IsNullOrWhiteSpace(value))
             .Cast<string>()
             .ToArray() ?? [];
 
     private JsonObject GetObject(string name) => _config[name] as JsonObject ?? new JsonObject();
 
-    private JsonObject GetOrCreateObject(string name)
-    {
-        if (_config[name] is JsonObject result)
-            return result;
-        result = new JsonObject();
-        _config[name] = result;
-        return result;
-    }
-
     private static string GetString(JsonObject? source, string name, string fallback = "") =>
-        source?[name]?.GetValue<string>() ?? fallback;
+        source?[name] is JsonValue value && value.TryGetValue<string>(out var text) ? text : fallback;
 
     private static bool GetBoolean(JsonObject? source, string name, bool fallback)
     {
@@ -735,24 +594,4 @@ internal sealed partial class ProfileEditorForm : FluentWindow, IDisposable
     private static int GetInteger(JsonObject? source, string name, int fallback) =>
         source?[name] is JsonValue value && value.TryGetValue<int>(out var result) ? result : fallback;
 
-    private static long GetLong(JsonObject? source, string name, long fallback)
-    {
-        if (source?[name] is not JsonValue value) return fallback;
-        if (value.TryGetValue<long>(out var result)) return result;
-        if (value.TryGetValue<uint>(out var unsigned)) return unsigned;
-        return value.TryGetValue<int>(out var integer) ? integer : fallback;
-    }
-
-    private long GetLong(string name, long fallback) => GetLong(_config, name, fallback);
-
-    private static ulong GetUnsignedLong(JsonObject? source, string name, ulong fallback)
-    {
-        if (source?[name] is not JsonValue value)
-            return fallback;
-        if (value.TryGetValue<ulong>(out var unsignedResult))
-            return unsignedResult;
-        return value.TryGetValue<long>(out var signedResult) && signedResult >= 0
-            ? (ulong)signedResult
-            : fallback;
-    }
 }

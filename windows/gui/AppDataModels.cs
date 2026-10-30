@@ -302,6 +302,11 @@ internal sealed class ProfileStore
             ?? throw new InvalidDataException($"配置 {profile.Name} 不是有效 JSON");
     }
 
+    // Same decoding as existing profiles; never writes the selected source.
+    public static JsonObject ReadConfigForImport(string path) =>
+        JsonNode.Parse(ReadMqvpnConfigFile(path)) as JsonObject
+        ?? throw new InvalidDataException("导入配置必须是 JSON 对象。");
+
     public void SaveConfig(ProxyProfile profile, JsonObject config)
     {
         var path = GetConfigPath(profile);
@@ -656,6 +661,8 @@ internal sealed class ProfileStore
             config["paths"] = new JsonArray((resolveDefault ?? GetDefaultPhysicalInterface)());
         if (config["paths"] is not JsonArray { Count: > 0 })
             throw new InvalidOperationException("Windows 连接需要至少一张物理网卡，请在节点设置中选择网卡或启用默认网卡模式。");
+        MqvpnProfileConfiguration.Validate(config, runtime: true);
+        RoutingSemantics.ValidateCoreRouteManagement(config, GetPolicy(profile.RoutingPolicyId));
         return config;
     }
 
@@ -1048,66 +1055,7 @@ internal sealed class ProfileStore
         };
     }
 
-    public static JsonObject CreateDefaultMqvpnConfig() => new()
-    {
-        ["mode"] = "client",
-        ["server_addr"] = string.Empty,
-        ["tls_server_name"] = string.Empty,
-        ["auth_key"] = string.Empty,
-        ["insecure"] = false,
-        ["tun_name"] = "mqvpn0",
-        ["dns"] = new JsonArray("1.1.1.1", "8.8.8.8"),
-        ["log_level"] = "info",
-        ["kill_switch"] = false,
-        ["manage_routes"] = false,
-        ["reconnect"] = true,
-        ["reconnect_interval"] = 5,
-        ["scheduler"] = "wlb",
-        ["request_server_scheduler"] = false,
-        ["cc"] = "bbr2",
-        ["init_max_path_id"] = 0,
-        ["paths"] = new JsonArray(),
-        ["pmtud"] = false,
-        ["path_mtu"] = 0,
-        ["tx_queue_len"] = 0,
-        ["tun_read_batch"] = 0,
-        ["reinjection"] = "off",
-        ["reinjection_srtt_factor_pct"] = 110,
-        ["reinjection_hard_deadline_ms"] = 500,
-        ["reinjection_deadline_lower_bound_ms"] = 20,
-        ["redundant"] = false,
-        ["redundant_ports"] = string.Empty,
-        ["hybrid"] = new JsonObject
-        {
-            ["enabled"] = false,
-            ["tcp"] = "auto",
-            ["tcp_max_flows"] = 256,
-            ["tcp_idle_timeout_sec"] = 300,
-            ["tcp_connect_timeout_sec"] = 10,
-        },
-        ["reorder"] = new JsonObject
-        {
-            ["enabled"] = false,
-            ["max_bytes_per_flow"] = 1572864,
-            ["classify_window"] = 64,
-            ["ack_demote_max_large"] = 3,
-            ["small_packet_threshold"] = 200,
-            ["reset_mark_packets"] = 8,
-            ["reset_idle_grace_ms"] = 10000,
-            ["max_flows"] = 65536,
-            ["global_max_bytes"] = 67108864,
-            ["ingress_idle_sec"] = 30,
-            ["egress_idle_sec"] = 300,
-        },
-        ["advanced"] = new JsonObject
-        {
-            ["recv_rate_limit"] = 0,
-            ["udp_gso"] = true,
-            ["udp_gro"] = true,
-            ["tun_offload"] = true,
-            ["tun_gro"] = true,
-        },
-    };
+    public static JsonObject CreateDefaultMqvpnConfig() => MqvpnProfileConfiguration.CreateDefault();
 
     public static RoutingDocument CreateDefaultRouting()
     {

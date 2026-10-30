@@ -40,6 +40,9 @@ function Invoke-Offline([string]$Exe, [string[]]$Arguments, [string]$LogName) {
     return $text
 }
 $report = Join-Path $ReportDirectory "gui-native-$Arch.json"
+if (-not (Test-Path -LiteralPath (Join-Path $unpacked 'README-GUI.md'))) { throw 'GUI configuration guide missing from final ZIP' }
+$clientExample = Get-Content -LiteralPath (Join-Path $unpacked 'examples/client.json') -Raw | ConvertFrom-Json
+if ($clientExample.mode -ne 'client' -or $clientExample.insecure -ne $false -or $clientExample.manage_routes -ne $false -or $clientExample.paths.Count -ne 0) { throw 'GUI client example contract mismatch' }
 Invoke-Offline (Join-Path $unpacked 'MQVPN.exe') @('--package-check',$unpacked,$Arch,$SourceSha,$report) 'gui-check' | Out-Null
 $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
 if (-not $result.sqliteRoundtrip -or -not $result.kernelUpdateRoundtrip -or $result.sourceSha -ne $SourceSha -or $result.architecture -ne $Arch) { throw 'Native GUI verification report failed' }

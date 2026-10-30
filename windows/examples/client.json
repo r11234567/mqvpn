@@ -1,0 +1,31 @@
+{
+  "mode": "client",
+  "server_addr": "203.0.113.10:443",
+  "tls_server_name": "vpn.example.com",
+  "auth_key": "REPLACE_WITH_THE_SAME_SERVER_PSK",
+  "insecure": false,
+  "tun_name": "mqvpn0",
+  "dns": ["1.1.1.1", "8.8.8.8"],
+  "paths": [],
+  "manage_routes": false,
+  "kill_switch": false,
+  "reconnect": true,
+  "reconnect_interval": 5,
+  "scheduler": "wlb",
+  "request_server_scheduler": false,
+  "cc": "bbr2",
+  "init_max_path_id": 0,
+  "mtu": 0,
+  "pmtud": false,
+  "path_mtu": 0,
+  "reinjection": "off",
+  "redundant": false,
+  "hybrid": {
+    "enabled": true,
+    "tcp": "auto",
+    "tcp_max_flows": 256,
+    "tcp_idle_timeout_sec": 300
+  },
+  "reorder": {"enabled": false},
+  "advanced": {"recv_rate_limit": 0}
+}

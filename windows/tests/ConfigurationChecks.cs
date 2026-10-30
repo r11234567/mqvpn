@@ -61,6 +61,16 @@ internal static class ConfigurationChecks
             PackageChecks.Run();
             return;
         }
+        if (args.FirstOrDefault() == "--verify-config-contract")
+        {
+            ConfigurationAlignmentChecks.VerifyContract(args[1]);
+            return;
+        }
+        if (args.Contains("--configuration"))
+        {
+            ConfigurationAlignmentChecks.Run();
+            return;
+        }
         Console.WriteLine("================================================================================");
         Console.WriteLine("MQVPN GUI production behavior checks");
         Console.WriteLine("================================================================================");
@@ -74,190 +84,11 @@ internal static class ConfigurationChecks
             FluentUi.EnsureApplication();
             FluentUi.SuppressDialogsForTesting = true;
 
-            // -------------------------------------------------------------------------
-            // 痛点 1: 0.19.0-beta-1 严格布尔配置与参数迁移测试
-            // -------------------------------------------------------------------------
-            Console.WriteLine("\n--- [Stage 1] Upstream 0.19.0-beta-1 Schema & Strict Booleans ---");
+            ConfigurationAlignmentChecks.Run();
             var config = ProfileStore.CreateDefaultMqvpnConfig();
             config["server_addr"] = "127.0.0.1:443";
             config["auth_key"] = "test-only-key";
             config["paths"] = new JsonArray("test-adapter");
-            config["tun_mtu"] = 1400;
-            config["custom_root"] = "preserve";
-            // 模拟旧版本传入的 "on" 字符串
-            config["reorder"]!["enabled"] = "on";
-            config["reorder_rules"] = JsonNode.Parse("""
-                [
-                  {"proto":"udp","port":443,"profile":"fiber_lte","max_wait_ms":50,"cap_packets":2048,"custom_rule":true},
-                  {"proto":"udp","port":53,"profile":"default_udp"}
-                ]
-                """);
-
-            using (var form = Create(config))
-            {
-                Check(Field<NumberBox>(form, "_mtu").Value == 1400, "legacy MTU import", "Expected MTU 1400");
-                Check(Field<CheckBox>(form, "_reorderCustomWait").IsChecked != true, "absent global wait remains inherited", "Expected custom wait unchecked");
-
-                // 验证 Reinjection 下拉框中绝不包含已被上游废弃的 dgram 模式
-                var reinjCombo = Field<ComboBox>(form, "_reinjection");
-                var reinjItems = reinjCombo.Items.Cast<object>().Select(x => x.ToString()).ToList();
-                Check(!reinjItems.Contains("dgram"), "0.19.0-beta-1 reinjection does not include obsolete 'dgram'", "Found obsolete 'dgram' in options");
-                Check(reinjItems.Contains("off") && reinjItems.Contains("deadline") && reinjItems.Contains("idle"),
-                    "0.19.0-beta-1 reinjection contains standard modes: off, deadline, idle", "Missing standard reinjection modes");
-
-                SetNumber(form, "_tunQueueLength", 2048);
-                SetNumber(form, "_tunReadBatch", 512);
-                SetNumber(form, "_initMaxPathId", 128);
-
-                // 0.19.0-beta-1 Multipath, PMTUD and Redundant mode checks
-                Field<CheckBox>(form, "_requestServerScheduler").IsChecked = true;
-                Field<CheckBox>(form, "_redundant").IsChecked = true;
-                Check(Field<ComboBox>(form, "_congestion").SelectedItem?.ToString() == "bbr",
-                    "redundant mode auto-recommends CC = bbr", "CC was not switched to bbr");
-                Field<Wpf.Ui.Controls.TextBox>(form, "_redundantPorts").Text = "4200,9000";
-                Field<CheckBox>(form, "_pmtud").IsChecked = true;
-                SetNumber(form, "_pathMtu", 1492);
-                Field<CheckBox>(form, "_tunOffload").IsChecked = true;
-                Field<CheckBox>(form, "_tunGro").IsChecked = true;
-
-                Save(form);
-
-                var saved = form.ResultConfig;
-                Check(saved["mtu"]!.GetValue<int>() == 1400 && !saved.ContainsKey("tun_mtu"), "MTU CLI key migration", "Expected mtu migrated and tun_mtu removed");
-                Check(saved["tx_queue_len"]!.GetValue<int>() == 2048 && saved["tun_read_batch"]!.GetValue<int>() == 512, "TUN tuning saved", "TUN queue/batch mismatch");
-                Check(saved["init_max_path_id"]!.GetValue<uint>() == 128, "core-supported Path ID maximum", "Path ID mismatch");
-                Check(saved["request_server_scheduler"]!.GetValue<bool>() == true, "0.19.0-beta-1 request_server_scheduler saved", "request_server_scheduler mismatch");
-                Check(saved["redundant"]!.GetValue<bool>() == true, "0.19.0-beta-1 redundant saved", "redundant mismatch");
-                Check(saved["redundant_ports"]!.GetValue<string>() == "4200,9000", "0.19.0-beta-1 redundant_ports saved", "redundant_ports mismatch");
-                Check(saved["pmtud"]!.GetValue<bool>() == true, "0.19.0-beta-1 pmtud saved", "pmtud mismatch");
-                Check(saved["path_mtu"]!.GetValue<int>() == 1492, "0.19.0-beta-1 path_mtu saved", "path_mtu mismatch");
-                Check(saved["advanced"]!["tun_offload"]!.GetValue<bool>() == true && saved["advanced"]!["tun_gro"]!.GetValue<bool>() == true,
-                    "0.19.0-beta-1 tun_offload and tun_gro saved", "advanced offload mismatch");
-
-                // 重点痛点：0.19.0-beta-1 严格要求保存出的 JSON 属性必须是原生 JSON 布尔值 (true / false)，字符串 "on"/"off" 会导致内核崩溃
-                var reorderNode = saved["reorder"]!["enabled"];
-                Check(reorderNode is JsonValue jv && jv.TryGetValue<bool>(out var isReorderBool) && isReorderBool,
-                    "0.19.0-beta-1 strict boolean serialization for reorder.enabled (true)", $"Expected boolean true, got {reorderNode?.ToJsonString()}");
-                var hybridNode = saved["hybrid"]!["enabled"];
-                Check(hybridNode is JsonValue jvH && jvH.TryGetValue<bool>(out var isHybridBool) && !isHybridBool,
-                    "0.19.0-beta-1 strict boolean serialization for hybrid.enabled (false)", $"Expected boolean false, got {hybridNode?.ToJsonString()}");
-
-                Check(!saved["reorder"]!.AsObject().ContainsKey("max_wait_ms") && !saved["reorder"]!.AsObject().ContainsKey("cap_packets"),
-                    "preset precedence preserved", "Global overrides unexpectedly present");
-                Check(saved["reorder_rules"]![0]!["profile"]!.GetValue<string>() == "fiber_lte" && saved["reorder_rules"]![1]!["profile"]!.GetValue<string>() == "default_udp",
-                    "independent rule presets", "Rule profiles mismatch");
-                Check(saved["reorder_rules"]![0]!["cap_packets"]!.GetValue<uint>() == 2048, "rule override retained", "Rule cap_packets mismatch");
-                Check(saved["custom_root"]!.GetValue<string>() == "preserve" && saved["reorder_rules"]![0]!["custom_rule"]!.GetValue<bool>(),
-                    "unknown fields retained", "Custom fields not retained");
-
-                using var reopened = Create(JsonNode.Parse(saved.ToJsonString())!.AsObject());
-                Check(Field<NumberBox>(reopened, "_initMaxPathId").Value == 128, "saved config reopens cleanly", "InitMaxPathId mismatch upon reopening");
-                Check(Field<CheckBox>(reopened, "_requestServerScheduler").IsChecked == true, "reopened request_server_scheduler true", "request_server_scheduler false");
-                Check(Field<CheckBox>(reopened, "_redundant").IsChecked == true, "reopened redundant true", "redundant false");
-                Check(Field<Wpf.Ui.Controls.TextBox>(reopened, "_redundantPorts").Text == "4200,9000", "reopened redundant_ports 4200,9000", "redundant_ports mismatch");
-                Check(Field<CheckBox>(reopened, "_pmtud").IsChecked == true, "reopened pmtud true", "pmtud false");
-                Check(Field<NumberBox>(reopened, "_pathMtu").Value == 1492, "reopened path_mtu 1492", "path_mtu mismatch");
-                Check(Field<CheckBox>(reopened, "_tunOffload").IsChecked == true && Field<CheckBox>(reopened, "_tunGro").IsChecked == true,
-                    "reopened tun_offload/tun_gro true", "tun_offload/tun_gro mismatch");
-            }
-
-            using (var form = Create(config))
-            {
-                Field<CheckBox>(form, "_automaticMtu").IsChecked = true;
-                Field<CheckBox>(form, "_reorderEnabled").IsChecked = false;
-                Field<CheckBox>(form, "_reorderCustomWait").IsChecked = true;
-                SetNumber(form, "_reorderMaxWait", 150);
-                Save(form);
-
-                Check(!form.ResultConfig.ContainsKey("mtu") && !form.ResultConfig.ContainsKey("tun_mtu"), "automatic MTU removes both keys", "MTU keys unexpectedly present");
-                Check(form.ResultConfig["reorder_rules"]!.AsArray().Count == 2, "disabled reorder retains rules", "Rules dropped");
-                Check(form.ResultConfig["reorder"]!["max_wait_ms"]!.GetValue<uint>() == 150, "explicit global override", "Max wait override mismatch");
-
-                // 重点痛点：关闭状态必须也是原生 JSON 布尔值 false
-                var reorderDisabledNode = form.ResultConfig["reorder"]!["enabled"];
-                Check(reorderDisabledNode is JsonValue jvOff && jvOff.TryGetValue<bool>(out var offBool) && !offBool,
-                    "0.19.0-beta-1 strict boolean serialization for reorder.enabled (false)", $"Expected boolean false, got {reorderDisabledNode?.ToJsonString()}");
-            }
-
-            // -------------------------------------------------------------------------
-            // 痛点 2: 0.19.0-beta-1 新增参数校验（RedundantPorts、PathMTU）与 Reorder 参数上下限
-            // -------------------------------------------------------------------------
-            Console.WriteLine("\n--- [Stage 2] 0.19.0-beta-1 Bounds & Invariant Validation ---");
-            var legacyPathConfig = config.DeepClone().AsObject();
-            legacyPathConfig["init_max_path_id"] = uint.MaxValue;
-            using (var old = Create(legacyPathConfig))
-            {
-                Check(Field<NumberBox>(old, "_initMaxPathId").Value == uint.MaxValue, "old excessive Path ID is shown without silently clamping it");
-                FluentUi.LastDialogMessage = null;
-                Save(old);
-                Check(FluentUi.LastDialogMessage?.Contains("InitMaxPathId") == true && old.ResultConfig["init_max_path_id"]!.GetValue<uint>() == uint.MaxValue,
-                    "old excessive Path ID requires explicit correction before saving");
-            }
-            using (var form = Create(config))
-            {
-                // 校验 RedundantPorts 端口合法性与上限 16 端口
-                Field<CheckBox>(form, "_redundant").IsChecked = true;
-                FluentUi.LastDialogMessage = null;
-                Field<Wpf.Ui.Controls.TextBox>(form, "_redundantPorts").Text = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17";
-                Save(form);
-                Check(FluentUi.LastDialogMessage != null && FluentUi.LastDialogMessage.Contains("16"),
-                    "RedundantPorts exceeding 16 ports rejected", "Should reject >16 ports");
-
-                FluentUi.LastDialogMessage = null;
-                Field<Wpf.Ui.Controls.TextBox>(form, "_redundantPorts").Text = "4200,70000";
-                Save(form);
-                Check(FluentUi.LastDialogMessage != null && FluentUi.LastDialogMessage.Contains("70000"),
-                    "RedundantPorts out of range (>65535) rejected", "Should reject port 70000");
-
-                FluentUi.LastDialogMessage = null;
-                Field<Wpf.Ui.Controls.TextBox>(form, "_redundantPorts").Text = "4200,0";
-                Save(form);
-                Check(FluentUi.LastDialogMessage != null && FluentUi.LastDialogMessage.Contains("0"),
-                    "RedundantPorts port 0 rejected", "Should reject port 0");
-
-                FluentUi.LastDialogMessage = null;
-                Field<Wpf.Ui.Controls.TextBox>(form, "_redundantPorts").Text = "4200, 9000";
-                SetNumber(form, "_pathMtu", 1000); // PathMTU must be 0 or 1280..9000
-                Save(form);
-                Check(FluentUi.LastDialogMessage != null && FluentUi.LastDialogMessage.Contains("PathMTU"),
-                    "PathMTU < 1280 (non-zero) rejected", "Should reject path mtu 1000");
-
-                FluentUi.LastDialogMessage = null;
-                SetNumber(form, "_pathMtu", 9500);
-                Save(form);
-                Check(FluentUi.LastDialogMessage != null && FluentUi.LastDialogMessage.Contains("PathMTU"),
-                    "PathMTU > 9000 rejected", "Should reject path mtu 9500");
-
-                FluentUi.LastDialogMessage = null;
-                SetNumber(form, "_pathMtu", 1500);
-                Save(form);
-                Check(FluentUi.LastDialogMessage == null && form.ResultConfig["path_mtu"]!.GetValue<int>() == 1500,
-                    "Valid 0.19.0-beta-1 parameters accepted", "Valid parameters unexpectedly rejected");
-            }
-            using (var form = Create(config))
-            {
-                var rows = form.ReorderRuleRows;
-                rows[0].CapPackets = "1000";
-                Check(!ReadRules(form), "non-power-of-two rule rejected", "Power of two validation failed");
-                rows[0].CapPackets = "2048";
-                rows[0].MaxWaitMs = "0";
-                Check(!ReadRules(form), "zero rule wait rejected", "Zero rule wait should be rejected");
-                rows[0].MaxWaitMs = "";
-                rows[1].Port = "443";
-                Check(!ReadRules(form), "duplicate port rejected", "Duplicate port collision should be rejected");
-                rows[1].Port = "53";
-                Check(ReadRules(form), "valid mixed rules accepted", "Valid rules rejected unexpectedly");
-
-                for (var i = 0; i < 15; i++)
-                {
-                    rows.Add(new ReorderRuleRow
-                    {
-                        Port = (10000 + i).ToString(),
-                        Profile = "quic_bulk",
-                    });
-                }
-                Check(!ReadRules(form), "core rule count limit enforced (max 16 rules)", "Core rule count limit not enforced");
-            }
 
             // -------------------------------------------------------------------------
             // 痛点 3: SQLite 数据库迁移、持久化与设置中心 4-in-1
@@ -539,7 +370,7 @@ internal static class ConfigurationChecks
     private static ProfileEditorForm Create(JsonObject config) => new("编辑配置", "欧洲多路径节点 01", config,
         new[] { new RoutingPolicy { Id = "truckersmp", Name = "仅 TruckersMP" } }, "truckersmp");
     private static T Field<T>(object instance, string name) => (T)instance.GetType().GetField(name, Private)!.GetValue(instance)!;
-    private static void SetNumber(object form, string name, double value) => Field<NumberBox>(form, name).Value = value;
+    private static void SetNumber(object form, string name, decimal value) => Field<IntegerInput>(form, name).Value = value;
     private static void Save(ProfileEditorForm form) => typeof(ProfileEditorForm).GetMethod("SaveAndClose", Private)!.Invoke(form, null);
     private static bool ReadRules(ProfileEditorForm form) => (bool)typeof(ProfileEditorForm).GetMethod("TryReadReorderRules", Private)!.Invoke(form, new object?[] { null, null })!;
     
