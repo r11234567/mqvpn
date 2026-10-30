@@ -1,30 +1,6 @@
 name: SNI and H2 Protocol Tests
 
 on:
-  push:
-    branches: [main, dev]
-    paths:
-      - 'src/sni_router.*'
-      - 'src/h2_proxy.*'
-      - 'src/mqvpn_server.c'
-      - 'src/mqvpn_config.c'
-      - 'src/config.*'
-      - 'src/main.c'
-      - 'src/vpn_server.h'
-      - 'src/platform/linux/platform_linux.c'
-      - 'src/platform/linux/server_socket_policy.h'
-      - 'src/server_h3_settings.h'
-      - 'src/hybrid/**'
-      - 'include/libmqvpn.h'
-      - 'tests/test_sni_router.c'
-      - 'tests/test_h2_proxy.c'
-      - 'tests/test_linux_server_socket.c'
-      - 'tests/test_server.c'
-      - 'tests/test_config.c'
-      - 'tests/test_tcp_egress.c'
-      - 'scripts/check_xquic_pin.sh'
-      - '.github/workflows/sni-h2-proxy-tests.yml'
-      - 'CMakeLists.txt'
   pull_request:
     branches: [main, 'sync/**']
   workflow_dispatch:

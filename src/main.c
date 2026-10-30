@@ -331,7 +331,12 @@ main(int argc, char *argv[])
         case 'x': control_addr = optarg; break;
         case 'T': status_mode = 1; break;
         case 'L': log_level_str = optarg; break;
-        case 'V': printf("mqvpn %s\n", mqvpn_version_string()); return 0;
+        case 'V': printf("mqvpn %s\n", mqvpn_version_string());
+#ifdef MQVPN_BUILD_VERSION_STR
+            printf("core %d.%d.%d; callback ABI %d\n", MQVPN_VERSION_MAJOR,
+                   MQVPN_VERSION_MINOR, MQVPN_VERSION_PATCH, MQVPN_CALLBACKS_ABI_VERSION);
+#endif
+            return 0;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
         }

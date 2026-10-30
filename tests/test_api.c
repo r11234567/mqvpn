@@ -911,7 +911,13 @@ TEST(version_string)
 {
     const char *v = mqvpn_version_string();
     ASSERT_NOT_NULL(v);
-    ASSERT_NOT_NULL(strstr(v, EXPECTED_VERSION));
+#ifdef MQVPN_BUILD_VERSION_STR
+    ASSERT_STR_EQ(v, MQVPN_BUILD_VERSION_STR);
+#elif defined(MQVPN_VERSION_SUFFIX_STR)
+    ASSERT_STR_EQ(v, EXPECTED_VERSION MQVPN_VERSION_SUFFIX_STR);
+#else
+    ASSERT_STR_EQ(v, EXPECTED_VERSION);
+#endif
 }
 
 /* ── Client lifecycle (without xquic — expects NULL due to engine init failure) ── */

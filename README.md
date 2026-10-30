@@ -110,7 +110,26 @@ implemented and tested. Do not infer fork status from an old commit alone.
 | xquic WLB flow placement and recovery | **Upstream design with retained fork fixes** | Acknowledged-goodput weights, independent flow/packet deficits, topology refresh and bounded recovery come from upstream. STREAM/control stays on MinRTT. Fork recovery and observability fixes remain in the pinned source. |
 | ~~xquic fixed STREAM reassembly-node limit~~ | ~~Fork-only mitigation~~ **Synchronized from [mp0rta/xquic#71](https://github.com/mp0rta/xquic/pull/71); replaced** | The stronger two-tier budget admits a dense 16 MiB receive window while rejecting sparse-node amplification: 8192 sparse nodes, a 256-byte/node density floor, a 32768 hard ceiling, and a reserved prefix slot for retransmission progress. |
 | xquic Retry sizing, PMTU, receive-buffer, WLB and TLS hardening | **Pinned xquic fork** | The detailed commit-to-fix map remains in [End-to-end fixes carried in the pinned xquic](#end-to-end-fixes-carried-in-the-pinned-xquic). |
-| Rolling native binaries from `main` | **Fork-only** | `.github/workflows/release.yml` updates the native `snapshot` prerelease after platform builds succeed. Native binaries carry a commit-derived version suffix. Canonically signed Android releases remain tag-only; ephemeral Android test APKs stay in workflow artifacts. |
+| Rolling native binaries from `main` | **Fork-only** | `.github/workflows/release.yml` updates the native `snapshot` prerelease after platform builds succeed. Binaries and asset names use an independent `snapshot+UTCtime.gSHA` version. Canonically signed Android releases remain tag-only; ephemeral Android test APKs stay in workflow artifacts. |
+
+Snapshot versions look like `snapshot+20261030T120000Z.g123456789abc`.
+The timestamp is the commit's UTC time, so reruns and all platform builds
+produce the same identity. `mqvpn --version` prints that identity, followed
+by the numeric core version and callback ABI used by the GUI's compatibility
+check. Tagged releases keep their regular numeric version.
+
+Release automation generates `build-version/build-version.cmake` with
+`scripts/resolve_build_version.sh` and loads it using
+`cmake -C "$BUILD_VERSION_FILE" ...`. The tracked `CMakeLists.txt` and shared
+library ABI retain their numeric versions. Debian requires a leading digit,
+so only the `.deb` package metadata uses `0~snapshot+...`; it sorts below
+official releases and installing it over a release may require allowing a
+downgrade. The binary and download filename still use `snapshot+...`.
+
+Each push to this fork's `main` starts CI, CodeQL, gitleaks, Performance
+Tests, Formal, and Release (which publishes the snapshot). H2/SNI integration
+workflows run on PRs; Stress Tests and Performance Weekly remain scheduled or
+manual. The Windows GUI checks run inside CI against its own Windows builds.
 
 ### Client certificate verification against the OS trust store
 

@@ -7,6 +7,10 @@ bundled separately with each kernel. Native dependencies are checked from
 the PE import and delay-import tables; a statically linked core does not
 require `xquic.dll`.
 
+Kernel updates also accept `snapshot+YYYYMMDDTHHMMSSZ.gSHA` builds when
+`mqvpn --version` explicitly reports core 0.19.x and callback ABI 3 on its
+second line. A snapshot label alone is insufficient to establish compatibility.
+
 The main CI builds each required native core once and uploads its executable,
 source/submodule SHAs, file hashes and dependency licenses. The reusable
 `windows-gui.yml` consumes those artifacts from the same run. It has no

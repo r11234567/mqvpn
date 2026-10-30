@@ -1,8 +1,6 @@
 name: H2 Proxy Protocol
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:

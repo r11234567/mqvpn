@@ -519,7 +519,10 @@ internal static class KernelInstaller
     internal static void EnsureMqvpnVersionCompatible(string output)
     {
         var version = Regex.Match(output, @"\bmqvpn\s+(\d+)\.(\d+)\.", RegexOptions.IgnoreCase);
-        if (!version.Success || version.Groups[1].Value != "0" || version.Groups[2].Value != "19")
+        var snapshot = Regex.IsMatch(output, @"(?m)^mqvpn snapshot\+\d{8}T\d{6}Z\.g[0-9a-f]{12}\r?$", RegexOptions.CultureInvariant);
+        var snapshotCore = Regex.IsMatch(output, @"(?m)^core 0\.19\.\d+; callback ABI 3\r?$", RegexOptions.CultureInvariant);
+        if (!(version.Success && version.Groups[1].Value == "0" && version.Groups[2].Value == "19") &&
+            !(snapshot && snapshotCore))
             throw new InvalidDataException("当前 GUI 的配置接口要求 MQVPN 0.19.x；请使用兼容内核或先更新 GUI。");
     }
 

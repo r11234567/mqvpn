@@ -54,9 +54,22 @@ internal static class PackageChecks
             catch (InvalidOperationException) { }
             check(true, "missing exact architecture/component is rejected without fallback");
             KernelInstaller.EnsureMqvpnVersionCompatible("mqvpn 0.19.0");
+            KernelInstaller.EnsureMqvpnVersionCompatible("mqvpn snapshot+20261030T120000Z.g123456789abc\ncore 0.19.0; callback ABI 3\n");
             try { KernelInstaller.EnsureMqvpnVersionCompatible("mqvpn 0.18.0"); throw new Exception("Expected incompatible configuration interface"); }
             catch (InvalidDataException) { }
             check(true, "kernel updates require the supported production configuration interface");
+            foreach (var invalid in new[]
+            {
+                "mqvpn snapshot+20261030T120000Z.g123456789abc",
+                "mqvpn snapshot+20261030T120000Z.g123456789abc\ncore 0.18.0; callback ABI 3\n",
+                "mqvpn snapshot+20261030T120000Z.g123456789abc\ncore 0.19.0; callback ABI 2\n",
+                "mqvpn snapshot+invalid\ncore 0.19.0; callback ABI 3\n",
+            })
+            {
+                try { KernelInstaller.EnsureMqvpnVersionCompatible(invalid); throw new Exception("Expected incompatible snapshot"); }
+                catch (InvalidDataException) { }
+            }
+            check(true, "snapshot kernel identity requires explicit compatible core and callback ABI metadata");
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
     }

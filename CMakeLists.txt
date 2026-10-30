@@ -21,29 +21,9 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 #   3 -> 4  callback ABI 3: the fd-based path and server socket calls are gone
 set(MQVPN_SOVERSION 4)
 
-# Build identity for anything that is not a tagged release. project(VERSION)
-# only accepts numeric version components, so a snapshot cannot express itself
-# there, and leaving it alone made every main build claim to be the release
-# whose number happened to be checked in. Artifacts, the deb version and
-# mqvpn --version then could not be told apart from the real thing.
-#
-# The release workflow passes the suffix for non-tag builds, e.g.
-# "+snapshot.20260922.g1a2b3c4d5e6f". Keep it to characters a Debian version
-# accepts (alphanumerics and . + ~; never "-", which starts the Debian
-# revision) so CPACK_PACKAGE_VERSION stays valid, and keep the leading "+" so
-# it sorts after the release it is built on top of.
-set(MQVPN_VERSION_SUFFIX "" CACHE STRING
-    "Build-identity suffix appended to the release version (snapshot builds)")
-set(MQVPN_FULL_VERSION "${PROJECT_VERSION}${MQVPN_VERSION_SUFFIX}")
-if(MQVPN_VERSION_SUFFIX)
-    if(NOT MQVPN_VERSION_SUFFIX MATCHES "^[+~][A-Za-z0-9.+~]*$")
-        message(FATAL_ERROR
-            "MQVPN_VERSION_SUFFIX must start with + or ~ and contain only "
-            "Debian-safe version characters: ${MQVPN_VERSION_SUFFIX}")
-    endif()
-    add_compile_definitions(MQVPN_VERSION_SUFFIX_STR="${MQVPN_VERSION_SUFFIX}")
-endif()
-message(STATUS "mqvpn build version: ${MQVPN_FULL_VERSION}")
+# Release automation generates an initial-cache file and loads it with -C.
+# Snapshot identity is separate from the numeric project and library ABI.
+include(cmake/BuildVersion.cmake)
 
 # ---------- Options ----------
 option(XQUIC_BUILD_DIR "Path to pre-built xquic build directory" "")
@@ -855,6 +835,8 @@ if(BUILD_TESTING)
     # unconditionally alongside the profile check rather than behind the lane.
     add_test(NAME check_bssl_build_guard
              COMMAND bash ${CMAKE_SOURCE_DIR}/tests/check_bssl_build_guard.sh)
+    add_test(NAME check_build_version
+             COMMAND bash ${CMAKE_SOURCE_DIR}/tests/check_build_version.sh)
     add_executable(test_route_parse_darwin
         tests/test_route_parse_darwin.c src/platform/darwin/routing.c
         src/platform/posix/dns_common.c src/log.c)
@@ -1095,6 +1077,8 @@ if(BUILD_TESTING)
     # unconditionally alongside the profile check rather than behind the lane.
     add_test(NAME check_bssl_build_guard
              COMMAND bash ${CMAKE_SOURCE_DIR}/tests/check_bssl_build_guard.sh)
+    add_test(NAME check_build_version
+             COMMAND bash ${CMAKE_SOURCE_DIR}/tests/check_build_version.sh)
 
     # Committed certificate fixtures must be one consistent set (openssl
     # verify on the DER files + the exact patched bytes the identity tests
@@ -1661,7 +1645,7 @@ if(DPKG_CMD)
 
     set(CPACK_GENERATOR "DEB")
     set(CPACK_DEBIAN_PACKAGE_NAME "mqvpn")
-    set(CPACK_PACKAGE_VERSION "${MQVPN_FULL_VERSION}")
+    set(CPACK_PACKAGE_VERSION "${MQVPN_PACKAGE_VERSION}")
     set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "${DPKG_ARCH}")
     set(CPACK_DEBIAN_FILE_NAME "mqvpn_${MQVPN_FULL_VERSION}_${DPKG_ARCH}.deb")
     set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)

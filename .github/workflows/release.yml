@@ -118,7 +118,7 @@ jobs:
           cmake -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX=/usr \
                 -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
-                -DMQVPN_VERSION_SUFFIX="$VERSION_SUFFIX" \
+                -C "$BUILD_VERSION_FILE" \
                 -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
           make -j$(nproc)
 
@@ -246,7 +246,7 @@ jobs:
                 -DXQUIC_BUILD_DIR="$GITHUB_WORKSPACE/third_party/xquic/build" \
                 -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
                 -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
-                -DMQVPN_VERSION_SUFFIX="$VERSION_SUFFIX" \
+                -C "$BUILD_VERSION_FILE" \
                 -DEVENT_LIB="$(brew --prefix libevent)/lib/libevent.a"
           cmake --build build -j "$(sysctl -n hw.ncpu)"
 
@@ -450,7 +450,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=${{ matrix.arch == 'amd64' && 'x64-windows-static' || 'arm64-windows-static' }} `
             -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON `
-            -DMQVPN_VERSION_SUFFIX="$env:VERSION_SUFFIX" `
+            -C "$env:BUILD_VERSION_FILE" `
             -DBUILD_TESTING=OFF ..
           cmake --build . --config Release
 
@@ -470,12 +470,26 @@ jobs:
             Write-Error "mqvpn.exe --help exited $LASTEXITCODE; output: $out"
             exit 1
           }
-          # Match the literal "Usage:" header that main.c:29 prints. Just
-          # matching "mqvpn" would be too loose (paths, runner output noise
-          # could match accidentally).
+          # Match the literal help banner, not just the program name.
           if (-not ($out -match '(?m)^Usage:')) {
-            Write-Error "mqvpn.exe --help did not print expected 'Usage:' banner; output: $out"
-            exit 1
+            throw "mqvpn.exe --help did not print expected 'Usage:' banner: $out"
+          }
+
+      - name: Verify build identity (Linux/macOS)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          actual=$(build/mqvpn --version)
+          printf '%s\n' "$actual"
+          [ "${actual%%$'\n'*}" = "mqvpn $VERSION" ]
+
+      - name: Verify build identity (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $out = & build/Release/mqvpn.exe --version
+          if ($LASTEXITCODE -ne 0 -or @($out)[0] -cne "mqvpn $env:VERSION") {
+            throw "mqvpn build identity differs from artifact version: $out"
           }
 
       - name: Stage Windows release artifact
@@ -947,6 +961,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Resolve build version
+        run: bash scripts/resolve_build_version.sh >> "$GITHUB_ENV"
+
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -972,17 +989,11 @@ jobs:
             exit 0
           }
 
-          # Recompute the snapshot version exactly as the build jobs did, so
-          # the release title names the version stamped into the assets
-          # instead of only the commit.
-          cmake_version=$(sed -n 's/^project(mqvpn VERSION \([0-9.][0-9.]*\).*/\1/p' CMakeLists.txt)
-          commit_date=$(git show -s --format=%cd --date=format:%Y%m%d "$GITHUB_SHA")
-          short_sha=${GITHUB_SHA:0:12}
-          version="${cmake_version}+snapshot.${commit_date}.g${short_sha}"
           notes=$(printf '%s\n' \
             "Automated prerelease from main at $GITHUB_SHA." \
             "" \
-            "Version \`$version\`. Native assets carry that version, so a snapshot is never mistaken for the \`v${cmake_version}\` release; the \`+\` also makes dpkg sort it after that release." \
+            "Version \`$VERSION\`, derived from the UTC commit time and SHA. Native binaries and asset names carry this independent snapshot identity." \
+            "Debian package metadata uses \`0~$VERSION\` so it remains valid and sorts below official releases." \
             "" \
             "Native assets are replaced after each successful main build." \
             "Android test APKs remain workflow artifacts with an ephemeral signing key; installable signed Android releases are published from v* tags.")
@@ -991,13 +1002,13 @@ jobs:
               "repos/$GITHUB_REPOSITORY/git/refs/tags/snapshot" \
               -f sha="$GITHUB_SHA" -F force=true >/dev/null
             gh release edit snapshot \
-              --title "mqvpn snapshot $version" \
+              --title "mqvpn $VERSION" \
               --notes "$notes" \
               --prerelease
           else
             gh release create snapshot \
               --target "$GITHUB_SHA" \
-              --title "mqvpn snapshot $version" \
+              --title "mqvpn $VERSION" \
               --notes "$notes" \
               --prerelease
           fi
@@ -1007,3 +1018,18 @@ jobs:
                   artifacts/mqvpn_*.zip \
                   artifacts/SHA256SUMS scripts/install.sh LICENSE NOTICE)
           gh release upload snapshot --clobber "${assets[@]}"
+
+          # Timestamped names differ every build; --clobber alone leaves old
+          # binaries attached. Remove obsolete native assets only after every
+          # current asset has uploaded successfully. Preserve other attachments.
+          declare -A current_assets
+          for asset in "${assets[@]}"; do current_assets["${asset##*/}"]=1; done
+          gh release view snapshot --json assets --jq '.assets[].name' > published-assets.txt
+          while IFS= read -r asset; do
+            case "$asset" in
+              mqvpn_*.tar.gz|mqvpn_*.deb|mqvpn_*.zip)
+                if [[ -z "${current_assets[$asset]:-}" ]]; then
+                  gh release delete-asset snapshot "$asset" --yes
+                fi ;;
+            esac
+          done < published-assets.txt
