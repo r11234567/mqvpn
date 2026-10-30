@@ -21,23 +21,10 @@ data class DemoSettings(
     val reorderEnabled: Boolean = false,
     val reorderProfile: String = MqvpnConfig.ReorderProfile.CELLULAR_BOND.name,
     val reorderPorts: String = "443",
-    val redundantEnabled: Boolean = false,
-    val redundantPorts: String = "",
     val hybridEnabled: Boolean = false,
     val hybridTcpMode: String = MqvpnConfig.HybridTcpMode.AUTO.name,
-    val bluetoothPathEnabled: Boolean = false,
-    val pathWifi: Boolean = true,
-    val pathCellular: Boolean = true,
-    val pathEthernet: Boolean = true,
-    val autoReconnect: Boolean = true,
-    val scheduler: String = SchedulerChoice.DEFAULT.name,
     val logLevel: String = MqvpnConfig.LogLevel.INFO.name,
 ) {
-    enum class SchedulerChoice { DEFAULT, MIN_RTT, WLB }
-
-    fun schedulerChoice(): SchedulerChoice =
-        SchedulerChoice.entries.firstOrNull { it.name == scheduler } ?: SchedulerChoice.DEFAULT
-
     fun reorderProfileEnum(): MqvpnConfig.ReorderProfile =
         MqvpnConfig.ReorderProfile.entries.firstOrNull { it.name == reorderProfile }
             ?: MqvpnConfig.ReorderProfile.CELLULAR_BOND
@@ -55,22 +42,6 @@ data class DemoSettings(
             .mapNotNull { it.trim().toIntOrNull() }
             .filter { it in 1..65535 }
 
-    private fun redundantTokens(): List<String> = redundantPorts.split(",").map { it.trim() }
-
-    /** Distinct valid ports; call only when [redundantPortsValid]. */
-    fun parsedRedundantPorts(): List<Int> =
-        if (redundantPorts.isBlank()) emptyList()
-        else redundantTokens().mapNotNull { it.toIntOrNull() }.filter { it in 1..65535 }.distinct()
-
-    /** Same rule as the C parser: all-or-nothing, never degrades to "all UDP". */
-    fun redundantPortsValid(): Boolean {
-        if (redundantPorts.isBlank()) return true
-        val t = redundantPorts.trim()
-        val tokens = redundantTokens()
-        return t.length < 255 && tokens.size <= MAX_REDUNDANT_PORTS &&
-            tokens.all { (it.toIntOrNull() ?: -1) in 1..65535 }
-    }
-
     fun distinctValidPortCount(): Int = parsedReorderPorts().distinct().size
 
     /** Tokens that are non-blank after trimming but don't parse as a valid 1..65535 port. */
@@ -79,40 +50,20 @@ data class DemoSettings(
             .map { it.trim() }
             .filter { it.isNotBlank() && (it.toIntOrNull() ?: -1) !in 1..65535 }
 
-    /** Fails on an invalid redundant port list instead of widening it to all UDP. */
-    fun toMqvpnConfig(): MqvpnConfig {
-        require(!redundantEnabled || redundantPortsValid()) {
-            "Redundant Ports is not a valid port list"
-        }
-        return MqvpnConfig(
-            serverAddress = serverAddress.trim(),
-            serverPort = serverPort,
-            tlsServerName = tlsServerName.trim().ifEmpty { null },
-            authKey = authKey.trim(),
-            insecure = insecure,
-            killSwitch = killSwitch,
-            reorderEnabled = reorderEnabled,
-            reorderProfile = reorderProfileEnum(),
-            reorderPorts = parsedReorderPorts(),
-            redundantEnabled = redundantEnabled,
-            redundantPorts = parsedRedundantPorts(),
-            logLevel = logLevelEnum(),
-            hybridEnabled = hybridEnabled,
-            hybridTcpMode = hybridTcpModeEnum(),
-            bluetoothPathEnabled = bluetoothPathEnabled,
-            wifiPathEnabled = pathWifi,
-            cellularPathEnabled = pathCellular,
-            ethernetPathEnabled = pathEthernet,
-            reconnect = autoReconnect,
-            scheduler = when (schedulerChoice()) {
-                SchedulerChoice.WLB -> MqvpnConfig.Scheduler.WLB
-                else -> MqvpnConfig.Scheduler.MIN_RTT
-            },
-            requestServerScheduler = schedulerChoice() != SchedulerChoice.DEFAULT,
-            // bbr2 slows a path down after random losses, which can leave it too slow for its full copy.
-            cc = if (redundantEnabled) MqvpnConfig.CongestionControl.BBR else MqvpnConfig.CongestionControl.BBR2,
-        )
-    }
+    fun toMqvpnConfig(): MqvpnConfig = MqvpnConfig(
+        serverAddress = serverAddress.trim(),
+        serverPort = serverPort,
+        tlsServerName = tlsServerName.trim().ifEmpty { null },
+        authKey = authKey.trim(),
+        insecure = insecure,
+        killSwitch = killSwitch,
+        reorderEnabled = reorderEnabled,
+        reorderProfile = reorderProfileEnum(),
+        reorderPorts = parsedReorderPorts(),
+        hybridEnabled = hybridEnabled,
+        hybridTcpMode = hybridTcpModeEnum(),
+        logLevel = logLevelEnum(),
+    )
 
     fun hostValid(): Boolean = serverAddress.trim().isNotBlank()
 
@@ -120,11 +71,7 @@ data class DemoSettings(
 
     fun reorderPortsValid(): Boolean = !reorderEnabled || parsedReorderPorts().isNotEmpty()
 
-    /** With every transport off no path is admitted and the tunnel never connects. */
-    fun pathPolicyValid(): Boolean = pathWifi || pathCellular || pathEthernet || bluetoothPathEnabled
-
-    fun isValid(): Boolean = hostValid() && portValid() && reorderPortsValid() &&
-        (!redundantEnabled || redundantPortsValid()) && pathPolicyValid()
+    fun isValid(): Boolean = hostValid() && portValid() && reorderPortsValid()
 
     companion object {
         /**
@@ -135,24 +82,5 @@ data class DemoSettings(
          * `MQVPN_REORDER_MAX_RULES` if either side changes.
          */
         const val MAX_REORDER_PORTS = 16
-
-        /** Mirrors `MQVPN_REDUNDANT_MAX_PORTS` in libmqvpn. */
-        const val MAX_REDUNDANT_PORTS = 16
     }
-}
-
-/** The three desktop-style "how to split traffic" choices. */
-enum class SplitChoice { THROUGHPUT, LOW_LATENCY, REDUNDANT }
-
-/** DEFAULT is shown as LOW_LATENCY (its real conversion is MIN_RTT without a server request). */
-fun DemoSettings.splitChoice(): SplitChoice = when {
-    redundantEnabled -> SplitChoice.REDUNDANT
-    schedulerChoice() == DemoSettings.SchedulerChoice.WLB -> SplitChoice.THROUGHPUT
-    else -> SplitChoice.LOW_LATENCY
-}
-
-fun DemoSettings.applySplitChoice(c: SplitChoice): DemoSettings = when (c) {
-    SplitChoice.THROUGHPUT -> copy(scheduler = DemoSettings.SchedulerChoice.WLB.name, redundantEnabled = false)
-    SplitChoice.LOW_LATENCY -> copy(scheduler = DemoSettings.SchedulerChoice.MIN_RTT.name, redundantEnabled = false)
-    SplitChoice.REDUNDANT -> copy(scheduler = DemoSettings.SchedulerChoice.MIN_RTT.name, redundantEnabled = true)
 }

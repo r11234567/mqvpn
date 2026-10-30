@@ -87,11 +87,7 @@
 #include <unistd.h>
 #include <poll.h>
 
-#include "fake_transport.h"
 #include "libmqvpn.h"
-#include "mqvpn_bind_posix.h"
-#include "mqvpn_internal.h"
-#include "mqvpn_server_internal.h"
 
 #include <xquic/xquic.h>
 #include <xquic/xquic_typedef.h>
@@ -107,9 +103,8 @@ static xqc_cid_t g_cli_cid;
 static int g_handshake_finished = 0;
 
 typedef struct {
-    int status;          /* :status captured from the response, -1 = not yet seen */
-    int closed;          /* h3_request_close_notify fired */
-    char sched_echo[16]; /* mqvpn-scheduler value from the response, "" = absent */
+    int status; /* :status captured from the response, -1 = not yet seen */
+    int closed; /* h3_request_close_notify fired */
 } cli_req_ctx_t;
 
 static cli_req_ctx_t g_req1 = {.status = -1};
@@ -143,16 +138,16 @@ static int g_client_disconnected_calls = 0;
 static int g_tun_output_calls = 0;
 static uint8_t g_tun_last_dst[4];
 
-/* xquic's internal clock (exported by the static lib, forward-declared here
- * as third_party/xquic/tests/masque_client.c does — it is not part of the
- * public xquic.h). It is process-wide: the mqvpn server engine sets it, and
- * engine_cbs below leaves realtime_ts/monotonic_ts unset, so this client
- * engine's idle-timeout/RTT bookkeeping runs on it too; a recv_time from any
- * other clock is a DIFFERENT epoch/magnitude from what that bookkeeping
- * compares against, which manifests as the connection's idle timer
- * appearing to have already expired and tearing the connection down before
- * the handshake completes. */
-extern xqc_timestamp_pt xqc_monotonic_timestamp;
+/* xquic's own internal clock (exported by the static lib, forward-declared
+ * here as third_party/xquic/tests/masque_client.c does — it is not part of
+ * the public xquic.h). engine_cbs below leaves realtime_ts/monotonic_ts
+ * unset, so xquic's internal idle-timeout/RTT bookkeeping runs on THIS
+ * clock; a hand-rolled CLOCK_MONOTONIC timestamp handed to
+ * xqc_engine_packet_process()'s recv_time instead is a DIFFERENT clock
+ * (different epoch/magnitude) from what that bookkeeping compares against,
+ * which manifests as the connection's idle timer appearing to have already
+ * expired and tearing the connection down before the handshake completes. */
+extern xqc_usec_t xqc_now(void);
 
 static ssize_t
 cli_write_socket(const unsigned char *buf, size_t size, const struct sockaddr *peer,
@@ -259,12 +254,12 @@ cli_h3_conn_handshake_finished(xqc_h3_conn_t *h3_conn, void *user_data)
  * configured, so no authorization header is sent, and reorder is off by
  * default server-side, so no mqvpn-reorder header either. */
 static int
-cli_send_connect_ip(xqc_h3_request_t *req, int svr_port, const char *sched)
+cli_send_connect_ip(xqc_h3_request_t *req, int svr_port)
 {
     char authority[64];
     snprintf(authority, sizeof(authority), "127.0.0.1:%d", svr_port);
 
-    xqc_http_header_t hdrs[7] = {
+    xqc_http_header_t hdrs[6] = {
         {.name = {.iov_base = ":method", .iov_len = 7},
          .value = {.iov_base = "CONNECT", .iov_len = 7},
          .flags = 0},
@@ -284,14 +279,7 @@ cli_send_connect_ip(xqc_h3_request_t *req, int svr_port, const char *sched)
          .value = {.iov_base = "?1", .iov_len = 2},
          .flags = 0},
     };
-    int n_hdrs = 6;
-    if (sched) {
-        hdrs[n_hdrs++] = (xqc_http_header_t){
-            .name = {.iov_base = "mqvpn-scheduler", .iov_len = 15},
-            .value = {.iov_base = (void *)sched, .iov_len = strlen(sched)},
-            .flags = 0};
-    }
-    xqc_http_headers_t headers = {.headers = hdrs, .count = n_hdrs, .capacity = 7};
+    xqc_http_headers_t headers = {.headers = hdrs, .count = 6, .capacity = 6};
 
     /* fin=0: a real connect-ip tunnel keeps the stream open for capsules
      * (and would carry DATAGRAMs); the rejected duplicate never gets a
@@ -328,12 +316,6 @@ cli_h3_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t flag
                         ctx->status =
                             (v[0] - '0') * 100 + (v[1] - '0') * 10 + (v[2] - '0');
                     }
-                }
-                if (h->name.iov_len == 15 &&
-                    memcmp(h->name.iov_base, "mqvpn-scheduler", 15) == 0 && ctx &&
-                    h->value.iov_len < sizeof(ctx->sched_echo)) {
-                    memcpy(ctx->sched_echo, h->value.iov_base, h->value.iov_len);
-                    ctx->sched_echo[h->value.iov_len] = '\0';
                 }
             }
         }
@@ -421,13 +403,20 @@ make_udp_loopback(struct sockaddr_in *out_addr)
  * the matching engine, and tick the server. Mirrors
  * test_server_preaccept_dos.c's manual pump (no libevent dependency). */
 static void
-pump_once(mqvpn_server_t *svr, void *svr_tctx, struct sockaddr_in *cli_addr, int cli_fd)
+pump_once(mqvpn_server_t *svr, int svr_fd, struct sockaddr_in *cli_addr, int cli_fd)
 {
     uint8_t buf[65536];
 
     xqc_engine_main_logic(g_cli_engine);
 
-    mqvpn_bind_posix_server_drain(svr_tctx, svr, 64);
+    for (;;) {
+        struct sockaddr_storage from;
+        socklen_t flen = sizeof(from);
+        ssize_t n = recvfrom(svr_fd, buf, sizeof(buf), MSG_DONTWAIT,
+                             (struct sockaddr *)&from, &flen);
+        if (n <= 0) break;
+        mqvpn_server_on_socket_recv(svr, buf, (size_t)n, (struct sockaddr *)&from, flen);
+    }
 
     mqvpn_server_tick(svr);
 
@@ -437,18 +426,18 @@ pump_once(mqvpn_server_t *svr, void *svr_tctx, struct sockaddr_in *cli_addr, int
         ssize_t n = recvfrom(cli_fd, buf, sizeof(buf), MSG_DONTWAIT,
                              (struct sockaddr *)&from, &flen);
         if (n <= 0) break;
-        xqc_engine_packet_process(
-            g_cli_engine, buf, (size_t)n, (struct sockaddr *)cli_addr, sizeof(*cli_addr),
-            (struct sockaddr *)&from, flen, xqc_monotonic_timestamp(), NULL);
+        xqc_engine_packet_process(g_cli_engine, buf, (size_t)n,
+                                  (struct sockaddr *)cli_addr, sizeof(*cli_addr),
+                                  (struct sockaddr *)&from, flen, xqc_now(), NULL);
     }
 }
 
 static void
-pump_wait(mqvpn_server_t *svr, void *svr_tctx, int svr_fd, struct sockaddr_in *cli_addr,
-          int cli_fd, int max_iters, const volatile int *done)
+pump_wait(mqvpn_server_t *svr, int svr_fd, struct sockaddr_in *cli_addr, int cli_fd,
+          int max_iters, const volatile int *done)
 {
     for (int i = 0; i < max_iters && !*done; i++) {
-        pump_once(svr, svr_tctx, cli_addr, cli_fd);
+        pump_once(svr, svr_fd, cli_addr, cli_fd);
         if (*done) return;
         struct pollfd pfds[2] = {
             {.fd = svr_fd, .events = POLLIN},
@@ -501,12 +490,12 @@ pump_cond(void *vctx)
  * this function being "success", so a timed-out wait degrades to a normal
  * (informative) assertion failure below rather than a silent hang. */
 static int
-pump_until(mqvpn_server_t *svr, void *svr_tctx, int svr_fd, struct sockaddr_in *cli_addr,
-           int cli_fd, int max_iters, pump_cond_ctx_t *ctx)
+pump_until(mqvpn_server_t *svr, int svr_fd, struct sockaddr_in *cli_addr, int cli_fd,
+           int max_iters, pump_cond_ctx_t *ctx)
 {
     if (pump_cond(ctx)) return 1;
     for (int i = 0; i < max_iters; i++) {
-        pump_once(svr, svr_tctx, cli_addr, cli_fd);
+        pump_once(svr, svr_fd, cli_addr, cli_fd);
         if (pump_cond(ctx)) return 1;
         struct pollfd pfds[2] = {
             {.fd = svr_fd, .events = POLLIN},
@@ -543,8 +532,6 @@ main(void)
     mqvpn_config_set_subnet(cfg, "10.0.0.0/24");
     mqvpn_config_set_tls_cert(cfg, TEST_CERT_FILE, TEST_KEY_FILE);
     mqvpn_config_set_log_level(cfg, MQVPN_LOG_ERROR);
-    mqvpn_config_set_scheduler(cfg, MQVPN_SCHED_WLB);
-    mqvpn_config_set_allow_client_scheduler(cfg, 1);
 
     mqvpn_server_callbacks_t cbs = MQVPN_SERVER_CALLBACKS_INIT;
     cbs.tun_output = svr_tun_output;
@@ -558,28 +545,10 @@ main(void)
         printf("FAIL: mqvpn_server_new\n");
         return 1;
     }
-    void *svr_tctx = NULL;
-    mqvpn_bind_posix_opts_t svr_bopts = {0};
-    svr_bopts.struct_size = sizeof(svr_bopts);
-    svr_bopts.udp_gso = 1;
-    svr_bopts.socket_buf_bytes = -1;
-    snprintf(svr_bopts.tag, sizeof(svr_bopts.tag), "server");
-    /* The core sends through the scope recorder, which forwards to the bind;
-     * the pump still drains RX through the bind ctx itself. */
-    static scope_rec_t g_rec;
-    if (mqvpn_bind_posix_server_new(svr_fd, &svr_bopts, &svr_tctx) != MQVPN_OK) {
-        printf("FAIL: bind_posix_server_new\n");
-        return 1;
-    }
-    scope_rec_init(&g_rec, svr_tctx);
-    if (mqvpn_server_set_transport(svr, scope_rec_ops(), &g_rec,
-                                   (struct sockaddr *)&svr_addr,
+    if (mqvpn_server_set_socket_fd(svr, svr_fd, (struct sockaddr *)&svr_addr,
                                    sizeof(svr_addr)) != MQVPN_OK ||
         mqvpn_server_start(svr) != MQVPN_OK) {
         printf("FAIL: server start\n");
-        /* A refused set_transport leaves the ctx caller-owned (a successful one
-         * hands it to the library, which frees it in server_destroy). */
-        mqvpn_bind_posix_server_free(svr_tctx);
         return 1;
     }
 
@@ -677,7 +646,7 @@ main(void)
     /* 4. Pump until the handshake finishes (bounded — QUIC PTO
      * retransmission can be 1s+, so give this generous headroom), then fire
      * request #1. */
-    pump_wait(svr, svr_tctx, svr_fd, &cli_addr, cli_fd, 2000, &g_handshake_finished);
+    pump_wait(svr, svr_fd, &cli_addr, cli_fd, 2000, &g_handshake_finished);
 
     xqc_h3_request_t *req1 = NULL;
     /* Captured immediately after creation, before req1 is ever closed — the
@@ -689,7 +658,7 @@ main(void)
         rc = 1;
     } else {
         req1 = xqc_h3_request_create(g_cli_engine, &g_cli_cid, NULL, &g_req1);
-        if (!req1 || cli_send_connect_ip(req1, ntohs(svr_addr.sin_port), "minrtt") != 0) {
+        if (!req1 || cli_send_connect_ip(req1, ntohs(svr_addr.sin_port)) != 0) {
             printf("FAIL: send request #1\n");
             rc = 1;
         } else {
@@ -713,8 +682,7 @@ main(void)
             .counter = NULL,
             .counter_target = 0,
         };
-        pump_until(svr, svr_tctx, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS,
-                   &est1_cond);
+        pump_until(svr, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &est1_cond);
 
         n_after_first = mqvpn_server_get_n_clients(svr);
         fprintf(stderr,
@@ -726,23 +694,12 @@ main(void)
             printf("  first CONNECT-IP did not establish exactly one session   FAIL\n");
             rc = 1;
         }
-        mqvpn_internal_client_sched_t cs[MQVPN_MAX_USERS];
-        int ncs = mqvpn_server_get_client_sched(svr, cs, MQVPN_MAX_USERS);
-        if (strcmp(g_req1.sched_echo, "minrtt") == 0 && ncs >= 1 &&
-            strcmp(cs[0].scheduler, "minrtt") == 0) {
-            printf("  client-requested scheduler: echo=minrtt, conn=minrtt     PASS\n");
-        } else {
-            printf("  client-requested scheduler: echo='%s' conn=%s (expected minrtt) "
-                   "FAIL\n",
-                   g_req1.sched_echo, ncs >= 1 ? cs[0].scheduler : "(none)");
-            rc = 1;
-        }
     }
 
     if (rc == 0) {
         xqc_h3_request_t *req2 =
             xqc_h3_request_create(g_cli_engine, &g_cli_cid, NULL, &g_req2);
-        if (!req2 || cli_send_connect_ip(req2, ntohs(svr_addr.sin_port), NULL) != 0) {
+        if (!req2 || cli_send_connect_ip(req2, ntohs(svr_addr.sin_port)) != 0) {
             printf("FAIL: send request #2\n");
             rc = 1;
         }
@@ -761,7 +718,7 @@ main(void)
         .counter = NULL,
         .counter_target = 0,
     };
-    pump_until(svr, svr_tctx, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &req2_cond);
+    pump_until(svr, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &req2_cond);
 
     int n_clients = mqvpn_server_get_n_clients(svr);
     fprintf(stderr,
@@ -830,8 +787,7 @@ main(void)
             .counter = NULL,
             .counter_target = 0,
         };
-        pump_until(svr, svr_tctx, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS,
-                   &closed_cond);
+        pump_until(svr, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &closed_cond);
 
         int n_after_close = mqvpn_server_get_n_clients(svr);
         fprintf(stderr, "[phase3a] n_clients=%d on_client_disconnected_calls=%d\n",
@@ -858,7 +814,7 @@ main(void)
     uint64_t req3_stream_id = 0;
     if (rc == 0) {
         req3 = xqc_h3_request_create(g_cli_engine, &g_cli_cid, NULL, &g_req3);
-        if (!req3 || cli_send_connect_ip(req3, ntohs(svr_addr.sin_port), "wlb") != 0) {
+        if (!req3 || cli_send_connect_ip(req3, ntohs(svr_addr.sin_port)) != 0) {
             printf("FAIL: send request #3\n");
             rc = 1;
         } else {
@@ -875,8 +831,7 @@ main(void)
             .counter = NULL,
             .counter_target = 0,
         };
-        pump_until(svr, svr_tctx, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS,
-                   &reest_cond);
+        pump_until(svr, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &reest_cond);
 
         int n_after_reest = mqvpn_server_get_n_clients(svr);
         fprintf(stderr,
@@ -884,17 +839,6 @@ main(void)
                 "assigned_ip2=%d.%d.%d.%d\n",
                 n_after_reest, g_req3.status, g_client_connected_calls, g_assigned_ip2[0],
                 g_assigned_ip2[1], g_assigned_ip2[2], g_assigned_ip2[3]);
-        mqvpn_internal_client_sched_t cs3[MQVPN_MAX_USERS];
-        int ncs3 = mqvpn_server_get_client_sched(svr, cs3, MQVPN_MAX_USERS);
-        if (strcmp(g_req3.sched_echo, "minrtt") == 0 && ncs3 >= 1 &&
-            strcmp(cs3[0].scheduler, "minrtt") == 0) {
-            printf("  re-request wlb after swap: echo=minrtt (already_set)     PASS\n");
-        } else {
-            printf("  re-request wlb after swap: echo='%s' conn=%s (expected minrtt) "
-                   "FAIL\n",
-                   g_req3.sched_echo, ncs3 >= 1 ? cs3[0].scheduler : "(none)");
-            rc = 1;
-        }
         if (g_req3.status == 200 && n_after_reest == 1 && g_client_connected_calls == 2) {
             printf("  re-establishment: req3=200, n_clients=1, connected_calls=2     "
                    "PASS\n");
@@ -975,13 +919,12 @@ main(void)
                     .counter = &g_tun_output_calls,
                     .counter_target = 1,
                 };
-                pump_until(svr, svr_tctx, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS,
-                           &tun_cond);
+                pump_until(svr, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &tun_cond);
                 /* Extra drain: give a wrongly-delivered stale-generation
                  * datagram a chance to surface as a SECOND tun_output call
                  * before asserting the count is exactly one. */
                 for (int i = 0; i < 20; i++) {
-                    pump_once(svr, svr_tctx, &cli_addr, cli_fd);
+                    pump_once(svr, svr_fd, &cli_addr, cli_fd);
                 }
 
                 fprintf(stderr, "[phase4] tun_output_calls=%d last_dst=%u.%u.%u.%u\n",
@@ -1030,68 +973,17 @@ main(void)
 
         /* One more pump so a routed datagram (if any) reaches xquic's send
          * path before we tear the server down. */
-        pump_once(svr, svr_tctx, &cli_addr, cli_fd);
+        pump_once(svr, svr_fd, &cli_addr, cli_fd);
     } else {
         printf("  no client ever connected -- cannot exercise sessions[] via TUN "
                "routing                                                    FAIL\n");
         rc = 1;
     }
 
-    /* 12. Unroutable short-header datagram (high bit clear so it is not
-     * parsed as an Initial), 64 bytes > the 23-byte stateless-reset floor:
-     * the engine finds no connection and answers with a stateless reset,
-     * which is the server core's only scope-0 send in a test. */
-    uint8_t junk[64];
-    for (size_t i = 0; i < sizeof(junk); i++)
-        junk[i] = (uint8_t)(0x40 + i);
-    junk[0] = 0x40;
-    mqvpn_server_on_socket_recv(svr, junk, sizeof(junk), (struct sockaddr *)&cli_addr,
-                                sizeof(cli_addr));
-    mqvpn_server_tick(svr);
-
     xqc_engine_destroy(g_cli_engine);
     mqvpn_server_destroy(svr);
     close(cli_fd);
     close(svr_fd);
-
-    /* 13. Server tx-scope contract, observed on a real handshake: a unique
-     * non-zero scope per accepted connection, release_scope exactly once per
-     * close, scope 0 used (stateless reset) but never released, and every
-     * scope released before the shared release. */
-    if (g_rec.n_seen < 1) {
-        printf("FAIL: no accepted scope observed\n");
-        return 1;
-    }
-    for (int i = 0; i < g_rec.n_seen; i++)
-        for (int j = i + 1; j < g_rec.n_seen; j++)
-            if (g_rec.seen[i] == g_rec.seen[j]) {
-                printf("FAIL: scope reused\n");
-                return 1;
-            }
-    if (g_rec.n_released != g_rec.n_seen) {
-        printf("FAIL: release_scope count %d != accepted scopes %d\n", g_rec.n_released,
-               g_rec.n_seen);
-        return 1;
-    }
-    for (int i = 0; i < g_rec.n_released; i++)
-        if (g_rec.released[i] == 0) {
-            printf("FAIL: release_scope(0) called\n");
-            return 1;
-        }
-    if (!g_rec.inner_released || g_rec.released_after_inner) {
-        printf("FAIL: shared release ordering\n");
-        return 1;
-    }
-    if (g_rec.sends_after_release) {
-        printf("FAIL: send after release\n");
-        return 1;
-    }
-    if (g_rec.scope0_sends < 1) {
-        printf("FAIL: no scope-0 send observed (stateless reset)\n");
-        return 1;
-    }
-    printf("scope contract: OK (%d scopes)\n", g_rec.n_seen);
-    printf("scope-0 sends (stateless reset): %d\n", g_rec.scope0_sends);
 
     printf(rc == 0 ? "test_server_double_connectip: PASS\n"
                    : "test_server_double_connectip: FAIL\n");

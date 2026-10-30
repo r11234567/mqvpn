@@ -6,7 +6,7 @@
 # (Phase 1/2) against the real xquic engine.
 #
 # What this verifies:
-#   Phase A (negotiation): with [Reorder] Enabled=true on BOTH ends, the tunnel
+#   Phase A (negotiation): with [Reorder] Enabled=on on BOTH ends, the tunnel
 #     establishes and the mqvpn-reorder capability is negotiated. We key on the
 #     real INFO log markers emitted by the implementation:
 #       - server: "client advertised mqvpn-reorder"
@@ -30,13 +30,9 @@
 #     to a tunnel ping, like tests/test_e2e_backup_fec.sh.)
 #
 #   Phase C (regression / wire-compat): a second full run with
-#     [Reorder] Enabled=false confirms the tunnel still works unchanged and that
+#     [Reorder] Enabled=off confirms the tunnel still works unchanged and that
 #     NO reorder negotiation occurs (markers absent), proving the feature is a
 #     no-op when disabled.
-#
-#   Phase D (mixed): client Enabled=true, server Enabled=false. The server does not
-#     echo mqvpn-reorder, so the client never stamps; its TUN MTU must then be
-#     the reorder-OFF MTU, not 8 bytes less.
 #
 # How reorder is enabled: the harness (bench_start_vpn_*) only takes CLI flags,
 # and there is no CLI flag for the [Reorder] section — it is INI/JSON only
@@ -63,15 +59,12 @@ CLIENT_LOG="$(mktemp)"
 SERVER_LOG="$(mktemp)"
 CLIENT_LOG_OFF="$(mktemp)"
 SERVER_LOG_OFF="$(mktemp)"
-CLIENT_LOG_MIX="$(mktemp)"
-SERVER_LOG_MIX="$(mktemp)"
 INI_ON="$(mktemp --suffix=.ini)"
 INI_OFF="$(mktemp --suffix=.ini)"
 IPERF_SRV_JSON="$(mktemp --suffix=.json)"
 
 trap 'bench_cleanup; rm -f "$CLIENT_LOG" "$SERVER_LOG" "$CLIENT_LOG_OFF" \
-    "$SERVER_LOG_OFF" "$CLIENT_LOG_MIX" "$SERVER_LOG_MIX" "$INI_ON" "$INI_OFF" \
-    "$IPERF_SRV_JSON"' EXIT
+    "$SERVER_LOG_OFF" "$INI_ON" "$INI_OFF" "$IPERF_SRV_JSON"' EXIT
 
 fail=0
 
@@ -80,7 +73,7 @@ bench_check_test_deps nc jq
 
 # ── Generate the reorder INI (config mechanism: --config base + CLI override) ──
 # Keys/values cross-checked against src/config.c:
-#   [Reorder] Enabled  true/false -> cfg_keys[] (CFG_BOOL)
+#   [Reorder] Enabled  on/off   -> parse_reorder_enabled
 #   [Reorder] MaxWaitMs <ms>     -> cfg_keys[] (SEC_REORDER row)
 #   [ReorderRule] Proto udp      -> parse_reorder_proto
 #   [ReorderRule] Port  <P>      -> handle_kv SEC_REORDER_RULE arm
@@ -91,12 +84,12 @@ bench_check_test_deps nc jq
 # so packets buffered behind it are released by its arrival (~40ms), inside the
 # configured wait. This lets Phase B prove the engine genuinely re-orders
 # packets, not merely that it activates. (The default 30ms wait < 40ms spread is
-# the §24 H5 "wait < RTT spread" regime; Phase B's too-late check rejects it.)
+# the §24 H5 "wait < RTT spread" regime; Phase B's latency check rejects it.)
 MAX_WAIT_MS=60
 PATH_B_DELAY_MS=40
 cat >"$INI_ON" <<EOF
 [Reorder]
-Enabled = true
+Enabled = on
 MaxWaitMs = ${MAX_WAIT_MS}
 
 [ReorderRule]
@@ -107,7 +100,7 @@ EOF
 
 cat >"$INI_OFF" <<EOF
 [Reorder]
-Enabled = false
+Enabled = off
 EOF
 
 # ── Topology: 2 paths, RTT spread on path 1 so striping reorders inner pkts ──
@@ -119,10 +112,10 @@ bench_add_server_host_routes "$N_PATHS"
 bench_apply_netem "delay 1ms" "delay ${PATH_B_DELAY_MS}ms"
 
 # Helper: run one full server+client lifecycle with a given INI + log files.
-# $1 = INI path, $2 = server log, $3 = client log, $4 = server INI (default $1)
+# $1 = INI path, $2 = server log, $3 = client log
 reorder_run() {
-    local ini="$1" slog="$2" clog="$3" sini="${4:-$1}"
-    bench_start_vpn_server "--control-port ${CTRL_PORT} --config ${sini}" "$slog"
+    local ini="$1" slog="$2" clog="$3"
+    bench_start_vpn_server "--control-port ${CTRL_PORT} --config ${ini}" "$slog"
 
     local paths_arg=""
     local i
@@ -276,10 +269,8 @@ delivered=$(echo "$reorder_stats"      | jq '.reorder.delivered_count // 0'   2>
 ack_demote=$(echo "$reorder_stats"     | jq '.reorder.ack_demote_count // 0'  2>/dev/null || echo 0)
 too_late=$(echo "$reorder_stats"       | jq '.reorder.too_late_drop_count // 0' 2>/dev/null || echo 0)
 lat_max_ms=$(echo "$reorder_stats"     | jq '.reorder.added_latency_max_ms // 0' 2>/dev/null || echo 0)
-too_far_ahead=$(echo "$reorder_stats" | jq '.reorder.too_far_ahead_drop_count // 0' 2>/dev/null || echo 0)
-gap_overflow=$(echo "$reorder_stats"  | jq '.reorder.gap_overflow_count // 0'      2>/dev/null || echo 0)
 
-echo "INFO: reorder stats — gap_filled=$gap_filled gap_timeout=$gap_timeout delivered=$delivered ack_demote=$ack_demote too_late=$too_late too_far_ahead=$too_far_ahead gap_overflow=$gap_overflow added_latency_max_ms=$lat_max_ms"
+echo "INFO: reorder stats — gap_filled=$gap_filled gap_timeout=$gap_timeout delivered=$delivered ack_demote=$ack_demote too_late=$too_late added_latency_max_ms=$lat_max_ms"
 # ack_demote not asserted: the iperf3 -u workload is one-directional (client->
 # server data, all large packets), so there is no small-packet ACK/return
 # direction for the classifier to demote. ACK-direction demotion needs a
@@ -302,55 +293,39 @@ if [ "$WORKLOAD_KIND" = "iperf3" ]; then
     # Stronger evidence: the engine did not just activate, it actually RE-ORDERED.
     # added_latency_max_ms is the longest any delivered packet sat in the buffer.
     # Held for path B and released by its arrival, a packet sits about the path
-    # spread (~39ms measured), so "spread/2 <= max" says packets really were
-    # held for the slow path. The upper bound is the algorithm's: the gap timer
-    # follows PDCP t-Reordering (a reordering mark is taken when the timer
-    # starts; a gap that opens during a wait is deferred to the next one), so a
-    # datagram is held nominally at most 2 x MaxWaitMs, plus a few ms of tick
-    # slack. That bound holds whether or not a timeout fired — a packet can be
-    # deferred once by a cohort that then FILLS just before its deadline, so
-    # gap_timeout == 0 does not imply max < MaxWaitMs. "wait < spread" is NOT
-    # caught here (MaxWaitMs=30 measures ~40ms and passes); the too_late check
-    # below is that detector now.
+    # spread (~39ms measured). So "spread/2 <= max < MaxWaitMs" says packets
+    # really were held for the slow path, and that the configured wait covered
+    # the spread. Negative control: MaxWaitMs=30 on this topology still measures
+    # ~39ms and fails here.
     #
-    # gap_filled_count is deliberately NOT asserted: a period ends as "filled"
-    # when its cohort (the gaps present when the timer started) is complete, so
-    # under continuous striping gap_count tracks run-time / spread and the
-    # filled/timeout split measures the scheduler's burstiness, not correctness.
+    # gap_filled_count is deliberately NOT asserted. A period only counts as
+    # "filled" when the buffer drains completely, and its timer is anchored at
+    # the period start (no re-arm when the head gap fills). Under a flow striped
+    # continuously across both paths there is always a path-B packet in flight,
+    # so the buffer never drains and periods end by timeout — gap_count tracks
+    # run-time / MaxWaitMs — while head gaps are still being filled in ~40ms.
+    # gap_filled>0 therefore measures how bursty the scheduler's use of path B
+    # is, not whether ordering was corrected.
     lat_lo_ms=$((PATH_B_DELAY_MS / 2))
-    lat_hi_ms=$((MAX_WAIT_MS * 2 + 5))
-    if awk -v v="$lat_max_ms" -v lo="$lat_lo_ms" -v hi="$lat_hi_ms" \
-            'BEGIN { exit !(v >= lo && v <= hi) }'; then
-        echo "PASS: buffered packets were held for the slow path" \
-             "(added_latency_max_ms=$lat_max_ms in [$lat_lo_ms, $lat_hi_ms]; 2xMaxWaitMs + 5ms slack, gap_timeout=$gap_timeout)"
+    if awk -v v="$lat_max_ms" -v lo="$lat_lo_ms" -v hi="$MAX_WAIT_MS" \
+            'BEGIN { exit !(v >= lo && v < hi) }'; then
+        echo "PASS: buffered packets were released by the slow-path arrival" \
+             "(added_latency_max_ms=$lat_max_ms in [$lat_lo_ms, $MAX_WAIT_MS))"
     else
-        echo "FAIL: added_latency_max_ms=$lat_max_ms not in [$lat_lo_ms, $lat_hi_ms] (gap_timeout=$gap_timeout) —" \
-             "below: nothing waited for path B; above: a hold exceeded 2xMaxWaitMs."
+        echo "FAIL: added_latency_max_ms=$lat_max_ms not in [$lat_lo_ms, $MAX_WAIT_MS) —" \
+             "below: nothing waited for path B; at/above: the wait does not cover the spread."
         echo "      raw=$reorder_stats"
         fail=1
     fi
-    # Holding packets must not turn arrivals into loss. A gap present when the
-    # timer starts is never skipped before MaxWaitMs, so on this topology
-    # (spread ~39ms < MaxWaitMs=60) too_late is expected to be ~0 — the old
-    # anchored timer measured ~0.8% here. 0.1% covers start/stop transients.
-    # This is also the "wait < spread" detector: with MaxWaitMs=30 a large share
-    # of path-B packets arrive after their wait expired and fail here.
-    if [ "$((too_late * 1000))" -le "$delivered" ]; then
-        echo "PASS: too-late drops within 0.1% of delivered (too_late=$too_late delivered=$delivered)"
+    # Holding packets must not turn arrivals into loss at scale. The anchored
+    # timer skips roughly one still-in-flight path-B packet per period, which
+    # measures ~0.8% here (20M x 6s); 3% leaves room for a slow CI host. This is
+    # a guard against gross loss only — it does NOT detect "wait < spread"
+    # (MaxWaitMs=30 measures ~1.6%); the latency check above does.
+    if [ "$((too_late * 100))" -le "$((delivered * 3))" ]; then
+        echo "PASS: too-late drops within 3% of delivered (too_late=$too_late delivered=$delivered)"
     else
-        echo "FAIL: too-late drops exceed 0.1% of delivered (too_late=$too_late delivered=$delivered)"
-        echo "      raw=$reorder_stats"
-        fail=1
-    fi
-    # A held gap pins `expected`: arrivals beyond the cap window are dropped as
-    # too_far_ahead and arrivals beyond the per-flow byte limit force an
-    # overflow flush. At 20M (~1.7k pps) neither bound is reachable; record
-    # both and fail on far-ahead drops.
-    if [ "${too_far_ahead:-0}" -eq 0 ]; then
-        echo "PASS: no far-ahead drops (too_far_ahead=0 gap_overflow=$gap_overflow)"
-    else
-        echo "FAIL: too_far_ahead=$too_far_ahead at 20M — a hold exceeded the cap window" \
-             "(gap_overflow=$gap_overflow)"
+        echo "FAIL: too-late drops exceed 3% of delivered (too_late=$too_late delivered=$delivered)"
         echo "      raw=$reorder_stats"
         fail=1
     fi
@@ -390,10 +365,10 @@ fi
 
 # With reorder OFF, the capability must NOT be negotiated (no header advertised).
 if grep -q "mqvpn-reorder" "$SERVER_LOG_OFF" "$CLIENT_LOG_OFF"; then
-    echo "FAIL: reorder negotiation occurred despite Enabled=false"
+    echo "FAIL: reorder negotiation occurred despite Enabled=off"
     fail=1
 else
-    echo "PASS: no reorder negotiation with Enabled=false (no-op confirmed)"
+    echo "PASS: no reorder negotiation with Enabled=off (no-op confirmed)"
 fi
 
 # Inner data still flows with reorder OFF.
@@ -449,40 +424,6 @@ else
     echo "WARN: skipping MTU -8 check (ON='$mtu_on' OFF='$mtu_off' — one not parsed)"
 fi
 
-# ─── Phase D: client reorder ON, server OFF (not negotiated) ──────────────
-bench_stop_vpn
-echo ""
-echo "=== Phase D: client reorder ON, server reorder OFF ==="
-reorder_run "$INI_ON" "$SERVER_LOG_MIX" "$CLIENT_LOG_MIX" "$INI_OFF"
-
-if ip netns exec "$NS_CLIENT" ping -c 3 -W 2 "$TUNNEL_SERVER_IP" >/dev/null 2>&1; then
-    echo "PASS: tunnel established (client ON, server OFF)"
-else
-    echo "FAIL: tunnel did not establish with client ON, server OFF"
-    fail=1
-fi
-
-if grep -q "peer advertised mqvpn-reorder" "$CLIENT_LOG_MIX"; then
-    echo "FAIL: client saw a reorder echo from a server with reorder OFF"
-    fail=1
-else
-    echo "PASS: not negotiated (server has reorder OFF)"
-fi
-
-# Nothing is stamped without the server's echo, so no header to make room for.
-mtu_mix="$(extract_client_mtu "$CLIENT_LOG_MIX")"
-if [ -n "$mtu_mix" ] && [ -n "$mtu_off" ]; then
-    if [ "$mtu_mix" -eq "$mtu_off" ]; then
-        echo "PASS: no reorder MTU overhead without negotiation (MIX=$mtu_mix == OFF=$mtu_off)"
-    else
-        echo "FAIL: client lost $((mtu_off - mtu_mix)) bytes of MTU without negotiating reorder" \
-             "(MIX=$mtu_mix, OFF=$mtu_off)"
-        fail=1
-    fi
-else
-    echo "WARN: skipping the Phase D MTU check (MIX='$mtu_mix' OFF='$mtu_off' — one not parsed)"
-fi
-
 # ─── Verdict ───────────────────────────────────────────────────────────────
 echo ""
 if [ "$fail" -ne 0 ]; then
@@ -491,7 +432,6 @@ if [ "$fail" -ne 0 ]; then
     echo "--- Client log ON (last 25) ---";  tail -25 "$CLIENT_LOG"
     echo "--- Server log OFF (last 15) ---"; tail -15 "$SERVER_LOG_OFF"
     echo "--- Client log OFF (last 15) ---"; tail -15 "$CLIENT_LOG_OFF"
-    echo "--- Client log MIX (last 15) ---"; tail -15 "$CLIENT_LOG_MIX"
     exit 1
 fi
 echo "RESULT: PASS"

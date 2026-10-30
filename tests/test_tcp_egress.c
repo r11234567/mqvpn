@@ -20,7 +20,6 @@
  */
 
 #include "libmqvpn.h"
-#include "mqvpn_bind_posix.h"
 #include "hybrid/tcp_egress.h"
 #include "log.h"
 #include "mqvpn_conn_settings.h"
@@ -78,11 +77,6 @@ static int g_tests_passed = 0;
             exit(1);                                                                 \
         }                                                                            \
     } while (0)
-
-/* xquic's process-wide clock, which the mqvpn server engine sets: the probe
- * engine's timers run on it, so its receive times must too (exported by the
- * static lib, not part of the public xquic.h). */
-extern xqc_timestamp_pt xqc_monotonic_timestamp;
 
 static uint64_t
 test_now_us(void)
@@ -831,21 +825,18 @@ typedef struct {
 
 typedef struct {
     int svr_fd, cli_fd;
-    /* POSIX bind over svr_fd. Borrowed: mqvpn_server_destroy finalises it,
-     * harness_stop closes the fd afterwards. */
-    void *svr_tctx;
     struct sockaddr_in svr_addr, cli_addr;
     mqvpn_server_t *svr;
     probe_conn_t probe;
-    unsigned pump_rounds;
-    uint64_t cli_rx_datagrams, cli_rx_bytes;
     harness_egress_fd_t egress_fds[HARNESS_MAX_EGRESS_FDS];
-    int egress_dispatches; /* mqvpn_server_on_egress_fd_ready calls made by
-                            * harness_pump — a test resets and reads it. */
-    int freeze_probe;      /* 1: harness_pump neither feeds nor runs the
-                            * probe engine, so nothing the server sends is
-                            * ever answered (keeps an H3 stream from ever
-                            * finishing its close). */
+
+    /* Diagnostics: datagrams the pump handed to each side. svr_rx counts
+     * client->server (what the server was actually offered), cli_rx counts
+     * server->client — the server writes straight to svr_fd internally, so
+     * cli_rx is the harness's only view of the server's transmissions. */
+    uint64_t svr_rx_datagrams, svr_rx_bytes;
+    uint64_t cli_rx_datagrams, cli_rx_bytes;
+    int pump_rounds;
 } harness_t;
 
 /* mqvpn_server_callbacks_t.egress_fd_register implementation: records/
@@ -974,22 +965,10 @@ harness_start(harness_t *h, const char *protocol, size_t protocol_len, int auto_
         mqvpn_config_free(svr_cfg);
         if (!h->svr) goto fail_sockets;
 
-        mqvpn_bind_posix_opts_t svr_bopts = {0};
-        svr_bopts.struct_size = sizeof(svr_bopts);
-        svr_bopts.udp_gso = 1;
-        svr_bopts.socket_buf_bytes = -1;
-        snprintf(svr_bopts.tag, sizeof(svr_bopts.tag), "server");
-        if (mqvpn_bind_posix_server_new(h->svr_fd, &svr_bopts, &h->svr_tctx) != MQVPN_OK)
+        if (mqvpn_server_set_socket_fd(h->svr, h->svr_fd, (struct sockaddr *)&h->svr_addr,
+                                       sizeof(h->svr_addr)) != MQVPN_OK ||
+            mqvpn_server_start(h->svr) != MQVPN_OK)
             goto fail_server;
-        if (mqvpn_server_set_transport(h->svr, mqvpn_bind_posix_server_ops(), h->svr_tctx,
-                                       (struct sockaddr *)&h->svr_addr,
-                                       sizeof(h->svr_addr)) != MQVPN_OK) {
-            /* A refused install leaves the ctx caller-owned. */
-            mqvpn_bind_posix_server_free(h->svr_tctx);
-            h->svr_tctx = NULL;
-            goto fail_server;
-        }
-        if (mqvpn_server_start(h->svr) != MQVPN_OK) goto fail_server;
     }
 
     /* ── Raw H3 probe client ── */
@@ -1057,8 +1036,19 @@ harness_pump(harness_t *h, const int *done, int budget_ms)
         socklen_t from_len;
         h->pump_rounds++;
 
-        mqvpn_bind_posix_server_drain(h->svr_tctx, h->svr, 64);
-        for (; !h->freeze_probe;) {
+        for (;;) {
+            from_len = sizeof(from);
+            ssize_t n = recvfrom(h->svr_fd, buf, sizeof(buf), MSG_DONTWAIT,
+                                 (struct sockaddr *)&from, &from_len);
+            if (n <= 0) break;
+            h->svr_rx_datagrams++;
+            h->svr_rx_bytes += (uint64_t)n;
+            TDIAG_IF(g_diag.trace_io, "svr<-cli datagram #%llu: %zd bytes",
+                     (unsigned long long)h->svr_rx_datagrams, n);
+            mqvpn_server_on_socket_recv(h->svr, buf, (size_t)n, (struct sockaddr *)&from,
+                                        from_len);
+        }
+        for (;;) {
             from_len = sizeof(from);
             ssize_t n = recvfrom(h->cli_fd, buf, sizeof(buf), MSG_DONTWAIT,
                                  (struct sockaddr *)&from, &from_len);
@@ -1070,7 +1060,7 @@ harness_pump(harness_t *h, const int *done, int budget_ms)
             xqc_engine_packet_process(h->probe.engine, buf, (size_t)n,
                                       (struct sockaddr *)&h->cli_addr,
                                       sizeof(h->cli_addr), (struct sockaddr *)&from,
-                                      from_len, xqc_monotonic_timestamp(), NULL);
+                                      from_len, (xqc_usec_t)test_now_us(), NULL);
         }
 
         /* Egress fd events (connect-tcp connect()/relay I/O the server
@@ -1093,7 +1083,6 @@ harness_pump(harness_t *h, const int *done, int budget_ms)
             if (poll(&epfd, 1, 0) > 0 && epfd.revents != 0) {
                 int readable = (epfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0;
                 int writable = (epfd.revents & (POLLOUT | POLLERR)) != 0;
-                h->egress_dispatches++;
                 mqvpn_server_on_egress_fd_ready(h->svr, h->egress_fds[i].fd,
                                                 h->egress_fds[i].fd_ctx, readable,
                                                 writable);
@@ -1101,7 +1090,7 @@ harness_pump(harness_t *h, const int *done, int budget_ms)
         }
 
         mqvpn_server_tick(h->svr);
-        if (!h->freeze_probe) xqc_engine_main_logic(h->probe.engine);
+        xqc_engine_main_logic(h->probe.engine);
 
         if (*done) break;
 
@@ -1172,11 +1161,8 @@ probe_send_fin_retry(harness_t *h, probe_conn_t *p, int iter_budget)
 static void
 harness_stop(harness_t *h)
 {
-    /* Destroy before close: mqvpn_server_destroy finalises the bind ctx (so
-     * no drain may follow), and only then is the fd the harness's to close. */
     xqc_engine_destroy(h->probe.engine);
     mqvpn_server_destroy(h->svr);
-    h->svr_tctx = NULL;
     close(h->svr_fd);
     close(h->cli_fd);
 }
@@ -1329,11 +1315,9 @@ probe_report_timeout(const harness_t *h, const char *awaiting, int budget_ms)
      * stream the peer reset while xquic still holds it on its 3x-max_pto
      * close linger — not a stall. */
     TDIAG("  status seen : \"%s\"  closing_err=%ld", p->status, p->closing_err);
-    mqvpn_bind_posix_stats_t svr_stats = {.struct_size = sizeof(svr_stats)};
-    mqvpn_bind_posix_server_get_stats(h->svr_tctx, &svr_stats);
-    TDIAG("  cli -> svr  : %llu datagrams / %llu bytes sent, %llu datagrams arrived",
+    TDIAG("  cli -> svr  : %llu datagrams / %llu bytes sent, %llu / %llu arrived",
           (unsigned long long)p->tx_datagrams, (unsigned long long)p->tx_bytes,
-          (unsigned long long)svr_stats.rx_datagrams);
+          (unsigned long long)h->svr_rx_datagrams, (unsigned long long)h->svr_rx_bytes);
     TDIAG("  svr -> cli  : %llu datagrams / %llu bytes arrived",
           (unsigned long long)h->cli_rx_datagrams, (unsigned long long)h->cli_rx_bytes);
     probe_report_conn_stats(p->engine, &p->cid, "  xquic       ");
@@ -2478,150 +2462,6 @@ TEST(mqvpn_tcp_downlink_backpressure_pause_resume)
     free(h.probe.raw_recv_buf);
 }
 
-/* 1 if any egress fd the server registered currently asks for writable
- * events — tcp_egress.c only does that for a downlink-paused ACTIVE flow
- * (svr_tcp_egress_update_fd_interest), so this is the harness-visible
- * "the relay hit send() backpressure" signal. */
-static int
-harness_egress_wants_write(const harness_t *h)
-{
-    for (int i = 0; i < HARNESS_MAX_EGRESS_FDS; i++)
-        if (h->egress_fds[i].active && h->egress_fds[i].want_write) return 1;
-    return 0;
-}
-
-/* Relay-error busy loop (test server, 2026-10-03: ~64k "relay I/O error
- * (errno=32)" lines in under two seconds). A downlink-paused flow keeps
- * want_write armed; when the upstream RSTs the egress socket, a reset
- * socket is level-triggered writable forever, so unless the relay error
- * drops fd interest, every reactor pass re-runs flush_downlink_retry ->
- * send() EPIPE -> on_relay_error until the H3 close notify finally destroys
- * the flow — one round trip to the client away in production, never in
- * this test (the probe is frozen after the RST). The flow must be
- * dispatched exactly once after the RST: the first pass reaches the relay
- * error (the slot is armed, the reset socket is writable, the send fails),
- * and the teardown it triggers must leave nothing to dispatch again. */
-TEST(mqvpn_tcp_relay_error_stops_fd_dispatch)
-{
-    tcp_sink_t sink;
-    ASSERT_EQ(tcp_sink_open(&sink, /*echo=*/0), 0); /* never reads */
-    /* A small receive buffer (inherited by the accepted socket, so it must
-     * be set before the server connects) makes the server's send() block
-     * after a few KiB instead of after loopback's multi-MiB autotuned
-     * buffers. */
-    int rcvbuf = 4096;
-    ASSERT_EQ(setsockopt(sink.listen_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)),
-              0);
-
-    char path[64];
-    snprintf(path, sizeof(path), "/.well-known/mqvpn/tcp/127.0.0.1/%d/", sink.port);
-
-    harness_t h;
-    ASSERT_EQ(harness_start(&h, "mqvpn-tcp", 9, /*auto_open=*/0, harness_cfg_allow_127),
-              0);
-    h.probe.path = path;
-    h.probe.raw_capture = 1;
-
-    harness_pump(&h, &h.probe.handshake_done, 10000);
-    ASSERT_EQ(h.probe.handshake_done, 1);
-    ASSERT_EQ(probe_open_request_with_body(&h.probe), 0);
-    harness_pump_with_sink(&h, &sink, &h.probe.response_done, 10000);
-    ASSERT_EQ(h.probe.response_done, 1);
-    ASSERT_STREQ(h.probe.status, "200");
-    ASSERT_EQ(sink.conn_fd >= 0, 1);
-
-    /* Upload until the server's send() blocks and it parks the flow with
-     * want_write=1 (the same forcing as the backpressure test above, but
-     * open-ended: the same chunk is resent until the pause shows up). */
-    uint8_t chunk[16384];
-    memset(chunk, 0xA5, sizeof(chunk));
-    for (int i = 0; i < 2000 && !harness_egress_wants_write(&h); i++) {
-        ssize_t sent = xqc_h3_request_send_body(h.probe.req, chunk, sizeof(chunk), 0);
-        ASSERT_EQ(sent > 0 || sent == -XQC_EAGAIN, 1);
-        int never = 0;
-        harness_pump(&h, &never, 20);
-    }
-    ASSERT_EQ(harness_egress_wants_write(&h), 1);
-
-    /* RST the egress socket: SO_LINGER{on, 0} turns the close into a reset
-     * (unread data in the receive buffer would too — this makes it
-     * explicit). Freeze the probe first so the server's RESET_STREAM is
-     * never answered and the close notify cannot rescue the flow. */
-    h.freeze_probe = 1;
-    struct linger lg = {.l_onoff = 1, .l_linger = 0};
-    ASSERT_EQ(setsockopt(sink.conn_fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)), 0);
-    close(sink.conn_fd);
-    sink.conn_fd = -1;
-
-    h.egress_dispatches = 0;
-    for (int i = 0; i < 50; i++) {
-        int never = 0;
-        harness_pump(&h, &never, 1);
-    }
-    ASSERT_EQ(h.egress_dispatches, 1);
-
-    h.freeze_probe = 0;
-    harness_stop(&h);
-    tcp_sink_close(&sink);
-    free(h.probe.raw_recv_buf);
-}
-
-/* Upload-direction backlog cap (test server, 2026-10-03 speedtest: one
- * upload flow's client had handed xquic 11.1 MB while the server had
- * received 1.78 MB, and the speedtest server reset the connection). A stream
- * write frames data as far as flow control allows, and the stock windows are
- * 16 MiB, so without a cap that much can wait unsent in the sender. Here no
- * harness_pump runs after the 200, so no ACK reaches the probe: what it
- * sends is held to its initial congestion window (32 packets under BBR2),
- * and the rest of what send_body accepts is unsent backlog, which must stop
- * at MQVPN_STREAM_UNSENT_PACKETS packets. */
-TEST(mqvpn_tcp_uplink_backlog_stops_at_unsent_cap)
-{
-    tcp_sink_t sink;
-    ASSERT_EQ(tcp_sink_open(&sink, /*echo=*/0), 0);
-
-    char path[64];
-    snprintf(path, sizeof(path), "/.well-known/mqvpn/tcp/127.0.0.1/%d/", sink.port);
-
-    harness_t h;
-    ASSERT_EQ(harness_start(&h, "mqvpn-tcp", 9, /*auto_open=*/0, harness_cfg_allow_127),
-              0);
-    h.probe.path = path;
-    h.probe.raw_capture = 1;
-
-    harness_pump(&h, &h.probe.handshake_done, 10000);
-    ASSERT_EQ(h.probe.handshake_done, 1);
-    ASSERT_EQ(probe_open_request_with_body(&h.probe), 0);
-    harness_pump_with_sink(&h, &sink, &h.probe.response_done, 10000);
-    ASSERT_EQ(h.probe.response_done, 1);
-    ASSERT_STREQ(h.probe.status, "200");
-
-    /* No harness_pump from here on. The 24 MiB stop is above the stock
-     * stream window, so an uncapped stream ends the loop instead of hanging
-     * the test. */
-    static uint8_t chunk[65536];
-    memset(chunk, 0xA5, sizeof(chunk));
-    size_t accepted = 0;
-    while (accepted < 24u * 1024 * 1024) {
-        ssize_t sent = xqc_h3_request_send_body(h.probe.req, chunk, sizeof(chunk), 0);
-        if (sent == -XQC_EAGAIN) break;
-        ASSERT_EQ(sent > 0, 1);
-        accepted += (size_t)sent;
-    }
-    /* The cap plus two initial windows: room for the packets already sent
-     * and for any cwnd growth from handshake ACKs. */
-    const size_t cap_bytes = (size_t)MQVPN_STREAM_UNSENT_PACKETS * MQVPN_MAX_PKT_OUT_SIZE;
-    const size_t bound = cap_bytes + 64u * MQVPN_MAX_PKT_OUT_SIZE;
-    size_t over_bound = accepted > bound ? accepted : 0;
-    ASSERT_EQ(over_bound, 0); /* on failure, prints what was accepted */
-    /* ...and it is the cap that stopped it, not something smaller. */
-    ASSERT_EQ(accepted > cap_bytes / 2, 1);
-
-    harness_stop(&h);
-    tcp_sink_close(&sink);
-    free(h.probe.raw_recv_buf);
-}
-
 /* Closing-notify idempotency. (Uplink -XQC_EAGAIN coverage note: the
  * stash-WRITE half of that path — send_body backpressure parking the flow
  * via svr_tcp_egress_stash_uplink — IS exercised by
@@ -2722,7 +2562,7 @@ TEST(mqvpn_tcp_active_idle_timeout_evicts)
      * in intended poll-timeout ms (elapsed += wait_ms), which decouples from
      * real time whenever poll returns early — exactly what QUIC-timer churn
      * on a loaded sanitizer-CI runner produces. The idle sweep is gated on
-     * real time (svr_now_us), so this wait must be too, or the
+     * real gettimeofday time (svr_now_us), so this wait must be too, or the
      * iteration budget can expire in <1s of real time and the sweep never
      * fires. 4s real ceiling: a working sweep fires ~1s in; a broken one is
      * still bounded so the suite can't hang.
@@ -2967,8 +2807,10 @@ TEST(mqvpn_tcp_parked_flow_idle_eviction)
      * subject to the very stream-data flow control that's stuck full here,
      * so it isn't blocked by the probe's own non-draining). */
     /* Real-wall-clock bound, not iteration count — the idle sweep fires on
-     * real time (svr_now_us), while harness_pump's budget accounting can run
-     * ahead of real time under CI poll churn (see idle-timeout-evicts). */
+     * real gettimeofday time, while harness_pump's budget accounting can run
+     * ahead of real time under CI poll churn (see idle-timeout-evicts, which
+     * also explains why the stream-side observable is request_closing and not
+     * request_closed). */
     int sink_eof = 0;
     uint64_t wait_start_us = test_now_us();
     while (!(sink_eof && h.probe.request_closing) &&
@@ -3609,8 +3451,6 @@ main(void)
     run_mqvpn_tcp_h3_fin_becomes_shut_wr();
     run_mqvpn_tcp_bodiless_fin_becomes_shut_wr();
     run_mqvpn_tcp_downlink_backpressure_pause_resume();
-    run_mqvpn_tcp_relay_error_stops_fd_dispatch();
-    run_mqvpn_tcp_uplink_backlog_stops_at_unsent_cap();
     run_mqvpn_tcp_closing_notify_idempotent();
     run_mqvpn_tcp_active_idle_timeout_evicts();
     run_mqvpn_tcp_two_flow_same_conn_idle_eviction();

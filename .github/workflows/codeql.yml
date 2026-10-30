@@ -2,19 +2,15 @@ name: CodeQL
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
   pull_request:
-    branches: [main, dev]
+    branches: [main]
   schedule:
     - cron: '0 6 * * 1'  # Weekly Monday 6:00 UTC
 
-concurrency:
-  group: codeql-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
   analyze:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       security-events: write
@@ -24,19 +20,19 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Verify pinned xquic source
+      - name: Apply xquic patches
         shell: bash
-        run: bash scripts/check_xquic_pin.sh
+        run: bash scripts/apply_xquic_patches.sh
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev libnghttp2-dev pkg-config
+          sudo apt-get install -y cmake libevent-dev
 
       # Cache keys carry a trailing -vN; bump in every job using the same
       # key whenever you change CMake flags or compiler. Keys here are
-      # kept separate from ci.yml's build job: that build also enables the
-      # unlimited congestion controller and therefore has different flags.
+      # intentionally identical to the ci.yml `build` job so the two
+      # workflows can share entries.
       - name: Compute xquic SHA
         id: xqsha
         run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
@@ -81,7 +77,7 @@ jobs:
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
           # v4: bumped with the BoringSSL cache — libxquic.so absorbs it.
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-v4
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-v4
 
       - name: Build xquic dependency
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -107,7 +103,7 @@ jobs:
           cmake --build build --target lwip_core --parallel "$(nproc)"
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4.39.1
+        uses: github/codeql-action/init@v4.38.0
         with:
           languages: c-cpp
           queries: security-and-quality
@@ -117,6 +113,6 @@ jobs:
         run: cmake --build build --parallel "$(nproc)"
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v4.39.1
+        uses: github/codeql-action/analyze@v4.38.0
         with:
           category: "/language:c-cpp"

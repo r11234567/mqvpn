@@ -7,7 +7,6 @@ import android.util.Log
 import com.mqvpn.sdk.core.internal.ReorderPlan
 import com.mqvpn.sdk.core.internal.TunnelCallbacks
 import com.mqvpn.sdk.core.internal.planReorder
-import com.mqvpn.sdk.core.internal.planRedundant
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.PathInfo
 import com.mqvpn.sdk.core.model.ReorderStats
@@ -17,83 +16,62 @@ import com.mqvpn.sdk.native_.NativeBridge
 /**
  * libmqvpn client engine wrapper.
  *
- * All methods must be called from the engine thread (single-thread guarantee).
- *
- * Paths go through the executor-owned native reactor ([reactorHandle]): it
- * wraps each fd in the bundled POSIX bind, polls and drains it on the engine
- * thread, and runs the release/destroy composites.
- *
- * After [destroy] the client handle is 0 and every method returns an error
- * (or an empty result) WITHOUT a JNI call: a task queued behind the cleanup
- * that destroyed the client (a TUN batch, for instance) must never reach a
- * freed pointer. Engine thread only, so the check is race-free.
+ * All methods must be called from the executor thread (single-thread guarantee).
  */
 class MqvpnTunnel internal constructor(
-    clientHandle: Long,
+    private val clientHandle: Long,
     private val cfgHandle: Long,
-    private val reactorHandle: Long,
     private val reorderEnabled: Boolean = false,
 ) {
-    /** 0 once [destroy] ran. Read by the poller (clientFn) on the engine thread. */
-    internal var clientHandle: Long = clientHandle
-        private set
-
-    private inline fun <T> live(destroyed: T, block: (Long) -> T): T {
-        val h = clientHandle
-        return if (h == 0L) destroyed else block(h)
-    }
-
     // --- Lifecycle ---
 
     fun setServerAddr(host: String, port: Int): Int =
-        live(ERR_INVALID_STATE) { NativeBridge.clientSetServerAddr(it, host, port) }
+        NativeBridge.clientSetServerAddr(clientHandle, host, port)
 
-    fun connect(): Int = live(ERR_INVALID_STATE) { NativeBridge.clientConnect(it) }
+    fun connect(): Int = NativeBridge.clientConnect(clientHandle)
 
-    fun disconnect(): Int = live(ERR_INVALID_STATE) { NativeBridge.clientDisconnect(it) }
+    fun disconnect(): Int = NativeBridge.clientDisconnect(clientHandle)
 
     fun setTunActive(active: Boolean, tunFd: Int): Int =
-        live(ERR_INVALID_STATE) { NativeBridge.clientSetTunActive(it, active, tunFd) }
+        NativeBridge.clientSetTunActive(clientHandle, active, tunFd)
 
-    // --- Path management (through the reactor) ---
+    // --- Path management ---
 
-    /** Path handle (>= 0) or -1; on -1 the caller still owns and closes [fd]. */
-    fun addPath(fd: Int, iface: String): Long =
-        live(-1L) { NativeBridge.reactorAddPath(reactorHandle, it, fd, iface) }
+    fun addPathFd(fd: Int, iface: String): Long =
+        NativeBridge.addPathFd(clientHandle, fd, iface)
 
-    /** Orderly removal; the caller closes the fd afterwards, then calls [pathReleased]. */
     fun removePath(pathHandle: Long): Int =
-        live(ERR_INVALID_STATE) { NativeBridge.reactorRemovePath(reactorHandle, it, pathHandle) }
+        NativeBridge.removePath(clientHandle, pathHandle)
 
-    /**
-     * Report that the platform is done with the path's socket. 0 = released;
-     * [NativeBridge.REACTOR_POISONED] = ledger corruption, the session must
-     * end; any other library error = the transport stays library-owned.
-     */
-    fun pathReleased(pathHandle: Long): Int =
-        live(ERR_INVALID_STATE) { NativeBridge.reactorPathReleased(reactorHandle, it, pathHandle) }
-
-    // --- I/O feed (TUN; path receive happens inside the reactor's wait) ---
+    // --- I/O feed ---
 
     fun onTunPacket(data: ByteArray, offset: Int, length: Int): Int =
-        live(ERR_INVALID_STATE) { NativeBridge.onTunPacket(it, data, offset, length) }
+        NativeBridge.onTunPacket(clientHandle, data, offset, length)
+
+    fun onSocketRecv(
+        pathHandle: Long, data: ByteArray, offset: Int, length: Int,
+        peerAddr: ByteArray, peerAddrLen: Int,
+    ): Int = NativeBridge.onSocketRecv(
+        clientHandle, pathHandle, data, offset, length, peerAddr, peerAddrLen,
+    )
 
     // --- Engine tick ---
 
-    fun tick(): Int = live(ERR_INVALID_STATE) { NativeBridge.clientTick(it) }
+    fun tick(): Int = NativeBridge.clientTick(clientHandle)
 
     // --- Query ---
 
-    fun getState(): Int = live(STATE_CLOSED) { NativeBridge.getState(it) }
+    fun getState(): Int = NativeBridge.getState(clientHandle)
 
     fun getReorderStats(): ReorderStats {
         if (!reorderEnabled) return ReorderStats()
-        val a = live(null) { NativeBridge.getReorderStats(it) } ?: return ReorderStats()
-        return decodeReorderStats(a)
+        val a = NativeBridge.getReorderStats(clientHandle) ?: return ReorderStats()
+        if (a.size < REORDER_STATS_FIELDS) return ReorderStats()
+        return ReorderStats(a[0], a[1], a[2], a[3], a[4], a[5], a[6])
     }
 
     fun getStats(): VpnStats {
-        val arr = live(null) { NativeBridge.getStats(it) } ?: return VpnStats()
+        val arr = NativeBridge.getStats(clientHandle) ?: return VpnStats()
         return VpnStats(
             bytesTx = arr[0],
             bytesRx = arr[1],
@@ -106,7 +84,7 @@ class MqvpnTunnel internal constructor(
     }
 
     fun getPaths(): List<PathInfo> {
-        val arr = live(null) { NativeBridge.getPaths(it) } ?: return emptyList()
+        val arr = NativeBridge.getPaths(clientHandle) ?: return emptyList()
         return arr.map { inner ->
             @Suppress("UNCHECKED_CAST")
             val a = inner as Array<Any>
@@ -128,7 +106,7 @@ class MqvpnTunnel internal constructor(
     )
 
     fun getInterest(): Interest {
-        val arr = live(null) { NativeBridge.getInterest(it) }
+        val arr = NativeBridge.getInterest(clientHandle)
             ?: return Interest(0, false, false)
         return Interest(
             nextTimerMs = arr[0],
@@ -139,27 +117,15 @@ class MqvpnTunnel internal constructor(
 
     // --- Cleanup ---
 
-    /**
-     * Whole-client teardown through the reactor (stop polling, harvest,
-     * mqvpn_client_destroy, forget the table). The handle is zeroed FIRST so
-     * a later task on the engine thread sees a destroyed tunnel. Idempotent.
-     * The caller closes the path fds after this returns.
-     */
     fun destroy() {
-        val h = clientHandle
-        if (h == 0L) return
-        clientHandle = 0L
-        NativeBridge.reactorClientDestroy(reactorHandle, h)
+        NativeBridge.clientDestroy(clientHandle)
         NativeBridge.configFree(cfgHandle)
     }
 
     companion object {
         private const val TAG = "MqvpnTunnel"
-        internal const val REORDER_STATS_FIELDS = 19
+        private const val REORDER_STATS_FIELDS = 7
         const val ERR_AGAIN = -9
-        /** MQVPN_ERR_INVALID_STATE: also what every call returns after [destroy]. */
-        const val ERR_INVALID_STATE = -13
-        private const val STATE_CLOSED = 6
 
         private fun applyReorder(cfg: Long, plan: ReorderPlan) {
             plan.warnings.forEach { Log.w(TAG, it) }
@@ -171,61 +137,28 @@ class MqvpnTunnel internal constructor(
             }
         }
 
-        /** Null when disabled. A failure is logged and the tunnel continues with redundant off. */
-        internal fun applyRedundant(
-            cfg: Long,
-            config: MqvpnConfig,
-            set: (Long, Boolean, IntArray) -> Int = NativeBridge::configSetRedundant,
-        ): Int? {
-            val plan = planRedundant(config) ?: return null
-            val rc = set(cfg, true, plan.ports)
-            if (rc != 0) Log.w(TAG, "configSetRedundant failed (rc=$rc)")
-            return rc
-        }
-
-        /** [reactorHandle]: the executor's NativeReactorWaiter.reactorHandle. */
-        internal fun create(config: MqvpnConfig, callbacks: TunnelCallbacks, reactorHandle: Long): MqvpnTunnel {
+        internal fun create(config: MqvpnConfig, callbacks: TunnelCallbacks): MqvpnTunnel {
             // Also guards startTunnel callers that bypass MqvpnManager.connect() (restored-config
             // path); note the service executor only logs a throw here.
             config.hostIdentifierError()?.let { throw IllegalArgumentException(it) }
-            require(reactorHandle != 0L) { "reactor handle required" }
-            // the native setter refuses anything else, and a tunnel with the
-            // default size instead would not be what was asked for
-            require(config.pathMtu == 0 || config.pathMtu in 1280..9000) {
-                "pathMtu must be 0 or 1280-9000, not ${config.pathMtu}"
-            }
             val cfg = NativeBridge.configNew()
             NativeBridge.configSetServer(cfg, config.serverAddress, config.serverPort)
             config.tlsServerName?.let { NativeBridge.configSetTlsServerName(cfg, it) }
             NativeBridge.configSetAuthKey(cfg, config.authKey)
             NativeBridge.configSetInsecure(cfg, config.insecure)
             NativeBridge.configSetScheduler(cfg, config.scheduler.native)
-            NativeBridge.configSetRequestServerScheduler(cfg, config.requestServerScheduler)
-            NativeBridge.configSetCc(cfg, config.cc.native)
             NativeBridge.configSetLogLevel(cfg, config.logLevel.native)
             NativeBridge.configSetMultipath(cfg, config.multipathEnabled)
             NativeBridge.configSetReconnect(cfg, config.reconnect, config.reconnectIntervalSec)
             NativeBridge.configSetKillswitchHint(cfg, config.killSwitch)
-            NativeBridge.configSetPathMtu(cfg, config.pathMtu)
-            NativeBridge.configSetPmtud(cfg, config.pmtud)
             NativeBridge.configSetHybridEnabled(cfg, config.hybridEnabled)
             NativeBridge.configSetHybridTcpMode(cfg, config.hybridTcpMode.native)
             NativeBridge.configSetAndroidClock(cfg)
             val plan = planReorder(config)
             applyReorder(cfg, plan)
-            applyRedundant(cfg, config)
             val handle = NativeBridge.clientNew(cfg, callbacks)
-            if (handle == 0L) {
-                NativeBridge.configFree(cfg) // the config is ours until a client owns a copy
-                throw IllegalStateException("mqvpn_client_new failed")
-            }
-            return MqvpnTunnel(handle, cfg, reactorHandle, plan.enabled)
+            check(handle != 0L) { "mqvpn_client_new failed" }
+            return MqvpnTunnel(handle, cfg, plan.enabled)
         }
     }
-}
-
-/** Native layout: 0-6 counters and percentiles, 7-18 residence_bucket[0..11]. */
-internal fun decodeReorderStats(a: LongArray): ReorderStats {
-    if (a.size < MqvpnTunnel.REORDER_STATS_FIELDS) return ReorderStats()
-    return ReorderStats(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a.copyOfRange(7, 19).toList())
 }

@@ -1,7 +1,8 @@
 # Log conventions
 
-What the levels mean, how a path is identified across lines, and how UTF-8
-output is read consistently across platforms.
+What the levels mean, how a path is identified across lines, and why printed
+strings are ASCII. Three rules, each of which was learned from a log that was
+hard to read.
 
 ## Levels, and the xquic mapping
 
@@ -74,15 +75,19 @@ the reason:
 path[handle=2 name=WLAN] CLOSED_DROPPED -> CLOSED_FREE reason=… retries=0 fd=-1 xqc_path_id=1
 ```
 
-## Log encoding
+## Printed strings are ASCII
 
-Source literals, configuration strings and adapter names use UTF-8. The Windows
-CLI selects UTF-8 for an attached console; redirected files and process pipes
-contain raw UTF-8 bytes, so their readers must decode UTF-8 too. MSVC builds
-first-party sources with `/utf-8`. The old ASCII-only literal gate has been
-retired; it could not protect non-ASCII adapter names and conflicted with the
-current upstream log format. Existing e2e log markers remain compatibility
-surfaces and are updated together with their consumers.
+Non-ASCII characters are not allowed inside C string literals, and
+`scripts/lint/check_log_string_ascii.py` fails CI if one appears. Write `->`
+and `--`, not `→` and `—`. Comments are exempt.
+
+A UTF-8 literal is written to the console as its raw bytes, which a non-UTF-8
+console decodes with its own codepage; on a Simplified Chinese Windows install
+that is CP936, and a single log line could show a correctly rendered adapter
+name beside a corrupted arrow, because the adapter name arrived from Win32
+already in the console's codepage. `docs/windows_build.md` has the byte-level
+walkthrough and explains why `SetConsoleOutputCP(CP_UTF8)` is not a sufficient
+answer.
 
 ## Reading the log on Android
 
@@ -90,7 +95,7 @@ A phone has no console, and several failures are named nowhere else — a
 certificate rejection says *why* only in this log. So the SDK keeps its own copy:
 `MqvpnLogBuffer` (`android/sdk-core/.../MqvpnLogBuffer.kt`) is a bounded ring
 that `MqvpnVpnService.onNativeLog` fills, and the sample app renders it under
-Settings > Logging > Open diagnostic log, with a level filter, a text filter, and a copy
+the Logs action on the dashboard, with a level filter, a text filter, and a copy
 button.
 
 Two details are deliberate:

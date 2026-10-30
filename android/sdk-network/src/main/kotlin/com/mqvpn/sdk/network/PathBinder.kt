@@ -38,16 +38,15 @@ object PathBinder {
      * 1. DatagramSocket(null) — socket owns fd1
      * 2. network.bindSocket(socket) — kernel sets SO_MARK
      * 3. socket.bind(ephemeral port)
-     * 4. ParcelFileDescriptor.fromDatagramSocket — pfd wraps fd1 (a dup of it
-     *    from API 29)
+     * 4. ParcelFileDescriptor.fromDatagramSocket — pfd owns fd1
      * 5. pfd.dup() → dupPfd with fd2
      * 6. dupPfd.detachFd() → rawFd (caller owns fd2)
-     * 7. pfd.close(), socket.close() — close the originals
+     * 7. pfd.close() — closes fd1
      * 8. return rawFd
      *
      * @param network Network to bind to, or null for default network.
      * @param protector VpnService.protect() callback, used only when network is null.
-     * @return Raw fd (the caller owns it and must close it), or -1 on error.
+     * @return Raw fd (caller must close with Os.close), or -1 on error.
      */
     fun bindAndDetachUdp(
         network: Network?,
@@ -67,7 +66,7 @@ object PathBinder {
      * Create a UDP socket with a specific local address.
      * AF is determined from [localAddr].
      *
-     * @return Raw fd (the caller owns it and must close it), or -1 on error.
+     * @return Raw fd (caller must close with Os.close), or -1 on error.
      */
     fun bindAndDetachUdpByLocalAddr(
         localAddr: InetAddress,
@@ -115,7 +114,7 @@ object PathBinder {
         }
         sock.bind(localBind)
 
-        // Step 4: Wrap the socket's fd in a ParcelFileDescriptor
+        // Step 4: Transfer fd ownership to ParcelFileDescriptor
         val pfd = ParcelFileDescriptor.fromDatagramSocket(sock)
 
         // If network is null, use protect() for VPN bypass
@@ -129,10 +128,7 @@ object PathBinder {
 
         // Step 7: Close originals
         pfd.close()
-        // From API 29 fromDatagramSocket holds a dup, so the socket's own fd
-        // must still be closed; before that (minSdk is 26) the pfd wrapped the
-        // socket's fd itself and this second close finds it closed. rawFd is a
-        // separate dup either way.
+        // sock is already invalidated by fromDatagramSocket; close is safe (no-op)
         sock.close()
 
         // Step 8: Return raw fd

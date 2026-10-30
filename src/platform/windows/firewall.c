@@ -11,8 +11,8 @@
  *   - Traffic on the TUN (Wintun) interface
  *
  * All filters are added under a single dynamic WFP session and sublayer.
- * Closing the engine ends the session and removes all of its objects.
- * Normal cleanup and process termination use the same lifetime contract.
+ * Closing the engine is the crash-safety backstop; normal cleanup still
+ * deletes filters explicitly before deleting their referenced sublayer.
  */
 
 #ifdef _WIN32
@@ -44,6 +44,11 @@ wfp_filter_base(FWPM_FILTER0 *f, const GUID *layer, const GUID *sublayer,
 static int
 add_filter(platform_win_ctx_t *p, const FWPM_FILTER0 *filter)
 {
+    if (p->n_wfp_filters >= MAX_WFP_FILTERS) {
+        LOG_WRN("killswitch: max filter count reached");
+        return -1;
+    }
+
     UINT64 fid = 0;
     DWORD err = FwpmFilterAdd0(p->wfp_engine, filter, NULL, &fid);
     if (err != ERROR_SUCCESS) {
@@ -51,7 +56,7 @@ add_filter(platform_win_ctx_t *p, const FWPM_FILTER0 *filter)
         return -1;
     }
 
-    p->n_wfp_filters++;
+    p->wfp_filter_ids[p->n_wfp_filters++] = fid;
     return 0;
 }
 

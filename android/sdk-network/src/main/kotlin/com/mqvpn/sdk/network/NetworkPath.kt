@@ -12,7 +12,6 @@ enum class PathType {
     WIFI,
     CELLULAR,
     ETHERNET,
-    BLUETOOTH,
     OTHER,
 }
 

@@ -1,3 +1,0 @@
----
-# Vendored upstream code: keep byte-identical to the tagged release.
-DisableFormat: true

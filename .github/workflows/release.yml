@@ -33,16 +33,17 @@ env:
   # Keep in sync with ndkVersion in android/sdk-native/build.gradle.kts and
   # NDK_VERSION in android-repro.yml.
   NDK_VERSION: "28.2.13676358"
-  # SHA-256 fingerprint of the canonical mqvpn upload certificate (public).
-  UPLOAD_CERT_SHA256: "F1:C5:D8:18:AE:C5:EA:4F:28:7B:44:CE:CC:1E:41:A0:AD:F2:B9:04:C8:EB:12:B3:41:F2:69:4F:BA:AB:B0:42"
+  # SHA-256 fingerprint of android/app/signing/mqvpn-release.p12.
+  # The keystore is intentionally public and is not a Play upload key.
+  UPLOAD_CERT_SHA256: "20:9C:C0:27:01:6C:72:1B:6C:9E:3C:88:5C:2E:19:FD:F5:55:E2:C3:7B:26:89:57:DC:77:CD:31:F2:79:9D:79"
 
 jobs:
   build-release:
     strategy:
       matrix:
         include:
-          # amd64 deb is intentionally built on 22.04, not 24.04.
-          # 24.04 links against libevent-2.1-7t64 (the t64
+          # amd64 deb is intentionally built on 22.04, not ubuntu-latest.
+          # ubuntu-latest (24.04) links against libevent-2.1-7t64 (the t64
           # transition rename), so dpkg-shlibdeps pins Depends: to a package
           # name that does not exist on Ubuntu 22.04 / Debian 12. Building on
           # 22.04 yields Depends: libevent-2.1-7, which is satisfied natively
@@ -51,16 +52,15 @@ jobs:
           # those. arm64 stays on 24.04 because GitHub has no 22.04 ARM runner.
           - { os: linux,   arch: amd64, runner: ubuntu-22.04     }
           - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
-          # macos-15 (arm64) matches ci.yml's darwin job — the only Darwin
+          # macos-14 (arm64) matches ci.yml's darwin job — the only Darwin
           # config that is continuously tested. Intel (x86_64) is deliberately
           # not built: no CI coverage, and Apple silicon covers current Macs.
-          - { os: darwin,  arch: arm64, runner: macos-15         }
+          - { os: darwin,  arch: arm64, runner: macos-14         }
           # amd64 pinned to windows-2022 (VS 2022): windows-latest migrated to
-          # VS 2026 in June 2026. windows-11-arm has no VS 2022 label and moved
-          # to VS 2026 by October 2026, so arm64 builds with that generator.
-          # Revisit amd64 (bump vs) before windows-2022 retires.
-          - { os: windows, arch: amd64, runner: windows-2022,   vs: "Visual Studio 17 2022" }
-          - { os: windows, arch: arm64, runner: windows-11-arm, vs: "Visual Studio 18 2026" }
+          # VS 2026 in June 2026, breaking the hardcoded "Visual Studio 17 2022"
+          # generator. Revisit (bump generator / Ninja) before windows-2022 retires.
+          - { os: windows, arch: amd64, runner: windows-2022     }
+          - { os: windows, arch: arm64, runner: windows-11-arm   }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -68,13 +68,47 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Verify pinned xquic source
+      - name: Apply xquic patches
         shell: bash
-        run: bash scripts/check_xquic_pin.sh
+        run: bash scripts/apply_xquic_patches.sh
 
       - name: Resolve build version
         shell: bash
-        run: bash scripts/resolve_build_version.sh >> "$GITHUB_ENV"
+        run: |
+          # Use sed (BRE) instead of `grep -oP` because Git for Windows' grep
+          # rejects -P with the runner's default locale ("supports only unibyte
+          # and UTF-8 locales"). sed avoids the PCRE dependency entirely.
+          CMAKE_VERSION=$(sed -n 's/^project(mqvpn VERSION \([0-9.][0-9.]*\).*/\1/p' CMakeLists.txt)
+          SUFFIX=""
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            # Skip the strict tag/CMake match for SemVer pre-release tags
+            # (e.g. v0.4.0-beta1) — CMake project(VERSION) only accepts
+            # numeric x.y.z, so the suffix is intentionally not in CMake.
+            if [[ "$TAG_VERSION" == *-* ]]; then
+              echo "Pre-release tag $TAG_VERSION — skipping strict version match"
+            elif [ "$TAG_VERSION" != "$CMAKE_VERSION" ]; then
+              echo "ERROR: Tag $TAG_VERSION != CMakeLists.txt $CMAKE_VERSION"
+              exit 1
+            fi
+          else
+            # Not a tag: this is a rolling snapshot of main. It must not claim
+            # to be the release number that happens to be checked in, or its
+            # artifacts, deb version and `mqvpn --version` are
+            # indistinguishable from the real release. "+" sorts after that
+            # release for dpkg; "-" is not used because it would start a
+            # Debian revision.
+            #
+            # The date comes from the commit, not from `date`: the Android
+            # reproducibility gate rebuilds the same commit later and compares
+            # the APK byte for byte, so anything in the version string has to
+            # be a function of the commit alone.
+            COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y%m%d "$GITHUB_SHA")
+            SUFFIX="+snapshot.${COMMIT_DATE}.g${GITHUB_SHA:0:12}"
+          fi
+          echo "VERSION=${CMAKE_VERSION}${SUFFIX}" >> "$GITHUB_ENV"
+          echo "VERSION_SUFFIX=$SUFFIX" >> "$GITHUB_ENV"
+          echo "building ${CMAKE_VERSION}${SUFFIX}"
 
       - name: Install dependencies
         if: matrix.os == 'linux'
@@ -118,7 +152,7 @@ jobs:
           cmake -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX=/usr \
                 -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
-                -C "$BUILD_VERSION_FILE" \
+                -DMQVPN_VERSION_SUFFIX="$VERSION_SUFFIX" \
                 -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
           make -j$(nproc)
 
@@ -167,7 +201,6 @@ jobs:
           cp build/libmqvpn.so* "$STAGING/lib/" 2>/dev/null || true
           cp third_party/xquic/build/libxquic.so "$STAGING/lib/"
           cp scripts/mqvpn-server-nat.sh "$STAGING/lib/mqvpn/"
-          cp build/mqvpn-nat-config "$STAGING/lib/mqvpn/"
           cp build-tarball/systemd/mqvpn-server.service "$STAGING/systemd/"
           cp build-tarball/systemd/mqvpn-client@.service "$STAGING/systemd/"
           cp systemd/server.conf.example "$STAGING/etc/mqvpn/"
@@ -246,7 +279,7 @@ jobs:
                 -DXQUIC_BUILD_DIR="$GITHUB_WORKSPACE/third_party/xquic/build" \
                 -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
                 -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
-                -C "$BUILD_VERSION_FILE" \
+                -DMQVPN_VERSION_SUFFIX="$VERSION_SUFFIX" \
                 -DEVENT_LIB="$(brew --prefix libevent)/lib/libevent.a"
           cmake --build build -j "$(sysctl -n hw.ncpu)"
 
@@ -387,7 +420,7 @@ jobs:
           # CMakeLists still reads it: left empty, its `NOT ... MATCHES "rel"`
           # guard compiles BORINGSSL_DISPATCH_TEST instrumentation into an
           # otherwise /O2 build. Same fix as the Linux jobs.
-          cmake -G "${{ matrix.vs }}" -A ${{ matrix.arch == 'amd64' && 'x64' || 'ARM64' }} `
+          cmake -G "Visual Studio 17 2022" -A ${{ matrix.arch == 'amd64' && 'x64' || 'ARM64' }} `
             -DBUILD_SHARED_LIBS=0 `
             -DCMAKE_BUILD_TYPE=Release `
             ${{ matrix.arch == 'arm64' && '-DOPENSSL_NO_ASM=1' || '' }} ..
@@ -421,7 +454,7 @@ jobs:
           # Does not fix the 64-bit enum issue (cl.exe always uses int as
           # enum underlying type regardless of /std:c11) — that's handled by
           # the xquic submodule patch (see fix/msvc-enum-truncation).
-          cmake -G "${{ matrix.vs }}" -A ${{ matrix.arch == 'amd64' && 'x64' || 'ARM64' }} `
+          cmake -G "Visual Studio 17 2022" -A ${{ matrix.arch == 'amd64' && 'x64' || 'ARM64' }} `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_STANDARD=11 `
             -DSSL_TYPE=boringssl `
@@ -442,7 +475,7 @@ jobs:
           cd build
           # Same C11 reasoning as the xquic build, kept consistent across
           # the two CMake invocations.
-          cmake -G "${{ matrix.vs }}" -A ${{ matrix.arch == 'amd64' && 'x64' || 'ARM64' }} `
+          cmake -G "Visual Studio 17 2022" -A ${{ matrix.arch == 'amd64' && 'x64' || 'ARM64' }} `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_STANDARD=11 `
             -DXQUIC_BUILD_DIR="${{ github.workspace }}/third_party/xquic/build/Release" `
@@ -450,7 +483,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=${{ matrix.arch == 'amd64' && 'x64-windows-static' || 'arm64-windows-static' }} `
             -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON `
-            -C "$env:BUILD_VERSION_FILE" `
+            -DMQVPN_VERSION_SUFFIX="$env:VERSION_SUFFIX" `
             -DBUILD_TESTING=OFF ..
           cmake --build . --config Release
 
@@ -470,26 +503,12 @@ jobs:
             Write-Error "mqvpn.exe --help exited $LASTEXITCODE; output: $out"
             exit 1
           }
-          # Match the literal help banner, not just the program name.
+          # Match the literal "Usage:" header that main.c:29 prints. Just
+          # matching "mqvpn" would be too loose (paths, runner output noise
+          # could match accidentally).
           if (-not ($out -match '(?m)^Usage:')) {
-            throw "mqvpn.exe --help did not print expected 'Usage:' banner: $out"
-          }
-
-      - name: Verify build identity (Linux/macOS)
-        if: matrix.os != 'windows'
-        shell: bash
-        run: |
-          actual=$(build/mqvpn --version)
-          printf '%s\n' "$actual"
-          [ "${actual%%$'\n'*}" = "mqvpn $VERSION" ]
-
-      - name: Verify build identity (Windows)
-        if: matrix.os == 'windows'
-        shell: pwsh
-        run: |
-          $out = & build/Release/mqvpn.exe --version
-          if ($LASTEXITCODE -ne 0 -or @($out)[0] -cne "mqvpn $env:VERSION") {
-            throw "mqvpn build identity differs from artifact version: $out"
+            Write-Error "mqvpn.exe --help did not print expected 'Usage:' banner; output: $out"
+            exit 1
           }
 
       - name: Stage Windows release artifact
@@ -598,26 +617,35 @@ jobs:
             mqvpn_*_${{ matrix.arch }}.tar.gz
 
   build-android:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 40
-    # The upload-key secrets live in the protected `release` environment whose
-    # deployment rule admits only v* tags, so GitHub — not a check inside this
-    # file — decides whether a run can read them. That is what actually stops a
-    # modified workflow on an arbitrary branch from signing with the canonical
-    # key. Non-tag runs request no environment, receive no secrets, and fall
-    # back to the ephemeral key below.
-    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'release' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
-      - name: Verify pinned xquic source
+      - name: Apply xquic patches
         shell: bash
-        run: bash scripts/check_xquic_pin.sh
+        run: bash scripts/apply_xquic_patches.sh
 
       - name: Resolve build version
-        run: bash scripts/resolve_build_version.sh >> "$GITHUB_ENV"
+        # Must match build-release's step, including the snapshot suffix: the
+        # APK name and the native version string are compared against the
+        # other platforms' artifacts in the same release.
+        run: |
+          CMAKE_VERSION=$(sed -n 's/^project(mqvpn VERSION \([0-9.][0-9.]*\).*/\1/p' CMakeLists.txt)
+          SUFFIX=""
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y%m%d "$GITHUB_SHA")
+            SUFFIX="+snapshot.${COMMIT_DATE}.g${GITHUB_SHA:0:12}"
+          fi
+          # Deliberately not exported as MQVPN_VERSION_SUFFIX: the native
+          # library is compared byte for byte by android-repro.yml, which
+          # rebuilds through scripts/build_android.sh without this variable.
+          # The suffix therefore reaches the APK name only, and the Android
+          # native version string stays at the release number.
+          echo "VERSION=${CMAKE_VERSION}${SUFFIX}" >> "$GITHUB_ENV"
+          echo "building ${CMAKE_VERSION}${SUFFIX}"
 
       - name: Install pinned NDK
         id: ndk
@@ -656,103 +684,13 @@ jobs:
           done
 
       - name: Set up JDK 21
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: 21
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6
-
-      # The stable upload key signs only official tag builds of the canonical
-      # repo. An APK carrying that signature is update-compatible and trusted
-      # by users, so it must never be producible from an arbitrary ref — a
-      # workflow_dispatch run on any branch would otherwise publish a
-      # canonical-key-signed artifact of unreviewed code. Every other run
-      # (forks, dispatch, branch experiments) uses the throwaway key below.
-      - name: Detect release keystore secret
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* && "$GITHUB_REPOSITORY" == mp0rta/mqvpn ]]; then
-            if [ -z "$KEYSTORE_B64" ]; then
-              # Never let an official tag release fall back to a throwaway key:
-              # a wrongly-signed release breaks in-place updates permanently and
-              # fails F-Droid's reproducible-build verification. Missing or
-              # wrong secrets fail this job before anything is signed; to
-              # rehearse the path, tag a pre-release (vX.Y.Z-rcN) and delete it.
-              echo "::error::ANDROID_KEYSTORE_B64 secret missing on an official tag build"
-              exit 1
-            fi
-            echo "HAVE_KEYSTORE=true" >> "$GITHUB_ENV"
-          else
-            # Assign explicitly rather than leaving it unset: earlier steps run
-            # repo scripts that could have appended HAVE_KEYSTORE=true to
-            # $GITHUB_ENV, and the last assignment wins.
-            echo "HAVE_KEYSTORE=false" >> "$GITHUB_ENV"
-            echo "Not an official tag build — signing with an ephemeral key"
-          fi
-
-      - name: Set up release keystore
-        # Official releases sign with the stable upload key from repo secrets
-        # (required for F-Droid reproducible-build verification, which grafts
-        # this signature onto F-Droid's own build). Forks and secret-less runs
-        # fall back to an ephemeral keystore so the job still succeeds.
-        if: env.HAVE_KEYSTORE == 'true'
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-        run: |
-          KEYSTORE="$RUNNER_TEMP/release.jks"
-          # $GITHUB_ENV uses NAME=value lines, so a password containing a
-          # newline would be truncated or rejected further down. Say so here
-          # rather than failing obscurely mid-build after a key rotation.
-          case "$KEYSTORE_PASSWORD" in
-            *[$'\n\r']*) echo "::error::ANDROID_KEYSTORE_PASSWORD must not contain newlines"; exit 1 ;;
-          esac
-          printf '%s' "$KEYSTORE_B64" | base64 -d > "$KEYSTORE"
-          # Preflight: refuse to sign with anything but the canonical upload
-          # key. Checks the alias holds a usable private key (certreq
-          # exercises it) and that the certificate fingerprint matches.
-          keytool -list -keystore "$KEYSTORE" -storepass "$KEYSTORE_PASSWORD" \
-              -alias mqvpn-upload 2>/dev/null | grep -q PrivateKeyEntry \
-            || { echo "::error::keystore alias mqvpn-upload missing or not a PrivateKeyEntry"; exit 1; }
-          keytool -certreq -keystore "$KEYSTORE" -storepass "$KEYSTORE_PASSWORD" \
-              -keypass "$KEYSTORE_PASSWORD" -alias mqvpn-upload -file /dev/null 2>/dev/null \
-            || { echo "::error::private key not usable with the provided password"; exit 1; }
-          FP=$(keytool -list -v -keystore "$KEYSTORE" -storepass "$KEYSTORE_PASSWORD" \
-                 -alias mqvpn-upload 2>/dev/null | sed -n 's/.*SHA256: //p' | head -1)
-          [ "$FP" = "$UPLOAD_CERT_SHA256" ] \
-            || { echo "::error::upload certificate fingerprint mismatch: got $FP"; exit 1; }
-          echo "MQVPN_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
-          echo "MQVPN_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
-          echo "MQVPN_KEY_ALIAS=mqvpn-upload" >> "$GITHUB_ENV"
-          echo "MQVPN_KEY_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
-
-      - name: Generate ephemeral release keystore
-        if: env.HAVE_KEYSTORE != 'true'
-        run: |
-          KEYSTORE="$RUNNER_TEMP/release.jks"
-          # Single password for both store and key entry. JDK 9+ defaults
-          # keytool to PKCS12, which silently ignores a distinct -keypass
-          # during -genkeypair and encrypts the key with the storePassword
-          # — a separate keyPass would later trip BadPaddingException at
-          # APK-signing time. Using one password matches PKCS12 conventions.
-          PASS=$(openssl rand -base64 24)
-          keytool -genkeypair -v \
-            -keystore "$KEYSTORE" \
-            -storepass "$PASS" \
-            -keypass "$PASS" \
-            -alias mqvpn-release \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=mqvpn sample, O=mqvpn, C=JP" >/dev/null
-          # Mask password in workflow logs; value is written only to the
-          # per-job env file ($GITHUB_ENV) which is scoped to this run.
-          echo "::add-mask::$PASS"
-          echo "MQVPN_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
-          echo "MQVPN_KEYSTORE_PASSWORD=$PASS" >> "$GITHUB_ENV"
-          echo "MQVPN_KEY_ALIAS=mqvpn-release" >> "$GITHUB_ENV"
-          echo "MQVPN_KEY_PASSWORD=$PASS" >> "$GITHUB_ENV"
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6
 
       # Stage license texts as assets/ before APK build. Android Gradle Plugin
       # auto-includes src/main/assets/ in the produced APK. Required by
@@ -761,42 +699,17 @@ jobs:
       - name: Stage license assets for APK
         run: scripts/stage_apk_license_assets.sh
 
-      - name: Build signed release APK and App Bundle
-        # One invocation so both outputs are signed inside this job's signing
-        # window (the keystore is destroyed in the next step). The .aab is the
-        # Play Store upload artifact and carries the same license assets.
+      - name: Build signed release APK
         working-directory: android
-        run: ./gradlew :app:assembleRelease :app:bundleRelease --no-daemon --stacktrace
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
 
-      - name: Clear signing material
-        # Signing is done; drop the keystore and blank the env vars so the
-        # steps that follow — including third-party actions such as
-        # upload-artifact — never have the private key or its password in
-        # reach. Runs even on failure.
-        if: always()
-        run: |
-          # Remove the decode target unconditionally, not just the exported
-          # path: a preflight failure aborts before that variable is set and
-          # would otherwise leave the keystore on disk.
-          rm -f "$RUNNER_TEMP/release.jks"
-          if [ -n "${MQVPN_KEYSTORE_PATH:-}" ]; then rm -f "$MQVPN_KEYSTORE_PATH"; fi
-          {
-            echo "MQVPN_KEYSTORE_PATH="
-            echo "MQVPN_KEYSTORE_PASSWORD="
-            echo "MQVPN_KEY_ALIAS="
-            echo "MQVPN_KEY_PASSWORD="
-          } >> "$GITHUB_ENV"
-
-      - name: Stage Android release artifacts
+      - name: Stage Android release artifact
         run: |
           SRC=android/app/build/outputs/apk/release/app-release.apk
           test -f "$SRC" || { echo "APK not found at $SRC"; ls -R android/app/build/outputs/apk/ || true; exit 1; }
           cp "$SRC" "mqvpn_${VERSION}_android.apk"
-          AAB=android/app/build/outputs/bundle/release/app-release.aab
-          test -f "$AAB" || { echo "AAB not found at $AAB"; ls -R android/app/build/outputs/bundle/ || true; exit 1; }
-          cp "$AAB" "mqvpn_${VERSION}_android.aab"
 
-      - name: Verify license assets in APK and AAB
+      - name: Verify license assets in APK
         run: |
           set -e
           expected=5
@@ -809,29 +722,11 @@ jobs:
             unzip -l "$apk" | grep -E 'assets/' || echo "  (none found)"
             exit 1
           fi
-          # Same check on the bundle: Play generates the user-facing APKs
-          # from it, so the assets must be present under base/.
-          aab=$(ls mqvpn_*_android.aab)
-          found=$(unzip -l "$aab" \
-                  | grep -cE 'base/assets/(LICENSE|NOTICE|third-party/(xquic|boringssl|lwip)\.txt)$' \
-                  || true)
-          if [ "$found" -ne "$expected" ]; then
-            echo "::error::AAB missing license assets (found $found of $expected)"
-            unzip -l "$aab" | grep -E 'assets/' || echo "  (none found)"
-            exit 1
-          fi
-
-      # The .aab stays a workflow artifact and is deliberately NOT attached to
-      # the GitHub release: it is not user-installable, and Play re-signs and
-      # re-packages it anyway. Download it from this run for the Play Console
-      # upload.
-      - name: Upload Android artifacts
+      - name: Upload Android artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-android
-          path: |
-            mqvpn_*_android.apk
-            mqvpn_*_android.aab
+          path: mqvpn_*_android.apk
 
   # Reproducibility is a release-time contract, not just a PR check: F-Droid
   # rebuilds the tagged commit and byte-compares it against the APK we sign
@@ -844,7 +739,7 @@ jobs:
   publish-release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-release, build-android, android-repro]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: write
@@ -860,13 +755,6 @@ jobs:
           merge-multiple: true
 
       - name: Verify the published APK reproduces
-        # F-Droid verifies our releases by grafting our signature onto their
-        # own rebuild and byte-comparing the result; apksigcopier is the tool
-        # they use for it. Running the same check here means a release F-Droid
-        # could not verify never gets published. Anything weaker (comparing
-        # entry checksums, say) would pass on APKs whose compressed bytes,
-        # entry order or alignment differ — exactly what grafting cannot
-        # tolerate.
         run: |
           set -euo pipefail
           signed=$(ls artifacts/mqvpn_*_android.apk)
@@ -954,15 +842,12 @@ jobs:
   publish-snapshot:
     if: github.ref == 'refs/heads/main'
     needs: [build-release, build-android]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Resolve build version
-        run: bash scripts/resolve_build_version.sh >> "$GITHUB_ENV"
 
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -974,7 +859,7 @@ jobs:
         run: |
           cd artifacts
           shopt -s nullglob
-          files=(mqvpn_*.tar.gz mqvpn_*.deb mqvpn_*.zip)
+          files=(mqvpn_*.tar.gz mqvpn_*.deb mqvpn_*.zip mqvpn_*_android.apk)
           [ "${#files[@]}" -gt 0 ] || { echo "::error::no snapshot artifacts"; exit 1; }
           sha256sum "${files[@]}" > SHA256SUMS
 
@@ -989,47 +874,37 @@ jobs:
             exit 0
           }
 
+          # Recompute the snapshot version exactly as the build jobs did, so
+          # the release title names the version stamped into the assets
+          # instead of only the commit.
+          cmake_version=$(sed -n 's/^project(mqvpn VERSION \([0-9.][0-9.]*\).*/\1/p' CMakeLists.txt)
+          commit_date=$(git show -s --format=%cd --date=format:%Y%m%d "$GITHUB_SHA")
+          short_sha=${GITHUB_SHA:0:12}
+          version="${cmake_version}+snapshot.${commit_date}.g${short_sha}"
           notes=$(printf '%s\n' \
             "Automated prerelease from main at $GITHUB_SHA." \
             "" \
-            "Version \`$VERSION\`, derived from the UTC commit time and SHA. Native binaries and asset names carry this independent snapshot identity." \
-            "Debian package metadata uses \`0~$VERSION\` so it remains valid and sorts below official releases." \
+            "Version \`$version\`. Every asset carries that version, so a snapshot is never mistaken for the \`v${cmake_version}\` release; the \`+\` also makes dpkg sort it after that release." \
             "" \
-            "Native assets are replaced after each successful main build." \
-            "Android test APKs remain workflow artifacts with an ephemeral signing key; installable signed Android releases are published from v* tags.")
+            "Assets are replaced after every successful main build, and this rolling tag always points at the newest one.")
           if gh release view snapshot >/dev/null 2>&1; then
             gh api --method PATCH \
               "repos/$GITHUB_REPOSITORY/git/refs/tags/snapshot" \
               -f sha="$GITHUB_SHA" -F force=true >/dev/null
             gh release edit snapshot \
-              --title "mqvpn $VERSION" \
+              --title "mqvpn snapshot $version" \
               --notes "$notes" \
               --prerelease
           else
             gh release create snapshot \
               --target "$GITHUB_SHA" \
-              --title "mqvpn $VERSION" \
+              --title "mqvpn snapshot $version" \
               --notes "$notes" \
               --prerelease
           fi
 
           shopt -s nullglob
           assets=(artifacts/mqvpn_*.tar.gz artifacts/mqvpn_*.deb \
-                  artifacts/mqvpn_*.zip \
+                  artifacts/mqvpn_*.zip artifacts/mqvpn_*_android.apk \
                   artifacts/SHA256SUMS scripts/install.sh LICENSE NOTICE)
           gh release upload snapshot --clobber "${assets[@]}"
-
-          # Timestamped names differ every build; --clobber alone leaves old
-          # binaries attached. Remove obsolete native assets only after every
-          # current asset has uploaded successfully. Preserve other attachments.
-          declare -A current_assets
-          for asset in "${assets[@]}"; do current_assets["${asset##*/}"]=1; done
-          gh release view snapshot --json assets --jq '.assets[].name' > published-assets.txt
-          while IFS= read -r asset; do
-            case "$asset" in
-              mqvpn_*.tar.gz|mqvpn_*.deb|mqvpn_*.zip)
-                if [[ -z "${current_assets[$asset]:-}" ]]; then
-                  gh release delete-asset snapshot "$asset" --yes
-                fi ;;
-            esac
-          done < published-assets.txt
