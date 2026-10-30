@@ -18,6 +18,8 @@ fuzz/corpus/tcp_lane/*
 /ci_sweep_results/
 /ci_bench_results/
 /ci_stress_results/
+# default --log of scripts/ci_transport_smoke.py (written to the cwd)
+transport-smoke.log
 # scratch drafts / abandoned scaffolds — kept on disk, never published
 /docs/tbd/
 !benchmarks/*.py
@@ -73,3 +75,12 @@ __pycache__/
 # keep curated *.bin seeds tracked, ignore SHA-named fuzzer output.
 fuzz/corpus/control_dispatch/*
 !fuzz/corpus/control_dispatch/*.bin
+
+# .NET build artifacts
+bin/
+obj/
+*.user
+*.suo
+windows/publish/
+*.db
+test_pub/

@@ -6,8 +6,5 @@
   status notification appears on Android 13+.
 - Disconnect now fully stops the VPN service and removes its
   notification.
-- Core library: new multipath reinjection support. The tunnel can send copies
-  of selected packets over a second link for smoother behavior on flaky
-  connections (config-level feature; no app UI yet).
 - Update BoringSSL to 0.20260813.0, picking up upstream TLS/crypto
   fixes since the previous pin.

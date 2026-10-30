@@ -23,6 +23,21 @@
 /* tcp_recved takes a u16_t; the deferred resume total can exceed 65535
  * (bounded by TCP_WND, 512 KiB on the non-iOS profile), so re-open the
  * window in u16-sized steps. */
+static inline uint64_t
+tcp_lane_uplink_xquic_bytes(const mqvpn_tcp_flow_t *f)
+{
+    return f->h3_request ? cli_tcp_lane_h3_unsent_queue_bytes(f->h3_request) : 0;
+}
+
+static inline void
+tcp_lane_uplink_withhold(mqvpn_tcp_flow_t *f)
+{
+    f->uplink_withheld = 1;
+    if (f->h3_request) {
+        (void)cli_tcp_lane_h3_set_write_notify(f->h3_request, 1);
+    }
+}
+
 static void
 tcp_lane_recved(struct tcp_pcb *pcb, uint32_t len)
 {
@@ -30,21 +45,6 @@ tcp_lane_recved(struct tcp_pcb *pcb, uint32_t len)
         u16_t chunk = (len > 0xFFFFu) ? (u16_t)0xFFFFu : (u16_t)len;
         MQVPN_TCP_LANE_TEST_RECVED(pcb, chunk);
         len -= chunk;
-    }
-}
-
-static uint64_t
-tcp_lane_uplink_xquic_bytes(const mqvpn_tcp_flow_t *f)
-{
-    return f->h3_request ? cli_tcp_lane_h3_unsent_queue_bytes(f->h3_request) : 0;
-}
-
-static void
-tcp_lane_uplink_withhold(mqvpn_tcp_flow_t *f)
-{
-    f->uplink_withheld = 1;
-    if (f->state == TCP_FLOW_ACTIVE && f->h3_request) {
-        (void)cli_tcp_lane_h3_set_write_notify(f->h3_request, 1);
     }
 }
 
@@ -198,9 +198,8 @@ tcp_lane_uplink_maybe_fin(mqvpn_tcp_flow_t *f)
  * entries MUST wait — ordering). Idempotent under repeated all-EAGAIN
  * writable notifies: nothing is popped until fully accepted, offsets only
  * advance. After a full drain, sends the pending H3 FIN (see above); then,
- * once the local queue is empty and xquic's retained connection queue is at
- * or below low-water, re-opens the lwIP receive window withheld under
- * backpressure.
+ * once the unsent backlog is below low-water, re-opens the lwIP receive
+ * window withheld under backpressure.
  *
  * Return: LIVE if the flow survives; the teardown status otherwise (`f` is
  * freed — hands off). tcp_lane.c's on_lwip_recv (the peer-FIN branch) is
@@ -257,7 +256,6 @@ tcp_lane_uplink_flush(mqvpn_tcp_flow_t *f)
         if (!f->tcp_fin_seen || f->fin_sent_to_h3) {
             (void)cli_tcp_lane_h3_set_write_notify(f->h3_request, 0);
         }
-
     } else if (f->uplink_withheld) {
         (void)cli_tcp_lane_h3_set_write_notify(f->h3_request, 1);
     }
@@ -294,7 +292,12 @@ tcp_lane_uplink_deliver(mqvpn_tcp_flow_t *f, struct pbuf *p)
 
     if (off == tot) {
         pbuf_free(p);
-        if (tcp_lane_uplink_xquic_bytes(f) >= MQVPN_TCP_LANE_BP_HIGH_WATER) {
+        /* A full H3 send clears xquic's write-notify flag. Already advertised
+         * TCP credit can deliver more data while we are withheld, so re-arm
+         * the drain callback even below HIGH until it returns all credit at
+         * LOW. Otherwise a later full accept can strand the old withholding. */
+        if (f->uplink_withheld ||
+            tcp_lane_uplink_xquic_bytes(f) >= MQVPN_TCP_LANE_BP_HIGH_WATER) {
             tcp_lane_uplink_withhold(f);
             f->uplink_withheld_recved += tot;
         } else {

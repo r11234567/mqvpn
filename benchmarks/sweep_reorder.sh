@@ -29,7 +29,7 @@
 #
 # Reorder ON vs OFF (--reorder on|off):
 #   The "is reorder net-positive?" follow-up. --reorder off runs each selected
-#   environment ONCE per repeat with [Reorder] Enabled=off (pure RAW
+#   environment ONCE per repeat with [Reorder] Enabled=false (pure RAW
 #   pass-through; MaxWaitMs/CapPackets are irrelevant so the wait/cap sweep is
 #   skipped) and writes a baseline CSV (default reorder_off_DATE.csv). The ON
 #   data is reused from the main perf sweep; sweep_reorder_analyze.py --off-csv
@@ -41,7 +41,8 @@
 #   sudo PICOQUICDEMO=<path> ./sweep_reorder.sh [--out CSV] [--env NAME]
 #        [--axis rtt|jitter|loss|bw|profiles] [--stage 1|2]
 #        [--mode perf|scale] [--reorder on|off] [--quick]
-#   Env overrides: REPEATS, MQVPN, PICOQUICDEMO, PICO_FILE_BYTES.
+#   Env overrides: REPEATS, MQVPN, PICOQUICDEMO, PICO_FILE_BYTES, SWEEP_WAITS, SWEEP_CAPS, STAGE1_CAP,
+#   STAGE2_WAITS, MAX_BYTES_PER_FLOW.
 
 set -euo pipefail
 
@@ -70,8 +71,14 @@ declare -A AXIS_ENVS=(
 # Stage-2 (cap sweep) operates only over these representative environments.
 STAGE2_ENVS=(baseline dual_lte fiber_lte lte_starlink lte_geo congested)
 
-WAIT_VALUES=(10 20 30 50 80 120 200 300)
-CAP_VALUES=(256 512 1024 2048 4096)
+# SWEEP_WAITS (Stage 1 wait axis) / SWEEP_CAPS (Stage 2 cap axis), space-
+# separated, pin the axes; STAGE1_CAP pins the cap Stage 1 holds fixed. An A/B
+# of two binaries at one operating point gives each run its own --out: resume
+# keys cells by env/wait/cap/repeat, not by binary, so a shared CSV skips the
+# second run (unless --force):
+#   sudo MQVPN=<bin> SWEEP_WAITS=50 STAGE1_CAP=1024 ./sweep_reorder.sh --stage 1 --out a.csv
+read -r -a WAIT_VALUES <<< "${SWEEP_WAITS:-10 20 30 50 80 120 200 300}"
+read -r -a CAP_VALUES <<< "${SWEEP_CAPS:-256 512 1024 2048 4096}"
 REPEATS="${REPEATS:-3}"
 
 # Per-env chosen wait for the Stage-2 cap sweep. Default 30 (engine default);
@@ -85,6 +92,11 @@ declare -A ENV_CHOSEN_WAIT=(
   [congested]=80
 )
 DEFAULT_CHOSEN_WAIT=30
+# STAGE2_WAITS="env=wait ..." overrides the table above per run, so each
+# scheduler's Stage 2 can sit at its own Stage-1 knee without editing the file.
+for kv in ${STAGE2_WAITS:-}; do
+    ENV_CHOSEN_WAIT["${kv%%=*}"]="${kv#*=}"
+done
 
 # ─── Fixed knobs ─────────────────────────────────────────────────────────────
 N_PATHS=2
@@ -102,7 +114,11 @@ PICO_TIMEOUT="${PICO_TIMEOUT:-90}"   # seconds
 PICO_CERT="${PICO_CERT:-${REPO_ROOT}/third_party/picoquic/certs/cert.pem}"
 PICO_KEY="${PICO_KEY:-${REPO_ROOT}/third_party/picoquic/certs/key.pem}"
 PICO_SNI="${PICO_SNI:-test}"
-STAGE1_CAP=1024   # Stage 1 holds cap fixed at 1024 while sweeping wait
+STAGE1_CAP="${STAGE1_CAP:-1024}"   # Stage 1 holds cap fixed (default 1024) while sweeping wait
+# MAX_BYTES_PER_FLOW sets [Reorder] MaxBytesPerFlow (unset = engine default).
+# The CSV has no bytes column and resume does not key on it: give each value
+# its own --out.
+MAX_BYTES_PER_FLOW="${MAX_BYTES_PER_FLOW:-}"
 
 # Scale-mode knobs (perf-mode ignores these). IngressIdleSec < EgressIdleSec is
 # a hard config-validation invariant (engine silently RAW-falls-back otherwise).
@@ -132,7 +148,7 @@ usage: sudo PICOQUICDEMO=<path> $0 [options]
   --mode <perf|scale>  perf (default) or scale-mode exercise
   --reorder <on|off>   on (default) = the normal perf/scale sweep. off = RAW
                        baseline: each env once per repeat with [Reorder]
-                       Enabled=off, no wait/cap loop, default out reorder_off_*.csv
+                       Enabled=false, no wait/cap loop, default out reorder_off_*.csv
                        (feed it to sweep_reorder_analyze.py --off-csv). Keep the
                        OFF CSV separate from the ON sweep — do NOT reuse the ON
                        run's --out, or the off/off rows mix into one file.
@@ -143,7 +159,9 @@ usage: sudo PICOQUICDEMO=<path> $0 [options]
                        the median over all samples per (env,wait,cap)). Use to
                        re-test; otherwise the resume cache skips done cells.
 Environments: ${!ENV_NETEM[*]}
-Env knobs: REPEATS (default 3), PICO_FILE_BYTES (default 20MiB), PICO_TIMEOUT (90s)
+Env knobs: REPEATS (default 3), PICO_FILE_BYTES (default 20MiB), PICO_TIMEOUT (90s),
+  STAGE2_WAITS ("env=wait ..." Stage-2 wait per env), MAX_BYTES_PER_FLOW
+  ([Reorder] MaxBytesPerFlow; use a separate --out per value)
 EOF
     exit 2
 }
@@ -262,21 +280,24 @@ trap cleanup_all EXIT
 # [ReorderRule]. CapPackets is the cap key (NOT CapPacketsPerFlow).
 write_ini() {
     local wait="$1" cap="$2"
-    # --reorder off: emit a minimal RAW-baseline INI. Enabled=off bypasses the
+    # --reorder off: emit a minimal RAW-baseline INI. Enabled=false bypasses the
     # whole engine, so MaxWaitMs/CapPackets/[ReorderRule] are irrelevant — omit
     # them rather than write the "off" sentinel wait/cap into numeric keys.
     if [ "$REORDER_MODE" = "off" ]; then
         {
             echo "[Reorder]"
-            echo "Enabled = off"
+            echo "Enabled = false"
         } >"$INI_FILE"
         return 0
     fi
     {
         echo "[Reorder]"
-        echo "Enabled = on"
+        echo "Enabled = true"
         echo "MaxWaitMs = ${wait}"
         echo "CapPackets = ${cap}"
+        if [ -n "$MAX_BYTES_PER_FLOW" ]; then
+            echo "MaxBytesPerFlow = ${MAX_BYTES_PER_FLOW}"
+        fi
         if [ "$MODE" = "scale" ]; then
             # IngressIdleSec < EgressIdleSec invariant enforced (else RAW fallback).
             echo "MaxFlows = ${SCALE_MAX_FLOWS}"
@@ -565,7 +586,7 @@ run_perf_sweep() {
 }
 
 # ─── reorder-OFF baseline sweep (--reorder off) ──────────────────────────────
-# Each selected env once per repeat with [Reorder] Enabled=off. No wait/cap
+# Each selected env once per repeat with [Reorder] Enabled=false. No wait/cap
 # loop (RAW pass-through ignores them), so the row carries the "off" sentinel in
 # the max_wait_ms/cap_pkts columns and all-zero reorder counters (the OFF engine
 # emits zeroed stats). Honors --env / --axis subsetting via select_envs; default
@@ -578,7 +599,7 @@ run_off_sweep() {
 
     local envs rep env
     envs="$(select_envs)"
-    echo "[off] RAW baseline (Enabled=off); envs: ${envs}"
+    echo "[off] RAW baseline (Enabled=false); envs: ${envs}"
     echo "[off] repeats: ${REPEATS}  out: ${OUT}"
 
     for env in $envs; do

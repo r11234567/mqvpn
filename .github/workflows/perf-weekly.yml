@@ -100,16 +100,10 @@ concurrency:
 
 jobs:
   perf-weekly:
-    # The schedule always runs this; only a dispatch that explicitly asked to
-    # skip it does not. `github.event.inputs` is null outside workflow_dispatch,
-    # so the comparison is false on a schedule and the job runs -- which is the
-    # behaviour that matters, since the series must never silently lose its
-    # core numbers.
     if: github.event.inputs.skip_core != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
-      # Job-level so the publish steps can gate on presence; see perf.yml.
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -120,9 +114,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Install dependencies
         run: |
@@ -168,7 +162,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-perf-v1
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-perf-v1
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -392,9 +386,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply xquic patches
+      - name: Verify pinned xquic source
         shell: bash
-        run: bash scripts/apply_xquic_patches.sh
+        run: bash scripts/check_xquic_pin.sh
 
       - name: Install dependencies
         run: |
@@ -435,7 +429,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-perf-v1
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-perf-v1
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'

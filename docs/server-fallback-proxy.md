@@ -56,6 +56,7 @@ QuicFallback = 127.0.0.1:4443
 QuicFallbackProxyProtocol = false
 Http2Backend = 127.0.0.1:8080
 Http2BackendTLS = false
+Http2BackendProxyProtocol = false
 MaxConnections = 64
 IdleTimeoutSec = 60
 ```
@@ -68,6 +69,7 @@ IdleTimeoutSec = 60
 | `QuicFallbackProxyProtocol` | Prefix the first fallback datagram with PROXY v2. Disable for QUIC listeners that do not support PROXY protocol (including nginx QUIC). | `true` |
 | `Http2Backend` | TCP `host:port` for prior-knowledge h2c requests. | none |
 | `Http2BackendTLS` | Reserved for a future TLS upstream. The server rejects `true`. | `false` |
+| `Http2BackendProxyProtocol` | Prefix each H2 connection with PROXY v2. Disable for ordinary h2c listeners; enable only when the backend accepts it. | `true` |
 | `MaxConnections` | Limit applied independently to tracked/fallback connections and the H2 pool. | `64` |
 | `IdleTimeoutSec` | Idle connection cleanup interval in seconds, up to 86400. | `60` |
 
@@ -92,6 +94,7 @@ JSON uses a bounded `proxy` object:
     "quic_fallback_proxy_protocol": false,
     "http2_backend": "127.0.0.1:8080",
     "http2_backend_tls": false,
+    "http2_backend_proxy_protocol": false,
     "max_connections": 64,
     "idle_timeout_sec": 60
   }
@@ -132,10 +135,10 @@ server {
     }
 }
 
-# Raw QUIC destination for SNI names not claimed by mqvpn. mqvpn sends a
-# PROXY protocol v2 UDP header before the first fallback datagram.
+# Raw QUIC destination for SNI names not claimed by mqvpn. This matches
+# QuicFallbackProxyProtocol = false in the example above.
 server {
-    listen 127.0.0.1:4443 quic reuseport proxy_protocol;
+    listen 127.0.0.1:4443 quic reuseport;
     server_name public.example.com;
 
     ssl_certificate     /etc/letsencrypt/live/public.example.com/fullchain.pem;

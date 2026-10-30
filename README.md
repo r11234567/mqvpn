@@ -53,6 +53,7 @@ https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
   - [Verifying downloads](#verifying-downloads)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
+  - [This fork: paired server and client examples](#this-fork-paired-server-and-client-examples)
   - [INI config](#ini-config)
   - [JSON config](#json-config)
   - [TUN MTU](#tun-mtu)
@@ -98,18 +99,37 @@ implemented and tested. Do not infer fork status from an old commit alone.
 | H3-to-h2c backpressure and Priority | **Fork-only, corrected after field deadlock, lossy-path starvation, and a throughput ceiling** | ~~256/128 KiB connection queue watermarks were tracked per stream and paused the shared h2c socket.~~ ~~**Replaced:** the watermarks now form one state machine per downstream QUIC connection.~~ **Replaced again:** the watermarks were the deadlock. They were fed an estimate that counted packets in flight, and a connection running at its bandwidth-delay product holds a congestion window of those continuously, so on a fast path the gate never reopened — the larger the response, the more certainly it latched. Pacing is now per stream and comes from xquic: mqvpn writes until `xqc_h3_request_send_body` returns a short write or `-XQC_EAGAIN`, keeps the write notification armed while a response waits, and is resumed directly by the acknowledgement that releases queue space. ~~Each connection admits at most one 16 KiB body chunk per stream per pass.~~ **Removed:** that quota capped one response at a slice per server tick, because a fully accepted write also drops a stream from writable scheduling and left nothing to re-arm the notification. A round-robin cursor still gives every response a turn, and `xqc_h3_request_get_unsent_queue_bytes` remains as a 1 MiB per-connection *memory* valve that cannot latch. The shared h2c fd stays readable: nghttp2 connection credit is returned after copying into the bounded response buffer, stream credit only after xquic accepts those bytes. The 50 ms event-loop clamp is a safety net for xquic suppressing notification under `DATA_BLOCKED`, not the recovery path. RFC 9218 `Priority` mapping and xquic's urgent packet queue remain. Pushback, valve, and fair-recovery coverage is in `tests/test_h2_proxy.c`. |
 | Hybrid TCP-lane uplink backpressure | **Fork-only, requires pinned xquic API** | `src/hybrid/tcp_lane_uplink.c` stops granting lwIP receive credit when either xquic returns EAGAIN/partial or its connection-wide **un-sent** byte estimate reaches 256 KiB. Credit resumes only after the local retry queue is empty and xquic drains to 64 KiB. Packets in flight are outside that estimate on purpose — counting them made the same gate latch closed on fast paths, which is what broke the H3 proxy above. The xquic boundary wrappers live in `src/mqvpn_client.c`; full-accept, pre-send-high-water, and repeated-EAGAIN regressions are pinned in `tests/test_tcp_lane.c`; memory accounting is in `docs/hybrid_h2_memory_budget.md`. |
 | ~~Unbounded Hybrid server egress read per reactor grant~~ | ~~Fork-only~~ **Synchronized from upstream ([mp0rta/mqvpn#349](https://github.com/mp0rta/mqvpn/pull/349); fixes [#348](https://github.com/mp0rta/mqvpn/issues/348))** | `src/hybrid/tcp_egress.c` limits each readable dispatch to a 64 KiB, whole-chunk budget so one busy TCP flow yields to its peers without disarming the level-triggered read event. `tests/test_tcp_egress.c` pins the exact first-dispatch budget and verifies that a later dispatch drains the remainder without manual re-arming. This is server-side reactor fairness; it complements rather than replaces the client-side xquic/lwIP backpressure above. |
-| Windows WFP cleanup lifecycle ([upstream #331](https://github.com/mp0rta/mqvpn/issues/331)) | **Fork-only** | `src/platform/windows/firewall.c` uses a dynamic WFP session for crash cleanup and, on normal exit or reconnect, deletes every tracked filter before its referenced sublayer. Cleanup failures are returned instead of logging a false success; reconnect then stops rather than stacking another ruleset. `tests/test_windows_firewall.c` pins deletion order, idempotent not-found handling, best-effort continuation, and retained retry state after an engine-close failure. |
+| Windows WFP cleanup lifecycle | **Upstream lifecycle + fork scoping** | The dynamic WFP session owns all filters and removes them when closed. Server permits match the mqvpn executable, UDP, and the exact endpoint. `tests/test_windows_firewall.c` is registered in the Windows test branch and checks session lifetime, failure handling and permit conditions. |
 | Windows kill-switch teardown and interface-bound leak protection ([upstream #330](https://github.com/mp0rta/mqvpn/issues/330), [#331](https://github.com/mp0rta/mqvpn/issues/331)) | **Leak protection fork-only; teardown synchronized from upstream ([mp0rta/mqvpn#356](https://github.com/mp0rta/mqvpn/pull/356))** | Windows split-default routes cannot redirect applications that select a physical interface with `IP_UNICAST_IF`/`IPV6_UNICAST_IF`, so the explicit `KillSwitch` is the protection boundary: its unconditional ALE block also covers interface-bound sockets, while the transport exception is restricted to the current mqvpn executable, UDP, and the configured server endpoint. ~~Teardown deleted each filter by ID and then the sublayer before closing the engine, and retried `FwpmEngineClose0` on a handle whose close had already failed.~~ **Replaced by upstream's design:** the dynamic session owns the objects, so closing the engine is the whole teardown and BFE also covers a crash or a kill; a failed close is terminal because a WFP engine handle is an RPC context handle whose post-failure state is undefined, so mqvpn records it, refuses to stack a second session over the stale one, and drives the process to exit. Policy-shape and teardown tests live in `tests/test_windows_firewall.c`; the operator contract is in `docs/windows_build.md` and the configuration guide. |
 | Android native logs | **Fork-only, retained** | JNI Logcat output, `onNativeLog`, and the app log view are intentionally retained across upstream syncs; see `docs/logging.md`. |
-| Hybrid TCP lane, reorder buffering, multipath recovery, route/killswitch hardening | **Fork-only** | Indexed by their public config sections below and covered by the corresponding `tests/test_*`, `scripts/ci_e2e/*`, and platform routing tests. |
+| Hybrid TCP lane, reorder buffering, multipath recovery, route/killswitch hardening | **Upstream baseline + independent fork increments** | Preserve the current upstream sans-I/O transport, Native Reactor, PMTUD and yyjson implementations. Keep the proxy, backpressure, platform scoping and benchmark increments indexed here. |
 | ~~xquic var-buffer underflow and submatrix overflow patch files~~ | ~~Local patch stack~~ **Synchronized into the pinned xquic fork** | Replaced by xquic commit `2ae918c`; the obsolete duplicate patch hunks must not be restored. |
 | ~~xquic active_connection_id_limit backport~~ | ~~`patches/xquic/0001-*`~~ **Synchronized upstream; local patch removed** | The new xquic pin already contains the exact RFC 9000 peer-CID accounting fix, confirmed by reverse-applying the former patch. |
-| xquic parser/allocation CodeQL hardening | **Local patch retained** | `patches/xquic/0002-*` still applies cleanly and covers null checks, bounds checks, and failure cleanup not present in the pin. |
-| xquic STREAM multipath scheduling | **Local patch retained** | `patches/xquic/0003-*` keeps stream packets on WLB's unpinned per-packet path so the hybrid TCP lane can aggregate links. |
-| ~~xquic fork-local WLB flow placement and recovery~~ | ~~Fork-only~~ **Synchronized from [mp0rta/xquic#71](https://github.com/mp0rta/xquic/pull/71); replaced** | The pinned xquic now uses acknowledged-goodput weights, independent smooth deficits for flow placement and packet scheduling, topology refresh, blackhole eviction, and bounded recovery probes. The upstream series deliberately keeps STREAM/control traffic on MinRTT; mqvpn's retained `0003-*` patch is the documented hybrid-mode override. Tests and implementation paths are indexed below. |
+| xquic parser/allocation CodeQL hardening | **Pinned dependency source** | The remaining defensive checks from the former `0002` overlay are now in the pinned xquic commit; upstream early-list initialization is retained. No workflow applies source patches. |
+| xquic STREAM multipath scheduling | **Upstream MinRTT** | The obsolete `0003` WRR overlay is removed. STREAM uses the measured upstream MinRTT fallback; WLB remains the datagram scheduler. |
+| xquic WLB flow placement and recovery | **Upstream design with retained fork fixes** | Acknowledged-goodput weights, independent flow/packet deficits, topology refresh and bounded recovery come from upstream. STREAM/control stays on MinRTT. Fork recovery and observability fixes remain in the pinned source. |
 | ~~xquic fixed STREAM reassembly-node limit~~ | ~~Fork-only mitigation~~ **Synchronized from [mp0rta/xquic#71](https://github.com/mp0rta/xquic/pull/71); replaced** | The stronger two-tier budget admits a dense 16 MiB receive window while rejecting sparse-node amplification: 8192 sparse nodes, a 256-byte/node density floor, a 32768 hard ceiling, and a reserved prefix slot for retransmission progress. |
 | xquic Retry sizing, PMTU, receive-buffer, WLB and TLS hardening | **Pinned xquic fork** | The detailed commit-to-fix map remains in [End-to-end fixes carried in the pinned xquic](#end-to-end-fixes-carried-in-the-pinned-xquic). |
-| Rolling binaries from `main` | **Fork-only** | `.github/workflows/release.yml` updates the `snapshot` prerelease only after Linux, macOS, Windows, and Android builds succeed; tagged releases remain immutable. |
+| Rolling native binaries from `main` | **Fork-only** | `.github/workflows/release.yml` updates the native `snapshot` prerelease after platform builds succeed. Binaries and asset names use an independent `snapshot+UTCtime.gSHA` version. Canonically signed Android releases remain tag-only; ephemeral Android test APKs stay in workflow artifacts. |
+
+Snapshot versions look like `snapshot+20261030T120000Z.g123456789abc`.
+The timestamp is the commit's UTC time, so reruns and all platform builds
+produce the same identity. `mqvpn --version` prints that identity, followed
+by the numeric core version and callback ABI used by the GUI's compatibility
+check. Tagged releases keep their regular numeric version.
+
+Release automation generates `build-version/build-version.cmake` with
+`scripts/resolve_build_version.sh` and loads it using
+`cmake -C "$BUILD_VERSION_FILE" ...`. The tracked `CMakeLists.txt` and shared
+library ABI retain their numeric versions. Debian requires a leading digit,
+so only the `.deb` package metadata uses `0~snapshot+...`; it sorts below
+official releases and installing it over a release may require allowing a
+downgrade. The binary and download filename still use `snapshot+...`.
+
+Each push to this fork's `main` starts CI, CodeQL, gitleaks, Performance
+Tests, Formal, and Release (which publishes the snapshot). H2/SNI integration
+workflows run on PRs; Stress Tests and Performance Weekly remain scheduled or
+manual. The Windows GUI checks run inside CI against its own Windows builds.
 
 ### Client certificate verification against the OS trust store
 
@@ -176,28 +196,23 @@ rules, an nginx example, the security properties, and the current limitations.
 
 ### Post-quantum key exchange (X25519MLKEM768)
 
-Both ends request hybrid ML-KEM-768 by default. It is compiled in rather than
-exposed as a config key; these two lines are identical in `src/mqvpn_client.c`
-and `src/mqvpn_server.c`:
+Both ends use the shared policy in `src/tls_policy.h`. Hybrid ML-KEM-768
+is first, followed by X25519 and the supported classical curves. A peer that
+only offers X25519 can still connect. `tests/test_tls_policy.c` checks both
+normal negotiations against the pinned BoringSSL, and the core loopback tests
+exercise the policy through xquic.
 
-```c
-/* Prioritize AES-256-GCM for stronger encryption */
-engine_ssl.ciphers =
-    "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256";
-/* Enable post-quantum key exchange with X25519MLKEM768 */
-engine_ssl.groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
-```
+BoringSSL chooses its own TLS 1.3 cipher preference order. Its xquic adapter
+ignores the cipher-order string, so this build does **not** guarantee AES-256
+priority. AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 remain available under
+BoringSSL's negotiation policy.
 
-ML-KEM-768 is listed first with the classical curves behind it, so a peer that
-does not offer it still negotiates X25519 — turning this on does not cut off
-older clients or servers.
-
-ML-KEM-768's 1184-byte key share breaks assumptions the transport was built on,
-so it needs these supporting settings to work at all:
+ML-KEM-768's large key share relies on the current packet-size handling and
+Retry header reserve. PMTUD is optional and follows the upstream configuration:
 
 | Setting | Value | Where |
 |---|---|---|
-| `enable_pmtud` | `1` | `src/mqvpn_conn_settings.c:131` |
+| `enable_pmtud` | Off by default; `0x3` (probe + blackhole recovery) when enabled | `src/mqvpn_conn_settings.c` |
 | `MQVPN_MAX_PKT_OUT_SIZE` | `1400` | `src/mqvpn_internal.h:40` |
 | `XQC_QUIC_MIN_MSS` / `XQC_QUIC_MAX_MSS` | `1200` / `1420` | xquic `src/transport/xqc_packet.h` |
 | `XQC_PACKET_OUT_HDR_GROWTH` | 277-byte reserve | xquic `src/transport/xqc_packet_out.h` |
@@ -487,7 +502,7 @@ fix and diagnostics in `42eac6c`, and waiting on `closing_notify` rather than
 curl -fsSL https://github.com/mp0rta/mqvpn/releases/latest/download/install.sh | sudo bash
 ```
 
-This downloads the latest release, installs the binary, and generates a self-signed TLS certificate, auth key, and server config at `/etc/mqvpn/server.conf`. Add `--start` to start the server and register it for automatic startup on boot:
+This downloads the latest release, installs the binary, and generates a self-signed TLS certificate, auth key, and server config at `/etc/mqvpn/server.conf`. The generated config turns on hybrid mode and the reorder buffer on the server side; each takes effect only for clients that also turn it on. Add `--start` to start the server and register it for automatic startup on boot:
 
 ```bash
 curl -fsSL https://github.com/mp0rta/mqvpn/releases/latest/download/install.sh \
@@ -520,6 +535,17 @@ sudo dpkg -i mqvpn_*.deb
 ```
 
 ### Windows client
+
+This fork also provides a Windows WPF GUI testing package for x64/ARM64 in
+the current PR's CI artifacts. See the [GUI setup and configuration guide](windows/README.md)
+and the [Windows GUI client JSON](windows/examples/client.json), paired with
+the [server example below](#this-fork-paired-server-and-client-examples).
+Import the JSON through the node list's **导入 JSON 为新节点** menu, replace
+the endpoint/SNI/PSK, and review the routing policy before connecting.
+The example uses `manage_routes: false` because the GUI manages routing;
+empty `paths` selects runtime default-adapter mode in the GUI. A direct
+Windows CLI invocation still requires at least one adapter. PR artifacts
+are testing packages and do not imply a signed stable GUI release.
 
 Pre-built binaries are shipped for Windows amd64 and arm64. Download `mqvpn_<VERSION>_windows_<ARCH>.zip` from [Releases](https://github.com/mp0rta/mqvpn/releases/latest), extract, and follow the bundled `README.txt` (admin PowerShell required).
 
@@ -564,6 +590,154 @@ sudo mqvpn --mode client --server YOUR_SERVER:443 \
 ## Configuration
 
 Config files support both INI and JSON. CLI arguments override config values.
+INI keys are case-insensitive, but values (such as paths and URLs) are preserved as given.
+
+### This fork: paired server and client examples
+
+These examples pair a Linux server with a CLI client built from this fork.
+Replace `vpn.example.com` with your server's DNS name, point it at the server,
+and allow inbound UDP 443. Install a certificate for that name and use the
+actual certificate/key paths below. Choose tunnel subnets that do not overlap
+your existing networks.
+
+Run `mqvpn --genkey` once and replace **both** occurrences of
+`REPLACE_WITH_THE_SAME_GENERATED_KEY` with its output. Do not use the
+placeholder as a real key. For multiple clients with separate identities,
+use per-user keys as described below instead of sharing this single key.
+
+Server (`/etc/mqvpn/fork-server.conf`):
+
+```ini
+[Interface]
+TunName = mqvpn0
+Listen = 0.0.0.0:443
+Subnet = 10.70.0.0/24
+Subnet6 = fd00:70::/112
+LogLevel = info
+MTU = 0
+PathMTU = 0
+PMTUD = false
+
+[TLS]
+Cert = /etc/letsencrypt/live/vpn.example.com/fullchain.pem
+Key = /etc/letsencrypt/live/vpn.example.com/privkey.pem
+
+[Auth]
+Key = REPLACE_WITH_THE_SAME_GENERATED_KEY
+MaxClients = 64
+
+[Multipath]
+Scheduler = wlb
+CC = bbr2
+InitMaxPathId = 8
+
+[Hybrid]
+Enabled = true
+Tcp = auto
+
+[Reorder]
+Enabled = false
+```
+
+Client (`/etc/mqvpn/fork-client.conf`):
+
+```ini
+[Server]
+Address = vpn.example.com:443
+ServerName = vpn.example.com
+Insecure = false
+
+[Auth]
+Key = REPLACE_WITH_THE_SAME_GENERATED_KEY
+
+[Interface]
+TunName = mqvpn0
+DNS = 1.1.1.1, 8.8.8.8
+LogLevel = info
+ManageRoutes = true
+KillSwitch = true
+Reconnect = true
+ReconnectInterval = 5
+MTU = 0
+PathMTU = 0
+PMTUD = false
+
+[Multipath]
+Scheduler = wlb
+CC = bbr2
+InitMaxPathId = 8
+Path = eth0
+Path = wlan0
+
+[Hybrid]
+Enabled = true
+Tcp = auto
+
+[Reorder]
+Enabled = false
+```
+
+Replace the two `Path` values with real client interfaces that can reach the
+server. Remove the second line for a single-path client. `ServerName` must
+match the certificate even if `Address` is changed to an IP address. Keep
+`Insecure = false`; on Linux, the issuing CA must be in BoringSSL's default
+trust store, or set `SSL_CERT_FILE` to a trusted PEM CA bundle. There is no
+`CaCert` INI key. See [certificate verification](docs/client-certificate-verification.md)
+for each platform's trust-store behavior.
+
+```bash
+sudo mqvpn --config /etc/mqvpn/fork-server.conf  # on the Linux server
+sudo mqvpn --config /etc/mqvpn/fork-client.conf  # on the client
+```
+
+The client example manages routes and DNS for a full tunnel. Router integrations
+whose own service manages routes should set `ManageRoutes = false`. On Windows,
+use the native CLI from an elevated terminal with `mqvpn.exe --config PATH`,
+install Wintun as described in [Windows setup](docs/windows_build.md), and use
+the actual Windows adapter names in `Path`. Save the file as UTF-8. With
+`KillSwitch = true`, Windows also blocks applications that bind directly to a
+physical interface. These examples describe the core CLI configuration; the
+Windows GUI's configuration editor has a separate set of supported fields.
+
+`Hybrid` requires a build with the TCP lane enabled on both endpoints. It
+carries inner TCP over reliable QUIC streams, whose scheduler remains MinRTT;
+`Scheduler = wlb` applies to the datagram lane. `Reorder` remains off here;
+enable it on both ends only for the inner QUIC use cases described in
+[Reorder buffer](#reorder-buffer-datagram-lane). `PMTUD` is opt-in: change
+`PMTUD = true` on the endpoints where path MTU discovery is wanted and the
+network supports it. `MTU = 0` and `PathMTU = 0` retain automatic sizing.
+`InitMaxPathId` accepts `0` (default 8) or `1`–`128`; it is a path-ID grant,
+not a request to create that many simultaneous interfaces.
+
+The fork's hybrid ML-KEM group preference is compiled into both endpoints;
+it has no INI switch. Negotiation still depends on the peer, and BoringSSL
+chooses the TLS 1.3 cipher order; the configuration does not guarantee AES-256.
+
+For optional **Linux-only** shared UDP-port routing, append this section to
+the server file only after preparing both backends and a build with nghttp2:
+
+```ini
+[Proxy]
+Enabled = true
+SNI = vpn.example.com
+QuicFallback = 127.0.0.1:4443
+QuicFallbackProxyProtocol = false
+Http2Backend = 127.0.0.1:8080
+Http2BackendTLS = false
+Http2BackendProxyProtocol = false
+MaxConnections = 64
+IdleTimeoutSec = 60
+```
+
+Matching SNI uses mqvpn: VPN requests enter the tunnel and ordinary HTTP/3
+requests go to the prior-knowledge cleartext HTTP/2 (h2c) backend. Unmatched
+SNI goes unchanged to the UDP QUIC fallback. Keep the backend ports private.
+Both PROXY protocol switches are explicitly off for ordinary backends; enable
+one only when that backend accepts PROXY v2. TLS to the H2 backend is currently
+unsupported, so keep `Http2BackendTLS = false`. See
+[server fallback proxy](docs/server-fallback-proxy.md) and
+[H2 PROXY protocol](docs/h2-proxy-protocol.md) for backend setup.
+
 ### INI config
 
 ```ini
@@ -587,14 +761,22 @@ User = bob:bob-secret
 Scheduler = wlb
 # CC = bbr2                     # Congestion control (bbr2|bbr|cubic|none, default: bbr2)
 
+[Hybrid]
+Enabled = true
+
+[Reorder]
+Enabled = true
+
 # Optional Linux-only shared-port routing. Keep disabled unless both backends
 # below are configured. See docs/server-fallback-proxy.md.
 [Proxy]
 Enabled = false
 # SNI = vpn.example.com,*.edge.example
 # QuicFallback = 127.0.0.1:4443
+# QuicFallbackProxyProtocol = false
 # Http2Backend = 127.0.0.1:8080
 # Http2BackendTLS = false
+# Http2BackendProxyProtocol = false
 # MaxConnections = 64
 # IdleTimeoutSec = 60
 ```
@@ -618,6 +800,12 @@ Scheduler = wlb
 # CC = bbr2                     # Congestion control (bbr2|bbr|cubic|none, default: bbr2)
 Path = eth0
 Path = wlan0
+
+# [Hybrid]                      # opt in to carry inner TCP over QUIC streams; see the [Hybrid] section
+# Enabled = true
+
+# [Reorder]                     # opt in for bulk inner QUIC; see the [Reorder] section
+# Enabled = true
 ```
 
 ### JSON config
@@ -642,12 +830,16 @@ Server example:
     "max_clients": 64,
     "scheduler": "wlb",
     "cc": "bbr2",
+    "hybrid": { "enabled": true },
+    "reorder": { "enabled": true },
     "proxy": {
         "enabled": false,
         "sni": "vpn.example.com,*.edge.example",
         "quic_fallback": "127.0.0.1:4443",
+        "quic_fallback_proxy_protocol": false,
         "http2_backend": "127.0.0.1:8080",
         "http2_backend_tls": false,
+        "http2_backend_proxy_protocol": false,
         "max_connections": 64,
         "idle_timeout_sec": 60
     }
@@ -661,7 +853,7 @@ Client example:
     "mode": "client",
     "server_addr": "203.0.113.1:443",
     "tls_server_name": "vpn.example.com",
-    "auth_key": "client-key",
+    "auth_key": "legacy-fallback-key",
     "insecure": false,
     "dns": ["1.1.1.1", "8.8.8.8"],
     "paths": ["eth0", "wlan0"],
@@ -890,8 +1082,8 @@ peer that has it off or does not know about it.
 
 ```ini
 [Reorder]
-Enabled = on             # default is off
-MaxWaitMs = 50           # reorder window: hold out-of-order datagrams up to this long
+Enabled = true
+MaxWaitMs = 50           # wait for a missing datagram this long (hold nominally <= 2x)
 CapPackets = 1024        # per-flow buffer cap (packets)
 
 # Optional: target specific inner flows with a tuned preset
@@ -939,10 +1131,16 @@ ReinjectionDeadlineLowerBoundMs = 20  # deadline mode: lower clamp (1-60000; cla
 
 - `deadline` — insurance for bonded tunnels running the [hybrid TCP lane](#hybrid-mode-tcp-lane). Most of the time it does nothing and costs nothing. When a link suddenly goes bad, data already sent on it must be recovered before in-order delivery lets anything behind it through — even data that already arrived via the healthy link — which in bad cases stalls transfers for up to a second; `deadline` resends the late data on the healthy link right away, shrinking that stall to a barely noticeable blip. Protects stream (TCP-lane) traffic only — with the hybrid lane disabled its effect is limited to control streams and a warning is logged.
 - `idle` — low-cost smoothing for interactive use (SSH, browsing): whenever the tunnel has nothing else to send, it uses that spare moment to send a copy of recent still-unconfirmed data over another link, shaving off occasional hiccups. No tuning needed.
-- `dgram` — for tunnels dedicated to real-time traffic (VoIP, gaming): every datagram-lane packet (UDP and other non-TCP traffic; hybrid-mode TCP is not duplicated) is sent over two links at once, so a lost packet or a dying link no longer causes dropouts or lag spikes. **Uses double the bandwidth for that traffic; not recommended for mixed tunnels** — it duplicates all inner UDP, including HTTP/3 video streams, so the usable speed of the datagram lane drops to a single link's capacity. Duplicates are delivered twice at the receiver's TUN unless the [reorder buffer](#reorder-buffer-datagram-lane) is enabled (it removes them); plain UDP apps may otherwise see duplicate packets.
+
+The former `dgram` value was removed. To keep live UDP streams alive across a dropped link, use redundant mode, which covers client uploads (`[Multipath] Redundant = true`; see the [website guide](https://docs.mqvpn.org/guide/multipath#redundant-mode)); every link should be able to carry the stream on its own (recommended).
 
 Per-path duplicated bytes are reported as `reinject_tx_bytes` in the control
 API `get_status` response.
+
+> **Upstream redundant mode note:**
+> To keep live UDP streams alive across a dropped link without datagram-lane duplication overhead,
+> redundant mode (`[Multipath] Redundant = on`) is also available, which covers client uploads;
+> every link should be able to carry the stream on its own (recommended).
 
 ## Hybrid mode (TCP lane)
 

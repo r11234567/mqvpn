@@ -186,9 +186,6 @@ active_context(void)
      * win_setup_killswitch() returns 0 at its !killswitch_enabled guard
      * before reaching the stale-session refusal under test. */
     p.killswitch_enabled = 1;
-    p.wfp_filter_ids[0] = 11;
-    p.wfp_filter_ids[1] = 22;
-    p.wfp_filter_ids[2] = 33;
     p.n_wfp_filters = 3;
     return p;
 }
