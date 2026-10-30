@@ -15,13 +15,4 @@ data class TunnelInfo(
     val assignedIp6: String? = null,
     val prefix6: Int = 0,
     val hasV6: Boolean = false,
-    /** Server's effective scheduler; null when the server did not report one. */
-    val serverScheduler: MqvpnConfig.Scheduler? = null,
-    /** The scheduler this client asked the server to use; null when it did not ask. */
-    val requestedScheduler: MqvpnConfig.Scheduler? = null,
-    /**
-     * Wall-clock ms when this session established, so a UI that re-attaches to
-     * a running service shows the real elapsed time; 0 when unknown.
-     */
-    val connectedAtMs: Long = 0,
 )

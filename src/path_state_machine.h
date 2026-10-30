@@ -4,13 +4,6 @@
 /*
  * path_state_machine.h — Path lifecycle internal state machine.
  *
- * This header includes path_entry_internal.h, re-exporting path_entry_t, so
- * the same include policy applies to it: only mqvpn_client.c,
- * path_state_machine.c, tests/test_path_state_machine.c and
- * formal/oracle/oracle_abs.h (the formal-verification harnesses' single
- * entry point) may include it (enforced by
- * scripts/lint/check_lifecycle_field_writes.sh).
- *
  * PR1 (Phase 1) introduced invariant checks, transition logging, and
  * state-residence timers against the legacy 5-value `mqvpn_path_status_t`.
  * PR2 added the internal 7-value `path_lifecycle_t` (defined in
@@ -38,6 +31,9 @@
  * fires residence-timer hooks, logs the transition, and emits the public
  * path_event callback. Direct field assignment from outside
  * path_state_machine.c is forbidden (lint enforced — spec §7.1).
+ *
+ * EVENT_FD_CLOSED is intentionally absent — spec §7.2 (PR5) introduces both
+ * the event and its emitter together.
  */
 typedef enum {
     PATH_EVENT_ACTIVATE_REQUESTED = 0,
@@ -47,9 +43,9 @@ typedef enum {
     PATH_EVENT_MANUAL_REACTIVATE,
     PATH_EVENT_PLATFORM_DROP,
     PATH_EVENT_REMOVE_API,
-    PATH_EVENT_ADD,
+    PATH_EVENT_ADD_FD,
     PATH_EVENT_CONN_RESET,
-    PATH_EVENT_TRANSPORT_RELEASED, /* platform stopped I/O; ctx finalised by the caller */
+    PATH_EVENT_FD_CLOSED, /* PR5 - platform reports fd close completion */
 } path_event_t;
 
 /* Activation attempt classification (spec §6.6). */
@@ -64,7 +60,7 @@ typedef enum {
  *     result, new_xqc_path_id (OK only), now_us
  *   VALIDATION_OK:
  *     validated_target (ACTIVE or STANDBY per initial_app_status), now_us
- *   XQUIC_REMOVED / PLATFORM_DROP / REMOVE_API / ADD / TRANSPORT_RELEASED / CONN_RESET:
+ *   XQUIC_REMOVED / PLATFORM_DROP / REMOVE_API / ADD_FD / CONN_RESET:
  *     now_us only
  *
  * Caller MUST always populate now_us (FSM does not call client_now_us()
@@ -94,13 +90,13 @@ _Static_assert(PATH_LC_CLOSED_FREE == 8,
                "path_lifecycle_t shape changed - review all FSM switches");
 _Static_assert(PATH_EVENT_CONN_RESET == 8,
                "path_event_t shape changed - review path_on_event dispatch");
-_Static_assert(PATH_EVENT_TRANSPORT_RELEASED == 9,
+_Static_assert(PATH_EVENT_FD_CLOSED == 9,
                "path_event_t shape changed - review path_on_event dispatch + "
-               "path_on_transport_released handler");
+               "path_on_fd_closed handler");
 
 /* Reason tag for transition logs. Phase 4 will extend this. */
 typedef enum {
-    PATH_REASON_ADD = 0,
+    PATH_REASON_ADD_FD = 0,
     PATH_REASON_ACTIVATE_OK,
     PATH_REASON_ACTIVATE_FAILED,
     PATH_REASON_XQUIC_REMOVED,
@@ -109,16 +105,16 @@ typedef enum {
     PATH_REASON_REACTIVATE,
     PATH_REASON_CONN_RESET,
     PATH_REASON_RETRY_RESET,
-    PATH_REASON_TRANSPORT_RELEASED, /* symmetric with PATH_REASON_XQUIC_REMOVED */
+    PATH_REASON_FD_CLOSED, /* PR5 - symmetric with PATH_REASON_XQUIC_REMOVED */
 } path_transition_reason_t;
 
-/* Phase 2 (PR2): internal 9-state lifecycle helpers.
+/* Phase 2 (PR2): internal 7-state lifecycle helpers.
  * The enum `path_lifecycle_t` is defined in path_entry_internal.h to avoid
  * a circular include (path_state_machine.h includes path_entry_internal.h
  * for path_entry_t, which contains a path_lifecycle_t field).
  *
- * PR3 split PENDING into PENDING / CREATE_WAIT / VALIDATING, which is how
- * the enum reaches its 9 states. */
+ * PR3 will further split PENDING into PENDING / CREATE_WAIT / VALIDATING
+ * (→ 9 states total). */
 
 /* Map internal lifecycle → public 5-state. Pure function. */
 MQVPN_INTERNAL mqvpn_path_status_t path_public_status_from_lifecycle(path_lifecycle_t s);
@@ -126,9 +122,9 @@ MQVPN_INTERNAL mqvpn_path_status_t path_public_status_from_lifecycle(path_lifecy
 /* Human-readable name (for logs). */
 MQVPN_INTERNAL const char *path_lifecycle_name(path_lifecycle_t s);
 
-/* Debug-build 9-state invariant check. Asserts the (state, transport_attached,
- * transport_released, transport_ctx, xquic_path_live, xqc_path_id,
- * recreate_after_us, path_stable_since_us) tuple is legal AND that p->status ==
+/* Debug-build 7-state invariant check. Asserts the (state, platform_attached,
+ * xquic_path_live, fd_valid, xqc_path_id, recreate_after_us,
+ * path_stable_since_us) tuple is legal AND that p->status ==
  * path_public_status_from_lifecycle(p->state) (denormalization invariant).
  * No-op in release builds. */
 MQVPN_INTERNAL void path_invariant_check(const path_entry_t *p);
@@ -140,8 +136,8 @@ MQVPN_INTERNAL const char *mqvpn_path_status_name(mqvpn_path_status_t s);
 MQVPN_INTERNAL const char *mqvpn_path_transition_reason_name(path_transition_reason_t r);
 
 /* Debug-build invariant check for the legacy 5-state model.
- * Asserts that the (status, transport_attached, transport_released,
- * xquic_path_live, xqc_path_id, recreate_after_us, path_stable_since_us)
+ * Asserts that the (status, platform_attached, xquic_path_live,
+ * fd_valid, xqc_path_id, recreate_after_us, path_stable_since_us)
  * tuple is in a known-legal combination. No-op in release builds
  * (uses assert()). MUST be called only after all coupled field
  * updates of a transition are complete — never mid-mutation. */
@@ -205,6 +201,15 @@ MQVPN_INTERNAL void client_log(struct mqvpn_client_s *c, mqvpn_log_level_t level
                                const char *fmt, ...);
 MQVPN_INTERNAL void path_fsm_fire_path_event(struct mqvpn_client_s *c,
                                              const path_entry_t *p);
+
+/* G-P15 (draft-21 §3.3 ¶6): mirror local lifecycle demotions onto the
+ * xquic conn via xqc_conn_mark_path_{standby,available,frozen}. The
+ * caller passes the xquic app_status int (XQC_APP_PATH_STATUS_STANDBY=1,
+ * AVAILABLE=2, FROZEN=3); the accessor dispatches to the right xquic
+ * API. Implementation in mqvpn_client.c (needs the full client struct
+ * for c->engine and c->conn->cid). No-op when engine/conn missing. */
+MQVPN_INTERNAL void client_notify_xqc_path_state(struct mqvpn_client_s *c,
+                                                 const path_entry_t *p, int app_status);
 
 /* PR4 - Per-tick stable-budget reset (relocated from mqvpn_client.c for
  * §7.1 file-scope allow on path_stable_since_us / recreate_retries writes).

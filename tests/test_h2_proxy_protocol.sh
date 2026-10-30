@@ -5,15 +5,14 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build}"
-MQVPN="${1:-$BUILD_DIR/mqvpn}"
 XQUIC_CLIENT="${XQUIC_CLIENT:-$PROJECT_ROOT/third_party/xquic/build/tests/test_client}"
 
 echo "=== H2 Proxy Protocol Test ==="
 echo "Build dir: $BUILD_DIR"
 
 # Check if binaries exist
-if [ ! -x "$MQVPN" ]; then
-    echo "ERROR: mqvpn binary not found at $MQVPN"
+if [ ! -f "$BUILD_DIR/mqvpn" ]; then
+    echo "ERROR: mqvpn binary not found at $BUILD_DIR/mqvpn"
     exit 1
 fi
 if [ ! -x "$XQUIC_CLIENT" ]; then
@@ -125,7 +124,7 @@ EOF
 
 # Start mqvpn server
 echo "[6/6] Starting mqvpn server with H2 proxy..."
-"$MQVPN" --config "$TEST_DIR/server.json" &
+"$BUILD_DIR/mqvpn" --config "$TEST_DIR/server.json" &
 MQVPN_PID=$!
 sleep 2
 

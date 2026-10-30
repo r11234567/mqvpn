@@ -20,6 +20,11 @@
  * future xquic merge renumbers the enum, this file fails to compile and the
  * mirror must be updated in lockstep.
  *
+ * app_path_status is deliberately NOT pinned here: mqvpn only relays those
+ * classes to xquic through the named xqc_conn_mark_path_* calls (see
+ * client_notify_xqc_path_state), never by numeric value, so there is no ABI
+ * value dependency to guard.
+ *
  * There is no runtime behaviour here — the _Static_asserts are the test.
  */
 
@@ -29,7 +34,7 @@
 
 #define PIN_PATH_STATE(mirror, real)                                                 \
     _Static_assert((mirror) == (real), "mqvpn " #mirror " drifted from xquic " #real \
-                                       " — update the mirror in mqvpn_internal.h")
+                                       " -- update the mirror in mqvpn_internal.h")
 
 PIN_PATH_STATE(MQVPN_XQC_PATH_STATE_INIT, XQC_PATH_STATE_INIT);
 PIN_PATH_STATE(MQVPN_XQC_PATH_STATE_VALIDATING, XQC_PATH_STATE_VALIDATING);
@@ -46,7 +51,7 @@ PIN_PATH_STATE(MQVPN_XQC_PATH_STATE_CLOSED, XQC_PATH_STATE_CLOSED);
  * conversation the comment asks for. */
 _Static_assert(MQVPN_MAX_PATHS == 8,
                "MQVPN_MAX_PATHS is ABI-frozen (embedded in mqvpn_client_info_t "
-               "layout) — see libmqvpn.h before changing this pin");
+               "layout) -- see libmqvpn.h before changing this pin");
 
 /* The H3-to-h2c proxy relies on these public symbols from the pinned xquic
  * fork. Pinning their declared types here makes an accidental submodule

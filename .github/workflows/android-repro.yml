@@ -44,16 +44,16 @@ env:
 
 jobs:
   android-repro:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
-      - name: Verify pinned xquic source
+      - name: Apply xquic patches
         shell: bash
-        run: bash scripts/check_xquic_pin.sh
+        run: bash scripts/apply_xquic_patches.sh
 
       - name: Check toolchain pins are in sync
         # The gate is only meaningful if it builds with the same toolchain as
@@ -76,13 +76,13 @@ jobs:
           echo "NDK pin in sync ($NDK_VERSION). BoringSSL is a submodule (single pin)."
 
       - name: Set up JDK 21
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6
         with:
           # Used for wrapper validation only. Caching is disabled because each
           # build below runs against its own GRADLE_USER_HOME — a shared one
@@ -111,7 +111,7 @@ jobs:
           ANDROID_NDK="$ANDROID_HOME/ndk/${NDK_VERSION}" \
             scripts/build_android.sh --abi arm64-v8a > /dev/null
           cd android
-          ./gradlew --no-daemon -q :app:assembleRelease
+          ./gradlew --no-daemon -q :app:assembleRelease -Pmqvpn.disableReleaseSigning=true
 
       - name: Build tree B in a Debian container
         # Debian with Debian's OpenJDK, mirroring where F-Droid rebuilds us.
@@ -136,7 +136,8 @@ jobs:
               scripts/stage_apk_license_assets.sh
               ANDROID_NDK=/sdk/ndk/'"$NDK_VERSION"' \
                 scripts/build_android.sh --abi arm64-v8a > /dev/null
-              cd android && ./gradlew --no-daemon -q :app:assembleRelease'
+              cd android && ./gradlew --no-daemon -q :app:assembleRelease \
+                -Pmqvpn.disableReleaseSigning=true'
 
       - name: Compare APKs
         run: |

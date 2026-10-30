@@ -20,18 +20,14 @@ mqvpn 的 H2 代理模块支持 Proxy Protocol v2，可以在代理转发时保�
 
 ```json
 {
-    "mode": "server",
+    "role": "server",
     "listen": "[::]:4433",
-    "cert_file": "/path/to/cert.pem",
-    "key_file": "/path/to/key.pem",
-    "auth_key": "replace-with-a-generated-key",
+    "cert": "/path/to/cert.pem",
+    "key": "/path/to/key.pem",
     "proxy": {
         "enabled": true,
         "sni": "vpn.example.com",
-        "quic_fallback": "127.0.0.1:4443",
-        "quic_fallback_proxy_protocol": false,
         "http2_backend": "127.0.0.1:8443",
-        "http2_backend_tls": false,
         "http2_backend_proxy_protocol": true
     }
 }
@@ -39,9 +35,8 @@ mqvpn 的 H2 代理模块支持 Proxy Protocol v2，可以在代理转发时保�
 
 **配置项说明：**
 
-- `proxy.http2_backend`: 明文 prior-knowledge HTTP/2（h2c）后端地址；上例开启了 Proxy Protocol，因此后端必须支持 PROXY v2。
-- `proxy.http2_backend_proxy_protocol`: 是否启用 Proxy Protocol v2（当前默认 true）；普通 h2c 后端需显式设为 false。
-- 代理仅支持 Linux 的 nghttp2 构建，同时需要 UDP QUIC fallback 和 h2c 后端；后端 TLS 暂不支持。完整路由要求见 [server fallback proxy](server-fallback-proxy.md)。
+- `proxy.http2_backend`: 后端 HTTP/2 服务器地址（必须支持 Proxy Protocol）
+- `proxy.http2_backend_proxy_protocol`: 是否启用 Proxy Protocol v2（默认 false）
 
 ### Nginx 后端配置
 
@@ -51,8 +46,8 @@ Nginx 需要在 `listen` 指令中添加 `proxy_protocol` 参数：
 http {
     server {
         # 启用 Proxy Protocol 监听
-        listen 127.0.0.1:8443 http2 proxy_protocol;
-        listen [::1]:8443 http2 proxy_protocol;
+        listen 127.0.0.1:8443 proxy_protocol;
+        listen [::1]:8443 proxy_protocol;
         server_name _;
 
         # 信任来自 localhost 的 Proxy Protocol 头部
@@ -91,7 +86,7 @@ http {
 http {
     # 端口 8443: 从 mqvpn 接收 Proxy Protocol 流量
     server {
-        listen 127.0.0.1:8443 http2 proxy_protocol;
+        listen 127.0.0.1:8443 proxy_protocol;
         server_name _;
         
         set_real_ip_from 127.0.0.1;
@@ -105,7 +100,7 @@ http {
 
     # 端口 8444: 直接访问（用于测试、内部调用等）
     server {
-        listen 127.0.0.1:8444 http2;
+        listen 127.0.0.1:8444;
         server_name _;
         
         location / {

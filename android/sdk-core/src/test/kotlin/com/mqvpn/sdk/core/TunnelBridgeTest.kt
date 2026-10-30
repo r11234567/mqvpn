@@ -33,7 +33,7 @@ class TunnelBridgeTest {
             block()
         }
         override fun start() {}
-        override fun stop(finalizer: () -> Unit) { finalizer() }
+        override fun stop() {}
     }
 
     // Fake tunnel that records onTunPacket calls

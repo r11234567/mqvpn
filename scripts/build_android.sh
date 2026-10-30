@@ -143,12 +143,7 @@ for ABI in $ABIS; do
     MQ_BUILD="${BUILD_DIR}/mqvpn"
     echo "  [3/3] Building libmqvpn..."
     mkdir -p "$MQ_BUILD"
-    version_args=()
-    if [[ -n "${BUILD_VERSION_FILE:-}" ]]; then
-        version_args=(-C "$BUILD_VERSION_FILE")
-    fi
     cmake -S "$PROJECT_ROOT" -B "$MQ_BUILD" \
-        "${version_args[@]}" \
         -DCMAKE_C_FLAGS="-ffile-prefix-map=$PROJECT_ROOT=/mqvpn" \
         -DCMAKE_TOOLCHAIN_FILE="$NDK_CMAKE" \
         -DANDROID_ABI="$ABI" \

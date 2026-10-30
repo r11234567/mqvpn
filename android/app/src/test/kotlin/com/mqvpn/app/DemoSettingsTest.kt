@@ -4,14 +4,10 @@
 package com.mqvpn.app
 
 import com.mqvpn.app.data.DemoSettings
-import com.mqvpn.app.data.SplitChoice
-import com.mqvpn.app.data.applySplitChoice
-import com.mqvpn.app.data.splitChoice
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -139,50 +135,6 @@ class DemoSettingsTest {
         assertEquals(listOf("abc"), settings.invalidPortTokens())
     }
 
-    // -- redundant mode ----------------------------------------------------------
-
-    @Test
-    fun `toMqvpnConfig maps redundant fields`() {
-        val c = DemoSettings(redundantEnabled = true, redundantPorts = " 4200, 9000 ").toMqvpnConfig()
-        assertTrue(c.redundantEnabled)
-        assertEquals(listOf(4200, 9000), c.redundantPorts)
-    }
-
-    @Test
-    fun `redundant mode sends with bbr, otherwise the default bbr2`() {
-        assertEquals(MqvpnConfig.CongestionControl.BBR, DemoSettings(redundantEnabled = true).toMqvpnConfig().cc)
-        assertEquals(MqvpnConfig.CongestionControl.BBR2, DemoSettings(redundantEnabled = false).toMqvpnConfig().cc)
-    }
-
-    @Test
-    fun `blank redundantPorts is valid and maps to empty`() {
-        val s = DemoSettings(serverAddress = "h", redundantEnabled = true, redundantPorts = "")
-        assertTrue(s.redundantPortsValid())
-        assertTrue(s.isValid())
-        assertEquals(emptyList<Int>(), s.toMqvpnConfig().redundantPorts)
-    }
-
-    @Test
-    fun `invalid redundantPorts are rejected, never degraded to all UDP`() {
-        listOf("4200,abc", "4200,", "0", "65536", List(17) { "4200" }.joinToString(","), "4".repeat(300))
-            .forEach { v ->
-                assertFalse(v, DemoSettings(redundantPorts = v).redundantPortsValid())
-                assertFalse(v, DemoSettings(serverAddress = "h", redundantEnabled = true, redundantPorts = v).isValid())
-                // connecting with it fails instead of duplicating all UDP
-                val enabled = DemoSettings(serverAddress = "h", redundantEnabled = true, redundantPorts = v)
-                assertThrows(v, IllegalArgumentException::class.java) { enabled.toMqvpnConfig() }
-                // ignored when the switch is off
-                assertTrue(v, DemoSettings(serverAddress = "h", redundantEnabled = false, redundantPorts = v).isValid())
-            }
-    }
-
-    @Test
-    fun `sixteen tokens are valid and deduplicated`() {
-        val s = DemoSettings(redundantPorts = List(16) { "4200" }.joinToString(","))
-        assertTrue(s.redundantPortsValid())
-        assertEquals(listOf(4200), s.parsedRedundantPorts())
-    }
-
     // -- toMqvpnConfig field mapping ------------------------------------------
 
     @Test
@@ -218,39 +170,6 @@ class DemoSettingsTest {
     fun `toMqvpnConfig maps serverPort directly`() {
         val settings = DemoSettings(serverPort = 8443)
         assertEquals(8443, settings.toMqvpnConfig().serverPort)
-    }
-
-    @Test
-    fun `toMqvpnConfig passes bluetoothPathEnabled through`() {
-        assertEquals(false, DemoSettings().toMqvpnConfig().bluetoothPathEnabled)
-        assertEquals(true, DemoSettings(bluetoothPathEnabled = true).toMqvpnConfig().bluetoothPathEnabled)
-    }
-
-    @Test
-    fun `path flags default on and reach the config`() {
-        val c = DemoSettings().toMqvpnConfig()
-        assertTrue(c.wifiPathEnabled && c.cellularPathEnabled && c.ethernetPathEnabled)
-        val off = DemoSettings(pathWifi = false, pathCellular = false, pathEthernet = false).toMqvpnConfig()
-        assertFalse(off.wifiPathEnabled || off.cellularPathEnabled || off.ethernetPathEnabled)
-    }
-
-    @Test
-    fun `autoReconnect maps to reconnect`() {
-        assertTrue(DemoSettings().toMqvpnConfig().reconnect)
-        assertFalse(DemoSettings(autoReconnect = false).toMqvpnConfig().reconnect)
-    }
-
-    @Test
-    fun `pathPolicyValid needs at least one of the four transports`() {
-        val allOff = DemoSettings(
-            serverAddress = "h", pathWifi = false, pathCellular = false,
-            pathEthernet = false, bluetoothPathEnabled = false,
-        )
-        assertFalse(allOff.pathPolicyValid())
-        assertFalse(allOff.isValid())
-        val btOnly = allOff.copy(bluetoothPathEnabled = true)
-        assertTrue(btOnly.pathPolicyValid())
-        assertTrue(btOnly.isValid())
     }
 
     // -- validation predicates ------------------------------------------------
@@ -319,45 +238,5 @@ class DemoSettingsTest {
         assertEquals(17, tokens.size)
         val ports = tokens.joinToString(",")
         assertEquals(16, DemoSettings(reorderPorts = ports).distinctValidPortCount())
-    }
-
-    // -- scheduler ----------------------------------------------------------
-
-    @Test
-    fun `scheduler choice maps to config scheduler and request flag`() {
-        val c0 = DemoSettings().toMqvpnConfig()
-        assertEquals(MqvpnConfig.Scheduler.MIN_RTT, c0.scheduler)
-        assertFalse(c0.requestServerScheduler)
-        val c1 = DemoSettings(scheduler = "MIN_RTT").toMqvpnConfig()
-        assertEquals(MqvpnConfig.Scheduler.MIN_RTT, c1.scheduler)
-        assertTrue(c1.requestServerScheduler)
-        val c2 = DemoSettings(scheduler = "WLB").toMqvpnConfig()
-        assertEquals(MqvpnConfig.Scheduler.WLB, c2.scheduler)
-        assertTrue(c2.requestServerScheduler)
-    }
-
-    @Test
-    fun `schedulerChoice falls back to DEFAULT on unknown name`() {
-        assertEquals(DemoSettings.SchedulerChoice.DEFAULT, DemoSettings(scheduler = "bogus").schedulerChoice())
-    }
-
-    // -- split choice -------------------------------------------------------
-
-    @Test
-    fun `splitChoice matrix`() {
-        fun c(s: String, r: Boolean) = DemoSettings(scheduler = s, redundantEnabled = r).splitChoice()
-        assertEquals(SplitChoice.THROUGHPUT, c("WLB", false))
-        assertEquals(SplitChoice.LOW_LATENCY, c("MIN_RTT", false))
-        assertEquals(SplitChoice.LOW_LATENCY, c("DEFAULT", false))
-        assertEquals(SplitChoice.REDUNDANT, c("WLB", true))
-        assertEquals(SplitChoice.REDUNDANT, c("MIN_RTT", true))
-    }
-
-    @Test
-    fun `applySplitChoice writes scheduler and redundant`() {
-        val b = DemoSettings(scheduler = "DEFAULT")
-        assertEquals(DemoSettings(scheduler = "WLB"), b.applySplitChoice(SplitChoice.THROUGHPUT))
-        assertEquals(DemoSettings(scheduler = "MIN_RTT"), b.applySplitChoice(SplitChoice.LOW_LATENCY))
-        assertEquals(DemoSettings(scheduler = "MIN_RTT", redundantEnabled = true), b.applySplitChoice(SplitChoice.REDUNDANT))
     }
 }

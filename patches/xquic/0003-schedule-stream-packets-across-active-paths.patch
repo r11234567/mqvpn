@@ -1,0 +1,29 @@
+From: mqvpn contributors <noreply@github.com>
+Subject: [PATCH] Schedule stream packets across active multipath paths
+
+WLB reserves flow hash zero for packets that must use the MinRTT fallback,
+but xquic assigns that value to every STREAM packet. That pins a single
+TCP-lane stream to the lowest-SRTT path and prevents aggregation. STREAM
+frames already carry offsets and are reordered by QUIC at the receiver, so
+they can use WLB's unpinned per-packet WRR selection just like datagrams.
+
+diff --git a/src/transport/xqc_packet_out.c b/src/transport/xqc_packet_out.c
+--- a/src/transport/xqc_packet_out.c
++++ b/src/transport/xqc_packet_out.c
+@@ -1247,6 +1247,14 @@ xqc_write_stream_frame_to_packet(xqc_connection_t *conn,
+     stream->stream_conn->conn_flow_ctl.fc_data_sent += *send_data_written;
+     packet_out->po_used_size += n_written;
+     packet_out->po_stream_id = stream->stream_id;
+     packet_out->po_stream_offset = stream->stream_send_offset;
++    /*
++     * WLB uses zero for packets that must take the MinRTT fallback. STREAM
++     * frames are independently ordered by QUIC using their offsets, so a
++     * stream packet can be scheduled by per-packet WRR and contribute to
++     * multipath aggregation. Keep the reserved unpinned sentinel distinct
++     * from both zero and a pinned flow hash.
++     */
++    packet_out->po_flow_hash = UINT32_MAX;
+ 
+ #ifdef XQC_ENABLE_FEC
+-- 
+2.43.0

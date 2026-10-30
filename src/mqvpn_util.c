@@ -41,23 +41,22 @@ mqvpn_error_string(mqvpn_error_t err)
 const char *
 mqvpn_version_string(void)
 {
-#ifdef MQVPN_BUILD_VERSION_STR
-    return MQVPN_BUILD_VERSION_STR;
-#else
     /* Computed once — no thread-safety concern (identical writes). */
     static char buf[64];
     if (buf[0] == '\0') {
-        /* Retain the legacy suffix option for downstream build scripts. */
-#  ifdef MQVPN_VERSION_SUFFIX_STR
-        snprintf(buf, sizeof(buf), "%d.%d.%d%s", MQVPN_VERSION_MAJOR, MQVPN_VERSION_MINOR,
-                 MQVPN_VERSION_PATCH, MQVPN_VERSION_SUFFIX_STR);
-#  else
-        snprintf(buf, sizeof(buf), "%d.%d.%d", MQVPN_VERSION_MAJOR, MQVPN_VERSION_MINOR,
-                 MQVPN_VERSION_PATCH);
-#  endif
+        /* MQVPN_VERSION_SUFFIX_STR is defined only for builds that are not a
+         * tagged release (see MQVPN_VERSION_SUFFIX in CMakeLists.txt), so a
+         * snapshot does not report itself as the release it was built on. */
+#ifdef MQVPN_VERSION_SUFFIX_STR
+        snprintf(buf, sizeof(buf), "%d.%d.%d.%d%s", MQVPN_VERSION_MAJOR,
+                 MQVPN_VERSION_MINOR, MQVPN_VERSION_PATCH, MQVPN_VERSION_TWEAK,
+                 MQVPN_VERSION_SUFFIX_STR);
+#else
+        snprintf(buf, sizeof(buf), "%d.%d.%d.%d", MQVPN_VERSION_MAJOR,
+                 MQVPN_VERSION_MINOR, MQVPN_VERSION_PATCH, MQVPN_VERSION_TWEAK);
+#endif
     }
     return buf;
-#endif
 }
 
 /* ─── Key generation ─── */

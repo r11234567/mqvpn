@@ -222,7 +222,6 @@ fi
 install -m 644 lib/libxquic.so "$INSTALL_PREFIX/lib/"
 mkdir -p "$INSTALL_PREFIX/lib/mqvpn"
 install -m 755 lib/mqvpn/mqvpn-server-nat.sh "$INSTALL_PREFIX/lib/mqvpn/"
-install -m 755 lib/mqvpn/mqvpn-nat-config "$INSTALL_PREFIX/lib/mqvpn/"
 install -m 644 systemd/mqvpn-server.service /lib/systemd/system/
 install -m 644 systemd/mqvpn-client@.service /lib/systemd/system/
 
@@ -300,14 +299,6 @@ if [ ! -f /etc/mqvpn/server.conf ]; then
         echo
         echo "[Multipath]"
         echo "Scheduler = wlb"
-        echo
-        # Server side only offers these; each takes effect for a client that
-        # also enables it.
-        echo "[Hybrid]"
-        echo "Enabled = true"
-        echo
-        echo "[Reorder]"
-        echo "Enabled = true"
         echo
         if [ "$ENABLE_CONTROL" -eq 1 ]; then
             echo "[Control]"

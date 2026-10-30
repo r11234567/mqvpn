@@ -21,41 +21,38 @@
 #include "libmqvpn.h"
 
 /* Forward-decl so consumers that only want CTRL_MAX_RESP_BYTES (e.g.
- * a standalone test or tool) don't transitively pull libevent
+ * tests/test_control_response_bound.c) don't transitively pull libevent
  * headers. The control_socket.c implementation itself includes
  * <event2/event.h> directly. */
 struct event_base;
 
 /* Maximum response size. Worst-case get_status with MQVPN_MAX_USERS=64 and
  * MQVPN_MAX_PATHS=8 produces ~210 KB; round up to 256 KB. The exact bound is
- * verified by tests/test_control_socket.c — bump it if either limit
+ * verified by tests/test_control_response_bound.c — bump it if either limit
  * grows. */
 #define CTRL_MAX_RESP_BYTES (256 * 1024)
 
 typedef struct ctrl_socket_s ctrl_socket_t;
 
-/* Receive-side UDP offload counters are owned by the platform's transport
- * ctx (mqvpn_bind_posix), so the control socket asks for them at request
- * time through this getter instead of borrowing pointers. rx_ctx is
- * opaque; fn may be NULL (reported as 0). No synchronization: the getter
- * runs on the same libevent loop as the RX path. */
-typedef void (*ctrl_rx_stats_fn)(void *rx_ctx, uint64_t *receives, uint64_t *datagrams);
-
 /* addr defaults to "127.0.0.1" when NULL.
  *
- * rx_stats reports the live receive-side UDP offload counters, emitted by
- * get_stats as udp_rx_*. They come in as a callback rather than through
- * mqvpn_stats_t because RX offload is a transport-implementation detail
- * (mqvpn_bind_posix), not a library concept: the library's mqvpn_stats_t
- * carries the transport-agnostic TX pair only. The transmit-side pair does
+ * gro_receives / gro_datagrams point at the platform's live receive-side UDP
+ * offload counters, reported by get_stats as udp_rx_*. They are borrowed, not
+ * copied: the caller must keep them alive for the socket's lifetime. Both may
+ * be NULL (reported as 0).
+ *
+ * They come in as parameters rather than through mqvpn_stats_t because UDP
+ * GRO is enabled and un-coalesced entirely in the platform layer — the
+ * library never observes it, so routing these through the library ABI would
+ * add fields nothing in the library produces. The transmit-side pair does
  * cross that ABI (mqvpn_stats_t.udp_tx_*) precisely because the library
- * issues those sends itself. */
-/* rx_ctx is borrowed until ctrl_socket_destroy. A caller-owned stack context
- * is valid when that caller drives the loop and destroys this socket before
- * returning (as linux_platform_run_server does). */
+ * issues those sends itself. Same split as the ABI has for UdpGso vs UdpGro.
+ *
+ * No synchronization: the platform's read callbacks are the only writers and
+ * run on the same libevent loop as this socket's handlers. */
 ctrl_socket_t *ctrl_socket_create(struct event_base *eb, const char *addr, int port,
-                                  mqvpn_server_t *server, ctrl_rx_stats_fn rx_stats,
-                                  void *rx_ctx);
+                                  mqvpn_server_t *server, const uint64_t *gro_receives,
+                                  const uint64_t *gro_datagrams);
 
 void ctrl_socket_destroy(ctrl_socket_t *cs);
 

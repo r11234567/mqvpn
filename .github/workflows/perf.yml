@@ -34,7 +34,7 @@ concurrency:
 
 jobs:
   perf-test:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       # Job-level rather than on the publish step, so the steps below can skip
@@ -52,21 +52,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Verify pinned xquic source
+      - name: Apply xquic patches
         shell: bash
-        run: bash scripts/check_xquic_pin.sh
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3 python3 jq openssl
-
-      - name: Cleanup stale state
-        run: |
-          sudo pkill -f 'mqvpn.*ci-bench' || true
-          sudo ip netns del ci-bench-server 2>/dev/null || true
-          sudo ip netns del ci-bench-client 2>/dev/null || true
-          sudo pkill -f 'iperf3' || true
+        run: bash scripts/apply_xquic_patches.sh
 
       # The self-hosted box had these preinstalled. gcc, make, git, python3, jq
       # and the AWS CLI already ship on the hosted image; these do not.
@@ -125,7 +113,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-perf-v1
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-${{ steps.bssl-pin.outputs.sha }}-patch-${{ hashFiles('patches/xquic/*.patch') }}-perf-v1
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
