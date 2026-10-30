@@ -6,7 +6,28 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+cleanup() {
+    local result=$?
+    set +e
+    if [ "$result" -ne 0 ]; then
+        echo "Build identity verification failed (exit $result)"
+        uname -a
+        cmake --version
+        for log in config.log build.log reject.log tag.log; do
+            if [ -f "$WORK/$log" ]; then
+                printf '\n--- %s ---\n' "$log"
+                cat "$WORK/$log"
+            fi
+        done
+        if [ -f "$WORK/snapshot/CMakeCache.txt" ]; then
+            grep -E '^(MQVPN_|CMAKE_MAKE_PROGRAM:|CMAKE_GENERATOR:)' "$WORK/snapshot/CMakeCache.txt" || true
+            cat "$WORK/snapshot/metadata"
+        fi
+    fi
+    rm -rf "$WORK"
+    exit "$result"
+}
+trap cleanup EXIT
 mkdir -p "$WORK/src/scripts" "$WORK/src/include"
 cp "$ROOT/scripts/resolve_build_version.sh" "$WORK/src/scripts/"
 cp "$ROOT/cmake/BuildVersion.cmake" "$WORK/src/"
@@ -46,7 +67,11 @@ configure() {
     }
 }
 check_binary() {
-    cmake --build "$WORK/$1" > "$WORK/build.log" 2>&1 || { cat "$WORK/build.log"; return 1; }
+    # Each identity compiles fresh, just like isolated release jobs. Apple's
+    # Make 3.81 ignores subsecond mtimes and can otherwise reuse snapshot
+    # objects when flags.make changes in the same second. Cache/metadata
+    # assertions below independently verify same-directory reconfiguration.
+    cmake --build "$WORK/$1" --clean-first --verbose > "$WORK/build.log" 2>&1 || { cat "$WORK/build.log"; return 1; }
     actual="$("$WORK/$1/probe")"
     [ "$actual" = "$2" ] || { echo "Wrong library identity: $actual, expected $2"; exit 1; }
 }
@@ -76,6 +101,10 @@ cmp "$WORK/expected.metadata" "$WORK/snapshot/metadata"
 GITHUB_REF=refs/tags/v0.19.0 bash scripts/resolve_build_version.sh > "$WORK/tag.env"
 grep -Fx 'VERSION=0.19.0' "$WORK/tag.env"
 configure snapshot -C "$version_file"
+grep -Fx 'MQVPN_BUILD_VERSION:STRING=' "$WORK/snapshot/CMakeCache.txt"
+grep -Fx 'MQVPN_VERSION_SUFFIX:STRING=' "$WORK/snapshot/CMakeCache.txt"
+printf '%s\n' '0.19.0' '0.19.0' '0.19.0' > "$WORK/expected.metadata"
+cmp "$WORK/expected.metadata" "$WORK/snapshot/metadata"
 check_binary snapshot 0.19.0
 configure default
 check_binary default 0.19.0
@@ -93,6 +122,7 @@ reject bad-suffix -DMQVPN_VERSION_SUFFIX=invalid
 if command -v dpkg-deb > /dev/null 2>&1 && command -v dpkg > /dev/null 2>&1; then
     GITHUB_REF=refs/heads/main GITHUB_SHA="$sha" bash scripts/resolve_build_version.sh > /dev/null
     configure snapshot -C "$version_file"
+    grep -Fx "MQVPN_BUILD_VERSION:STRING=$expected" "$WORK/snapshot/CMakeCache.txt"
     check_binary snapshot "$expected"
     (cd "$WORK/snapshot" && cpack -G DEB > "$WORK/package.log" 2>&1) || {
         cat "$WORK/package.log"; exit 1;

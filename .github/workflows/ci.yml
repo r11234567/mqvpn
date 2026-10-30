@@ -159,12 +159,25 @@ jobs:
                 -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
           make -j$(nproc)
 
+      - name: Resolve CI build identity
+        shell: bash
+        run: GITHUB_SHA="$(git rev-parse HEAD)" bash scripts/resolve_build_version.sh >> "$GITHUB_ENV"
+
       - name: Build mqvpn
         run: |
           mkdir -p build && cd build
           cmake -DCMAKE_BUILD_TYPE=Release \
+                -C "$BUILD_VERSION_FILE" \
                 -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
           make -j$(nproc)
+
+      - name: Verify snapshot CLI identity
+        shell: bash
+        run: |
+          actual=$(build/mqvpn --version)
+          printf '%s\n' "$actual"
+          [ "${actual%%$'\n'*}" = "mqvpn $VERSION" ]
+          printf '%s\n' "$actual" | grep -Fx 'core 0.19.0; callback ABI 3'
 
       # Needs the resolved mqvpn_lib source list, which the configure inside
       # "Build mqvpn" writes to build/mqvpn_lib_sources.txt.
@@ -961,12 +974,17 @@ jobs:
                 -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" ..
           make -j"$(sysctl -n hw.ncpu)"
 
+      - name: Resolve CI build identity
+        shell: bash
+        run: GITHUB_SHA="$(git rev-parse HEAD)" bash scripts/resolve_build_version.sh >> "$GITHUB_ENV"
+
       - name: Build mqvpn (core libs + Darwin platform TUs + CLI + tests)
         # Expect a new EGRESS "forcing OFF" WARNING here: MQVPN_ENABLE_HYBRID_TCP_EGRESS
         # defaults ON but the EGRESS gate still blocks APPLE (server egress
         # stays OFF on macOS by design) — cosmetic, do not "fix" it.
         run: |
           cmake -B build-darwin -DCMAKE_BUILD_TYPE=Debug \
+            -C "$BUILD_VERSION_FILE" \
             -DXQUIC_BUILD_DIR="$GITHUB_WORKSPACE/third_party/xquic/build" \
             -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
             -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
@@ -983,6 +1001,13 @@ jobs:
         run: |
           ls -l build-darwin/libmqvpn.a build-darwin/*.dylib build-darwin/mqvpn
           file -L build-darwin/*.dylib
+
+      - name: Verify snapshot CLI identity
+        run: |
+          actual=$(build-darwin/mqvpn --version)
+          printf '%s\n' "$actual"
+          [ "${actual%%$'\n'*}" = "mqvpn $VERSION" ]
+          printf '%s\n' "$actual" | grep -Fx 'core 0.19.0; callback ABI 3'
 
       - name: Run Darwin unit tests
         run: ctest --test-dir build-darwin --no-tests=error --output-on-failure
@@ -1252,6 +1277,10 @@ jobs:
             -DXQC_ENABLE_XOR=ON ..
           cmake --build . --config Release
 
+      - name: Resolve CI build identity
+        shell: bash
+        run: GITHUB_SHA="$(git rev-parse HEAD)" bash scripts/resolve_build_version.sh >> "$GITHUB_ENV"
+
       - name: Build mqvpn
         # Expect a new EGRESS "forcing OFF" WARNING here: MQVPN_ENABLE_HYBRID_TCP_EGRESS
         # defaults ON but the EGRESS gate still blocks WIN32 (server egress
@@ -1270,6 +1299,7 @@ jobs:
             -DBORINGSSL_BUILD_DIR="${{ github.workspace }}/third_party/xquic/third_party/boringssl/build/Release" `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=${{ matrix.arch }}-windows-static `
+            -C "$env:BUILD_VERSION_FILE" `
             -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON ..
           cmake --build . --config Release
 
@@ -1299,7 +1329,14 @@ jobs:
       # init in main) instead of only checking the file exists. --version
       # exits 0 without needing wintun or admin rights.
       - name: Smoke-run binary
-        run: build/Release/mqvpn.exe --version
+        shell: pwsh
+        run: |
+          $out = & build/Release/mqvpn.exe --version
+          if ($LASTEXITCODE -ne 0 -or @($out)[0] -cne "mqvpn $env:VERSION" -or
+              @($out) -cnotcontains 'core 0.19.0; callback ABI 3') {
+            throw "Snapshot binary identity/core metadata mismatch: $out"
+          }
+          $out
 
       # The Windows platform's transport wiring on a real runner: the
       # client's first QUIC Initial must leave through the Winsock bind and

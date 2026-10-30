@@ -7,6 +7,11 @@ bundled separately with each kernel. Native dependencies are checked from
 the PE import and delay-import tables; a statically linked core does not
 require `xquic.dll`.
 
+CI stamps its actual Windows cores with their checked-out commit's snapshot
+identity before packaging. Native x64 and ARM64 smoke checks require that
+identity and the core/callback ABI metadata; final ZIP verification exercises
+the updater with those same executables.
+
 Kernel updates also accept `snapshot+YYYYMMDDTHHMMSSZ.gSHA` builds when
 `mqvpn --version` explicitly reports core 0.19.x and callback ABI 3 on its
 second line. A snapshot label alone is insufficient to establish compatibility.
