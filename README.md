@@ -53,6 +53,7 @@ https://github.com/user-attachments/assets/9862b717-a00f-4faf-a098-0e10d912b8a5
   - [Verifying downloads](#verifying-downloads)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
+  - [This fork: paired server and client examples](#this-fork-paired-server-and-client-examples)
   - [INI config](#ini-config)
   - [JSON config](#json-config)
   - [TUN MTU](#tun-mtu)
@@ -561,6 +562,152 @@ sudo mqvpn --mode client --server YOUR_SERVER:443 \
 Config files support both INI and JSON. CLI arguments override config values.
 INI keys are case-insensitive, but values (such as paths and URLs) are preserved as given.
 
+### This fork: paired server and client examples
+
+These examples pair a Linux server with a CLI client built from this fork.
+Replace `vpn.example.com` with your server's DNS name, point it at the server,
+and allow inbound UDP 443. Install a certificate for that name and use the
+actual certificate/key paths below. Choose tunnel subnets that do not overlap
+your existing networks.
+
+Run `mqvpn --genkey` once and replace **both** occurrences of
+`REPLACE_WITH_THE_SAME_GENERATED_KEY` with its output. Do not use the
+placeholder as a real key. For multiple clients with separate identities,
+use per-user keys as described below instead of sharing this single key.
+
+Server (`/etc/mqvpn/fork-server.conf`):
+
+```ini
+[Interface]
+TunName = mqvpn0
+Listen = 0.0.0.0:443
+Subnet = 10.70.0.0/24
+Subnet6 = fd00:70::/112
+LogLevel = info
+MTU = 0
+PathMTU = 0
+PMTUD = false
+
+[TLS]
+Cert = /etc/letsencrypt/live/vpn.example.com/fullchain.pem
+Key = /etc/letsencrypt/live/vpn.example.com/privkey.pem
+
+[Auth]
+Key = REPLACE_WITH_THE_SAME_GENERATED_KEY
+MaxClients = 64
+
+[Multipath]
+Scheduler = wlb
+CC = bbr2
+InitMaxPathId = 8
+
+[Hybrid]
+Enabled = true
+Tcp = auto
+
+[Reorder]
+Enabled = false
+```
+
+Client (`/etc/mqvpn/fork-client.conf`):
+
+```ini
+[Server]
+Address = vpn.example.com:443
+ServerName = vpn.example.com
+Insecure = false
+
+[Auth]
+Key = REPLACE_WITH_THE_SAME_GENERATED_KEY
+
+[Interface]
+TunName = mqvpn0
+DNS = 1.1.1.1, 8.8.8.8
+LogLevel = info
+ManageRoutes = true
+KillSwitch = true
+Reconnect = true
+ReconnectInterval = 5
+MTU = 0
+PathMTU = 0
+PMTUD = false
+
+[Multipath]
+Scheduler = wlb
+CC = bbr2
+InitMaxPathId = 8
+Path = eth0
+Path = wlan0
+
+[Hybrid]
+Enabled = true
+Tcp = auto
+
+[Reorder]
+Enabled = false
+```
+
+Replace the two `Path` values with real client interfaces that can reach the
+server. Remove the second line for a single-path client. `ServerName` must
+match the certificate even if `Address` is changed to an IP address. Keep
+`Insecure = false`; on Linux, the issuing CA must be in BoringSSL's default
+trust store, or set `SSL_CERT_FILE` to a trusted PEM CA bundle. There is no
+`CaCert` INI key. See [certificate verification](docs/client-certificate-verification.md)
+for each platform's trust-store behavior.
+
+```bash
+sudo mqvpn --config /etc/mqvpn/fork-server.conf  # on the Linux server
+sudo mqvpn --config /etc/mqvpn/fork-client.conf  # on the client
+```
+
+The client example manages routes and DNS for a full tunnel. Router integrations
+whose own service manages routes should set `ManageRoutes = false`. On Windows,
+use the native CLI from an elevated terminal with `mqvpn.exe --config PATH`,
+install Wintun as described in [Windows setup](docs/windows_build.md), and use
+the actual Windows adapter names in `Path`. Save the file as UTF-8. With
+`KillSwitch = true`, Windows also blocks applications that bind directly to a
+physical interface. These examples describe the core CLI configuration; the
+Windows GUI's configuration editor has a separate set of supported fields.
+
+`Hybrid` requires a build with the TCP lane enabled on both endpoints. It
+carries inner TCP over reliable QUIC streams, whose scheduler remains MinRTT;
+`Scheduler = wlb` applies to the datagram lane. `Reorder` remains off here;
+enable it on both ends only for the inner QUIC use cases described in
+[Reorder buffer](#reorder-buffer-datagram-lane). `PMTUD` is opt-in: change
+`PMTUD = true` on the endpoints where path MTU discovery is wanted and the
+network supports it. `MTU = 0` and `PathMTU = 0` retain automatic sizing.
+`InitMaxPathId` accepts `0` (default 8) or `1`–`128`; it is a path-ID grant,
+not a request to create that many simultaneous interfaces.
+
+The fork's hybrid ML-KEM group preference is compiled into both endpoints;
+it has no INI switch. Negotiation still depends on the peer, and BoringSSL
+chooses the TLS 1.3 cipher order; the configuration does not guarantee AES-256.
+
+For optional **Linux-only** shared UDP-port routing, append this section to
+the server file only after preparing both backends and a build with nghttp2:
+
+```ini
+[Proxy]
+Enabled = true
+SNI = vpn.example.com
+QuicFallback = 127.0.0.1:4443
+QuicFallbackProxyProtocol = false
+Http2Backend = 127.0.0.1:8080
+Http2BackendTLS = false
+Http2BackendProxyProtocol = false
+MaxConnections = 64
+IdleTimeoutSec = 60
+```
+
+Matching SNI uses mqvpn: VPN requests enter the tunnel and ordinary HTTP/3
+requests go to the prior-knowledge cleartext HTTP/2 (h2c) backend. Unmatched
+SNI goes unchanged to the UDP QUIC fallback. Keep the backend ports private.
+Both PROXY protocol switches are explicitly off for ordinary backends; enable
+one only when that backend accepts PROXY v2. TLS to the H2 backend is currently
+unsupported, so keep `Http2BackendTLS = false`. See
+[server fallback proxy](docs/server-fallback-proxy.md) and
+[H2 PROXY protocol](docs/h2-proxy-protocol.md) for backend setup.
+
 ### INI config
 
 ```ini
@@ -596,8 +743,10 @@ Enabled = true
 Enabled = false
 # SNI = vpn.example.com,*.edge.example
 # QuicFallback = 127.0.0.1:4443
+# QuicFallbackProxyProtocol = false
 # Http2Backend = 127.0.0.1:8080
 # Http2BackendTLS = false
+# Http2BackendProxyProtocol = false
 # MaxConnections = 64
 # IdleTimeoutSec = 60
 ```
@@ -657,8 +806,10 @@ Server example:
         "enabled": false,
         "sni": "vpn.example.com,*.edge.example",
         "quic_fallback": "127.0.0.1:4443",
+        "quic_fallback_proxy_protocol": false,
         "http2_backend": "127.0.0.1:8080",
         "http2_backend_tls": false,
+        "http2_backend_proxy_protocol": false,
         "max_connections": 64,
         "idle_timeout_sec": 60
     }
@@ -672,7 +823,7 @@ Client example:
     "mode": "client",
     "server_addr": "203.0.113.1:443",
     "tls_server_name": "vpn.example.com",
-    "auth_key": "client-key",
+    "auth_key": "legacy-fallback-key",
     "insecure": false,
     "dns": ["1.1.1.1", "8.8.8.8"],
     "paths": ["eth0", "wlan0"],
