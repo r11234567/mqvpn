@@ -388,6 +388,9 @@ cli_tcp_lane_h3_send(void *h3_request, const uint8_t *buf, size_t len, int fin)
     if (ret > (ssize_t)len) {
         ret = (ssize_t)len;
     }
+    /* Real xqc_h3_stream_send_data clears NEED_WRITE_NOTIFY on a full
+     * accept, even if the application explicitly enabled it earlier. */
+    g_h3_write_notify_enabled = (ret != (ssize_t)len);
     if (ret > 0 && buf) {
         size_t room = sizeof(g_h3_capture) - g_h3_capture_len;
         size_t n = ((size_t)ret <= room) ? (size_t)ret : room;
@@ -1610,6 +1613,51 @@ test_relay_full_accept_withholds_on_xquic_queue(void)
 
     f->pcb = NULL;
     mqvpn_tcp_lane_free(lane);
+}
+
+static void
+test_relay_withheld_credit_survives_full_accept(void)
+{
+    const uint64_t queue_sizes[] = {MQVPN_TCP_LANE_BP_LOW_WATER + 1, 0};
+    for (size_t i = 0; i < sizeof(queue_sizes) / sizeof(queue_sizes[0]); i++) {
+        relay_reset();
+        mqvpn_hybrid_config_t cfg;
+        mqvpn_hybrid_config_default(&cfg);
+        mqvpn_tcp_lane_t *lane =
+            mqvpn_tcp_lane_new(&cfg, 0x1114ULL, NULL, fake_clock, NULL);
+        struct tcp_pcb pcb;
+        int fake_req, fake_stream;
+        mqvpn_tcp_flow_t *f = setup_flow(lane, &pcb, 5103, &fake_req, &fake_stream, 1);
+        ASSERT_TRUE(f != NULL, "flow established");
+
+        g_h3_send_queue_bytes = MQVPN_TCP_LANE_BP_HIGH_WATER - 500;
+        g_h3_queue_grows_with_send = 1;
+        mqvpn_tcp_lane_on_lwip_recv(f, &pcb, mk_pbuf(1000), ERR_OK);
+        ASSERT_EQ_INT(f->uplink_withheld_recved, 1000, "first delivery withheld");
+        ASSERT_EQ_INT(g_h3_write_notify_enabled, 1, "drain notification armed");
+
+        /* An already advertised TCP window permits another delivery while
+         * xquic drains. Its full H3 accept clears the previous subscription. */
+        g_h3_queue_grows_with_send = 0;
+        g_h3_send_queue_bytes = queue_sizes[i];
+        mqvpn_tcp_lane_on_lwip_recv(f, &pcb, mk_pbuf(1000), ERR_OK);
+        ASSERT_EQ_INT(g_h3_capture_len, 2000, "both deliveries accepted exactly once");
+        ASSERT_EQ_INT(g_h3_write_notify_enabled, 1,
+                      "full accept re-arms notification for outstanding withheld credit");
+        ASSERT_EQ_INT(f->uplink_withheld_recved, 2000,
+                      "withheld deliveries remain charged until low-water callback");
+        ASSERT_EQ_INT(g_recved_total, 0, "hysteresis retained until drain callback");
+
+        g_h3_send_queue_bytes = 0;
+        if (g_h3_write_notify_enabled) {
+            mqvpn_tcp_lane_on_h3_writable(lane, &fake_stream);
+        }
+        ASSERT_EQ_INT(g_recved_total, 2000, "all credit restored through armed callback");
+        ASSERT_EQ_INT(f->uplink_withheld, 0, "backpressure latch released");
+        ASSERT_EQ_INT(g_h3_write_notify_enabled, 0, "idle subscription released");
+        f->pcb = NULL;
+        mqvpn_tcp_lane_free(lane);
+    }
 }
 
 static void
@@ -3813,6 +3861,76 @@ test_idle_eviction_sweep_cadence_gate(void)
     mqvpn_tcp_lane_free(lane);
 }
 
+/* find_flow_by_stream walks lane->bound_head, not the table: the list must
+ * hold exactly the flows that have a stream, through binds and both teardown
+ * flavours, with consistent back links. */
+static int
+bound_list_ok(mqvpn_tcp_lane_t *lane, int *n_out)
+{
+    int n = 0, in_table = 0;
+    mqvpn_tcp_flow_t *prev = NULL;
+    for (mqvpn_tcp_flow_t *f = lane->bound_head; f; f = f->bound_next) {
+        if (f->bound_prev != prev || f->stream == NULL) return 0;
+        prev = f;
+        n++;
+    }
+    for (uint32_t i = 0; i < lane->n_buckets; i++)
+        for (mqvpn_tcp_flow_t *f = lane->buckets[i]; f; f = f->next)
+            if (f->stream) in_table++;
+    *n_out = n;
+    return n == in_table;
+}
+
+static void
+test_bound_list_tracks_streams(void)
+{
+    mqvpn_hybrid_config_t cfg;
+    mqvpn_hybrid_config_default(&cfg);
+    cfg.enabled = 1;
+    cfg.tcp_mode = MQVPN_HYBRID_TCP_STREAM;
+    mqvpn_tcp_lane_t *lane = mqvpn_tcp_lane_new(&cfg, 0x6161ULL, NULL, NULL, NULL);
+    ASSERT_TRUE(lane != NULL, "lane_new succeeds");
+
+    enum { N = 6 };
+    struct tcp_pcb pcbs[N];
+    int reqs[N], streams[N];
+    mqvpn_tcp_flow_t *flows[N];
+    int n = -1;
+    for (int i = 0; i < N; i++) {
+        flows[i] =
+            setup_flow(lane, &pcbs[i], (uint16_t)(5100 + i), &reqs[i], &streams[i], 0);
+        ASSERT_TRUE(flows[i] != NULL, "flow set up and bound");
+    }
+    ASSERT_TRUE(bound_list_ok(lane, &n) && n == N, "every bound flow is listed once");
+
+    /* Every stream reaches its own flow. */
+    for (int i = 0; i < N; i++)
+        mqvpn_tcp_lane_on_stream_established(lane, &streams[i]);
+    for (int i = 0; i < N; i++)
+        ASSERT_EQ_INT(flows[i]->state, TCP_FLOW_ACTIVE, "2xx reached the right flow");
+
+    /* Both teardown flavours unlink: the H3 side resetting (close_h3=0), at
+     * the head, middle and tail of the list, and a rejection (close_h3=1). */
+    mqvpn_tcp_lane_on_h3_closing(lane, &streams[N - 1]); /* list head */
+    mqvpn_tcp_lane_on_h3_closing(lane, &streams[2]);
+    mqvpn_tcp_lane_on_h3_closing(lane, &streams[0]); /* list tail */
+    ASSERT_TRUE(bound_list_ok(lane, &n) && n == N - 3, "torn-down flows unlinked");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_on_h3_writable(lane, &streams[2]), 0,
+                  "a torn-down flow's stream finds nothing");
+
+    int req_x, stream_x;
+    struct tcp_pcb pcb_x;
+    mqvpn_tcp_flow_t *fx = setup_flow(lane, &pcb_x, 5200, &req_x, &stream_x, 0);
+    ASSERT_TRUE(fx != NULL && bound_list_ok(lane, &n) && n == N - 2, "re-grown list");
+    mqvpn_tcp_lane_on_stream_rejected(lane, &stream_x);
+    ASSERT_TRUE(bound_list_ok(lane, &n) && n == N - 3, "rejected flow unlinked");
+    for (int i = 1; i < N - 1; i++) {
+        if (i == 2) continue;
+        flows[i]->pcb = NULL; /* stack-fake pcbs: keep lane_free off them */
+    }
+    mqvpn_tcp_lane_free(lane);
+}
+
 int
 main(void)
 {
@@ -3826,9 +3944,11 @@ main(void)
     test_markers_dont_consume_tcp_budget();
     test_marker_cap();
     test_accept_key_correspondence();
+    test_bound_list_tracks_streams();
     test_relay_full_accept();
     test_relay_xquic_queue_blocks_before_send();
     test_relay_full_accept_withholds_on_xquic_queue();
+    test_relay_withheld_credit_survives_full_accept();
     test_relay_eagain_then_writable_flush();
     test_relay_partial_accept();
     test_relay_pending_stream_buffering();

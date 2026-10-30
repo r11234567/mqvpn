@@ -5,8 +5,9 @@ Certificate verification has exactly one owner for each handshake.
 | Client | Owner | Trust source | Identity check |
 |---|---|---|---|
 | Linux CLI/library default | xquic/BoringSSL | BoringSSL default CA file/directory, overridable by `SSL_CERT_FILE` and `SSL_CERT_DIR` | BoringSSL hostname/IP verification |
-| Windows CLI | `mqvpn_windows_cert_verify` | Windows certificate stores and enterprise policy | `CERT_CHAIN_POLICY_SSL` with the effective server name |
-| macOS CLI and iOS PoC | `mqvpn_apple_cert_verify` | Keychain trust settings through `SecTrust` | `SecPolicyCreateSSL` with the effective server name |
+| Windows CLI | `mqvpn_win_cert_verify` | Windows certificate stores and enterprise policy | `CERT_CHAIN_POLICY_SSL` with the effective server name |
+| macOS CLI | `mqvpn_apple_cert_verify` | Keychain trust settings through `SecTrust` | `SecPolicyCreateSSL` with the effective server name |
+| iOS app | `SystemTrust` in `ios/app/Shared/SystemTrust.swift` | Keychain through `SecTrust` | TLS server policy with the effective server name |
 | Android SDK/app | `jni_cert_verify` / `PlatformTrust` | Android `X509TrustManager` | DNS and IP subjectAltName matching; no commonName fallback |
 
 The platform functions are installed with
@@ -69,7 +70,7 @@ Relevant code:
 
 - `src/mqvpn_client.c`
 - `include/libmqvpn.h`
-- `src/platform/windows/cert_verify_windows.c`
+- `src/platform/windows/cert_verify.c`
 - `src/platform/darwin/cert_verify_apple.c`
 - `android/sdk-native/src/main/jni/mqvpn_jni.c`
 - `android/sdk-native/src/main/kotlin/com/mqvpn/sdk/native_/PlatformTrust.kt`

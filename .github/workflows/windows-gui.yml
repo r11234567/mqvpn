@@ -1,0 +1,103 @@
+name: Windows GUI native verification and packages
+
+on:
+  workflow_call:
+    inputs:
+      source-sha:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  dependencies:
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source-sha }}
+      - name: Resolve third-party releases once for both architectures
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./scripts/resolve_windows_gui_deps.ps1 -LockFile build/dependency-lock.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-gui-dependency-lock
+          path: build/dependency-lock.json
+          if-no-files-found: error
+
+  verify-package:
+    name: Native GUI and package (${{ matrix.arch }})
+    needs: dependencies
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+            vs: Visual Studio 17 2022
+            cmake_arch: x64
+          - arch: arm64
+            runner: windows-11-arm
+            vs: Visual Studio 18 2026
+            cmake_arch: ARM64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source-sha }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+      - uses: actions/download-artifact@v8
+        with:
+          name: mqvpn-windows-${{ matrix.arch }}
+          path: build/core-artifact
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-gui-dependency-lock
+          path: build/gui-deps
+      - name: Build and run production GUI checks natively
+        shell: pwsh
+        run: |
+          cmake -S windows/tests/config-contract -B build/gui-config-contract -G '${{ matrix.vs }}' -A ${{ matrix.cmake_arch }}
+          if ($LASTEXITCODE -ne 0) { throw 'C configuration contract configure failed' }
+          cmake --build build/gui-config-contract --config Debug
+          if ($LASTEXITCODE -ne 0) { throw 'C configuration contract build failed' }
+          $env:MQVPN_CONFIG_CONTRACT_EXE = (Resolve-Path build/gui-config-contract/Debug/config_contract.exe).Path
+          $env:MQVPN_CONFIG_EVIDENCE = (Join-Path $PWD 'build/config-fixtures')
+          dotnet build windows/tests/GUI.Tests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { throw 'GUI test build failed' }
+          & ./windows/tests/bin/Release/net9.0-windows/GUI.Tests.exe
+          if ($LASTEXITCODE -ne 0) { throw 'GUI behavior checks failed' }
+      - name: Publish self-contained GUI and package the same-run core
+        shell: pwsh
+        run: |
+          ./scripts/package_windows_gui.ps1 -Arch ${{ matrix.arch }} -CoreDirectory build/core-artifact -DependencyLock build/gui-deps/dependency-lock.json
+      - name: Unpack final ZIP and verify offline native runtime
+        shell: pwsh
+        run: |
+          ./scripts/verify_windows_gui_package.ps1 -Arch ${{ matrix.arch }} -SourceSha '${{ inputs.source-sha }}' -ZipPath dist/mqvpn_windows_gui_${{ matrix.arch }}.zip -ReportDirectory build/package-reports
+      - name: Upload screenshots and package verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gui-evidence-${{ matrix.arch }}
+          path: |
+            windows/tests/bin/Release/net9.0-windows/screenshots/
+            build/package-reports/
+            build/config-fixtures/
+            dist/mqvpn_windows_gui_${{ matrix.arch }}/package-manifest.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload verified distribution ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: mqvpn_windows_gui_${{ matrix.arch }}
+          path: dist/mqvpn_windows_gui_${{ matrix.arch }}.zip
+          if-no-files-found: error
+          retention-days: 14

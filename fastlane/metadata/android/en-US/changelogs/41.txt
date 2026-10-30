@@ -1,5 +1,10 @@
-- The TUN interface's transmit queue depth and its per-wakeup read
-  batch are configurable ([Interface] TxQueueLen and TunReadBatch).
-  Bursty small-packet traffic such as a game on a fixed tick could
-  overflow the kernel's default 500-packet ring, which shows up only
-  as the interface's tx_dropped counter.
+- Plugging in Ethernet no longer drops Wi-Fi: Wi-Fi, mobile data and
+  Ethernet stay up together.
+- New setting "Use Bluetooth tethering" adds a connection shared over
+  Bluetooth.
+- A network that gets its IPv4 address after IPv6 is now used once the
+  address arrives.
+- Fix the tunnel not starting again after Android refused a network
+  request.
+- Hybrid mode: heavy transfers no longer delay other tunnel traffic by
+  seconds.
