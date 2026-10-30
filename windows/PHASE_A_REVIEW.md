@@ -53,3 +53,41 @@ phase B and are not claimed complete here. Live network/route/WFP acceptance
 also remains unperformed. Keep PR #15 unmerged and wait for current-head
 Windows/GUI checks before phase B. No Performance, Weekly, Stress or Release
 workflow is manually started by this work.
+
+## Hybrid e2e follow-up at the phase A gate
+
+Runs 41003746880 and 41007117110 passed native Windows x64/ARM64 core and
+final GUI ZIP verification. The latter failed in H2 functional Test 8:
+IPv6 throughput was 40.1 Mbps and both paths carried MBs, but the lighter
+path's share was 0.17 against 0.2. IPv6 connectivity and flow recovery passed;
+the Release performance step was skipped, so the earlier BASE-B throughput
+collapse was not retested by that run.
+
+A real local netns comparison exposed a separate backpressure defect:
+`xqc_h3_stream_send_data` clears write notifications on a full accept, while
+mqvpn can still owe earlier withheld TCP receive credit. Retain withholding
+and re-arm the drain notification after subsequent full accepts until the
+low-water callback restores all credit. The corrected H3 test substitute and
+two queue-drain cases fail ten assertions on the old code and pass on the fix
+(4786 assertions). XQUIC scheduling, API, configuration and dependency pins
+remain unchanged. This source defect is confirmed; its connection to the
+earlier CI BASE-B failure still needs direct evidence.
+
+Test 8 now uses equal lossless 10 Mbps legs, retains the 50 KB / 0.2 path-load
+gates, and additionally requires receiver throughput above 15 Mbps. The real
+Debug tunnel achieved 18.4 Mbps with share 0.99 and passed flow recovery. An
+actual single-path negative control achieved 9.2 Mbps and was rejected by both
+the capacity and path-count assertions. Remove idle post-burst polling,
+preserve the immediate path snapshot, and capture full state on either gate
+failure. Test 3 retains its asymmetric loss/jitter workload and existing
+gates/retry budget. The workflow also runs the independent Release performance
+step after a failed functional step, preserving both failures as job failures.
+
+Current-source clang Debug `-Werror` ASan/UBSan CTest: 58/58 passed. Bash,
+ShellCheck (existing SC2207 exclusions), clang-format 18.1.3 and actionlint
+checks passed. The complete real-netns H2 Debug functional and Release
+performance suites both passed. The full functional run repeated IPv6 at
+18.3 Mbps / share 1.00; BASE-B samples were 36.2, 20.7 and 15.4 Mbps without
+retries, and asymmetric multipath averaged 49.1 Mbps / share 0.78 (1.81x the
+best single-leg average). These local measurements are not hosted-CI results.
+The new-head CI gate remains pending; phase B stays paused and PR #15 unmerged.

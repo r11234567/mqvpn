@@ -126,15 +126,17 @@
 #     (both paths must carry real load, lighter path >=20% of the heavier —
 #     the direct proof against a scheduler that pinned traffic on one path;
 #     the absolute byte floor differs from Test 3's, see the check below).
-#     Like Test 3 this phase runs under netem, and for a reason that is a
-#     property of the scheduler rather than a convenience: TCP-lane traffic
-#     rides QUIC STREAM packets, which carry po_flow_hash == 0, so the WLB
+#     This phase uses two equal, lossless, rate-limited netem legs and also
+#     requires throughput above either leg's capacity. Test 3 retains the
+#     asymmetric loss/jitter profile. Shaping follows from the scheduler's
+#     design: TCP-lane traffic rides QUIC STREAM packets, which carry
+#     po_flow_hash == 0, so the WLB
 #     scheduler routes them through its MinRTT fallback rather than the
 #     WRR/flow-pinning path used for datagrams. That fallback only ever
 #     reaches for a second path when the lowest-SRTT one is cwnd-blocked, so
 #     on an UNSHAPED pair — where one veth absorbs the whole offered load —
 #     a 100%-on-one-path result is correct behaviour, not a regression. See
-#     the netem call in the Test 8 body for the measurements that settled it.
+#     the netem call in the Test 8 body for the controlled workload.
 #     A separate long-lived v6 TCP-lane flow then proves failover: path 0's
 #     client-side link is dropped mid-flow and the flow must keep making
 #     progress on the surviving path, the same technique
@@ -1932,28 +1934,18 @@ ip netns exec "$NS_CLIENT" sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null
 # addressing note above).
 ip netns exec "$NS_SERVER" ip -6 addr add "${V6_EGRESS_IP}/128" dev lo
 
-# Shape both legs before the tunnel comes up. WITHOUT this the load-share
-# assertion below is not a scheduler check but a coin flip: stream-lane
-# packets take WLB's MinRTT fallback (po_flow_hash == 0), which spills onto a
-# second path only while the lowest-SRTT one is cwnd-blocked, and an unshaped
-# veth pair is fast enough that one path never blocks. Measured on the same
-# binary, 2 runs each: unshaped gave minshare 0.00 / 0.00 (and 0.05 / 0.39 on
-# a build with a larger lwIP window — i.e. the outcome tracked an unrelated
-# buffer size, which is precisely what a load-share gate must NOT do), while
-# this shaped topology gave 0.72 / 0.78 / 0.81 / 0.86 across both builds —
-# a 3.6x margin over the >=0.2 threshold with no window sensitivity left.
-# Shaping also caps the burst at 40+100 mbit, so a slow CI runner measures
-# the same region a fast one does.
-#
-# Ordering: bench_setup_netns_n recreates the namespaces (and with them the
-# qdiscs), so netem MUST be applied after the topology, before the tunnel.
-# The profile is re-derived here rather than reusing Test 3's NETEM_A/NETEM_B
-# for the same reason this phase keeps its own copy of the load-share check:
-# Test 8 must not break silently if Test 3 is reordered or dropped.
-NETEM_PROFILE_T8="lte_starlink"
-NETEM_SPEC_T8="${BENCH_ENV_NETEM[$NETEM_PROFILE_T8]}"
-echo "  profile=${NETEM_PROFILE_T8} pathA='${NETEM_SPEC_T8%%|*}' pathB='${NETEM_SPEC_T8#*|}'"
-bench_apply_netem "${NETEM_SPEC_T8%%|*}" "${NETEM_SPEC_T8#*|}"
+# STREAM uses MinRTT (DD §7), not equal-share WRR. The old 40/100 mbit,
+# random-loss/jitter profile need not saturate both paths in a short Debug
+# burst: CI measured 40.1 Mbps with both paths carrying MBs but share=0.17.
+# Use equal lossless legs below the Debug sender's capacity for this
+# functional aggregation check; Test 3 keeps the asymmetric stress profile.
+# Retain the >=0.2 share gate and additionally demand >1.5x ONE leg's rate:
+# merely selecting one path cannot satisfy that capacity check.
+# Apply after recreating namespaces, before starting the tunnel.
+PATH_RATE_MBPS_T8=10
+NETEM_T8="delay 20ms rate ${PATH_RATE_MBPS_T8}mbit"
+echo "  IPv6 controlled profile: each path '${NETEM_T8}'"
+bench_apply_netem "$NETEM_T8" "$NETEM_T8"
 
 N_PATHS=2
 hybrid_run "$INI_T8" "$SERVER_LOG_T8" "$CLIENT_LOG_T8"
@@ -1992,37 +1984,25 @@ fi
 #    carry real load, lighter path >=20% of the heavier) — the direct proof
 #    against a scheduler that pinned all traffic on one path. A fresh copy
 #    of the check (not a shared function with Test 3) so this phase cannot
-#    perturb Test 3's already-verified logic. The absolute byte floor is
-#    HALF of Test 3's (see the FLOOR clause below) — same shape, different
-#    threshold, deliberately not tracking Test 3's value. ──
+#    perturb Test 3's logic. The absolute byte floor remains 50 KB. ──
 IPERF_DURATION_T8=6
 V6_IPERF_MBPS="$(run_iperf3_v6_through_tunnel "$V6_EGRESS_IP" "$IPERF_DURATION_T8")"
 echo "  IPv6 iperf3 (both paths active): ${V6_IPERF_MBPS} Mbps"
-if awk -v m="$V6_IPERF_MBPS" 'BEGIN{exit !(m>0)}'; then
-    echo "OK: IPv6 iperf3 measurement produced a nonzero sample"
+if awk -v m="$V6_IPERF_MBPS" -v r="$PATH_RATE_MBPS_T8" 'BEGIN{exit !(m>1.5*r)}'; then
+    echo "PASS: IPv6 throughput exceeds 1.5x one ${PATH_RATE_MBPS_T8} Mbps leg's capacity"
 else
-    echo "FAIL: IPv6 iperf3 measurement returned 0.0 Mbps — measurement broken"
+    echo "FAIL: IPv6 throughput ${V6_IPERF_MBPS} Mbps does not exceed 1.5x one ${PATH_RATE_MBPS_T8} Mbps leg's capacity"
+    iperf3_snapshot "${IPERF_EVIDENCE}/t8-capacity-failed.txt" full
     fail=1
 fi
 
-# Prove the stream lane carried this traffic (not a silent raw fallthrough)
-# while the client is still alive.
-assert_stream_lane_used "$CLIENT_LOG_T8" "Test8 v6 stream"
-
-stats_t8=""
-agg_check_t8=""
-for _ in $(seq 1 15); do
-    stats_t8="$(bench_query_control "$CTRL_PORT" get_status)"
-    agg_check_t8="$(echo "$stats_t8" | python3 -c "
+# Snapshot immediately after the burst. Polling these cumulative counters
+# after the sender has exited adds no new load and cannot repair a bad share.
+stats_t8="$(bench_query_control "$CTRL_PORT" get_status)"
+printf '%s\n' "$stats_t8" >"${IPERF_EVIDENCE}/t8-path-status.json"
+agg_check_t8="$(echo "$stats_t8" | python3 -c "
 import sys, json
-# Half of Test 3's 100000 floor: this phase is a single ~6s iperf3 burst,
-# not Test 3's repeated run_iperf3_repeated series, so fewer per-path bytes
-# accumulate before the get_status snapshot — while still being far above
-# handshake/probe noise (an idle path can't reach 50 KB on control frames).
-# Measured under the netem profile applied above: the LIGHTER path carried
-# 31.9-33.5 MB across 4 runs, so the floor sits ~640x below the observed
-# value and is doing what it is meant to do (catch a dead path), not
-# gatekeeping throughput.
+# Far above handshake/probe noise; unchanged from the original Test 8 gate.
 FLOOR = 50000
 try:
     d = json.load(sys.stdin)
@@ -2051,19 +2031,19 @@ if lo < 0.2 * hi:
     print('FAIL imbalanced lo=%d hi=%d minshare=%.2f' % (lo, hi, share)); sys.exit()
 print('OK lo=%d hi=%d minshare=%.2f' % (lo, hi, share))
 ")"
-    if [ "${agg_check_t8#OK}" != "$agg_check_t8" ]; then
-        break
-    fi
-    sleep 1
-done
 echo "  per-path load (tx+rx) after IPv6 iperf3 burst: ${agg_check_t8}"
 if [ "${agg_check_t8#OK}" != "$agg_check_t8" ]; then
     echo "PASS: both paths carried meaningful load from IPv6 TCP-lane traffic (${agg_check_t8})"
 else
     echo "FAIL: per-path utilization check failed for IPv6 traffic (${agg_check_t8})"
     echo "      raw get_status: $stats_t8"
+    iperf3_snapshot "${IPERF_EVIDENCE}/t8-share-failed.txt" full
     fail=1
 fi
+
+# Prove the stream lane carried this traffic (not a silent raw fallthrough)
+# while the client is still alive; its periodic log may take up to 40s.
+assert_stream_lane_used "$CLIENT_LOG_T8" "Test8 v6 stream"
 
 # ── Failover: a long-lived v6 TCP-lane flow, then bring one path down and
 #    confirm it keeps flowing on the survivor — same technique

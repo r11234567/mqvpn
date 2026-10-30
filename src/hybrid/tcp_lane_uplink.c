@@ -292,7 +292,12 @@ tcp_lane_uplink_deliver(mqvpn_tcp_flow_t *f, struct pbuf *p)
 
     if (off == tot) {
         pbuf_free(p);
-        if (tcp_lane_uplink_xquic_bytes(f) >= MQVPN_TCP_LANE_BP_HIGH_WATER) {
+        /* A full H3 send clears xquic's write-notify flag. Already advertised
+         * TCP credit can deliver more data while we are withheld, so re-arm
+         * the drain callback even below HIGH until it returns all credit at
+         * LOW. Otherwise a later full accept can strand the old withholding. */
+        if (f->uplink_withheld ||
+            tcp_lane_uplink_xquic_bytes(f) >= MQVPN_TCP_LANE_BP_HIGH_WATER) {
             tcp_lane_uplink_withhold(f);
             f->uplink_withheld_recved += tot;
         } else {

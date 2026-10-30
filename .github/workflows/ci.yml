@@ -1653,9 +1653,13 @@ jobs:
         run: sudo -E tests/test_e2e_hybrid_h1.sh build/mqvpn
 
       - name: E2E hybrid H2 TCP-lane suite (netns, functional phases)
+        id: hybrid-functional
         run: HYBRID_H2_PHASES=functional sudo -E timeout --foreground --kill-after=15s 10m tests/test_e2e_hybrid_h2.sh build/mqvpn
 
       - name: E2E hybrid H2 throughput gate (netns, Release build)
+        # Preserve the independent perf evidence even when a functional check
+        # fails. Both steps still gate the job; no continue-on-error or rerun.
+        if: ${{ !cancelled() && (steps.hybrid-functional.outcome == 'success' || steps.hybrid-functional.outcome == 'failure') }}
         run: HYBRID_H2_PHASES=perf sudo -E timeout --foreground --kill-after=15s 12m tests/test_e2e_hybrid_h2.sh build-release/mqvpn
 
       # Preserve both healthy and failing measurements: per-sample iperf JSON,

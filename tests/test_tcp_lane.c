@@ -388,6 +388,9 @@ cli_tcp_lane_h3_send(void *h3_request, const uint8_t *buf, size_t len, int fin)
     if (ret > (ssize_t)len) {
         ret = (ssize_t)len;
     }
+    /* Real xqc_h3_stream_send_data clears NEED_WRITE_NOTIFY on a full
+     * accept, even if the application explicitly enabled it earlier. */
+    g_h3_write_notify_enabled = (ret != (ssize_t)len);
     if (ret > 0 && buf) {
         size_t room = sizeof(g_h3_capture) - g_h3_capture_len;
         size_t n = ((size_t)ret <= room) ? (size_t)ret : room;
@@ -1610,6 +1613,51 @@ test_relay_full_accept_withholds_on_xquic_queue(void)
 
     f->pcb = NULL;
     mqvpn_tcp_lane_free(lane);
+}
+
+static void
+test_relay_withheld_credit_survives_full_accept(void)
+{
+    const uint64_t queue_sizes[] = {MQVPN_TCP_LANE_BP_LOW_WATER + 1, 0};
+    for (size_t i = 0; i < sizeof(queue_sizes) / sizeof(queue_sizes[0]); i++) {
+        relay_reset();
+        mqvpn_hybrid_config_t cfg;
+        mqvpn_hybrid_config_default(&cfg);
+        mqvpn_tcp_lane_t *lane =
+            mqvpn_tcp_lane_new(&cfg, 0x1114ULL, NULL, fake_clock, NULL);
+        struct tcp_pcb pcb;
+        int fake_req, fake_stream;
+        mqvpn_tcp_flow_t *f = setup_flow(lane, &pcb, 5103, &fake_req, &fake_stream, 1);
+        ASSERT_TRUE(f != NULL, "flow established");
+
+        g_h3_send_queue_bytes = MQVPN_TCP_LANE_BP_HIGH_WATER - 500;
+        g_h3_queue_grows_with_send = 1;
+        mqvpn_tcp_lane_on_lwip_recv(f, &pcb, mk_pbuf(1000), ERR_OK);
+        ASSERT_EQ_INT(f->uplink_withheld_recved, 1000, "first delivery withheld");
+        ASSERT_EQ_INT(g_h3_write_notify_enabled, 1, "drain notification armed");
+
+        /* An already advertised TCP window permits another delivery while
+         * xquic drains. Its full H3 accept clears the previous subscription. */
+        g_h3_queue_grows_with_send = 0;
+        g_h3_send_queue_bytes = queue_sizes[i];
+        mqvpn_tcp_lane_on_lwip_recv(f, &pcb, mk_pbuf(1000), ERR_OK);
+        ASSERT_EQ_INT(g_h3_capture_len, 2000, "both deliveries accepted exactly once");
+        ASSERT_EQ_INT(g_h3_write_notify_enabled, 1,
+                      "full accept re-arms notification for outstanding withheld credit");
+        ASSERT_EQ_INT(f->uplink_withheld_recved, 2000,
+                      "withheld deliveries remain charged until low-water callback");
+        ASSERT_EQ_INT(g_recved_total, 0, "hysteresis retained until drain callback");
+
+        g_h3_send_queue_bytes = 0;
+        if (g_h3_write_notify_enabled) {
+            mqvpn_tcp_lane_on_h3_writable(lane, &fake_stream);
+        }
+        ASSERT_EQ_INT(g_recved_total, 2000, "all credit restored through armed callback");
+        ASSERT_EQ_INT(f->uplink_withheld, 0, "backpressure latch released");
+        ASSERT_EQ_INT(g_h3_write_notify_enabled, 0, "idle subscription released");
+        f->pcb = NULL;
+        mqvpn_tcp_lane_free(lane);
+    }
 }
 
 static void
@@ -3900,6 +3948,7 @@ main(void)
     test_relay_full_accept();
     test_relay_xquic_queue_blocks_before_send();
     test_relay_full_accept_withholds_on_xquic_queue();
+    test_relay_withheld_credit_survives_full_accept();
     test_relay_eagain_then_writable_flush();
     test_relay_partial_accept();
     test_relay_pending_stream_buffering();
