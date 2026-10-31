@@ -231,7 +231,8 @@ internal sealed class MainForm : FluentWindow
 
     public bool IsDisposed { get; private set; }
 
-    private string BasePath => AppContext.BaseDirectory;
+    private readonly string _basePath;
+    private string BasePath => _basePath;
     private string ConfigDirectory => System.IO.Path.Combine(BasePath, "config");
     private string RuntimeDirectory => System.IO.Path.Combine(BasePath, "runtime");
     private string MqvpnExecutable => System.IO.Path.Combine(BasePath, "runtime", "mqvpn", "mqvpn.exe");
@@ -242,8 +243,9 @@ internal sealed class MainForm : FluentWindow
     private string XrayConfig => System.IO.Path.Combine(ConfigDirectory, "active-xray.json");
     private string CurrentLogLevel => LogLevels.Normalize(_profiles?.State.LogLevel);
 
-    public MainForm()
+    public MainForm(string? basePath = null)
     {
+        _basePath = System.IO.Path.GetFullPath(basePath ?? AppContext.BaseDirectory);
         FluentUi.ConfigureWindow(this, "MQVPN", 1220, 820, 1000, 680);
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
 
@@ -1255,10 +1257,11 @@ internal sealed class MainForm : FluentWindow
 
     private void InitializeApplication()
     {
+        // ProfileStore creates first-run configuration. Only shipped binaries
+        // are prerequisites; requiring generated config here prevents bootstrap.
         var required = new[]
         {
             MqvpnExecutable,
-            System.IO.Path.Combine(ConfigDirectory, "client-windows.json"),
             XrayExecutable,
         };
         var missing = required.Where(path => !System.IO.File.Exists(path)).ToArray();
