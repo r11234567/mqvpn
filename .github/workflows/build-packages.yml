@@ -409,6 +409,7 @@ jobs:
           cmake -G "${{ matrix.vs }}" -A ${{ matrix.arch == 'amd64' && 'x64' || 'ARM64' }} `
             -DBUILD_SHARED_LIBS=0 `
             -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
             ${{ matrix.arch == 'arm64' && '-DOPENSSL_NO_ASM=1' || '' }} ..
           cmake --build . --target ssl --config Release
           cmake --build . --target crypto --config Release
@@ -442,6 +443,7 @@ jobs:
           # the xquic submodule patch (see fix/msvc-enum-truncation).
           cmake -G "${{ matrix.vs }}" -A ${{ matrix.arch == 'amd64' && 'x64' || 'ARM64' }} `
             -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
             -DCMAKE_C_STANDARD=11 `
             -DSSL_TYPE=boringssl `
             -DSSL_PATH="${{ github.workspace }}/third_party/xquic/third_party/boringssl" `
@@ -463,6 +465,7 @@ jobs:
           # the two CMake invocations.
           cmake -G "${{ matrix.vs }}" -A ${{ matrix.arch == 'amd64' && 'x64' || 'ARM64' }} `
             -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
             -DCMAKE_C_STANDARD=11 `
             -DXQUIC_BUILD_DIR="${{ github.workspace }}/third_party/xquic/build/Release" `
             -DBORINGSSL_BUILD_DIR="${{ github.workspace }}/third_party/xquic/third_party/boringssl/build/Release" `
@@ -509,6 +512,17 @@ jobs:
           $out = & build/Release/mqvpn.exe --version
           if ($LASTEXITCODE -ne 0 -or @($out)[0] -cne "mqvpn $env:VERSION_DISPLAY") {
             throw "mqvpn build identity differs from artifact version: $out"
+          }
+
+      - name: Verify standalone Windows runtime
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $dependencies = & dumpbin /dependents build/Release/mqvpn.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect Windows executable imports' }
+          $dependencies
+          if ($dependencies -match '(?i)(vcruntime|msvcp|libevent|xquic)[^\s]*\.dll') {
+            throw 'Windows package requires a compiler or unbundled third-party runtime'
           }
 
       - name: Stage Windows release artifact
