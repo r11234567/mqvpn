@@ -13,7 +13,9 @@ function Read-GitHubApi([string]$Path) {
 }
 function Resolve-Release([string]$Repository, [string[]]$Assets) {
     $releases = Read-GitHubApi "repos/$Repository/releases?per_page=30"
-    $release = @($releases | Where-Object { -not $_.draft })[0]
+    # Include prereleases and choose by publication time, not API creation order.
+    $release = @($releases | Where-Object { -not $_.draft } |
+        Sort-Object { [DateTimeOffset]$_.published_at } -Descending)[0]
     if (-not $release) { throw "No release for $Repository" }
     $commit = Read-GitHubApi "repos/$Repository/commits/$([uri]::EscapeDataString($release.tag_name))"
     $selected = foreach ($name in $Assets) {
@@ -27,8 +29,7 @@ function Resolve-Release([string]$Repository, [string[]]$Assets) {
 }
 $lock = [ordered]@{
     schema = 1
-    wintun = @{ version = '0.14.1'; url = 'https://www.wintun.net/builds/wintun-0.14.1.zip'
-        sha256 = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51' }
+    wintun = & (Join-Path $PSScriptRoot 'resolve_wintun.ps1')
     xray = Resolve-Release 'XTLS/Xray-core' @('Xray-windows-64.zip', 'Xray-windows-arm64-v8a.zip')
     geodata = Resolve-Release 'Loyalsoldier/v2ray-rules-dat' @('geoip.dat', 'geosite.dat')
 }

@@ -18,27 +18,8 @@ permissions:
   contents: read
 
 jobs:
-  dependencies:
-    runs-on: windows-2022
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ inputs.source-sha }}
-      - name: Resolve third-party releases once for both architectures
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: ./scripts/resolve_windows_gui_deps.ps1 -LockFile build/dependency-lock.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: windows-gui-dependency-lock
-          path: build/dependency-lock.json
-          if-no-files-found: error
-
   verify-package:
     name: Native GUI and package (${{ matrix.arch }})
-    needs: dependencies
     strategy:
       fail-fast: false
       matrix:
@@ -64,13 +45,10 @@ jobs:
         with:
           name: mqvpn-windows-${{ matrix.arch }}
           path: build/core-artifact
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: windows-gui-dependency-lock
-          path: build/gui-deps
       - name: Build and run production GUI checks natively
         shell: pwsh
         run: |
+          ./tests/check_windows_gui_deps.ps1
           cmake -S windows/tests/config-contract -B build/gui-config-contract -G '${{ matrix.vs }}' -A ${{ matrix.cmake_arch }}
           if ($LASTEXITCODE -ne 0) { throw 'C configuration contract configure failed' }
           cmake --build build/gui-config-contract --config Debug
@@ -83,7 +61,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'GUI behavior checks failed' }
       - name: Publish self-contained GUI and package the same-run core
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
+          # Resolve afresh in every job attempt, including failed-job reruns.
+          ./scripts/resolve_windows_gui_deps.ps1 -LockFile build/gui-deps/dependency-lock.json
           ./scripts/package_windows_gui.ps1 -Arch ${{ matrix.arch }} -CoreDirectory build/core-artifact -DependencyLock build/gui-deps/dependency-lock.json
       - name: Unpack final ZIP and verify offline native runtime
         shell: pwsh

@@ -36,7 +36,7 @@ jobs:
           else
             git ls-files > /tmp/mqvpn-gui-paths
           fi
-          if grep -Eq '^(windows/|src/|include/|cmake/|third_party/|CMakeLists\.txt$|scripts/(package_windows_gui|resolve_windows_gui_deps|verify_windows_gui_package|write_windows_core_manifest)\.ps1$|\.github/workflows/(ci|windows-gui|snapshot|release|build-packages)\.yml$)' /tmp/mqvpn-gui-paths; then
+          if grep -Eq '^(windows/|src/|include/|cmake/|third_party/|CMakeLists\.txt$|tests/check_windows_gui_deps\.ps1$|scripts/(package_windows_gui|resolve_windows_gui_deps|resolve_wintun|verify_windows_gui_package|write_windows_core_manifest)\.ps1$|\.github/workflows/(ci|windows-gui|snapshot|release|build-packages)\.yml$)' /tmp/mqvpn-gui-paths; then
             echo 'gui=true' >> "$GITHUB_OUTPUT"
           else
             echo 'gui=false' >> "$GITHUB_OUTPUT"

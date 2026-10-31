@@ -12,7 +12,8 @@ identity before packaging. Native x64 and ARM64 smoke checks require that
 identity and the core/callback ABI metadata; final ZIP verification exercises
 the updater with those same executables.
 
-Kernel updates also accept `snapshot+YYYYMMDDTHHMMSSZ.gSHA` builds when
+Kernel updates accept `snapshot YYYY-MM-DD HH:MM UTC` and legacy
+`snapshot+YYYYMMDDTHHMMSSZ.gSHA` builds when
 `mqvpn --version` explicitly reports core 0.19.x and callback ABI 3 on its
 second line. A snapshot label alone is insufficient to establish compatibility.
 
@@ -24,7 +25,7 @@ and Windows changes select both native architectures; a documentation-only
 change does not independently select GUI packaging.
 
 The packaging script now requires an explicit core artifact directory and a
-dependency lock. The previous `CoreMqvpnExe`/`CoreMqvpnZip` options and automatic
+freshly resolved dependency metadata. The previous `CoreMqvpnExe`/`CoreMqvpnZip` options and automatic
 upstream-release fallback have been removed because they cannot establish
 the required source pairing. Run these commands with PowerShell 7.2 or later
 from a clean checkout matching the core artifact:
@@ -47,9 +48,15 @@ runtime linkage consistently for BoringSSL, XQUIC and MQVPN and uses separate
 cache keys for architecture and build flags. ARM64 follows the existing
 release build's `OPENSSL_NO_ASM` choice; this is not a performance claim.
 
-The lock fixes Wintun's version/hash and resolves Xray and GeoData once for
-both architectures. Downloads do not carry the GitHub API token. The package
-manifest records the exact inputs and file hashes. These hashes establish
+Each architecture resolves Xray and GeoData immediately before packaging,
+including on failed-job reruns. The newest publication is selected across
+both prereleases and stable releases; drafts are excluded. Wintun's current
+archive and checksum are read from its official download page for both CLI
+and GUI packages. No dependency version is pinned or reused from an earlier
+job. The generated `dependency-lock.json` name is retained for updater
+compatibility and records this package's actual inputs; it does not select
+versions for future builds. Downloads do not carry the GitHub API token.
+The package manifest records the exact inputs and file hashes. These hashes establish
 consistency and provenance within the build; they are not release signatures.
 Required third-party license materials travel with the package.
 

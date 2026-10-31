@@ -32,8 +32,6 @@ permissions:
 
 env:
   MQVPN_BUILD_CHANNEL: ${{ inputs.channel }}
-  WINTUN_VER: "0.14.1"
-  WINTUN_SHA256: "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
   # Keep in sync with ndkVersion in android/sdk-native/build.gradle.kts and
   # NDK_VERSION in android-repro.yml.
   NDK_VERSION: "28.2.13676358"
@@ -363,7 +361,17 @@ jobs:
         if: matrix.os == 'windows'
         run: vcpkg install libevent:${{ matrix.arch == 'amd64' && 'x64-windows-static' || 'arm64-windows-static' }}
 
-      # Cache key includes WINTUN_SHA256, so a hit implies the verified
+      - name: Resolve latest official Wintun (Windows)
+        if: matrix.os == 'windows'
+        id: wintun
+        shell: pwsh
+        run: |
+          $latest = ./scripts/resolve_wintun.ps1
+          "version=$($latest.version)" >> $env:GITHUB_OUTPUT
+          "url=$($latest.url)" >> $env:GITHUB_OUTPUT
+          "sha256=$($latest.sha256)" >> $env:GITHUB_OUTPUT
+
+      # Cache key includes the current official SHA-256, so a hit implies verified
       # bytes — no re-verify on hit (trusts GitHub Actions cache integrity).
       - name: Cache wintun
         if: matrix.os == 'windows'
@@ -371,14 +379,17 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: wintun-extract
-          key: wintun-${{ env.WINTUN_VER }}-${{ env.WINTUN_SHA256 }}
+          key: wintun-${{ steps.wintun.outputs.version }}-${{ steps.wintun.outputs.sha256 }}
 
       - name: Fetch and verify wintun (Windows)
         if: matrix.os == 'windows' && steps.cache-wintun.outputs.cache-hit != 'true'
         shell: pwsh
+        env:
+          WINTUN_URL: ${{ steps.wintun.outputs.url }}
+          WINTUN_SHA256: ${{ steps.wintun.outputs.sha256 }}
         run: |
-          $zip = "wintun-${env:WINTUN_VER}.zip"
-          Invoke-WebRequest -Uri "https://www.wintun.net/builds/$zip" -OutFile $zip
+          $zip = 'wintun.zip'
+          Invoke-WebRequest -Uri $env:WINTUN_URL -OutFile $zip
           $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           if ($actual -ne $env:WINTUN_SHA256.ToLower()) {
             Write-Error "wintun.zip sha256 mismatch: got $actual want $env:WINTUN_SHA256"

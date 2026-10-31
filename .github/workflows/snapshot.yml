@@ -16,6 +16,8 @@ on:
       - 'tests/check_build_version.sh'
       - 'tests/check_publish_assets.sh'
       - 'scripts/*windows*.ps1'
+      - 'scripts/resolve_wintun.ps1'
+      - 'tests/check_windows_gui_deps.ps1'
       - 'cmake/BuildVersion.cmake'
       - 'CMakeLists.txt'
       - 'android/app/build.gradle.kts'
