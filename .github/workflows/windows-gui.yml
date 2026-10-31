@@ -6,6 +6,13 @@ on:
       source-sha:
         type: string
         required: true
+      version:
+        description: Optional distribution version for release asset names
+        type: string
+        default: ''
+      artifact-prefix:
+        type: string
+        default: mqvpn_windows_gui_
 
 permissions:
   contents: read
@@ -15,7 +22,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.source-sha }}
       - name: Resolve third-party releases once for both architectures
@@ -23,7 +30,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: ./scripts/resolve_windows_gui_deps.ps1 -LockFile build/dependency-lock.json
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: windows-gui-dependency-lock
           path: build/dependency-lock.json
@@ -47,17 +54,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.source-sha }}
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: '9.0.x'
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: mqvpn-windows-${{ matrix.arch }}
           path: build/core-artifact
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: windows-gui-dependency-lock
           path: build/gui-deps
@@ -84,7 +91,7 @@ jobs:
           ./scripts/verify_windows_gui_package.ps1 -Arch ${{ matrix.arch }} -SourceSha '${{ inputs.source-sha }}' -ZipPath dist/mqvpn_windows_gui_${{ matrix.arch }}.zip -ReportDirectory build/package-reports
       - name: Upload screenshots and package verification evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: gui-evidence-${{ matrix.arch }}
           path: |
@@ -94,10 +101,18 @@ jobs:
             dist/mqvpn_windows_gui_${{ matrix.arch }}/package-manifest.json
           if-no-files-found: warn
           retention-days: 7
+      - name: Stage versioned distribution ZIP
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force build/distribution | Out-Null
+          $name = if ($env:PACKAGE_VERSION) { "mqvpn_$($env:PACKAGE_VERSION)_windows_gui_${{ matrix.arch }}.zip" } else { 'mqvpn_windows_gui_${{ matrix.arch }}.zip' }
+          Copy-Item -LiteralPath 'dist/mqvpn_windows_gui_${{ matrix.arch }}.zip' -Destination (Join-Path build/distribution $name)
       - name: Upload verified distribution ZIP
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: mqvpn_windows_gui_${{ matrix.arch }}
-          path: dist/mqvpn_windows_gui_${{ matrix.arch }}.zip
+          name: ${{ inputs.artifact-prefix }}${{ matrix.arch }}
+          path: build/distribution/*.zip
           if-no-files-found: error
           retention-days: 14

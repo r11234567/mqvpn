@@ -63,14 +63,14 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "::error::$1"; exit 1; }
-          rel=.github/workflows/release.yml
+          rel=.github/workflows/build-packages.yml
           gradle_ndk=$(sed -n 's/.*ndkVersion = "\([^"]*\)".*/\1/p' \
                        android/sdk-native/build.gradle.kts | head -1)
           rel_ndk=$(sed -n 's/^  NDK_VERSION: "\([^"]*\)".*/\1/p' "$rel" | head -1)
           [ -n "$gradle_ndk" ] && [ -n "$rel_ndk" ] \
             || fail "could not parse NDK pins — update the patterns in this step"
           [ "$rel_ndk" = "$NDK_VERSION" ] \
-            || fail "NDK pin drift: release.yml has $rel_ndk, this gate has $NDK_VERSION"
+            || fail "NDK pin drift: build-packages.yml has $rel_ndk, this gate has $NDK_VERSION"
           [ "$gradle_ndk" = "$NDK_VERSION" ] \
             || fail "NDK pin drift: sdk-native has $gradle_ndk, this gate has $NDK_VERSION"
           echo "NDK pin in sync ($NDK_VERSION). BoringSSL is a submodule (single pin)."
@@ -107,6 +107,10 @@ jobs:
           tar -C "$GITHUB_WORKSPACE" --exclude=.git --sort=name -cf - . | tar -C "$d" -xmf -
           cd "$d"
           export GRADLE_USER_HOME="$RUNNER_TEMP/gradle-home-a"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            version_env=$(bash scripts/resolve_build_version.sh)
+            export BUILD_VERSION_FILE="$(printf '%s\n' "$version_env" | sed -n 's/^BUILD_VERSION_FILE=//p')"
+          fi
           scripts/stage_apk_license_assets.sh
           ANDROID_NDK="$ANDROID_HOME/ndk/${NDK_VERSION}" \
             scripts/build_android.sh --abi arm64-v8a > /dev/null
@@ -129,10 +133,15 @@ jobs:
             -v "$d:/src" -v "$ANDROID_HOME:/sdk:ro" -w /src \
             -e ANDROID_HOME=/sdk -e ANDROID_SDK_ROOT=/sdk \
             -e ANDROID_USER_HOME=/tmp/.android -e GRADLE_USER_HOME=/tmp/gradle-home-b \
+            -e GITHUB_REF \
             debian:trixie bash -euc '
               apt-get update -qq
               DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
                 openjdk-21-jdk-headless cmake ninja-build git unzip > /dev/null
+              if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+                version_env=$(bash scripts/resolve_build_version.sh)
+                export BUILD_VERSION_FILE="$(printf "%s\n" "$version_env" | sed -n "s/^BUILD_VERSION_FILE=//p")"
+              fi
               scripts/stage_apk_license_assets.sh
               ANDROID_NDK=/sdk/ndk/'"$NDK_VERSION"' \
                 scripts/build_android.sh --abi arm64-v8a > /dev/null
