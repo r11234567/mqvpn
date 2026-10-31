@@ -54,6 +54,12 @@ foreach ($kernel in @('mqvpn','xray')) {
     $argument = if ($kernel -eq 'mqvpn') { '--version' } else { 'version' }
     $version = Invoke-Offline (Join-Path $unpacked "runtime/$kernel/$kernel.exe") @($argument) "$kernel-version"
     if ([string]::IsNullOrWhiteSpace($version)) { throw "$kernel did not report a version" }
+    if ($kernel -eq 'mqvpn') {
+        $coreIdentity = [regex]::Match($version, '(?m)^mqvpn (?<version>[^\r\n]+)').Groups['version'].Value
+        if ($result.guiVersion.TrimStart('v') -ne $coreIdentity) { throw "GUI/core build identity mismatch: $($result.guiVersion) vs $coreIdentity" }
+        $manifest = Get-Content -LiteralPath (Join-Path $unpacked 'package-manifest.json') -Raw | ConvertFrom-Json
+        if ($manifest.buildVersion -ne $coreIdentity) { throw 'Package manifest build identity mismatch' }
+    }
 }
 Copy-Item -LiteralPath (Join-Path $unpacked 'package-manifest.json') -Destination (Join-Path $ReportDirectory "manifest-$Arch.json")
 Write-Host "Verified final ZIP, source $SourceSha, native $Arch, self-contained SQLite, updater and core startup. No VPN or host routes were started."

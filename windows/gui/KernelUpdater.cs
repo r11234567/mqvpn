@@ -390,7 +390,8 @@ internal static class KernelInstaller
             var asm = typeof(MainForm).Assembly;
             var ver = asm.GetName().Version;
             var infoVer = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
-            return !string.IsNullOrEmpty(infoVer) ? $"v{infoVer}" : (ver is not null ? $"v{ver.Major}.{ver.Minor}.{ver.Build}" : "v1.2.0");
+            return FormatInstalledVersion("gui", !string.IsNullOrEmpty(infoVer) ? infoVer :
+                (ver is not null ? $"{ver.Major}.{ver.Minor}.{ver.Build}" : string.Empty));
         }
 
         if (kernel == "geodata")
@@ -413,9 +414,15 @@ internal static class KernelInstaller
 
     internal static string FormatInstalledVersion(string kernel, string output)
     {
-        if (kernel != "mqvpn") return output.Trim();
+        if (kernel == "xray")
+        {
+            var xray = Regex.Match(output, @"(?im)^Xray\s+(?<version>\d+\.\d+\.\d+(?:\.[0-9]+)?(?:-[0-9A-Za-z.-]+)?)(?=\s|$)");
+            return xray.Success ? xray.Groups["version"].Value : output.Trim();
+        }
+        if (kernel is not ("mqvpn" or "gui")) return output.Trim();
         var snapshot = SnapshotTime(output);
         if (snapshot is not null) return "s." + snapshot.Value.ToString("yyyyMMdd.HHmm'UTC'", CultureInfo.InvariantCulture);
+        if (kernel == "gui") return "v" + output.Trim().TrimStart('v').Split('+')[0];
         var version = Regex.Match(output, @"(?m)^mqvpn\s+(?<version>[^\r\n]+)");
         return version.Success ? version.Groups["version"].Value.Trim() : output.Trim();
     }
@@ -424,12 +431,14 @@ internal static class KernelInstaller
     {
         if (string.IsNullOrWhiteSpace(installed)) return false;
         if (installed == "未安装") return true;
-        if (kernel != "mqvpn")
+        if (kernel is not ("mqvpn" or "gui" or "xray"))
             return !string.Equals(installed.TrimStart('v'), release.Tag.TrimStart('v'), StringComparison.OrdinalIgnoreCase);
 
+        if (kernel is "gui" or "xray") installed = FormatInstalledVersion(kernel, installed);
+
         var currentSnapshot = SnapshotTime(installed);
-        var rolling = release.Tag == "snapshot" || release.Tag.StartsWith("s.", StringComparison.Ordinal) ||
-                      release.Tag.StartsWith("snapshot-", StringComparison.Ordinal);
+        var rolling = kernel != "xray" && (release.Tag == "snapshot" || release.Tag.StartsWith("s.", StringComparison.Ordinal) ||
+                      release.Tag.StartsWith("snapshot-", StringComparison.Ordinal));
         if (rolling)
         {
             var candidate = ReleaseSnapshotTime(release);
@@ -438,7 +447,7 @@ internal static class KernelInstaller
 
         // Compatibility metadata is only used for ordering channels, not shown
         // as the snapshot's installed version. Never offer an older stable core.
-        var current = Regex.Match(installed, currentSnapshot is not null
+        var current = Regex.Match(installed, currentSnapshot is not null && kernel == "mqvpn"
             ? @"(?m)^core (?<version>\d+\.\d+\.\d+(?:\.\d+)?)(?<pre>-[0-9A-Za-z.-]+)?"
             : @"(?m)^(?:mqvpn\s+|v)?(?<version>\d+\.\d+\.\d+(?:\.\d+)?)(?<pre>-[0-9A-Za-z.-]+)?");
         var target = Regex.Match(release.Tag, @"^v?(?<version>\d+\.\d+\.\d+(?:\.\d+)?)(?<pre>-[0-9A-Za-z.-]+)?$");
@@ -453,7 +462,7 @@ internal static class KernelInstaller
 
     internal static string FormatReleaseVersion(string kernel, GitHubRelease release)
     {
-        var snapshot = kernel == "mqvpn" ? ReleaseSnapshotTime(release) : null;
+        var snapshot = kernel is "mqvpn" or "gui" ? ReleaseSnapshotTime(release) : null;
         return snapshot is not null ? "s." + snapshot.Value.ToString("yyyyMMdd.HHmm'UTC'", CultureInfo.InvariantCulture) : release.Tag;
     }
 
@@ -634,7 +643,7 @@ internal static class KernelInstaller
         var output = (await outputTask).Trim();
         var error = (await errorTask).Trim();
         var reported = output.Length > 0 ? output : error;
-        // Xray prints its build details across several lines; keep them all and let the UI wrap.
+        // Preserve raw build details for validation; display and ordering normalize them separately.
         var lines = reported.Replace("\r\n", "\n").Replace('\r', '\n')
             .Split('\n')
             .Select(line => line.Trim())
