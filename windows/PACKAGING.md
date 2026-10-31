@@ -12,6 +12,13 @@ identity before packaging. Native x64 and ARM64 smoke checks require that
 identity and the core/callback ABI metadata; final ZIP verification exercises
 the updater with those same executables.
 
+User configuration is generated on first launch, not shipped in the archive.
+Startup checks require the MQVPN and Xray executables before loading the
+profile store; a missing `config/client-windows.json` must not block that
+initialization. The native GUI regression suite invokes the actual window's
+initialization with an empty config directory and verifies both first-run
+creation and restart preservation of existing node data.
+
 Kernel updates accept `snapshot YYYY-MM-DD HH:MM UTC` and legacy
 `snapshot+YYYYMMDDTHHMMSSZ.gSHA` builds when
 `mqvpn --version` explicitly reports core 0.19.x and callback ABI 3 on its

@@ -61,6 +61,11 @@ internal static class ConfigurationChecks
             PackageChecks.Run();
             return;
         }
+        if (args.Contains("--startup"))
+        {
+            StartupChecks.Run();
+            return;
+        }
         if (args.FirstOrDefault() == "--verify-config-contract")
         {
             ConfigurationAlignmentChecks.VerifyContract(args[1]);
@@ -81,6 +86,7 @@ internal static class ConfigurationChecks
             PersistenceChecks.ResetAndReopen();
             LifecycleChecks.RunAsync().GetAwaiter().GetResult();
             PackageChecks.Run();
+            StartupChecks.Run();
             FluentUi.EnsureApplication();
             FluentUi.SuppressDialogsForTesting = true;
 

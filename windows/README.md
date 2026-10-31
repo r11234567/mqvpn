@@ -9,6 +9,10 @@ Wintun, Xray, SQLite, licenses and a source/dependency manifest ship in the ZIP.
 Native x64/ARM64 package checks run in CI; see [verification](PHASE_B_REVIEW.md)
 for the scope actually completed locally.
 
+The first launch creates `config/client-windows.json` and the node database
+automatically. You do not need to copy the example into `config` before
+opening the GUI. Existing node configuration is preserved on later launches.
+
 ## Import and connect
 
 1. Prepare the Linux server using the paired server/client example in the
