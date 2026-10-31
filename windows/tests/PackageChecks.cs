@@ -113,6 +113,35 @@ internal static class PackageChecks
                 KernelInstaller.IsReleaseNewer("mqvpn", "mqvpn 0.19.0-rc.2", Release("v0.19.0")) &&
                 !KernelInstaller.IsReleaseNewer("mqvpn", "mqvpn 0.19.0", Release("v0.19.0-rc.2")),
                 "prerelease ordering is numeric and stable releases follow release candidates");
+
+            const string guiSnapshot = "s.20261031.1511UTC";
+            check(KernelInstaller.FormatInstalledVersion("gui", guiSnapshot + "+248007d171ef3fbe") == guiSnapshot &&
+                KernelInstaller.FormatInstalledVersion("gui", "v1.2.0+248007d171ef3fbe") == "v1.2.0",
+                "GUI display normalizes snapshot and legacy assembly metadata");
+            check(KernelInstaller.FormatReleaseVersion("gui", fromAsset) == "s.20261031.1200UTC" &&
+                !KernelInstaller.IsReleaseNewer("gui", guiSnapshot, Release("snapshot", "mqvpn s.20261031.1511UTC")) &&
+                !KernelInstaller.IsReleaseNewer("gui", guiSnapshot, fromAsset) &&
+                KernelInstaller.IsReleaseNewer("gui", guiSnapshot, Release("snapshot", "mqvpn s.20261031.1512UTC")) &&
+                KernelInstaller.IsReleaseNewer("gui", "v1.2.0+248007d171ef3fbe", fromAsset),
+                "GUI rolling releases compare timestamps and can upgrade legacy builds");
+            check(!KernelInstaller.IsReleaseNewer("gui", guiSnapshot, Release("snapshot", "unknown")) &&
+                !KernelInstaller.IsReleaseNewer("gui", "v1.2.0+248007d", Release("v1.2.0")) &&
+                !KernelInstaller.IsReleaseNewer("gui", "v1.2.0+248007d", Release("v1.1.0")) &&
+                KernelInstaller.IsReleaseNewer("gui", "v1.2.0+248007d", Release("v1.3.0")),
+                "GUI equal, older and unknown releases do not trigger false updates");
+
+            const string xray = "Xray 26.10.31 (Xray, Penetrates Everything.) a4a3dff (go1.27.3 windows/amd64)\r\nA unified platform for anti-censorship.\r\n";
+            check(KernelInstaller.FormatInstalledVersion("xray", xray) == "26.10.31" &&
+                !KernelInstaller.IsReleaseNewer("xray", xray, Release("v26.10.31")) &&
+                !KernelInstaller.IsReleaseNewer("xray", xray, Release("v26.10.30")) &&
+                KernelInstaller.IsReleaseNewer("xray", xray, Release("v26.11.1")),
+                "Xray compares the reported version, not the full multiline banner");
+            check(KernelInstaller.IsReleaseNewer("xray", "Xray 26.10.31-rc.2 (test)", Release("v26.10.31-rc.10")) &&
+                KernelInstaller.IsReleaseNewer("xray", "Xray 26.10.31-rc.10 (test)", Release("v26.10.31")) &&
+                !KernelInstaller.IsReleaseNewer("xray", xray, Release("v26.10.31-rc.10")) &&
+                KernelInstaller.IsReleaseNewer("xray", "未安装", Release("v26.10.31")) &&
+                !KernelInstaller.IsReleaseNewer("xray", "version unavailable", Release("v26.10.31")),
+                "Xray handles prereleases, missing installations and unknown identities");
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
     }

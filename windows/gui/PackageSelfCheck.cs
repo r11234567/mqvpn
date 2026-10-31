@@ -20,6 +20,13 @@ internal static class PackageSelfCheck
             if (!runtimeOnly && args[2] != PackageContract.CurrentArchitecture)
                 throw new InvalidOperationException("验收必须在目标架构原生进程中执行");
             var manifest = runtimeOnly ? null : PackageContract.Validate(args[1], args[2], args[3]);
+            var guiVersion = KernelInstaller.GetInstalledVersionAsync("gui", "").GetAwaiter().GetResult();
+            if (!runtimeOnly)
+            {
+                var coreVersion = KernelInstaller.GetInstalledVersionAsync("mqvpn", Path.Combine(args[1], "runtime")).GetAwaiter().GetResult();
+                if (guiVersion.TrimStart('v') != KernelInstaller.FormatInstalledVersion("mqvpn", coreVersion))
+                    throw new InvalidDataException("GUI 与同包核心的构建版本不一致");
+            }
             var store = ProfileStore.Load(temp);
             var config = ProfileStore.CreateDefaultMqvpnConfig();
             config["server_addr"] = "offline.example:443";
@@ -72,6 +79,7 @@ internal static class PackageSelfCheck
                 kernelUpdateRoundtrip = !runtimeOnly,
                 coreClr = coreClr ?? "single-file image", sqlite,
                 networkAccess = false,
+                guiVersion,
             }));
             return 0;
         }

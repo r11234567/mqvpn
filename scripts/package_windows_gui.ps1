@@ -29,6 +29,13 @@ foreach ($entry in $core.files) {
     $file = Join-Path $CoreDirectory $entry.path
     if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $entry.sha256) { throw "Core artifact checksum mismatch: $($entry.path)" }
 }
+# Use the verified, same-run core as the GUI/updater build identity too.
+# Renaming the ZIP alone does not change .NET's assembly metadata.
+$coreVersion = & (Join-Path $CoreDirectory 'mqvpn.exe') --version
+if ($LASTEXITCODE -ne 0) { throw 'Cannot read the same-run core build identity' }
+$versionMatch = [regex]::Match(($coreVersion -join "`n"), '(?m)^mqvpn (?<version>s\.\d{8}\.\d{4}UTC|\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?)\r?$')
+if (-not $versionMatch.Success) { throw 'Unsupported core build identity for GUI packaging' }
+$buildVersion = $versionMatch.Groups['version'].Value
 $lock = Get-Content -LiteralPath $DependencyLock -Raw | ConvertFrom-Json
 if ($lock.schema -ne 1) { throw 'Unsupported dependency lock' }
 $workParent = [IO.Path]::GetFullPath((Join-Path $repoRoot 'build/gui-packaging'))
@@ -46,7 +53,7 @@ function Download-Plain([string]$Url, [string]$Destination, [string]$Digest = ''
     $downloaded.Add(@{ url = $Url; sha256 = $hash })
 }
 function Publish-SelfContained([string]$Project) {
-    & dotnet publish (Join-Path $repoRoot $Project) -c Release -r $rid --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:PublishTrimmed=false -o $OutputDir
+    & dotnet publish (Join-Path $repoRoot $Project) -c Release -r $rid --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:PublishTrimmed=false "-p:InformationalVersion=$buildVersion" -p:IncludeSourceRevisionInInformationalVersion=false -o $OutputDir
     if ($LASTEXITCODE -ne 0) { throw "Publish failed: $Project" }
 }
 function Export-NuGetLicenses {
@@ -144,7 +151,7 @@ try {
         @{ path = [IO.Path]::GetRelativePath($OutputDir,$_.FullName).Replace('\','/'); sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
     })
     @{ schema = 1; architecture = $Arch; rid = $rid; sourceSha = $core.sourceSha; xquicSha = $core.xquicSha; boringSslSha = $core.boringSslSha
-       dependencies = $lock; downloads = $downloaded.ToArray(); files = $files; selfContained = $true } |
+       buildVersion = $buildVersion; dependencies = $lock; downloads = $downloaded.ToArray(); files = $files; selfContained = $true } |
         ConvertTo-Json -Depth 15 | Set-Content -LiteralPath (Join-Path $OutputDir 'package-manifest.json') -Encoding utf8NoBOM
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ZipOutput) | Out-Null
     Compress-Archive -Path (Join-Path $OutputDir '*') -DestinationPath $ZipOutput -CompressionLevel Optimal
