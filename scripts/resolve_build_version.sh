@@ -61,7 +61,7 @@ fi
 version="${identity:-${base}${suffix}}"
 display="$version"
 if [[ -n "$identity" ]]; then
-    display="snapshot ${commit_date:0:4}-${commit_date:4:2}-${commit_date:6:2} ${commit_date:9:2}:${commit_date:11:2} UTC"
+    display="s.${commit_date:0:8}.${commit_date:9:4}UTC"
 fi
 printf 'VERSION=%s\nVERSION_DISPLAY=%s\nVERSION_SUFFIX=%s\nBUILD_VERSION_FILE=%s\nSNAPSHOT_VERSION_CODE=%s\n' \
     "$version" "$display" "$suffix" "$version_file" "$snapshot_code"

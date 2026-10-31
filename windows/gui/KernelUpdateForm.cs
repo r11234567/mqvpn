@@ -251,7 +251,8 @@ internal sealed class KernelUpdateForm : FluentWindow, IDisposable
         try
         {
             row.SetBusy(true, "正在查询本地版本与 GitHub 最新发行版...");
-            row.InstalledVersion = await KernelInstaller.GetInstalledVersionAsync(row.Kernel, _runtimeRoot);
+            var installedOutput = await KernelInstaller.GetInstalledVersionAsync(row.Kernel, _runtimeRoot);
+            row.InstalledVersion = KernelInstaller.FormatInstalledVersion(row.Kernel, installedOutput);
             row.Release = await GitHubReleaseClient.GetLatestAsync(
                 row.Source,
                 row.IncludePreRelease,
@@ -262,13 +263,12 @@ internal sealed class KernelUpdateForm : FluentWindow, IDisposable
                 : KernelInstaller.SelectAsset(row.Kernel, row.Release).Name;
             var marker = row.Release.IsPreRelease ? "（预发布）" : string.Empty;
 
-            var isNewer = !string.IsNullOrWhiteSpace(row.InstalledVersion) &&
-                          !string.Equals(row.InstalledVersion.TrimStart('v'), row.Release.Tag.TrimStart('v'), StringComparison.OrdinalIgnoreCase);
+            var isNewer = KernelInstaller.IsReleaseNewer(row.Kernel, installedOutput, row.Release);
             row.HasNewVersion = isNewer;
 
-            var versionTip = isNewer ? " [发现新版本]" : " [已是最新]";
+            var versionTip = isNewer ? " [发现新版本]" : " [未发现更新]";
             row.SetStatus(
-                $"已安装：{row.InstalledVersion} | 最新：{row.Release.Tag}{marker}{versionTip}{Environment.NewLine}" +
+                $"已安装：{row.InstalledVersion} | 最新：{KernelInstaller.FormatReleaseVersion(row.Kernel, row.Release)}{marker}{versionTip}{Environment.NewLine}" +
                 $"更新包：{assetNames}");
 
             if (!string.IsNullOrWhiteSpace(row.Release.Body))
@@ -341,7 +341,8 @@ internal sealed class KernelUpdateForm : FluentWindow, IDisposable
             else
                 await KernelInstaller.InstallAsync(row.Kernel, assets[0], _runtimeRoot, CancellationToken.None);
 
-            row.InstalledVersion = await KernelInstaller.GetInstalledVersionAsync(row.Kernel, _runtimeRoot);
+            row.InstalledVersion = KernelInstaller.FormatInstalledVersion(row.Kernel,
+                await KernelInstaller.GetInstalledVersionAsync(row.Kernel, _runtimeRoot));
             row.SetStatus("更新完成：" + row.InstalledVersion);
         }
         catch (Exception ex)

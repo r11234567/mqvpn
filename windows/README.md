@@ -67,6 +67,13 @@ files, stop the affected processes, then replace them with rollback on failure;
 they retain user configuration. During this PR, use the complete current CI
 package when evaluating changes; release updates may point to a different SHA.
 
+Snapshot core versions are shown as `s.YYYYMMDD.HHMMUTC`, with the numeric
+core/ABI line used internally for compatibility checks. Enable **预发布** to
+query rolling snapshots. Snapshot timestamps and numeric release versions
+are compared in order; an older stable release is not flagged as an upgrade.
+Install the complete current GUI package when moving to the compact snapshot
+format so its updater recognizes the new core identity.
+
 Settings supports ZIP backup/import and factory reset. Reset creates a safety
 backup first and replaces application-managed nodes/settings/routes/default
 configuration. It does not remove unrelated external files or historical

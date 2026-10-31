@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
+using System.Globalization;
 using TruckersMP.Proxy.Packaging;
 
 namespace TruckersMP.Proxy;
@@ -410,6 +411,91 @@ internal static class KernelInstaller
         return await RunVersionAsync(executable, kernel == "mqvpn" ? "--version" : "version", CancellationToken.None);
     }
 
+    internal static string FormatInstalledVersion(string kernel, string output)
+    {
+        if (kernel != "mqvpn") return output.Trim();
+        var snapshot = SnapshotTime(output);
+        if (snapshot is not null) return "s." + snapshot.Value.ToString("yyyyMMdd.HHmm'UTC'", CultureInfo.InvariantCulture);
+        var version = Regex.Match(output, @"(?m)^mqvpn\s+(?<version>[^\r\n]+)");
+        return version.Success ? version.Groups["version"].Value.Trim() : output.Trim();
+    }
+
+    internal static bool IsReleaseNewer(string kernel, string installed, GitHubRelease release)
+    {
+        if (string.IsNullOrWhiteSpace(installed)) return false;
+        if (installed == "未安装") return true;
+        if (kernel != "mqvpn")
+            return !string.Equals(installed.TrimStart('v'), release.Tag.TrimStart('v'), StringComparison.OrdinalIgnoreCase);
+
+        var currentSnapshot = SnapshotTime(installed);
+        var rolling = release.Tag == "snapshot" || release.Tag.StartsWith("s.", StringComparison.Ordinal) ||
+                      release.Tag.StartsWith("snapshot-", StringComparison.Ordinal);
+        if (rolling)
+        {
+            var candidate = ReleaseSnapshotTime(release);
+            return candidate is not null && (currentSnapshot is null || candidate > currentSnapshot);
+        }
+
+        // Compatibility metadata is only used for ordering channels, not shown
+        // as the snapshot's installed version. Never offer an older stable core.
+        var current = Regex.Match(installed, currentSnapshot is not null
+            ? @"(?m)^core (?<version>\d+\.\d+\.\d+(?:\.\d+)?)(?<pre>-[0-9A-Za-z.-]+)?"
+            : @"(?m)^(?:mqvpn\s+|v)?(?<version>\d+\.\d+\.\d+(?:\.\d+)?)(?<pre>-[0-9A-Za-z.-]+)?");
+        var target = Regex.Match(release.Tag, @"^v?(?<version>\d+\.\d+\.\d+(?:\.\d+)?)(?<pre>-[0-9A-Za-z.-]+)?$");
+        if (!current.Success || !target.Success) return false;
+        static Version Numeric(Match match) => new(string.Join('.', match.Groups["version"].Value.Split('.')
+            .Concat(Enumerable.Repeat("0", 4)).Take(4)));
+        var comparison = Numeric(target).CompareTo(Numeric(current));
+        if (comparison != 0) return comparison > 0;
+        if (currentSnapshot is not null) return false;
+        return ComparePrerelease(target.Groups["pre"].Value, current.Groups["pre"].Value) > 0;
+    }
+
+    internal static string FormatReleaseVersion(string kernel, GitHubRelease release)
+    {
+        var snapshot = kernel == "mqvpn" ? ReleaseSnapshotTime(release) : null;
+        return snapshot is not null ? "s." + snapshot.Value.ToString("yyyyMMdd.HHmm'UTC'", CultureInfo.InvariantCulture) : release.Tag;
+    }
+
+    private static DateTimeOffset? ReleaseSnapshotTime(GitHubRelease release)
+    {
+        if (release.Tag != "snapshot" && !release.Tag.StartsWith("s.", StringComparison.Ordinal) &&
+            !release.Tag.StartsWith("snapshot-", StringComparison.Ordinal)) return null;
+        return SnapshotTime(release.Tag) ?? SnapshotTime(release.Name) ??
+            release.Assets.Select(asset => SnapshotTime(asset.Name)).FirstOrDefault(time => time is not null);
+    }
+
+    private static int ComparePrerelease(string left, string right)
+    {
+        if (left == right) return 0;
+        if (left.Length == 0) return 1;
+        if (right.Length == 0) return -1;
+        var a = left[1..].Split('.');
+        var b = right[1..].Split('.');
+        for (var i = 0; i < Math.Min(a.Length, b.Length); i++)
+        {
+            var an = System.Numerics.BigInteger.TryParse(a[i], out var av);
+            var bn = System.Numerics.BigInteger.TryParse(b[i], out var bv);
+            var comparison = an && bn ? av.CompareTo(bv) : an != bn ? (an ? -1 : 1) : string.CompareOrdinal(a[i], b[i]);
+            if (comparison != 0) return comparison;
+        }
+        return a.Length.CompareTo(b.Length);
+    }
+
+    private static DateTimeOffset? SnapshotTime(string value)
+    {
+        var compact = Regex.Match(value,
+            @"s\.(?<date>\d{8})\.(?<time>\d{4})UTC|snapshot-(?<date>\d{8})-(?<time>\d{4})-UTC|snapshot\+(?<date>\d{8})T(?<time>\d{4})\d{2}Z\.g[0-9a-f]{12}");
+        var stamp = compact.Success ? compact.Groups["date"].Value + compact.Groups["time"].Value : "";
+        if (!compact.Success)
+        {
+            var legacy = Regex.Match(value, @"snapshot (?<date>\d{4}-\d{2}-\d{2}) (?<time>\d{2}:\d{2}) UTC");
+            if (legacy.Success) stamp = legacy.Groups["date"].Value.Replace("-", "") + legacy.Groups["time"].Value.Replace(":", "");
+        }
+        return DateTimeOffset.TryParseExact(stamp, "yyyyMMddHHmm", CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var time) ? time : null;
+    }
+
     public static async Task InstallGeoDataAsync(
         IReadOnlyList<GitHubAsset> assets,
         string runtimeRoot,
@@ -519,7 +605,8 @@ internal static class KernelInstaller
     internal static void EnsureMqvpnVersionCompatible(string output)
     {
         var version = Regex.Match(output, @"\bmqvpn\s+(\d+)\.(\d+)\.", RegexOptions.IgnoreCase);
-        var snapshot = Regex.IsMatch(output, @"(?m)^mqvpn snapshot(?: \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC|\+\d{8}T\d{6}Z\.g[0-9a-f]{12})\r?$", RegexOptions.CultureInvariant);
+        var snapshot = Regex.IsMatch(output, @"(?m)^mqvpn (?:s\.\d{8}\.\d{4}UTC|snapshot(?: \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC|\+\d{8}T\d{6}Z\.g[0-9a-f]{12}))\r?$", RegexOptions.CultureInvariant);
+        snapshot = snapshot && SnapshotTime(output) is not null;
         var snapshotCore = Regex.IsMatch(output, @"(?m)^core 0\.19\.\d+; callback ABI 3\r?$", RegexOptions.CultureInvariant);
         if (!(version.Success && version.Groups[1].Value == "0" && version.Groups[2].Value == "19") &&
             !(snapshot && snapshotCore))

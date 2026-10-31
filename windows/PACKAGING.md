@@ -19,7 +19,12 @@ initialization. The native GUI regression suite invokes the actual window's
 initialization with an empty config directory and verifies both first-run
 creation and restart preservation of existing node data.
 
-Kernel updates accept `snapshot YYYY-MM-DD HH:MM UTC` and legacy
+Snapshot kernels display `s.YYYYMMDD.HHMMUTC`. The update panel shows that
+identity without the separate numeric core/ABI compatibility line. Rolling
+snapshot updates compare UTC timestamps; older stable versions are not
+reported as upgrades merely because their version string differs.
+
+Kernel updates accept `s.YYYYMMDD.HHMMUTC`, `snapshot YYYY-MM-DD HH:MM UTC` and legacy
 `snapshot+YYYYMMDDTHHMMSSZ.gSHA` builds when
 `mqvpn --version` explicitly reports core 0.19.x and callback ABI 3 on its
 second line. A snapshot label alone is insufficient to establish compatibility.

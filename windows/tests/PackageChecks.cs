@@ -54,6 +54,7 @@ internal static class PackageChecks
             catch (InvalidOperationException) { }
             check(true, "missing exact architecture/component is rejected without fallback");
             KernelInstaller.EnsureMqvpnVersionCompatible("mqvpn 0.19.0");
+            KernelInstaller.EnsureMqvpnVersionCompatible("mqvpn s.20261030.1200UTC\ncore 0.19.0; callback ABI 3\n");
             KernelInstaller.EnsureMqvpnVersionCompatible("mqvpn snapshot 2026-10-30 12:00 UTC\ncore 0.19.0; callback ABI 3\n");
             KernelInstaller.EnsureMqvpnVersionCompatible("mqvpn snapshot+20261030T120000Z.g123456789abc\ncore 0.19.0; callback ABI 3\n");
             try { KernelInstaller.EnsureMqvpnVersionCompatible("mqvpn 0.18.0"); throw new Exception("Expected incompatible configuration interface"); }
@@ -67,12 +68,51 @@ internal static class PackageChecks
                 "mqvpn snapshot 2026-10-30 12:00 UTC",
                 "mqvpn snapshot 2026-10-30 12:00 UTC\ncore 0.18.0; callback ABI 3\n",
                 "mqvpn snapshot+invalid\ncore 0.19.0; callback ABI 3\n",
+                "mqvpn s.20261030.1200UTC",
+                "mqvpn s.20261030.1200UTC\ncore 0.18.0; callback ABI 3\n",
+                "mqvpn s.20261030.1200UTC\ncore 0.19.0; callback ABI 2\n",
+                "mqvpn s.20261330.1200UTC\ncore 0.19.0; callback ABI 3\n",
             })
             {
                 try { KernelInstaller.EnsureMqvpnVersionCompatible(invalid); throw new Exception("Expected incompatible snapshot"); }
                 catch (InvalidDataException) { }
             }
             check(true, "snapshot kernel identity requires explicit compatible core and callback ABI metadata");
+
+            const string current = "mqvpn s.20261030.1200UTC\r\ncore 0.19.0; callback ABI 3\r\n";
+            check(KernelInstaller.FormatInstalledVersion("mqvpn", current) == "s.20261030.1200UTC",
+                "GUI shows only the snapshot identity, not numeric core/ABI metadata");
+            check(KernelInstaller.FormatInstalledVersion("mqvpn", "mqvpn 0.19.0\n") == "0.19.0",
+                "stable GUI display strips the executable prefix");
+            check(KernelInstaller.FormatInstalledVersion("mqvpn", "mqvpn snapshot 2026-10-30 12:00 UTC\ncore 0.19.0; callback ABI 3") == "s.20261030.1200UTC" &&
+                KernelInstaller.FormatInstalledVersion("mqvpn", "mqvpn snapshot+20261030T120000Z.g123456789abc\ncore 0.19.0; callback ABI 3") == "s.20261030.1200UTC",
+                "GUI normalizes both legacy snapshot formats");
+            static GitHubRelease Release(string tag, string name = "") => new(tag, name, Array.Empty<GitHubAsset>(), tag == "snapshot" || tag.Contains('-'));
+            check(!KernelInstaller.IsReleaseNewer("mqvpn", current, Release("v0.16.4.1")) &&
+                !KernelInstaller.IsReleaseNewer("mqvpn", "mqvpn snapshot 2026-10-31 14:19 UTC\ncore 0.19.0; callback ABI 3", Release("v0.16.4.1")) &&
+                !KernelInstaller.IsReleaseNewer("mqvpn", current, Release("v0.19.0")),
+                "an older or same-core stable release is not offered as a snapshot upgrade");
+            check(!KernelInstaller.IsReleaseNewer("mqvpn", "mqvpn 0.19.0", Release("v0.16.4.1")) &&
+                KernelInstaller.IsReleaseNewer("mqvpn", "未安装", Release("v0.19.0")) &&
+                KernelInstaller.IsReleaseNewer("mqvpn", "mqvpn 0.18.9", Release("v0.19.0")),
+                "numeric core updates compare versions instead of unequal strings");
+            check(KernelInstaller.IsReleaseNewer("mqvpn", current, Release("snapshot", "mqvpn s.20261031.1200UTC")) &&
+                !KernelInstaller.IsReleaseNewer("mqvpn", current, Release("snapshot", "mqvpn s.20261030.1200UTC")) &&
+                !KernelInstaller.IsReleaseNewer("mqvpn", current, Release("snapshot", "mqvpn s.20261029.1200UTC")),
+                "rolling snapshots compare UTC timestamps for newer, equal and older builds");
+            var fromAsset = new GitHubRelease("snapshot", "Snapshot", new[]
+                { new GitHubAsset("mqvpn_snapshot-20261031-1200-UTC_windows_amd64.zip", "", 1) }, true);
+            check(KernelInstaller.IsReleaseNewer("mqvpn", current, fromAsset) &&
+                !KernelInstaller.IsReleaseNewer("mqvpn", current, Release("snapshot", "unknown")),
+                "snapshot comparison uses asset timestamps when needed and rejects unknown identities");
+            check(KernelInstaller.FormatReleaseVersion("mqvpn", fromAsset) == "s.20261031.1200UTC" &&
+                KernelInstaller.FormatReleaseVersion("mqvpn", Release("v0.19.0")) == "v0.19.0",
+                "latest release display resolves the rolling tag to a snapshot version");
+            check(KernelInstaller.IsReleaseNewer("mqvpn", "mqvpn 0.19.0-rc.2", Release("v0.19.0-rc.10")) &&
+                !KernelInstaller.IsReleaseNewer("mqvpn", "mqvpn 0.19.0-rc.10", Release("v0.19.0-rc.2")) &&
+                KernelInstaller.IsReleaseNewer("mqvpn", "mqvpn 0.19.0-rc.2", Release("v0.19.0")) &&
+                !KernelInstaller.IsReleaseNewer("mqvpn", "mqvpn 0.19.0", Release("v0.19.0-rc.2")),
+                "prerelease ordering is numeric and stable releases follow release candidates");
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
     }
