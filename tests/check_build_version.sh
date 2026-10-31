@@ -61,7 +61,7 @@ GIT_AUTHOR_DATE='2001-02-03T04:05:06+0000' GIT_COMMITTER_DATE='2001-02-03T04:05:
     git -c user.name=Test -c user.email=test@example.invalid commit -qm fixture
 sha="$(git rev-parse HEAD)"
 expected="snapshot-20010203-0405-UTC"
-display="snapshot 2001-02-03 04:05 UTC"
+display="s.20010203.0405UTC"
 
 configure() {
     cmake -S . -B "$WORK/$1" -DCMAKE_BUILD_TYPE=Debug \
@@ -88,6 +88,7 @@ reject() {
 GITHUB_REF=refs/heads/main GITHUB_SHA="$sha" TZ=Pacific/Kiritimati \
     bash scripts/resolve_build_version.sh > "$WORK/snapshot.env"
 grep -Fx "VERSION=$expected" "$WORK/snapshot.env"
+grep -Fx "VERSION_DISPLAY=$display" "$WORK/snapshot.env"
 version_file="$(sed -n 's/^BUILD_VERSION_FILE=//p' "$WORK/snapshot.env")"
 [ -f "$version_file" ]
 # The resolver must not pre-create build/ (the Windows release uses mkdir).

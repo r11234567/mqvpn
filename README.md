@@ -112,7 +112,7 @@ implemented and tested. Do not infer fork status from an old commit alone.
 | xquic Retry sizing, PMTU, receive-buffer, WLB and TLS hardening | **Pinned xquic fork** | The detailed commit-to-fix map remains in [End-to-end fixes carried in the pinned xquic](#end-to-end-fixes-carried-in-the-pinned-xquic). |
 | Rolling packages from `main` | **Fork-only** | `.github/workflows/snapshot.yml` publishes the rolling `snapshot` prerelease after all packages pass. Snapshot and tagged Release have separate entrypoints and share `.github/workflows/build-packages.yml` for packaging. |
 
-`mqvpn --version` displays `mqvpn snapshot 2026-10-31 12:34 UTC`, followed
+`mqvpn --version` displays `mqvpn s.20261031.1234UTC`, followed
 by the numeric core version and callback ABI used by the GUI compatibility
 check. The timestamp uses the commit's UTC time, rounded down to the minute,
 so reruns and all architectures agree. Downloads use the filename-safe version

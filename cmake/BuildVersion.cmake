@@ -17,8 +17,8 @@ if(MQVPN_BUILD_VERSION)
     if(MQVPN_VERSION_SUFFIX)
         message(FATAL_ERROR "A snapshot identity cannot also have a legacy version suffix")
     endif()
-    string(REGEX REPLACE "^snapshot-([0-9][0-9][0-9][0-9])([0-9][0-9])([0-9][0-9])-([0-9][0-9])([0-9][0-9])-UTC$"
-           "snapshot \\1-\\2-\\3 \\4:\\5 UTC" MQVPN_FULL_VERSION "${MQVPN_BUILD_VERSION}")
+    string(REGEX REPLACE "^snapshot-([0-9]+)-([0-9]+)-UTC$"
+           "s.\\1.\\2UTC" MQVPN_FULL_VERSION "${MQVPN_BUILD_VERSION}")
     # dpkg requires a leading digit. Keep snapshot ordering below a real
     # release without borrowing that release's checked-in version number.
     set(MQVPN_PACKAGE_VERSION "0~${MQVPN_BUILD_VERSION}")
