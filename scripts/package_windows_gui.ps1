@@ -39,6 +39,7 @@ foreach ($relative in @('runtime/mqvpn','runtime/xray','third-party')) { New-Ite
 $downloaded = [Collections.Generic.List[object]]::new()
 function Download-Plain([string]$Url, [string]$Destination, [string]$Digest = '') {
     # No API credentials or authenticated headers are used for asset downloads.
+    Write-Host "Downloading $Url"
     Invoke-WebRequest -Uri $Url -OutFile $Destination -UserAgent 'MQVPN-Packaging'
     $hash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($Digest -and $hash -ne ($Digest -replace '^sha256:', '')) { throw "Download checksum mismatch: $Url" }

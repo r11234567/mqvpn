@@ -54,6 +54,7 @@ internal static class PackageChecks
             catch (InvalidOperationException) { }
             check(true, "missing exact architecture/component is rejected without fallback");
             KernelInstaller.EnsureMqvpnVersionCompatible("mqvpn 0.19.0");
+            KernelInstaller.EnsureMqvpnVersionCompatible("mqvpn snapshot 2026-10-30 12:00 UTC\ncore 0.19.0; callback ABI 3\n");
             KernelInstaller.EnsureMqvpnVersionCompatible("mqvpn snapshot+20261030T120000Z.g123456789abc\ncore 0.19.0; callback ABI 3\n");
             try { KernelInstaller.EnsureMqvpnVersionCompatible("mqvpn 0.18.0"); throw new Exception("Expected incompatible configuration interface"); }
             catch (InvalidDataException) { }
@@ -63,6 +64,8 @@ internal static class PackageChecks
                 "mqvpn snapshot+20261030T120000Z.g123456789abc",
                 "mqvpn snapshot+20261030T120000Z.g123456789abc\ncore 0.18.0; callback ABI 3\n",
                 "mqvpn snapshot+20261030T120000Z.g123456789abc\ncore 0.19.0; callback ABI 2\n",
+                "mqvpn snapshot 2026-10-30 12:00 UTC",
+                "mqvpn snapshot 2026-10-30 12:00 UTC\ncore 0.18.0; callback ABI 3\n",
                 "mqvpn snapshot+invalid\ncore 0.19.0; callback ABI 3\n",
             })
             {

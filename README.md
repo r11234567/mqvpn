@@ -110,26 +110,45 @@ implemented and tested. Do not infer fork status from an old commit alone.
 | xquic WLB flow placement and recovery | **Upstream design with retained fork fixes** | Acknowledged-goodput weights, independent flow/packet deficits, topology refresh and bounded recovery come from upstream. STREAM/control stays on MinRTT. Fork recovery and observability fixes remain in the pinned source. |
 | ~~xquic fixed STREAM reassembly-node limit~~ | ~~Fork-only mitigation~~ **Synchronized from [mp0rta/xquic#71](https://github.com/mp0rta/xquic/pull/71); replaced** | The stronger two-tier budget admits a dense 16 MiB receive window while rejecting sparse-node amplification: 8192 sparse nodes, a 256-byte/node density floor, a 32768 hard ceiling, and a reserved prefix slot for retransmission progress. |
 | xquic Retry sizing, PMTU, receive-buffer, WLB and TLS hardening | **Pinned xquic fork** | The detailed commit-to-fix map remains in [End-to-end fixes carried in the pinned xquic](#end-to-end-fixes-carried-in-the-pinned-xquic). |
-| Rolling native binaries from `main` | **Fork-only** | `.github/workflows/release.yml` updates the native `snapshot` prerelease after platform builds succeed. Binaries and asset names use an independent `snapshot+UTCtime.gSHA` version. Canonically signed Android releases remain tag-only; ephemeral Android test APKs stay in workflow artifacts. |
+| Rolling packages from `main` | **Fork-only** | `.github/workflows/snapshot.yml` publishes the rolling `snapshot` prerelease after all packages pass. Snapshot and tagged Release have separate entrypoints and share `.github/workflows/build-packages.yml` for packaging. |
 
-Snapshot versions look like `snapshot+20261030T120000Z.g123456789abc`.
-The timestamp is the commit's UTC time, so reruns and all platform builds
-produce the same identity. `mqvpn --version` prints that identity, followed
-by the numeric core version and callback ABI used by the GUI's compatibility
-check. Tagged releases keep their regular numeric version.
+`mqvpn --version` displays `mqvpn snapshot 2026-10-31 12:34 UTC`, followed
+by the numeric core version and callback ABI used by the GUI compatibility
+check. The timestamp uses the commit's UTC time, rounded down to the minute,
+so reruns and all architectures agree. Downloads use the filename-safe version
+`snapshot-20261031-1234-UTC`, without seconds or a commit hash. Provenance and
+GUI package manifests retain the full source commit separately.
 
-Release automation generates `build-version/build-version.cmake` with
+Both workflows build Linux amd64/arm64 (`.deb` and `.tar.gz`), macOS
+amd64/arm64 (`.tar.gz`), Windows CLI amd64/arm64 (`.zip`), Windows GUI
+x64/arm64 (`.zip`, including the same-run core), and Android arm64 (`.apk`).
+A missing or empty package blocks publication. Android App Bundles (`.aab`)
+stay in workflow artifacts. iOS remains a CI-tested source build requiring
+Apple signing for installation; these workflows do not publish an iOS app.
+
+Snapshot automation generates `build-version/build-version.cmake` with
 `scripts/resolve_build_version.sh` and loads it using
-`cmake -C "$BUILD_VERSION_FILE" ...`. The tracked `CMakeLists.txt` and shared
-library ABI retain their numeric versions. Debian requires a leading digit,
-so only the `.deb` package metadata uses `0~snapshot+...`; it sorts below
-official releases and installing it over a release may require allowing a
-downgrade. The binary and download filename still use `snapshot+...`.
+`cmake -C "$BUILD_VERSION_FILE" ...`. CMake injects the temporary version
+into the application; the tracked `CMakeLists.txt` and shared-library ABI
+retain their numeric versions. Debian package metadata uses
+`0~snapshot-20261031-1234-UTC`, which sorts below official releases and may
+require allowing a downgrade when installing over a release. Android
+snapshots receive the same display version and a timestamp-derived version
+code. Test APKs use an ephemeral signing key, so replacing a previously
+installed build signed with another key requires uninstalling it first.
+
+`release.yml` runs for `v*` tags; manual Release runs must also select a tag.
+Release and prerelease tags must match the numeric CMake version, and
+prerelease suffixes remain visible in the application and asset names.
+Upstream's canonical Android certificate is enforced only for upstream's
+repository; fork APKs still require a valid signature and must reproduce
+against an independent rebuild before release publication.
 
 Each push to this fork's `main` starts CI, CodeQL, gitleaks, Performance
-Tests, Formal, and Release (which publishes the snapshot). H2/SNI integration
+Tests, Formal, and Snapshot. Changes to packaging workflows also build the
+full snapshot package matrix on PRs without publishing. H2/SNI integration
 workflows run on PRs; Stress Tests and Performance Weekly remain scheduled or
-manual. The Windows GUI checks run inside CI against its own Windows builds.
+manual. Windows GUI checks run against Windows builds from the same run.
 
 ### Client certificate verification against the OS trust store
 
@@ -468,7 +487,7 @@ fix and diagnostics in `42eac6c`, and waiting on `closing_notify` rather than
 | [Ubuntu/Debian (amd64/arm64)](#client-deb-package) | Ubuntu 22.04 / Debian 12 | ✅ | 📋 | Release package |
 | [Arch Linux (amd64/arm64)](https://aur.archlinux.org/packages/mqvpn) | rolling | ✅ | 📋 | AUR |
 | [Windows (amd64/arm64)](#windows-client) | Windows 10 | ✅ | 📋 | Release archive |
-| [macOS arm64](https://github.com/mp0rta/homebrew-tap#install) | macOS 14 (Sonoma) | ✅ | 📋 | Homebrew / Release archive |
+| [macOS amd64/arm64](https://github.com/mp0rta/homebrew-tap#install) | macOS 14 (Sonoma) | ✅ | 📋 | Homebrew / Release archive |
 | iOS | iOS 15 | — | 🚧 | App Store planned |
 | [Android](https://github.com/mp0rta/mqvpn/releases) | Android 8.0 (API 26) | — | 🧪 | APK / F-Droid pending / Play Store planned |
 
@@ -551,7 +570,7 @@ Pre-built binaries are shipped for Windows amd64 and arm64. Download `mqvpn_<VER
 
 ### macOS client
 
-Pre-built binaries are shipped for Apple silicon (arm64). Download `mqvpn_<VERSION>_darwin_arm64.tar.gz` from [Releases](https://github.com/mp0rta/mqvpn/releases/latest), extract, and follow the bundled `README.txt` (sudo required).
+Pre-built binaries are shipped for Apple silicon (arm64) and Intel (amd64). Download `mqvpn_<VERSION>_darwin_<ARCH>.tar.gz` from [Releases](https://github.com/mp0rta/mqvpn/releases/latest), extract, and follow the bundled `README.txt` (sudo required).
 
 ### Verifying downloads
 

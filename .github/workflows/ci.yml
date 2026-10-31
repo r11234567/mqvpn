@@ -36,7 +36,7 @@ jobs:
           else
             git ls-files > /tmp/mqvpn-gui-paths
           fi
-          if grep -Eq '^(windows/|src/|include/|cmake/|third_party/|CMakeLists\.txt$|scripts/(package_windows_gui|resolve_windows_gui_deps|verify_windows_gui_package|write_windows_core_manifest)\.ps1$|\.github/workflows/(ci|windows-gui)\.yml$)' /tmp/mqvpn-gui-paths; then
+          if grep -Eq '^(windows/|src/|include/|cmake/|third_party/|CMakeLists\.txt$|tests/check_windows_gui_deps\.ps1$|scripts/(package_windows_gui|resolve_windows_gui_deps|resolve_wintun|verify_windows_gui_package|write_windows_core_manifest)\.ps1$|\.github/workflows/(ci|windows-gui|snapshot|release|build-packages)\.yml$)' /tmp/mqvpn-gui-paths; then
             echo 'gui=true' >> "$GITHUB_OUTPUT"
           else
             echo 'gui=false' >> "$GITHUB_OUTPUT"
@@ -176,7 +176,7 @@ jobs:
         run: |
           actual=$(build/mqvpn --version)
           printf '%s\n' "$actual"
-          [ "${actual%%$'\n'*}" = "mqvpn $VERSION" ]
+          [ "${actual%%$'\n'*}" = "mqvpn $VERSION_DISPLAY" ]
           printf '%s\n' "$actual" | grep -Fx 'core 0.19.0; callback ABI 3'
 
       # Needs the resolved mqvpn_lib source list, which the configure inside
@@ -903,7 +903,13 @@ jobs:
     # Darwin platform TUs, the full mqvpn CLI (client mode; server mode +
     # control_socket are intentionally not ported — see CMakeLists.txt),
     # and the Darwin unit test binaries (run via ctest below).
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, runner: macos-15 }
+          - { arch: amd64, runner: macos-15-intel }
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -930,7 +936,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: third_party/xquic/third_party/boringssl
-          key: bssl-${{ steps.bssl-pin.outputs.sha }}-darwin-arm64-clang-v2
+          key: bssl-${{ steps.bssl-pin.outputs.sha }}-${{ matrix.runner }}-${{ matrix.arch }}-clang-v3
 
       - name: Build BoringSSL
         if: steps.bssl-cache.outputs.cache-hit != 'true'
@@ -955,7 +961,7 @@ jobs:
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
           # v2: bumped with the BoringSSL cache — see the linux-build job.
-          key: xquic-${{ steps.xqsha.outputs.sha }}-darwin-arm64-clang-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-v2
+          key: xquic-${{ steps.xqsha.outputs.sha }}-${{ matrix.runner }}-${{ matrix.arch }}-clang-release-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-v3
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
@@ -1006,7 +1012,7 @@ jobs:
         run: |
           actual=$(build-darwin/mqvpn --version)
           printf '%s\n' "$actual"
-          [ "${actual%%$'\n'*}" = "mqvpn $VERSION" ]
+          [ "${actual%%$'\n'*}" = "mqvpn $VERSION_DISPLAY" ]
           printf '%s\n' "$actual" | grep -Fx 'core 0.19.0; callback ABI 3'
 
       - name: Run Darwin unit tests
@@ -1026,10 +1032,10 @@ jobs:
       # For on-machine checks the runner cannot do (a real server, interface
       # drop/re-add). Links Homebrew's libevent dynamically: the target Mac
       # needs `brew install libevent`.
-      - name: Upload mqvpn (macOS arm64)
+      - name: Upload mqvpn (macOS ${{ matrix.arch }})
         uses: actions/upload-artifact@v7
         with:
-          name: mqvpn-darwin-arm64
+          name: mqvpn-darwin-${{ matrix.arch }}
           path: build-darwin/mqvpn
           retention-days: 7
 
@@ -1332,7 +1338,7 @@ jobs:
         shell: pwsh
         run: |
           $out = & build/Release/mqvpn.exe --version
-          if ($LASTEXITCODE -ne 0 -or @($out)[0] -cne "mqvpn $env:VERSION" -or
+          if ($LASTEXITCODE -ne 0 -or @($out)[0] -cne "mqvpn $env:VERSION_DISPLAY" -or
               @($out) -cnotcontains 'core 0.19.0; callback ABI 3') {
             throw "Snapshot binary identity/core metadata mismatch: $out"
           }
