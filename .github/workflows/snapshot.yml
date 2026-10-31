@@ -13,8 +13,11 @@ on:
       - '.github/workflows/android-repro.yml'
       - 'scripts/resolve_build_version.sh'
       - 'scripts/prepare_publish_assets.sh'
+      - 'tests/check_build_version.sh'
+      - 'tests/check_publish_assets.sh'
       - 'scripts/*windows*.ps1'
       - 'cmake/BuildVersion.cmake'
+      - 'CMakeLists.txt'
       - 'android/app/build.gradle.kts'
 
 concurrency:
