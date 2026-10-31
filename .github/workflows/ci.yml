@@ -1338,7 +1338,7 @@ jobs:
         shell: pwsh
         run: |
           $out = & build/Release/mqvpn.exe --version
-          if ($LASTEXITCODE -ne 0 -or @($out)[0] -cne "mqvpn $env:VERSION" -or
+          if ($LASTEXITCODE -ne 0 -or @($out)[0] -cne "mqvpn $env:VERSION_DISPLAY" -or
               @($out) -cnotcontains 'core 0.19.0; callback ABI 3') {
             throw "Snapshot binary identity/core metadata mismatch: $out"
           }
