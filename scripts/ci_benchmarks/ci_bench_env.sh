@@ -41,6 +41,9 @@ VPN_LISTEN_PORT="4433"
 IPERF3_PORT="5201"
 CI_BENCH_SCHEDULER="${CI_BENCH_SCHEDULER:-wlb}"
 CI_BENCH_LOG_LEVEL="${CI_BENCH_LOG_LEVEL:-error}"
+# Stable across command substitutions; every sample retains its raw evidence.
+CI_BENCH_RAW_DIR="${CI_BENCH_RAW_DIR:-${CI_BENCH_RESULTS}/raw/$(date -u +%Y%m%d_%H%M%S)-$$}"
+CI_BENCH_RESULT_TOOL="${CI_BENCH_DIR}/ci_bench_results.py"
 
 # WLB scheduler instrumentation. With this set to 1 both ends run at
 # --log-level info and their output is captured, so the once-a-second
@@ -105,14 +108,14 @@ ci_bench_check_deps() {
     fi
     MQVPN="$(realpath "$MQVPN")"
 
-    for cmd in iperf3 openssl python3 tc; do
+    for cmd in iperf3 openssl python3 tc timeout ss; do
         if ! command -v "$cmd" &>/dev/null; then
             echo "error: $cmd not found"
             exit 1
         fi
     done
 
-    mkdir -p "$CI_BENCH_RESULTS"
+    mkdir -p "$CI_BENCH_RESULTS" "$CI_BENCH_RAW_DIR"
 }
 
 # ── Stale state cleanup (run before setup) ──
@@ -482,7 +485,7 @@ ci_bench_run_iperf() {
     local _cb_iperf_target="${CI_BENCH_IPERF_TARGET:-$TUNNEL_SERVER_IP}"
 
     local json_file
-    json_file="$(mktemp)"
+    json_file="$(mktemp --suffix=.json)"
 
     # iperf3 server always in NS_SERVER (bound to the target address).
     # iperf3 client always in NS_CLIENT.
@@ -536,12 +539,15 @@ ci_bench_run_iperf() {
     # Without these, one unreachable path hangs the whole run until the job
     # timeout — which is exactly how the weekly netsim `classes` job burned 60
     # minutes while its siblings finished in six.
-    ip netns exec "$NS_CLIENT" timeout $((duration + 20)) \
-        iperf3 $args > "$json_file" 2>&1 || true
+    local iperf_exit=0
+    ip netns exec "$NS_CLIENT" timeout --kill-after=5 $((duration + 20)) \
+        iperf3 $args > "$json_file" 2>&1 || iperf_exit=$?
 
     kill "$iperf_srv_pid" 2>/dev/null || true
     wait "$iperf_srv_pid" 2>/dev/null || true
 
+    python3 "$CI_BENCH_RESULT_TOOL" record "$json_file" \
+        --duration "$duration" --exit-code "$iperf_exit" --archive "$CI_BENCH_RAW_DIR"
     echo "$json_file"
 }
 
@@ -564,50 +570,7 @@ ci_bench_run_iperf() {
 # receiver can know what failed to arrive.
 ci_bench_parse_udp_quality() {
     local json_file="$1"
-    python3 -c "
-import json
-try:
-    with open('${json_file}') as f:
-        data = json.load(f)
-except Exception:
-    print('NA NA NA NA NA')
-    raise SystemExit(0)
-
-end = data.get('end') or {}
-# -R (DL) puts the receiving side in sum_received / the server's summary; a UDP
-# run reports its delivery stats under 'sum' on the sender and
-# 'sum_received' on the receiver depending on direction and version, so try
-# each in the order that prefers a receiver's view.
-cand = []
-for key in ('sum_received', 'sum', 'sum_sent'):
-    v = end.get(key)
-    if isinstance(v, dict):
-        cand.append(v)
-srv = end.get('sum_sent_receiver') or {}
-if isinstance(srv, dict) and srv:
-    cand.insert(0, srv)
-
-pkts = lost_pct = jitter = ooo = mbps = None
-for c in cand:
-    if pkts is None and isinstance(c.get('packets'), (int, float)):
-        pkts = c['packets']
-    if lost_pct is None and isinstance(c.get('lost_percent'), (int, float)):
-        lost_pct = c['lost_percent']
-    if jitter is None and isinstance(c.get('jitter_ms'), (int, float)):
-        jitter = c['jitter_ms']
-    if ooo is None and isinstance(c.get('out_of_order'), (int, float)):
-        ooo = c['out_of_order']
-    if mbps is None and isinstance(c.get('bits_per_second'), (int, float)):
-        mbps = c['bits_per_second'] / 1e6
-
-def f(v, spec='%.3f'):
-    return 'NA' if v is None else (spec % v)
-
-print('%s %s %s %s %s' % (f(lost_pct), f(jitter),
-                          f(ooo, '%d') if ooo is not None else 'NA',
-                          f(pkts, '%d') if pkts is not None else 'NA',
-                          f(mbps, '%.3f')))
-"
+    python3 "$CI_BENCH_RESULT_TOOL" udp "$json_file"
 }
 
 # Extract per-second latency-proxy percentiles from an iperf3 UDP document.
@@ -646,21 +609,7 @@ else:
 # Extract throughput (Mbps) from iperf3 JSON
 ci_bench_parse_throughput() {
     local json_file="$1"
-    python3 -c "
-import json
-try:
-    with open('${json_file}') as f:
-        data = json.load(f)
-    end = data.get('end', {})
-    if 'sum_received' in end:
-        print(f\"{end['sum_received']['bits_per_second'] / 1e6:.1f}\")
-    elif 'sum' in end:
-        print(f\"{end['sum']['bits_per_second'] / 1e6:.1f}\")
-    else:
-        print('0.0')
-except Exception:
-    print('0.0')
-"
+    python3 "$CI_BENCH_RESULT_TOOL" throughput "$json_file"
 }
 
 # ── Sanity check ──
@@ -669,30 +618,9 @@ ci_bench_sanity_check() {
     local json_file="$1"
     local desc="${2:-benchmark}"
 
-    local has_nonzero
-    has_nonzero=$(python3 -c "
-import json
-with open('${json_file}') as f:
-    data = json.load(f)
-
-def check(obj):
-    if isinstance(obj, dict):
-        for v in obj.values():
-            if check(v): return True
-    elif isinstance(obj, list):
-        for v in obj:
-            if check(v): return True
-    elif isinstance(obj, (int, float)):
-        if obj > 0: return True
-    return False
-
-results = data.get('results', data)
-print('1' if check(results) else '0')
-")
-
-    if [ "$has_nonzero" = "0" ]; then
-        echo "ERROR: $desc — all results are zero (iperf3 likely failed)"
-        exit 1
+    if ! python3 "$CI_BENCH_RESULT_TOOL" core "$json_file"; then
+        echo "ERROR: $desc has missing, invalid or incomplete measurements" >&2
+        return 1
     fi
 }
 

@@ -119,3 +119,5 @@ echo ""
 echo "================================================================"
 echo "  Done. Results: $OUTPUT_FILE"
 echo "================================================================"
+
+ci_bench_sanity_check "$OUTPUT_FILE" "backup FEC benchmark"

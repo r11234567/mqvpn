@@ -340,8 +340,14 @@ measure_pathset() {
     local samples=() i jf
     for (( i=0; i<REPEATS; i++ )); do
         jf="$(ci_bench_run_iperf TCP DL "$IPERF_SEC" "$IPERF_STREAMS")"
-        samples+=("$(ci_bench_parse_throughput "$jf")")
+        local sample
+        sample="$(ci_bench_parse_throughput "$jf")"
         rm -f "$jf"
+        if [ "$sample" = NA ]; then
+            MEASURED_STATUS=measurement_incomplete
+            return 0
+        fi
+        samples+=("$sample")
     done
     MEASURED_MBPS="$(med "${samples[@]}")"
     MEASURED_CV="$(cv_pct "${samples[@]}")"

@@ -1,0 +1,29 @@
+name: Benchmark Harness
+
+on:
+  push:
+    branches: [main, dev]
+    paths: ['scripts/ci_benchmarks/**', 'scripts/ci_stress/**', 'tests/test_benchmark*', '.github/workflows/benchmark-harness.yml']
+  pull_request:
+    paths: ['scripts/ci_benchmarks/**', 'scripts/ci_stress/**', 'tests/test_benchmark*', '.github/workflows/benchmark-harness.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install harness dependencies
+        run: sudo apt-get update && sudo apt-get install -y iperf3 iproute2 shellcheck
+      - name: Measurement and result regression tests
+        run: python3 -m unittest discover -s tests -p 'test_benchmark*.py' -v
+      - name: Shell syntax and errors
+        run: |
+          find scripts/ci_benchmarks scripts/ci_stress -name '*.sh' -exec bash -n {} \;
+          shellcheck -S error scripts/ci_benchmarks/*.sh scripts/ci_stress/*.sh tests/test_benchmark_harness.sh
+      - name: Real TCP and UDP receiver measurements
+        run: sudo bash tests/test_benchmark_harness.sh
