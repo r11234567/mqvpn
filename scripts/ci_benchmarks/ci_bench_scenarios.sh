@@ -156,37 +156,19 @@ trap 'exit 130' INT
 # it. Rewriting after every row costs one python invocation against a scenario
 # that takes 40-100 s, and means the artifact is never further behind than the
 # scenario currently running.
-emit_results() {
+_cb_write_results() {
     [ -n "${TEST_NAME:-}" ] || return 0
-    [ -s "$ROWS" ] || return 0
     RESULTS_OUT="${CI_BENCH_RESULTS}/${TEST_NAME}_${RESULTS_STAMP}.json"
-    python3 -c "
-import json, sys, os
-rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-doc = {
-  'test': sys.argv[2],
-  'commit': os.environ.get('CI_BENCH_COMMIT', 'unknown'),
-  'timestamp': sys.argv[3],
-  'mode': sys.argv[4],
-  # Self-describing arm, so a document read on its own says which side of an
-  # A/B it is rather than relying on the artifact it arrived in.
-  'arm': os.environ.get('CI_BENCH_ARM') or 'default',
-  'arm_reorder': os.environ.get('CI_BENCH_REORDER') or 'default',
-  'iperf_sec': int(sys.argv[5]),
-  'iperf_streams': int(sys.argv[6]),
-  'repeats': int(sys.argv[7]),
-  'complete': int(sys.argv[8]),
-  'caps': {'netem_seed': int(sys.argv[9]), 'pps_police': int(sys.argv[10]),
-           'nat': int(sys.argv[11])},
-  'results': rows,
+    python3 "${SCRIPT_DIR}/ci_bench_netsim_results.py" "$1" "$ROWS" "$RESULTS_OUT" \
+        --mode "$MODE" --scheduler "$CI_BENCH_SCHEDULER" \
+        --transit "${CATALOG_TRANSIT:-bgp_junk}" \
+        --complete "${RESULTS_COMPLETE:-0}" --seconds "$IPERF_SEC" \
+        --streams "$IPERF_STREAMS" --repeats "$REPEATS" \
+        --seed "$NETSIM_HAVE_SEED" --pps "$NETSIM_HAVE_PPS" --nat "$NETSIM_HAVE_NAT"
 }
-json.dump(doc, open(sys.argv[12], 'w'), indent=2)" \
-        "$ROWS" "$TEST_NAME" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$MODE" \
-        "$IPERF_SEC" "$IPERF_STREAMS" "$REPEATS" "${RESULTS_COMPLETE:-0}" \
-        "$NETSIM_HAVE_SEED" "$NETSIM_HAVE_PPS" "$NETSIM_HAVE_NAT" \
-        "$RESULTS_OUT" ||
-        echo "::error::emit_results failed to write ${RESULTS_OUT} -- a" \
-             "malformed row used to discard the whole document silently"
+
+emit_results() {
+    _cb_write_results emit
 }
 
 # Echo the findings on the row just appended as GitHub annotations, so a defect
@@ -207,80 +189,10 @@ for msg in row.get('findings') or []:
 " || true
 }
 
-# Harness health, as a gate rather than a footnote.
-#
-# Every scenario loop swallows its own failure (`|| echo "(continuing)"`) and
-# every mode ends by setting RESULTS_COMPLETE=1, so a mode in which most
-# scenarios never established a tunnel still exited 0 with complete: 1. Run
-# 33302660068 was exactly that: 6 of 13 `classes` rows, 4 of 10 `combo` rows and
-# 2 of 4 `special` rows never brought a tunnel up -- the entire non-public NAT
-# axis -- and the weekly was green on all eleven jobs. `complete` only ever
-# meant "the loop reached the end", which is not how it reads.
-#
-# The split matters: a scenario that could not RUN is a harness defect and fails
-# the job. A scenario that ran and produced a bad number is a finding about the
-# code under test -- those are annotated and counted, never fatal, or the weekly
-# would be red until xquic is fixed and would stop reporting anything.
-CI_BENCH_MAX_FAIL_PCT="${CI_BENCH_MAX_FAIL_PCT:-25}"
-
+# Required coverage is a manifest, not the number of rows that happened to
+# survive setup. QUIC/game subtests participate in the completeness verdict.
 _cb_summarise_and_gate() {
-    [ -s "$ROWS" ] || { echo "::error::no rows recorded at all"; return 1; }
-    python3 -c "
-import json, sys, collections
-rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-limit = float(sys.argv[2])
-
-# Only a scenario that could not RUN counts against this gate. 'measured_zero'
-# means the tunnel came up, iperf ran, and the answer was zero -- a result, and
-# a bad one, but not a harness failure, so gating on it would make the harness
-# fail whenever the code under test performs badly. That distinction is the
-# whole point of the status field §0.3 B added.
-COULD_NOT_RUN = {'tunnel_never_up', 'client_start_failed', 'setup_failed'}
-
-# Three outcomes, not two. A run_pair row carries one status per measurement,
-# so 'a=ok b=tunnel_never_up mp=ok' did produce two of its three numbers -- but
-# its aggregation_efficiency and vs_best_single are null, which is what the
-# multipath conclusions in the matrix are actually built on. Partial counts
-# against the gate; the message says so rather than claiming nothing ran.
-def outcome(r):
-    parts = [p.split('=')[-1] for p in str(r.get('status', '?')).split()]
-    blocked = [p for p in parts if p in COULD_NOT_RUN]
-    if not blocked:
-        return 'complete'
-    return 'dead' if len(blocked) == len(parts) else 'partial'
-
-kinds = collections.Counter(outcome(r) for r in rows)
-bad = [r for r in rows if outcome(r) != 'complete']
-reasons = collections.Counter()
-for r in rows:
-    for part in [p.split('=')[-1] for p in str(r.get('status', '?')).split()]:
-        if part != 'ok':
-            reasons[part] += 1
-
-findings = collections.Counter()
-for r in rows:
-    for f in r.get('findings') or []:
-        findings[f.split(':', 1)[0]] += 1
-
-print('')
-print('rows=%d  complete=%d  partial=%d  dead=%d'
-      % (len(rows), kinds['complete'], kinds['partial'], kinds['dead']))
-if reasons:
-    print('failure reasons: ' + ', '.join('%s x%d' % kv for kv in reasons.most_common()))
-if findings:
-    print('findings: ' + ', '.join('%s x%d' % kv for kv in findings.most_common()))
-    for k, n in findings.most_common():
-        print('::warning title=netsim findings::%s raised on %d row(s)' % (k, n))
-
-pct = 100.0 * len(bad) / len(rows)
-if pct > limit:
-    print('::error::%.0f%% of scenarios (%d/%d) did not produce a complete '
-          'measurement (%d partial, %d with nothing at all), over the %.0f%% '
-          'allowed -- read this as a harness failure, not as a result'
-          % (pct, len(bad), len(rows), kinds['partial'], kinds['dead'], limit))
-    raise SystemExit(1)
-print('scenarios measured end to end: %.0f%%' % (100.0 - pct))
-" "$ROWS" "$CI_BENCH_MAX_FAIL_PCT"
+    _cb_write_results gate
 }
 
 netsim_query_control() {
@@ -318,10 +230,10 @@ MEASURED_CV=0.0
 MEASURED_STATUS=ok
 
 measure_pathset() {
-    local paths="$1"
+    local paths="$1" scheduler="${2:-$CI_BENCH_SCHEDULER}"
     MEASURED_MBPS=0.0; MEASURED_CV=0.0; MEASURED_STATUS=ok
 
-    if ! ci_bench_start_client "$paths" >/dev/null 2>&1; then
+    if ! ci_bench_start_client "$paths" "$scheduler" >/dev/null 2>&1; then
         MEASURED_STATUS=client_start_failed
         return 0
     fi
@@ -1319,11 +1231,11 @@ run_pair() {
     local dev0 dev1 a b mp cv st_a st_b st_mp status
     dev0="$(netsim_veth_cli 0)"; dev1="$(netsim_veth_cli 1)"
     # Plain calls, not $( ) -- see measure_pathset.
-    measure_pathset "--path $dev0"
+    measure_pathset "--path $dev0" "$sched"
     a="$MEASURED_MBPS"; st_a="$MEASURED_STATUS"
-    measure_pathset "--path $dev1"
+    measure_pathset "--path $dev1" "$sched"
     b="$MEASURED_MBPS"; st_b="$MEASURED_STATUS"
-    measure_pathset "--path $dev0 --path $dev1"
+    measure_pathset "--path $dev0 --path $dev1" "$sched"
     mp="$MEASURED_MBPS"; cv="$MEASURED_CV"; st_mp="$MEASURED_STATUS"
 
     status=ok
@@ -1713,7 +1625,7 @@ run_quic() {
     # Multipath only. The solo legs are what run_pair already measures for TCP,
     # and a QUIC row costs a 20 MiB transfer -- tripling that to restate a
     # comparison the TCP rows already carry would buy nothing.
-    if ! ci_bench_start_client "--path $dev0 --path $dev1" >/dev/null 2>&1; then
+    if ! ci_bench_start_client "--path $dev0 --path $dev1" "$sched" >/dev/null 2>&1; then
         st=client_start_failed
     elif ! ci_bench_wait_tunnel "$TUNNEL_WAIT_SEC" >/dev/null 2>&1; then
         st=tunnel_never_up

@@ -25,6 +25,27 @@ The parser emits `NA` for an invalid sample, never synthetic zero throughput or
 zero loss. A numeric decline can be a valid measurement of a performance problem;
 measurement validity and performance health must be reported separately.
 
+## Netsim coverage and verdicts
+
+`ci_bench_netsim_results.py` maintains the expected scenario/scheduler manifest
+for every mode. Missing and duplicate rows remain visible in the result and
+fail the gate. FEC cells are required by the scheduler mode; a build without
+FEC is incomplete coverage rather than a smaller successful matrix. Cancelled
+runs retain the manifest and the rows that completed.
+
+`execution_complete` means the scenario loop finished. `measurement_complete`
+also requires every expected transfer, including QUIC repeats and game traffic,
+to have a valid result. The legacy `complete` field now follows this stricter
+meaning. `harness_valid` identifies setup, manifest and generator defects.
+`performance_health` is `pass`, `degraded` (diagnostic findings), `regression`
+(valid zero delivery), or `inconclusive` (incomplete evidence). A valid
+performance decline is never reclassified as a setup failure.
+
+Incomplete measurements and zero delivery fail the gate. Diagnostic findings
+emit warnings and remain visibly `degraded`; `CI_BENCH_STRICT_PERF=1` additionally
+fails on them. Their heuristic thresholds are not statistical proof of a
+regression. Both endpoints use the row's scheduler during paired measurements.
+
 ## Harness regression tests
 
 Run without a VPN build:
