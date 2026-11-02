@@ -39,6 +39,7 @@ export AWS_DEFAULT_REGION=auto
 # 1. Upload new JSONs (immutable: filename has timestamp, long cache)
 for result in ci_bench_results/*.json; do
   [ -f "$result" ] || continue
+  [ "$(basename "$result")" != index.json ] || continue
   aws s3 cp "$result" "s3://${R2_BUCKET}/${PREFIX}/$(basename "$result")" \
     --endpoint-url "$ENDPOINT" --cache-control "public, max-age=31536000, immutable"
 done

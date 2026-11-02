@@ -19,6 +19,7 @@ class PublishTests(unittest.TestCase):
             bindir = root/'bin'; bindir.mkdir()
             results = root/'ci_bench_results'; results.mkdir()
             (results/'result.json').write_text('{"test":"aggregate"}')
+            (results/'index.json').write_text('[]') # never upload a stale index before reading the remote one
             (results/'raw').mkdir()
             raw = results/'raw/private.json'; raw.write_text('{"not":"public"}'); raw.chmod(0)
             aws = bindir/'aws'
