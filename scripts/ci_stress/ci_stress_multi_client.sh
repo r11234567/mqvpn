@@ -34,7 +34,12 @@ if [ "${1:-}" != "" ]; then
     MQVPN="$1"
 fi
 
-NUM_CLIENTS=60
+NUM_CLIENTS="${CI_STRESS_NUM_CLIENTS:-60}"
+TRAFFIC_SEC="${CI_STRESS_CLIENT_TRAFFIC_SEC:-30}"
+[[ "$NUM_CLIENTS" =~ ^[1-9][0-9]*$ ]] && [ "$NUM_CLIENTS" -le 64 ] || {
+    echo 'client count must be 1..64' >&2; exit 2;
+}
+[[ "$TRAFFIC_SEC" =~ ^[1-9][0-9]*$ ]] || { echo 'invalid traffic duration' >&2; exit 2; }
 
 # Subnet addressing (all on 10.50.0.0/24)
 SERVER_NS="ci-stress-server"
@@ -48,6 +53,9 @@ multi_client_cleanup() {
     echo "Cleaning up multi-client topology..."
 
     ci_stress_monitor_stop
+    for pid in "${TRAFFIC_CLIENT_PIDS[@]:-}" "${TRAFFIC_SERVER_PIDS[@]:-}" "${PROBE_PIDS[@]:-}"; do
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    done
 
     # Stop all client processes
     for pid in "${CLIENT_PIDS[@]}"; do
@@ -138,7 +146,7 @@ ip netns exec "$SERVER_NS" "$MQVPN" \
     --cert "${WORK_DIR}/server.crt" \
     --key "${WORK_DIR}/server.key" \
     --auth-key "$PSK" \
-    --log-level "$CI_STRESS_LOG_LEVEL" &
+    --log-level "$CI_STRESS_LOG_LEVEL" >"${CI_STRESS_RAW_DIR}/vpn-server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
 
@@ -150,7 +158,7 @@ echo "VPN server running (PID $SERVER_PID)"
 
 # ── Start server RSS/fd monitor ──
 
-SERVER_MONITOR_LOG="${CI_STRESS_RESULTS}/multi_client_server_monitor.log"
+SERVER_MONITOR_LOG="${CI_STRESS_RAW_DIR}/multi-client-server-monitor.log"
 ci_stress_monitor_start "$SERVER_PID" "$SERVER_MONITOR_LOG"
 
 # ── Create 60 client netns + veths bridged to server ──
@@ -205,6 +213,9 @@ echo ""
 echo "Starting ${NUM_CLIENTS} VPN clients..."
 
 CLIENT_PIDS=()
+CONNECTION_STARTED=$SECONDS
+TUNNEL_TIMEOUT="${CI_STRESS_CLIENT_CONNECT_TIMEOUT:-60}"
+CONNECTION_DEADLINE=$((SECONDS + TUNNEL_TIMEOUT))
 for i in $(seq 1 "$NUM_CLIENTS"); do
     client_ns="ci-stress-c${i}"
     veth_client="ci-s-c${i}a"
@@ -215,7 +226,7 @@ for i in $(seq 1 "$NUM_CLIENTS"); do
         --path "$veth_client" \
         --auth-key "$PSK" \
         --insecure \
-        --log-level "$CI_STRESS_LOG_LEVEL" &
+        --log-level "$CI_STRESS_LOG_LEVEL" >"${CI_STRESS_RAW_DIR}/vpn-client-${i}.log" 2>&1 &
     CLIENT_PIDS+=($!)
 
     if [ $((i % 10)) -eq 0 ]; then
@@ -231,42 +242,36 @@ sleep 3
 echo ""
 echo "Waiting for tunnels to come up (timeout 60s)..."
 
-TUNNEL_TIMEOUT=60
 clients_connected=0
 clients_failed=0
 connected_indices=()
-
+PROBE_PIDS=()
+mkdir -p "$WORK_DIR/probes"
+# Each probe shares one deadline measured from the launch batch. Slow clients
+# cannot receive another full timeout merely by being checked later.
 for i in $(seq 1 "$NUM_CLIENTS"); do
-    client_ns="ci-stress-c${i}"
-    pid="${CLIENT_PIDS[$((i - 1))]}"
-
-    # Check if client process is still alive
-    if ! kill -0 "$pid" 2>/dev/null; then
-        clients_failed=$((clients_failed + 1))
-        continue
-    fi
-
-    # Try pinging tunnel server from this client
-    tunnel_ok=0
-    elapsed=0
-    while [ "$elapsed" -lt "$TUNNEL_TIMEOUT" ]; do
-        if ip netns exec "$client_ns" ping -c 1 -W 1 "$TUNNEL_SERVER_IP" >/dev/null 2>&1; then
-            tunnel_ok=1
-            break
-        fi
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
-
-    if [ "$tunnel_ok" -eq 1 ]; then
+    (
+        trap - EXIT TERM INT
+        while [ "$SECONDS" -lt "$CONNECTION_DEADLINE" ]; do
+            if ! kill -0 "${CLIENT_PIDS[$((i - 1))]}" 2>/dev/null; then break; fi
+            if ip netns exec "ci-stress-c${i}" ping -c 1 -W 1 "$TUNNEL_SERVER_IP" >/dev/null 2>&1; then
+                printf '%s\n' "$((SECONDS - CONNECTION_STARTED))" >"$WORK_DIR/probes/$i"
+                exit 0
+            fi
+            sleep 1
+        done
+        exit 1
+    ) &
+    PROBE_PIDS+=("$!")
+done
+for pid in "${PROBE_PIDS[@]}"; do wait "$pid" || true; done
+PROBE_PIDS=()
+for i in $(seq 1 "$NUM_CLIENTS"); do
+    if [ -s "$WORK_DIR/probes/$i" ]; then
         clients_connected=$((clients_connected + 1))
         connected_indices+=("$i")
     else
         clients_failed=$((clients_failed + 1))
-    fi
-
-    if [ $((i % 10)) -eq 0 ]; then
-        echo "  checked ${i}/${NUM_CLIENTS}: connected=${clients_connected} failed=${clients_failed}"
     fi
 done
 
@@ -275,12 +280,64 @@ echo "=== Connection Summary ==="
 echo "  Connected: ${clients_connected}/${NUM_CLIENTS}"
 echo "  Failed:    ${clients_failed}/${NUM_CLIENTS}"
 
+# Every connected client carries rate-limited traffic simultaneously, first
+# upload and then download. Dedicated ports avoid iperf3's single-test server
+# serialization. Preserve each client's receiver result and completion status.
+TRAFFIC_ROWS="${CI_STRESS_RAW_DIR}/client-traffic.jsonl"
+: >"$TRAFFIC_ROWS"
+traffic_ok=0
+traffic_failed=0
+for direction in UL DL; do
+    TRAFFIC_SERVER_PIDS=()
+    TRAFFIC_CLIENT_PIDS=()
+    for i in "${connected_indices[@]}"; do
+        ip netns exec "$SERVER_NS" iperf3 -s -1 -B "$TUNNEL_SERVER_IP" -p "$((5300 + i))" \
+            >"${CI_STRESS_RAW_DIR}/iperf-server-${i}-${direction}.log" 2>&1 &
+        TRAFFIC_SERVER_PIDS+=("$!")
+    done
+    sleep 1
+    reverse=()
+    if [ "$direction" = DL ]; then reverse=(-R); fi
+    for i in "${connected_indices[@]}"; do
+        ip netns exec "ci-stress-c${i}" timeout --kill-after=5 $((TRAFFIC_SEC + 30)) \
+            iperf3 -c "$TUNNEL_SERVER_IP" -p "$((5300 + i))" -t "$TRAFFIC_SEC" \
+            -b "${CI_STRESS_CLIENT_RATE:-2M}" "${reverse[@]}" --json \
+            >"${CI_STRESS_RAW_DIR}/iperf-client-${i}-${direction}.json" 2>&1 &
+        TRAFFIC_CLIENT_PIDS+=("$!")
+    done
+    for index in "${!connected_indices[@]}"; do
+        i="${connected_indices[$index]}"
+        rc=0
+        wait "${TRAFFIC_CLIENT_PIDS[$index]}" || rc=$?
+        kill "${TRAFFIC_SERVER_PIDS[$index]}" 2>/dev/null || true
+        wait "${TRAFFIC_SERVER_PIDS[$index]}" 2>/dev/null || true
+        sample="${CI_STRESS_RAW_DIR}/iperf-client-${i}-${direction}.json"
+        python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" record "$sample" \
+            --duration "$TRAFFIC_SEC" --exit-code "$rc"
+        rate="$(python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" throughput "$sample")"
+        if [ "$rate" = NA ] || ! awk -v r="$rate" 'BEGIN {exit !(r+0>0)}'; then
+            traffic_failed=$((traffic_failed + 1))
+        else
+            traffic_ok=$((traffic_ok + 1))
+        fi
+        python3 - "$sample" "$i" "$direction" >>"$TRAFFIC_ROWS" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))['_mqvpn']
+print(json.dumps(dict(doc, client=int(sys.argv[2]), direction=sys.argv[3])))
+PY
+    done
+    TRAFFIC_CLIENT_PIDS=()
+    TRAFFIC_SERVER_PIDS=()
+done
+echo "Concurrent client traffic: ok=$traffic_ok failed=$traffic_failed expected=$((NUM_CLIENTS * 2))"
+
 # ── Stabilization period (monitor resources under load) ──
 
 echo ""
 echo "Stabilizing for 30s (monitoring resources)..."
-sleep 30
-ci_stress_check_resources "$SERVER_MONITOR_LOG" "server (during stabilization)" || true
+sleep "${CI_STRESS_STABILIZE_SEC:-30}"
+EARLY_RESOURCE_FAILED=0
+ci_stress_check_resources "$SERVER_MONITOR_LOG" "server (during stabilization)" || EARLY_RESOURCE_FAILED=1
 
 # ── Verify: ping from each connected client through tunnel ──
 
@@ -317,8 +374,9 @@ done
 CLIENT_SANITIZER_FAIL=0
 for i in $(seq 1 "$NUM_CLIENTS"); do
     pid="${CLIENT_PIDS[$((i - 1))]}"
-    exit_code=0
-    wait "$pid" 2>/dev/null || exit_code=$?
+    ci_stress_reap_pid "$pid" "client-$i"
+    exit_code="$_CS_LAST_EXIT"
+    CLIENT_PIDS[$((i - 1))]=""
     # exit 143 = SIGTERM (normal kill)
     if [ "$exit_code" -ne 0 ] && [ "$exit_code" -ne 143 ]; then
         echo "  WARN: client $i (PID $pid) exited with code $exit_code"
@@ -333,11 +391,9 @@ echo "OK: all clients stopped"
 ci_stress_monitor_stop
 
 echo "Stopping VPN server..."
-SERVER_EXIT=0
-if kill -0 "$SERVER_PID" 2>/dev/null; then
-    kill "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || SERVER_EXIT=$?
-fi
+ci_stress_reap_pid "$SERVER_PID" server
+SERVER_EXIT="$_CS_LAST_EXIT"
+SERVER_PID=""
 echo "OK: server stopped (exit=$SERVER_EXIT)"
 
 # ── Check server resources ──
@@ -346,6 +402,7 @@ echo ""
 echo "=== Resource Check ==="
 
 resource_status="pass"
+if [ "$EARLY_RESOURCE_FAILED" -ne 0 ]; then resource_status="fail"; fi
 if ! ci_stress_check_resources "$SERVER_MONITOR_LOG" "server"; then
     resource_status="fail"
 fi
@@ -368,6 +425,8 @@ else
     resource_status="fail"
 fi
 
+ci_stress_check_sanitizer || resource_status="fail"
+
 # ── Extract server RSS from monitor log ──
 
 read -r server_rss_initial server_rss_final server_rss_max <<< "$(python3 -c "
@@ -387,8 +446,10 @@ else:
 
 if [ "$resource_status" = "fail" ]; then
     overall_status="fail"
-elif [ "$clients_connected" -lt $((NUM_CLIENTS / 2)) ]; then
-    # Less than half connected = fail
+elif [ "$clients_connected" -ne "$NUM_CLIENTS" ] || [ "$verify_fail" -ne 0 ] \
+    || [ "$verify_ok" -ne "$NUM_CLIENTS" ] || [ "$traffic_failed" -ne 0 ] \
+    || [ "$traffic_ok" -ne $((NUM_CLIENTS * 2)) ]; then
+    # Every client must remain usable and complete both traffic directions.
     overall_status="fail"
 else
     overall_status="pass"
@@ -399,8 +460,9 @@ fi
 timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 output_file="${CI_STRESS_RESULTS}/multi_client_$(date +%s).json"
 
-python3 -c "
+PYTHONPATH="$SCRIPT_DIR" python3 -c "
 import json, sys
+from ci_stress_results import fairness
 
 result = {
     'test': 'multi_client',
@@ -409,12 +471,19 @@ result = {
     'num_clients': ${NUM_CLIENTS},
     'clients_connected': ${clients_connected},
     'clients_failed': ${clients_failed},
+    'clients_verified': ${verify_ok},
+    'verification_failed': ${verify_fail},
+    'traffic_ok': ${traffic_ok},
+    'traffic_failed': ${traffic_failed},
+    'traffic_expected': $((NUM_CLIENTS * 2)),
+    'client_traffic': [json.loads(line) for line in open('${TRAFFIC_ROWS}') if line.strip()],
     'server_rss_initial_kb': ${server_rss_initial},
     'server_rss_final_kb': ${server_rss_final},
     'server_rss_max_kb': ${server_rss_max},
     'status': '${overall_status}'
 }
 
+result['fairness'] = fairness(result['client_traffic'])
 with open('${output_file}', 'w') as f:
     json.dump(result, f, indent=2)
     f.write('\n')

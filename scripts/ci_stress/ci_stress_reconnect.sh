@@ -22,7 +22,8 @@ if [ "${1:-}" != "" ]; then
     MQVPN="$1"
 fi
 
-TOTAL_CYCLES=500
+TOTAL_CYCLES="${CI_STRESS_RECONNECT_CYCLES:-500}"
+[[ "$TOTAL_CYCLES" =~ ^[1-9][0-9]*$ ]] || { echo 'invalid reconnect cycle count' >&2; exit 2; }
 TUNNEL_TIMEOUT=15
 PROGRESS_INTERVAL=50
 
@@ -44,7 +45,7 @@ ci_stress_apply_netem
 
 ci_stress_start_server wlb
 
-SERVER_MONITOR_LOG="${CI_STRESS_RESULTS}/reconnect_server_monitor.log"
+SERVER_MONITOR_LOG="${CI_STRESS_RAW_DIR}/reconnect-server-monitor.log"
 ci_stress_monitor_start "$_CS_SERVER_PID" "$SERVER_MONITOR_LOG"
 
 # ── Reconnect loop ──
@@ -163,8 +164,8 @@ fi
 
 if [ "$resource_status" = "fail" ]; then
     overall_status="fail"
-elif [ "$cycles_failed" -gt $((TOTAL_CYCLES / 10)) ]; then
-    # More than 10% failures
+elif [ "$cycles_failed" -ne 0 ] || [ "$((cycles_ok + cycles_failed))" -ne "$TOTAL_CYCLES" ]; then
+    # Every requested deterministic cycle must succeed.
     overall_status="fail"
 else
     overall_status="pass"

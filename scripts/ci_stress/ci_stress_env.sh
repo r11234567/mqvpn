@@ -23,8 +23,9 @@ CI_STRESS_RESULTS="${CI_STRESS_RESULTS:-${CI_STRESS_DIR}/../../ci_stress_results
 CI_STRESS_COMMIT="${CI_STRESS_COMMIT:-$(git -C "$CI_STRESS_DIR" rev-parse HEAD 2>/dev/null || echo unknown)}"
 
 # Namespace and veth names (different from ci-bench to avoid conflicts)
-NS_SERVER="ci-stress-server"
-NS_CLIENT="ci-stress-client"
+CI_STRESS_NAMESPACE_PREFIX="${CI_STRESS_NAMESPACE_PREFIX:-ci-stress}"
+NS_SERVER="${CI_STRESS_NAMESPACE_PREFIX}-server"
+NS_CLIENT="${CI_STRESS_NAMESPACE_PREFIX}-client"
 VETH_A0="ci-s-a0"
 VETH_A1="ci-s-a1"
 VETH_B0="ci-s-b0"
@@ -44,13 +45,15 @@ IP_B_SERVER_ADDR="10.200.0.1"
 TUNNEL_SERVER_IP="10.0.0.1"
 VPN_LISTEN_PORT="4433"
 CI_STRESS_LOG_LEVEL="${CI_STRESS_LOG_LEVEL:-warn}"
+CI_STRESS_RAW_DIR="${CI_STRESS_RAW_DIR:-${CI_STRESS_RESULTS}/raw/$(date -u +%Y%m%d_%H%M%S)-$$}"
+CI_STRESS_MONITOR_INTERVAL="${CI_STRESS_MONITOR_INTERVAL:-10}"
 
 # Optional log capture. When a caller sets these before ci_stress_start_server
 # / ci_stress_start_client, that VPN process's stdout+stderr goes to the named
 # file instead of being inherited. Only scripts that assert on log content opt
 # in (ci_stress_failover.sh); the others keep today's inline console output.
-CI_STRESS_SERVER_LOG="${CI_STRESS_SERVER_LOG:-}"
-CI_STRESS_CLIENT_LOG="${CI_STRESS_CLIENT_LOG:-}"
+CI_STRESS_SERVER_LOG="${CI_STRESS_SERVER_LOG:-${CI_STRESS_RAW_DIR}/vpn-server.log}"
+CI_STRESS_CLIENT_LOG="${CI_STRESS_CLIENT_LOG:-${CI_STRESS_RAW_DIR}/vpn-client.log}"
 
 # Default netem
 NETEM_A="${NETEM_A:-delay 10ms rate 300mbit}"
@@ -66,28 +69,44 @@ _CS_MONITOR_PIDS=()
 # ── Dependency checks ──
 
 ci_stress_check_deps() {
+    [[ "$CI_STRESS_NAMESPACE_PREFIX" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'invalid namespace prefix' >&2; exit 2; }
+    [[ "$CI_STRESS_MONITOR_INTERVAL" =~ ^[1-9][0-9]*$ ]] || { echo 'invalid monitor interval' >&2; exit 2; }
+    [[ "${CI_STRESS_STOP_GRACE:-10}" =~ ^[1-9][0-9]*$ ]] || { echo 'invalid shutdown grace' >&2; exit 2; }
     if [ ! -f "$MQVPN" ]; then
         echo "error: mqvpn binary not found at $MQVPN"
         exit 1
     fi
     MQVPN="$(realpath "$MQVPN")"
 
-    for cmd in iperf3 openssl python3 tc; do
+    for cmd in iperf3 openssl python3 tc timeout; do
         if ! command -v "$cmd" &>/dev/null; then
             echo "error: $cmd not found"
             exit 1
         fi
     done
 
-    mkdir -p "$CI_STRESS_RESULTS"
+    mkdir -p "$CI_STRESS_RESULTS" "$CI_STRESS_RAW_DIR"
 }
 
 # ── Stale state cleanup ──
 
+# A network namespace does not isolate /proc or pkill. Enumerate its actual
+# members, optionally matching comm, so another harness cannot be killed.
+ci_stress_kill_ns_processes() {
+    local ns="$1" comm="${2:-}" pid actual
+    for pid in $(ip netns pids "$ns" 2>/dev/null); do
+        actual="$(cat "/proc/$pid/comm" 2>/dev/null)" || continue
+        [ -z "$comm" ] || [ "$actual" = "$comm" ] || continue
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+}
+
 ci_stress_cleanup_stale() {
-    pkill -f "mqvpn.*ci-stress" 2>/dev/null || true
-    ip netns exec "$NS_SERVER" pkill -f "iperf3" 2>/dev/null || true
-    ip netns exec "$NS_CLIENT" pkill -f "iperf3" 2>/dev/null || true
+    ci_stress_kill_ns_processes "$NS_SERVER"
+    ci_stress_kill_ns_processes "$NS_CLIENT"
+    ci_stress_kill_ns_processes "$NS_SERVER" iperf3
+    ci_stress_kill_ns_processes "$NS_CLIENT" iperf3
     ip netns del "$NS_SERVER" 2>/dev/null || true
     ip netns del "$NS_CLIENT" 2>/dev/null || true
     ip link del "$VETH_A0" 2>/dev/null || true
@@ -247,18 +266,7 @@ ci_stress_start_client() {
     local scheduler="${2:-wlb}"
     local server_addr="${3:-$IP_A_SERVER_ADDR}"
 
-    # Kill previous client (capture exit code for sanitizer check)
-    if [ -n "$_CS_CLIENT_PID" ] && kill -0 "$_CS_CLIENT_PID" 2>/dev/null; then
-        kill "$_CS_CLIENT_PID" 2>/dev/null || true
-        local _exit=0
-        wait "$_CS_CLIENT_PID" 2>/dev/null || _exit=$?
-        if [ "$_exit" -ne 0 ] && [ "$_exit" -ne 143 ]; then
-            _CS_CLIENT_SANITIZER_FAIL=1
-            echo "WARN: previous VPN client (PID $_CS_CLIENT_PID) exited with code $_exit"
-        fi
-        _CS_CLIENT_PID=""
-        sleep 1
-    fi
+    ci_stress_stop_client
 
     if [ -n "$CI_STRESS_CLIENT_LOG" ]; then exec 3>>"$CI_STRESS_CLIENT_LOG"; else exec 3>&1; fi
     ip netns exec "$NS_CLIENT" "$MQVPN" \
@@ -305,33 +313,56 @@ ci_stress_wait_tunnel() {
 _CS_CLIENT_SANITIZER_FAIL=0
 _CS_SERVER_SANITIZER_FAIL=0
 
+# Always reap owned children, including a child which died before cleanup.
+# A watchdog bounds a wedged graceful shutdown; SIGKILL is a test failure.
+ci_stress_reap_pid() {
+    local pid="$1" label="${2:-process}" watcher done_file rc=0
+    done_file="$(mktemp "${CI_STRESS_RAW_DIR}/stop.XXXXXX")"
+    if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null || true; fi
+    # Cancel through a marker rather than SIGTERM: killing a background shell
+    # before it execs its watchdog can run the caller's inherited EXIT trap.
+    python3 -c '
+import os, pathlib, signal, sys, time
+pid, grace, done = int(sys.argv[1]), float(sys.argv[2]), pathlib.Path(sys.argv[3])
+deadline = time.monotonic() + grace
+while done.stat().st_size == 0:
+    if time.monotonic() >= deadline:
+        try: os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+        break
+    time.sleep(0.05)
+' "$pid" "${CI_STRESS_STOP_GRACE:-10}" "$done_file" 2>/dev/null &
+    watcher=$!
+    wait "$pid" 2>/dev/null || rc=$?
+    printf 'done\n' >"$done_file"
+    wait "$watcher" 2>/dev/null || true
+    rm -f "$done_file"
+    _CS_LAST_EXIT="$rc"
+    printf '%s %s %s\n' "$label" "$pid" "$rc" >> "${CI_STRESS_RAW_DIR}/process-exits.log"
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 143 ]; then
+        echo "WARN: $label exited $rc (including forced shutdown)"
+    fi
+}
+
 ci_stress_stop_client() {
-    if [ -n "$_CS_CLIENT_PID" ] && kill -0 "$_CS_CLIENT_PID" 2>/dev/null; then
-        kill "$_CS_CLIENT_PID" 2>/dev/null || true
-        local _exit=0
-        wait "$_CS_CLIENT_PID" 2>/dev/null || _exit=$?
-        # exit 143 = SIGTERM (normal kill), anything else is ASan/UBSan
-        if [ "$_exit" -ne 0 ] && [ "$_exit" -ne 143 ]; then
+    if [ -n "$_CS_CLIENT_PID" ]; then
+        ci_stress_reap_pid "$_CS_CLIENT_PID" client
+        if [ "$_CS_LAST_EXIT" -ne 0 ] && [ "$_CS_LAST_EXIT" -ne 143 ]; then
             _CS_CLIENT_SANITIZER_FAIL=1
-            echo "WARN: VPN client (PID $_CS_CLIENT_PID) exited with code $_exit"
         fi
         _CS_CLIENT_PID=""
-        sleep 1
+        sleep "${CI_STRESS_STOP_PAUSE:-1}"
     fi
 }
 
 ci_stress_stop_vpn() {
     ci_stress_stop_client
-    if [ -n "$_CS_SERVER_PID" ] && kill -0 "$_CS_SERVER_PID" 2>/dev/null; then
-        kill "$_CS_SERVER_PID" 2>/dev/null || true
-        local _exit=0
-        wait "$_CS_SERVER_PID" 2>/dev/null || _exit=$?
-        if [ "$_exit" -ne 0 ] && [ "$_exit" -ne 143 ]; then
+    if [ -n "$_CS_SERVER_PID" ]; then
+        ci_stress_reap_pid "$_CS_SERVER_PID" server
+        if [ "$_CS_LAST_EXIT" -ne 0 ] && [ "$_CS_LAST_EXIT" -ne 143 ]; then
             _CS_SERVER_SANITIZER_FAIL=1
-            echo "WARN: VPN server (PID $_CS_SERVER_PID) exited with code $_exit"
         fi
         _CS_SERVER_PID=""
-        sleep 1
     fi
 }
 
@@ -347,8 +378,13 @@ ci_stress_check_sanitizer() {
         echo "  FAIL: VPN client reported ASan/UBSan error"
         failed=1
     fi
+    if grep -rE 'ERROR: (AddressSanitizer|LeakSanitizer)|SUMMARY: (AddressSanitizer|UndefinedBehaviorSanitizer)|runtime error:' \
+            "$CI_STRESS_RAW_DIR" --include='*.log' >/dev/null 2>&1; then
+        echo "  FAIL: sanitizer diagnostic in captured logs"
+        failed=1
+    fi
     if [ "$failed" -eq 0 ]; then
-        echo "  OK: no sanitizer errors"
+        echo "  OK: collected process exits and logs show no sanitizer error"
     fi
     return $failed
 }
@@ -401,13 +437,14 @@ ci_stress_monitor_start() {
     : > "$logfile"
 
     (
+        trap - EXIT TERM INT
         while kill -0 "$pid" 2>/dev/null; do
             local ts rss_kb fd_count
             ts=$(date +%s)
             rss_kb=$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
             fd_count=$(ls "/proc/$pid/fd" 2>/dev/null | wc -l)
             echo "$ts $rss_kb $fd_count" >> "$logfile"
-            sleep 10
+            sleep "$CI_STRESS_MONITOR_INTERVAL"
         done
     ) &
     _CS_MONITOR_PIDS+=($!)
@@ -423,88 +460,31 @@ ci_stress_monitor_stop() {
     _CS_MONITOR_PIDS=()
 }
 
-# True when the binary under test is an ASan build.
-#
-# ASan reserves a large shadow region and quarantines freed memory instead of
-# returning it, so a sanitizer build's RSS climbs by hundreds of percent with
-# nothing leaking -- which is why the growth check below is skipped for them.
-# Leak coverage does not depend on it: LeakSanitizer still runs at exit and
-# the fd check still applies.
-#
-# Detect it from the binary, not from ASAN_OPTIONS: that variable is a tuning
-# knob rather than a marker, and a caller who simply did not export it turns a
-# clean run red for the wrong reason. The variable is still honoured as a
-# fallback for when the binary cannot be read.
+# ASan quarantine and allocator effects make RSS growth inconclusive.
+# A readable binary, rather than ASAN_OPTIONS, identifies instrumentation.
 ci_stress_is_asan_build() {
-    [ -n "${ASAN_OPTIONS:-}" ] && return 0
-    LC_ALL=C grep -qa "__asan_init" "$MQVPN" 2>/dev/null
+    if [ -r "$MQVPN" ]; then
+        LC_ALL=C grep -qa "__asan_init" "$MQVPN"
+    else
+        [ -n "${ASAN_OPTIONS:-}" ]
+    fi
 }
 
-# Check resource log for leaks.
-# Fails if RSS grew >50% from initial or fd count increased.
-# Usage: ci_stress_check_resources LOGFILE LABEL
 ci_stress_check_resources() {
-    local logfile="$1"
-    local label="${2:-process}"
-    local result=0
+    local logfile="$1" label="${2:-process}" asan=0
+    ci_stress_is_asan_build && asan=1
+    echo "Resource evidence: $label"
+    python3 "${CI_STRESS_DIR}/ci_stress_results.py" "$logfile" \
+        --asan "$asan" --interval "$CI_STRESS_MONITOR_INTERVAL" \
+        --warmup "${CI_STRESS_WARMUP_SEC:-30}"
+}
 
-    if [ ! -s "$logfile" ]; then
-        echo "WARN: $label monitor log is empty"
-        return 0
-    fi
-
-    CS_ASAN="$(ci_stress_is_asan_build && echo 1 || echo 0)" python3 -c "
-import sys
-
-lines = open('${logfile}').read().strip().split('\n')
-if len(lines) < 2:
-    print('  $label: not enough data points ({} samples)'.format(len(lines)))
-    sys.exit(0)
-
-samples = []
-for line in lines:
-    parts = line.split()
-    if len(parts) >= 3:
-        samples.append((int(parts[0]), int(parts[1]), int(parts[2])))
-
-if not samples:
-    print('  $label: no valid samples')
-    sys.exit(0)
-
-initial_rss = samples[0][1]
-final_rss = samples[-1][1]
-initial_fd = samples[0][2]
-final_fd = samples[-1][2]
-max_rss = max(s[1] for s in samples)
-
-print(f'  $label: RSS initial={initial_rss}KB final={final_rss}KB max={max_rss}KB ({len(samples)} samples)')
-print(f'  $label: fd  initial={initial_fd} final={final_fd}')
-
-import os
-asan_enabled = os.environ.get('CS_ASAN') == '1'
-
-failed = False
-
-if initial_rss > 0:
-    growth = (max_rss - initial_rss) / initial_rss
-    if growth > 0.5:
-        if asan_enabled:
-            print(f'  SKIP: $label RSS grew {growth*100:.0f}% (ASan shadow memory, not a real leak)')
-        else:
-            print(f'  FAIL: $label RSS grew {growth*100:.0f}% (>{50}% threshold)')
-            failed = True
-
-if final_fd > initial_fd:
-    print(f'  FAIL: $label fd count leaked ({initial_fd} -> {final_fd})')
-    failed = True
-
-if failed:
-    sys.exit(1)
-else:
-    print(f'  OK: $label resources stable')
-"
-    result=$?
-    return $result
+# Kernel-delivered inner bytes at the receiving TUN, independent of iperf's
+# control socket and sender-side buffering. Missing counters are invalid.
+ci_stress_tun_rx_bytes() {
+    local receiver="$NS_SERVER"
+    [ "${1:-UL}" != DL ] || receiver="$NS_CLIENT"
+    ip netns exec "$receiver" cat /sys/class/net/mqvpn0/statistics/rx_bytes 2>/dev/null
 }
 
 # ── Cleanup ──
@@ -515,13 +495,10 @@ ci_stress_cleanup() {
 
     ci_stress_monitor_stop
 
-    [ -n "$_CS_CLIENT_PID" ] && kill "$_CS_CLIENT_PID" 2>/dev/null || true
-    [ -n "$_CS_SERVER_PID" ] && kill "$_CS_SERVER_PID" 2>/dev/null || true
-    _CS_CLIENT_PID=""
-    _CS_SERVER_PID=""
+    ci_stress_stop_vpn
 
-    ip netns exec "$NS_SERVER" pkill -f "iperf3" 2>/dev/null || true
-    ip netns exec "$NS_CLIENT" pkill -f "iperf3" 2>/dev/null || true
+    ci_stress_kill_ns_processes "$NS_SERVER" iperf3
+    ci_stress_kill_ns_processes "$NS_CLIENT" iperf3
     sleep 1
 
     ip netns exec "$NS_CLIENT" tc qdisc del dev "$VETH_A0" root 2>/dev/null || true

@@ -2,7 +2,7 @@ name: Stress Tests
 
 on:
   schedule:
-    - cron: '0 6 * * 0'  # Sunday 6:00 UTC (after perf-weekly at 3:00)
+    - cron: '0 6 * * 0'  # Independent schedule; no completion dependency on perf-weekly
   workflow_dispatch:
 
 permissions:
@@ -14,8 +14,12 @@ concurrency:
 
 jobs:
   build:
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [asan, release]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -46,16 +50,21 @@ jobs:
         uses: actions/cache@v6
         with:
           path: third_party/xquic/third_party/boringssl
-          key: bssl-${{ steps.bssl-pin.outputs.sha }}-linux-clang-fpic-stress-v1
+          key: bssl-${{ steps.bssl-pin.outputs.sha }}-linux-clang-${{ matrix.profile }}-fpic-stress-v3
 
       - name: Build BoringSSL
         if: steps.bssl-cache.outputs.cache-hit != 'true'
         run: |
           cd third_party/xquic/third_party/boringssl
           mkdir -p build && cd build
-          # No CMAKE_BUILD_TYPE here on purpose — see ci.yml's sanitizer job.
-          CC=clang CXX=clang++ cmake -DBUILD_SHARED_LIBS=0 -DBUILD_TESTING=OFF \
-            -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          flags='-fPIC'
+          type=Release
+          if [ '${{ matrix.profile }}' = asan ]; then
+            flags="$flags -fsanitize=address,undefined -fno-omit-frame-pointer"
+            type=Debug
+          fi
+          CC=clang CXX=clang++ cmake -DCMAKE_BUILD_TYPE="$type" -DBUILD_SHARED_LIBS=0 -DBUILD_TESTING=OFF \
+            -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$flags" ..
           make -j$(nproc) ssl crypto
 
       - name: Cache xquic (clang Debug, stress)
@@ -67,32 +76,50 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-stress-v3
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-${{ steps.bssl-pin.outputs.sha }}-source-v1-stress-${{ matrix.profile }}-v5
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
         run: |
           cd third_party/xquic
           mkdir -p build && cd build
-          CC=clang cmake -DCMAKE_BUILD_TYPE=Debug -DSSL_TYPE=boringssl \
+          type=Release; asan=OFF; flags='-Wno-unknown-warning-option'
+          if [ '${{ matrix.profile }}' = asan ]; then
+            type=Debug; asan=ON
+            flags="$flags -fsanitize=address,undefined -fno-omit-frame-pointer"
+          fi
+          CC=clang cmake -DCMAKE_BUILD_TYPE="$type" -DSSL_TYPE=boringssl -DASAN="$asan" \
             -DXQC_ENABLE_BBR2=ON \
             -DXQC_ENABLE_FEC=ON \
             -DXQC_ENABLE_XOR=ON \
-            -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" ..
+            -DCMAKE_C_FLAGS="$flags" ..
           make -j$(nproc)
 
-      - name: Build mqvpn (ASan + UBSan)
+      - name: Build mqvpn (${{ matrix.profile }})
         run: |
           mkdir -p build && cd build
-          CC=clang cmake -DCMAKE_BUILD_TYPE=Debug \
-            -DENABLE_SANITIZERS=ON \
+          type=Release; asan=OFF; link=''
+          if [ '${{ matrix.profile }}' = asan ]; then
+            type=Debug; asan=ON; link=-fsanitize-link-c++-runtime
+          fi
+          CC=clang cmake -DCMAKE_BUILD_TYPE="$type" \
+            -DENABLE_SANITIZERS="$asan" \
+            -DCMAKE_EXE_LINKER_FLAGS="$link" \
+            -DCMAKE_C_STANDARD_LIBRARIES=-lstdc++ \
             -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
           make -j$(nproc)
+
+      - name: Verify dependency instrumentation
+        if: matrix.profile == 'asan'
+        run: |
+          nm -D third_party/xquic/build/libxquic.so > /tmp/stress-xquic-symbols
+          grep -q __asan /tmp/stress-xquic-symbols
+          grep -q __ubsan /tmp/stress-xquic-symbols
 
       - name: Upload build
         uses: actions/upload-artifact@v7
         with:
-          name: stress-build
+          name: stress-build-${{ matrix.profile }}
           path: |
             build/mqvpn
             build/libmqvpn.a
@@ -100,6 +127,10 @@ jobs:
           retention-days: 1
 
   long-running:
+    strategy:
+      fail-fast: false
+      matrix:
+        direction: [UL, DL]
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -109,23 +140,27 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libevent-dev iptables iproute2 iperf3
       - uses: actions/download-artifact@v8
         with:
-          name: stress-build
+          name: stress-build-asan
       - name: Restore shared libs
         run: |
-          sudo cp third_party/xquic/build/libxquic.so* /usr/local/lib/ 2>/dev/null || true
+          sudo cp third_party/xquic/build/libxquic.so* /usr/local/lib/
           sudo ldconfig
       - name: Make executable
         run: chmod +x build/mqvpn
-      - name: Long-running stress test (15min)
+      - name: Long-running stress test (15min, ${{ matrix.direction }})
         env:
+          CI_STRESS_DIRECTION: ${{ matrix.direction }}
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: sudo -E bash scripts/ci_stress/ci_stress_long_running.sh build/mqvpn
+      - name: Make stress artifacts readable by the runner
+        if: always()
+        run: if [ -d ci_stress_results ]; then sudo chown -R "$(id -u):$(id -g)" ci_stress_results; fi
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: stress-long-running
+          name: stress-long-running-${{ matrix.direction }}
           path: ci_stress_results/
           retention-days: 30
 
@@ -139,10 +174,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libevent-dev iptables iproute2 iperf3
       - uses: actions/download-artifact@v8
         with:
-          name: stress-build
+          name: stress-build-asan
       - name: Restore shared libs
         run: |
-          sudo cp third_party/xquic/build/libxquic.so* /usr/local/lib/ 2>/dev/null || true
+          sudo cp third_party/xquic/build/libxquic.so* /usr/local/lib/
           sudo ldconfig
       - name: Make executable
         run: chmod +x build/mqvpn
@@ -151,6 +186,9 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: sudo -E bash scripts/ci_stress/ci_stress_reconnect.sh build/mqvpn
+      - name: Make stress artifacts readable by the runner
+        if: always()
+        run: if [ -d ci_stress_results ]; then sudo chown -R "$(id -u):$(id -g)" ci_stress_results; fi
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
@@ -169,18 +207,21 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libevent-dev iptables iproute2 iperf3
       - uses: actions/download-artifact@v8
         with:
-          name: stress-build
+          name: stress-build-asan
       - name: Restore shared libs
         run: |
-          sudo cp third_party/xquic/build/libxquic.so* /usr/local/lib/ 2>/dev/null || true
+          sudo cp third_party/xquic/build/libxquic.so* /usr/local/lib/
           sudo ldconfig
       - name: Make executable
         run: chmod +x build/mqvpn
-      - name: Multi-client stress (60 clients)
+      - name: Multi-client stress (60 clients, concurrent UL and DL)
         env:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: sudo -E bash scripts/ci_stress/ci_stress_multi_client.sh build/mqvpn
+      - name: Make stress artifacts readable by the runner
+        if: always()
+        run: if [ -d ci_stress_results ]; then sudo chown -R "$(id -u):$(id -g)" ci_stress_results; fi
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
@@ -199,22 +240,57 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libevent-dev iptables iproute2 iperf3
       - uses: actions/download-artifact@v8
         with:
-          name: stress-build
+          name: stress-build-asan
       - name: Restore shared libs
         run: |
-          sudo cp third_party/xquic/build/libxquic.so* /usr/local/lib/ 2>/dev/null || true
+          sudo cp third_party/xquic/build/libxquic.so* /usr/local/lib/
           sudo ldconfig
       - name: Make executable
         run: chmod +x build/mqvpn
-      - name: Failover storm (100 cycles)
+      - name: Failover storm (100 cycles, including silent and one-way blackholes)
         env:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: sudo -E bash scripts/ci_stress/ci_stress_failover.sh build/mqvpn
+      - name: Make stress artifacts readable by the runner
+        if: always()
+        run: if [ -d ci_stress_results ]; then sudo chown -R "$(id -u):$(id -g)" ci_stress_results; fi
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: stress-failover
+          path: ci_stress_results/
+          retention-days: 30
+
+  release-soak:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install runtime deps
+        run: sudo apt-get update && sudo apt-get install -y libevent-dev iptables iproute2 iperf3
+      - uses: actions/download-artifact@v8
+        with:
+          name: stress-build-release
+      - name: Restore runtime
+        run: |
+          sudo cp third_party/xquic/build/libxquic.so* /usr/local/lib/
+          sudo ldconfig
+          chmod +x build/mqvpn
+      - name: Optimized two-hour receiver-progress and RSS soak
+        env:
+          CI_STRESS_LONG_DURATION: '7200'
+          CI_STRESS_DIRECTION: UL
+        run: sudo -E bash scripts/ci_stress/ci_stress_long_running.sh build/mqvpn
+      - name: Make stress artifacts readable by the runner
+        if: always()
+        run: if [ -d ci_stress_results ]; then sudo chown -R "$(id -u):$(id -g)" ci_stress_results; fi
+      - name: Upload all soak evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-release-soak
           path: ci_stress_results/
           retention-days: 30
