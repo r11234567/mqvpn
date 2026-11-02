@@ -80,6 +80,9 @@ def load_rows(root):
                 r = dict(r)
                 r['direction'] = r.get('direction', doc.get('direction', 'DL'))
                 r['pair_id'] = doc.get('pair_id')
+                r['_artifact_complete'] = doc.get('measurement_complete')
+                r['_artifact_harness_valid'] = doc.get('harness_valid')
+                r['_artifact_health'] = doc.get('performance_health')
                 rows.append((mode, r.get("arm") or doc_arm, r))
     return rows
 
@@ -933,6 +936,21 @@ def emit_coverage(rows, by_key, arms):
     print(f"- measurements: {len(by_key)}")
     bad = sum(1 for _m, _a, r in rows if r.get("status") not in (None, "ok"))
     print(f"- rows whose status was not ok: {bad}")
+    print()
+    print("| mode | arm | direction | measurement complete | performance health |")
+    print("|---|---|---|---|---|")
+    groups = {}
+    for mode, arm, row in rows:
+        groups.setdefault((mode, arm, row.get('direction','DL')), []).append(row)
+    for (mode, arm, direction), group in sorted(groups.items()):
+        complete = ('false' if any(r.get('_artifact_complete') is False for r in group)
+                    else 'true' if all(r.get('_artifact_complete') is True for r in group) else 'unknown')
+        states = {r.get('_artifact_health') or r.get('performance_health') or 'unknown' for r in group}
+        if complete == 'false': states.add('inconclusive')
+        print(f"| {mode} | {arm} | {direction} | {complete} | {', '.join(sorted(states))} |")
+    print()
+    print("Completed diagnostic execution does not imply healthy performance. "
+          "Separate matrix jobs may use different VMs; only matching pair IDs identify serial same-VM arms.")
     print()
 
 

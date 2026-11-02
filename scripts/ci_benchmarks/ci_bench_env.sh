@@ -52,9 +52,8 @@ export CI_BENCH_COMMIT CI_BENCH_RAW_DIR CI_BENCH_SCHEDULER
 # read back after a measurement. Off by default: it raises the log level for
 # the whole run.
 #
-# The counters are aggregates maintained in the scheduler, not per-packet log
-# lines, so the capture itself does not move the throughput being measured --
-# which matters, because the number under investigation IS the throughput.
+# The counters are aggregated rather than logged per packet. Logging can still
+# perturb a shared runner; compare matching log settings and measure the cost.
 #
 # The SERVER log is the one that answers the question. Every measurement here
 # is iperf3 in the DL direction, so the bulk data is scheduled by the server's

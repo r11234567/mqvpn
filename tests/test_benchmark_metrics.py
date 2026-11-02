@@ -23,10 +23,12 @@ class ProtocolMetricsTests(unittest.TestCase):
                 row = {'scenario':'homo_good','scheduler':'wlb','mode_family':'quic',
                        'quic_goodput_mbps':100, 'quic_samples':3, 'quic_status':'ok',
                        'samp_cpu_util_pct':10, 'findings':['test_warning: diagnostic'] if arm=='alternate' else []}
-                (Path(folder)/(arm+'.json')).write_text(json.dumps({'mode':'quic','arm':arm,'results':[row]}))
+                (Path(folder)/(arm+'.json')).write_text(json.dumps({'mode':'quic','arm':arm,'results':[row],
+                    'measurement_complete':arm=='default', 'performance_health':'pass' if arm=='default' else 'inconclusive'}))
             result = subprocess.run([sys.executable,'-X','utf8',str(script),folder],capture_output=True,text=True,encoding='utf-8')
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertIn('test_warning',result.stdout)
+            self.assertIn('inconclusive',result.stdout)
 
     def test_comparison_directions_cannot_overwrite_each_other(self):
         a = {'scenario':'mtu_split', 'scheduler':'wlb', 'direction':'DL'}
