@@ -19,7 +19,7 @@ on:
       netsim_modes:
         description: >-
           Comma-separated netsim modes to narrow to (e.g. "classes,sched,tiers").
-          Leave EMPTY for the full set of 15, which is what the schedule runs and
+          Leave EMPTY for the full set of 16, which is what the schedule runs and
           what any conclusion about coverage needs.
         required: false
         default: ''
@@ -245,7 +245,7 @@ jobs:
   # Builds the netsim matrix as modes x arms. A static matrix can be neither
   # narrowed nor doubled by an input, and both are wanted:
   #
-  #   - The full 15 modes are the default, because a conclusion about coverage
+  #   - The full 16 modes are the default, because a conclusion about coverage
   #     needs all of them. `netsim_modes` only narrows, and only on a dispatch.
   #   - `arms` runs the same modes twice in ONE dispatch, as parallel jobs. An
   #     A/B done as two dispatches is not just slower, it is weaker: these
@@ -268,6 +268,7 @@ jobs:
           # Kept in step with the comments on each mode below.
           modes = [
               {"id": "paths",       "args": "paths"},
+              {"id": "mixed",       "args": "mixed"},
               {"id": "classes",     "args": "classes"},
               {"id": "combo",       "args": "combo"},
               {"id": "special",     "args": "special"},
@@ -466,7 +467,7 @@ jobs:
       # build_picoquic.sh does not generate them -- caching the binary alone
       # would restore a tree whose server cannot start.
       - name: Cache picoquic
-        if: startsWith(matrix.id, 'quic')
+        if: startsWith(matrix.id, 'quic') || startsWith(matrix.id, 'mixed')
         id: picoquic-cache
         uses: actions/cache@v6
         with:
@@ -474,7 +475,7 @@ jobs:
           key: picoquic-${{ hashFiles('scripts/ci_interop/build_picoquic.sh') }}-linux-v1
 
       - name: Build picoquic
-        if: startsWith(matrix.id, 'quic') && steps.picoquic-cache.outputs.cache-hit != 'true'
+        if: (startsWith(matrix.id, 'quic') || startsWith(matrix.id, 'mixed')) && steps.picoquic-cache.outputs.cache-hit != 'true'
         run: bash scripts/ci_interop/build_picoquic.sh
 
       - name: Scenario ${{ matrix.id }}

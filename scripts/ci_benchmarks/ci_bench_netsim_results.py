@@ -27,6 +27,8 @@ def expected_rows(mode, scheduler="wlb", transit="bgp_junk"):
         names = CLASSES
     elif mode == "paths":
         names = [f'paths_{n}' for n in (1,2,4,8)]
+    elif mode == "mixed":
+        names = ['homo_good', 'asym_capacity']
     elif mode == "mtu":
         names = MTU
     elif mode == "combo":
@@ -76,7 +78,7 @@ def classify(row, mode):
         for phase, key in phase_keys.items():
             if phases.get(phase) not in (None, "ok", "measured_zero"):
                 row[key] = None
-        if not phases:
+        if not phases and mode != 'mixed':
             for key in list(row):
                 if key.endswith("_mbps"):
                     row[key] = None
@@ -88,6 +90,9 @@ def classify(row, mode):
         required = ["single_path_mbps"]
     elif mode == "paths":
         required = ['single_dl_mbps','single_ul_mbps','multipath_dl_mbps','multipath_ul_mbps']
+    elif mode == "mixed":
+        required = ['tcp_mbps','quic_goodput_mbps','udp_dl_mbps','udp_ul_mbps','baseline_dl_mbps','baseline_ul_mbps']
+        reasons.extend(row.get('mixed_errors') or [])
     elif mode == "tiers":
         required = ["multipath_mbps"]
     elif mode == "quic":

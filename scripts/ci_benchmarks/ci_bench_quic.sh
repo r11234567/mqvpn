@@ -53,6 +53,7 @@ _CB_QUIC_CLI_LOG=""
 # must not be run in a subshell, because the pids it records would be lost.
 QUIC_GOODPUT="NA"
 QUIC_STATUS=ok
+QUIC_DURATION=NA
 
 # ci_bench_quic_available -> 0 if an inner-QUIC transfer can be run
 #
@@ -86,7 +87,7 @@ ci_bench_quic_available() {
 # ci_bench_raw_throughput.sh:73 uses).
 ci_bench_quic_transfer() {
     local target="$1"
-    QUIC_GOODPUT="NA"; QUIC_STATUS=ok
+    QUIC_GOODPUT="NA"; QUIC_STATUS=ok; QUIC_DURATION=NA
 
     if ! ci_bench_quic_available; then
         QUIC_STATUS=picoquic_missing
@@ -139,10 +140,10 @@ ci_bench_quic_transfer() {
     result="${stem}.measurement.json"
     python3 "${SCRIPT_DIR}/ci_bench_metrics.py" quic "$_CB_QUIC_CLI_LOG" \
         --bytes "$CI_BENCH_QUIC_BYTES" --exit-code "$client_exit" >"$result" || true
-    read -r QUIC_STATUS QUIC_GOODPUT < <(python3 - "$result" <<'PY'
+    read -r QUIC_STATUS QUIC_GOODPUT QUIC_DURATION < <(python3 - "$result" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
-print(d['status'], d.get('receiver_mbps', 'NA'))
+print(d['status'], d.get('receiver_mbps', 'NA'), d.get('observed_duration_s', 'NA'))
 PY
     )
     return 0

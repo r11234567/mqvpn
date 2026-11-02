@@ -134,6 +134,14 @@ congestion control as its cause.
 The scheduled matrix adds a `paths` mode with 1/2/4/8 configured and verified
 active paths and both TCP directions. This is Linux namespace performance
 coverage; existing platform CI still owns Windows/mobile lifecycle coverage.
+The `mixed` mode adds equal and asymmetric pairs with TCP bulk download,
+repeated inner QUIC objects and simultaneous small-UDP upload/download, each on
+an independent generator port. It records isolated UDP controls, completed
+receiver measurements, QUIC attempt windows and positive TCP interval overlap.
+A living background process alone cannot satisfy the mixed-load check. Object
+gaps and timing precision remain visible; the generator does not claim every
+instant is saturated by QUIC. The default weekly plan now has 16 mode jobs and
+151 expected scenario rows after the paired MTU/game expansions.
 The MTU mode runs four serial same-VM arms: PMTUD off/on x DL/UL, in a shuffled
 order with pair identity. PMTUD is configured using `[Interface] PMTUD`; the
 product default is unchanged. Config, control state and both TUN MTUs are saved

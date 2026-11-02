@@ -42,6 +42,7 @@ source "${SCRIPT_DIR}/ci_bench_host.sh"
 source "${SCRIPT_DIR}/ci_bench_sampler.sh"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/ci_bench_quic.sh"
+source "${SCRIPT_DIR}/ci_bench_mixed.sh"
 
 MODE="${1:-percommit}"
 case "$MODE" in
@@ -2440,6 +2441,10 @@ ci_bench_check_deps
 netsim_detect_caps
 
 case "$MODE" in
+  mixed)
+    TEST_NAME=netsim_mixed
+    for class in homo_good asym_capacity; do run_mixed "$class" || echo "mixed $class failed; retaining manifest"; done
+    ;;
   paths)
     TEST_NAME=netsim_paths
     for n in 1 2 4 8; do run_path_scale "$n" || echo "paths $n failed; manifest will report missing coverage"; done

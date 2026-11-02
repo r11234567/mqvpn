@@ -61,6 +61,22 @@ class NetsimTests(unittest.TestCase):
         self.assertEqual([r['scenario'] for r in netsim.expected_rows('paths')],
                          ['paths_1', 'paths_2', 'paths_4', 'paths_8'])
 
+    def test_weekly_expansion_includes_mixed_and_paired_arms(self):
+        modes = 'classes combo special mtu sched tiers quic game vps paths mixed'.split()
+        count = sum(len(netsim.expected_rows(m)) for m in modes)
+        count += sum(len(netsim.expected_rows('catalog',transit=t)) for t in ('iplc','bgp_opt','bgp_plain','bgp_junk','carrier_qos'))
+        count += 3 * len(netsim.expected_rows('mtu')) + len(netsim.expected_rows('game'))
+        self.assertEqual(count,151)
+
+    def test_mixed_failure_keeps_other_completed_protocols(self):
+        row = {'status':'measurement_incomplete','mixed_errors':['inner_quic_incomplete_during_udp'],
+               'tcp_mbps':100,'quic_goodput_mbps':None,'udp_dl_mbps':.8,'udp_ul_mbps':.8,
+               'baseline_dl_mbps':.8,'baseline_ul_mbps':.8}
+        result = netsim.classify(row,'mixed')
+        self.assertEqual(result['tcp_mbps'],100)
+        self.assertIsNone(result['quic_goodput_mbps'])
+        self.assertFalse(result['measurement_complete'])
+
     def test_invalid_phase_is_null_not_zero_and_ratios_are_inconclusive(self):
         row = dict(pair(), status="a=ok b=measurement_incomplete mp=ok", solo_b_mbps=0)
         out = netsim.classify(row, "classes")

@@ -13,9 +13,27 @@ from ci_bench_metrics import quic_transfer, saturation, udp_point
 from ci_bench_results import InvalidMeasurement
 from ci_bench_failover_measure import interval, sustained, analyse
 from ci_bench_ab_report import key_of
+from ci_bench_mixed_results import summarise as mixed_summary
 
 
 class ProtocolMetricsTests(unittest.TestCase):
+    def test_mixed_load_requires_receiver_progress_and_quic_overlap(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for name in ('baseline_dl','baseline_ul','udp_dl','udp_ul','tcp'):
+                duration = 12 if name=='tcp' else 4
+                raw = {'end':{'sum_received':{'seconds':duration,'bytes':1000000,'bits_per_second':2000000,
+                                             'lost_percent':0,'jitter_ms':1}},
+                       'intervals':[{'sum':{'start':i,'end':i+1,'seconds':1,'bits_per_second':2000000}} for i in range(duration)]}
+                (root/(name+'.json')).write_text(json.dumps(raw))
+                (root/(name+'.path')).write_text(name+'.json')
+            (root/'udp-window.json').write_text('{"start_s":3,"end_s":8}')
+            (root/'tcp-window.json').write_text('{"start_s":0,"end_s":14}')
+            (root/'quic.jsonl').write_text('{"start_s":4,"end_s":6,"status":"ok","mbps":20}\n')
+            self.assertEqual(mixed_summary(root,'homo_good')['status'],'ok')
+            (root/'quic.jsonl').write_text('{"start_s":0,"end_s":1,"status":"ok","mbps":20}\n')
+            self.assertIn('inner_quic_incomplete_during_udp',mixed_summary(root,'homo_good')['mixed_errors'])
+
     def test_report_renders_asymmetric_findings_quic_and_host_rows(self):
         script = Path(__file__).resolve().parents[1]/'scripts/ci_benchmarks/ci_bench_ab_report.py'
         with tempfile.TemporaryDirectory() as folder:
