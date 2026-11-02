@@ -34,9 +34,21 @@ git -C "${DEST}" checkout "${PICOQUIC_PIN}"
 # ci/build_picotls.sh which clones h2o/picotls into ../picotls and builds it.
 # Build picotls first (skip if already built), then build the picoquicdemo target.
 PICOTLS_DIR="${REPO_ROOT}/third_party/picotls"
-if [ ! -f "${PICOTLS_DIR}/libpicotls-core.a" ]; then
-    ( cd "${DEST}" && ./ci/build_picotls.sh )
+PICOTLS_PIN="bfa67875982afc4c24f21e146cef4747fa189c2f"
+if [ ! -d "${PICOTLS_DIR}/.git" ]; then
+    git clone https://github.com/h2o/picotls.git "$PICOTLS_DIR"
 fi
+git -C "$PICOTLS_DIR" fetch origin "$PICOTLS_PIN"
+git -C "$PICOTLS_DIR" checkout "$PICOTLS_PIN"
+git -C "$PICOTLS_DIR" submodule update --init --recursive
+# A stale core archive alone does not prove OpenSSL support was built. Require
+# all libraries and fail during configuration if OpenSSL headers are absent.
+pkg-config --exists openssl || { echo 'OpenSSL development files required (libssl-dev)' >&2; exit 1; }
+cmake -S "$PICOTLS_DIR" -B "$PICOTLS_DIR" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$PICOTLS_DIR" -j"$(nproc)"
+for lib in core openssl minicrypto; do
+    test -s "${PICOTLS_DIR}/libpicotls-${lib}.a" || { echo "missing picotls-${lib}" >&2; exit 1; }
+done
 ( cd "${DEST}" \
     && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build -j"$(nproc)" --target picoquicdemo )

@@ -37,10 +37,11 @@ export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
 export AWS_DEFAULT_REGION=auto
 
 # 1. Upload new JSONs (immutable: filename has timestamp, long cache)
-aws s3 cp ci_bench_results/ "s3://${R2_BUCKET}/${PREFIX}/" \
-  --endpoint-url "$ENDPOINT" --recursive \
-  --exclude '*' --include '*.json' \
-  --cache-control "public, max-age=31536000, immutable"
+for result in ci_bench_results/*.json; do
+  [ -f "$result" ] || continue
+  aws s3 cp "$result" "s3://${R2_BUCKET}/${PREFIX}/$(basename "$result")" \
+    --endpoint-url "$ENDPOINT" --cache-control "public, max-age=31536000, immutable"
+done
 
 # 2. Read current index.json. Distinguish 404 (initial state) from real errors:
 #    silently treating auth/network failure as "empty" would wipe the entire index.

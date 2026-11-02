@@ -37,10 +37,10 @@
 CI_BENCH_QUIC_DIR="${CI_BENCH_QUIC_DIR:-}"
 PICOQUICDEMO="${PICOQUICDEMO:-}"
 
-# 20 MiB. Large enough that BBR leaves startup and the steady-state oscillation
-# (if any) has room to appear; small enough that a collapsed regime still
-# finishes inside PICO_TIMEOUT instead of returning NA for the wrong reason.
-CI_BENCH_QUIC_BYTES="${CI_BENCH_QUIC_BYTES:-20971520}"
+# Fixed 128 MiB object. Duration is recorded per attempt. A timeout is an
+# incomplete transfer; short successful runs cannot establish steady-state
+# oscillation. The shape analysis has its own minimum sample requirement.
+CI_BENCH_QUIC_BYTES="${CI_BENCH_QUIC_BYTES:-134217728}"
 CI_BENCH_QUIC_TIMEOUT="${CI_BENCH_QUIC_TIMEOUT:-90}"
 CI_BENCH_QUIC_PORT="${CI_BENCH_QUIC_PORT:-5401}"
 CI_BENCH_QUIC_SNI="${CI_BENCH_QUIC_SNI:-test}"
@@ -93,8 +93,11 @@ ci_bench_quic_transfer() {
         return 0
     fi
 
-    _CB_QUIC_SVR_LOG="$(mktemp)"
-    _CB_QUIC_CLI_LOG="$(mktemp)"
+    mkdir -p "$CI_BENCH_RAW_DIR"
+    local stem
+    stem="$(mktemp -u "${CI_BENCH_RAW_DIR}/quic.XXXXXXXX")"
+    _CB_QUIC_SVR_LOG="${stem}.server.log"
+    _CB_QUIC_CLI_LOG="${stem}.client.log"
 
     # -1 closes after one connection (one measurement is one bulk GET); -D
     # keeps the payload off disk at both ends, which matters on a 2-vCPU runner
@@ -109,7 +112,7 @@ ci_bench_quic_transfer() {
     sleep 1
     if ! kill -0 "$svr_pid" 2>/dev/null; then
         QUIC_STATUS=quic_server_failed
-        rm -f "$_CB_QUIC_SVR_LOG" "$_CB_QUIC_CLI_LOG"
+        wait "$svr_pid" 2>/dev/null || true
         return 0
     fi
 
@@ -119,11 +122,12 @@ ci_bench_quic_transfer() {
     # way ci_bench_run_iperf does -- without it one collapsed path hangs the
     # mode until the job timeout, which is how a weekly netsim job once burned
     # 60 minutes while its siblings finished in six.
+    local client_exit=0
     timeout -k 5 "$CI_BENCH_QUIC_TIMEOUT" \
         ip netns exec "$NS_CLIENT" "$PICOQUICDEMO" \
         -G bbr -D -n "$CI_BENCH_QUIC_SNI" \
         "$target" "$CI_BENCH_QUIC_PORT" "/${CI_BENCH_QUIC_BYTES}" \
-        >"$_CB_QUIC_CLI_LOG" 2>&1 || true
+        >"$_CB_QUIC_CLI_LOG" 2>&1 || client_exit=$?
 
     # Kill the server before waiting on it: with -1 it blocks until its first
     # connection, so a client that never got through would leave a bare `wait`
@@ -131,26 +135,15 @@ ci_bench_quic_transfer() {
     kill "$svr_pid" 2>/dev/null || true
     wait "$svr_pid" 2>/dev/null || true
 
-    # The client prints BOTH "Received ... Mbps." (download) and "Sent ... Mbps."
-    # (upload). Match the Received line only -- taking the last Mbps token on
-    # the page would silently report the ACK-direction rate as the throughput.
-    local gp
-    gp="$(awk '
-        /^Received [0-9]+ bytes in .* Mbps/ {
-            for (i = 1; i <= NF; i++)
-                if ($i == "Mbps" || $i == "Mbps.") { print $(i - 1); break }
-        }' "$_CB_QUIC_CLI_LOG" 2>/dev/null | tail -1 || true)"
-
-    if [ -z "$gp" ]; then
-        # NA, never 0. A failed transfer and a genuinely zero-throughput one are
-        # different findings, and the report filters the sentinel instead of
-        # averaging it into a result.
-        QUIC_GOODPUT="NA"
-        QUIC_STATUS=quic_no_goodput
-    else
-        QUIC_GOODPUT="$gp"
-    fi
-
-    rm -f "$_CB_QUIC_SVR_LOG" "$_CB_QUIC_CLI_LOG"
+    local result
+    result="${stem}.measurement.json"
+    python3 "${SCRIPT_DIR}/ci_bench_metrics.py" quic "$_CB_QUIC_CLI_LOG" \
+        --bytes "$CI_BENCH_QUIC_BYTES" --exit-code "$client_exit" >"$result" || true
+    read -r QUIC_STATUS QUIC_GOODPUT < <(python3 - "$result" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d['status'], d.get('receiver_mbps', 'NA'))
+PY
+    )
     return 0
 }

@@ -43,37 +43,12 @@ NETSIM_SERVER_ADDR="10.99.0.1"
 # a reason to emit packets the far side cannot forward.
 NETSIM_FULL_MTU=1500
 
-# The smallest link MTU that still fits the client's default outer datagram.
-#
-# src/mqvpn_internal.h pins MQVPN_MAX_PKT_OUT_SIZE at 1400, which is the QUIC
-# packet size — the UDP payload. On the wire that is 1400 + 8 (UDP) + 20 (IPv4)
-# = 1428 bytes. So the `1400` level this matrix leans on hardest — it appears in
-# hetero_extreme, carrier_pair, home_plus_tether, dual_mobile, sat_plus_cell and
-# six of the ten combo legs — is not "a slightly smaller MTU". It is a link that
-# cannot carry the client's default packet at all, and whether it carries
-# anything depends on PMTUD converging DOWNWARD — which xquic could not do until
-# 6ba4261 and now can (see netsim_mtu_class).
-NETSIM_CLIENT_PKT_SIZE=1400
+# IPv4 default-packet reference only. The label is not evidence of enabled
+# PMTUD or its convergence. Effective TUN MTU/control/config are retained per
+# measurement; IPv6 adds a different outer overhead and has separate E2Es.
+NETSIM_CLIENT_PKT_SIZE="${CI_BENCH_OUTER_PAYLOAD_REFERENCE:-1400}"
 NETSIM_MIN_FITTING_MTU=$(( NETSIM_CLIENT_PKT_SIZE + 8 + 20 ))
 
-# netsim_mtu_class <mtu> — how an MTU level relates to what the client emits.
-#
-#   fits     >= 1428: the default packet goes through unmodified
-#   boundary == 1428: exact fit, no headroom for any option
-#   below     < 1428: the default packet does NOT fit, so the path carries
-#                     traffic only if the sender shrinks. It could not: xquic's
-#                     packet size was monotonically non-decreasing, which is the
-#                     mechanism behind vs_best_single 0.195-0.317 on the mtu
-#                     classes. Fixed in xquic 6ba4261 -- the PMTU search is now
-#                     per path, a new path starts at the QUIC-guaranteed size
-#                     rather than inheriting the connection's, and the
-#                     connection's size is recomputed in both directions.
-#
-#                     A `below` leg is therefore expected to aggregate now, and
-#                     the class exists to keep checking that it does: run_pair
-#                     raises `pmtu_blackhole_regression` when such a leg still
-#                     costs throughput. Do not read a `below` class as a known
-#                     defect any more -- read the finding.
 netsim_mtu_class() {
     local mtu="${1#bh}"
     # No clamp anywhere means the veth default, which is a real MTU and a
@@ -326,29 +301,20 @@ netsim_apply_nat() {
         echo "netsim: unknown NAT type '$nat'" >&2
         return 1
     fi
-    # Degrade to 'public' rather than failing the scenario; detect_caps said so.
-    [ "$NETSIM_HAVE_NAT" = 1 ] || return 0
+    # Requested NAT must be installed exactly; capability loss fails this row.
+    [ "$NETSIM_HAVE_NAT" = 1 ] || { echo "required NAT unavailable: $nat" >&2; return 1; }
 
-    # -C before -A: the comment above claimed idempotency, but a bare -A stacks
-    # a duplicate rule on every call. It held only because each caller happens
-    # to run netsim_setup first (which deletes the namespace) — an invariant
-    # worth enforcing rather than depending on, since netsim_roam flushes this
-    # same chain mid-scenario.
-    # shellcheck disable=SC2086  # flags are intentionally word-split
+    # Preserve the requested rule, including its port range. A fallback
+    # MASQUERADE rule would emulate a different scenario.
     ip netns exec "$hop" iptables -t nat -C POSTROUTING -o "$out" \
         -j MASQUERADE ${NETSIM_NAT[$nat]} 2>/dev/null ||
     ip netns exec "$hop" iptables -t nat -A POSTROUTING -o "$out" \
-        -j MASQUERADE ${NETSIM_NAT[$nat]} 2>/dev/null ||
-    ip netns exec "$hop" iptables -t nat -C POSTROUTING -o "$out" \
-        -j MASQUERADE 2>/dev/null ||
-    ip netns exec "$hop" iptables -t nat -A POSTROUTING -o "$out" \
-        -j MASQUERADE 2>/dev/null || true
+        -j MASQUERADE ${NETSIM_NAT[$nat]} || return 1
+    # Bidirectional UDP entries use the stream timeout, not the unreplied
+    # timeout. Both must expire for the idle-aging scenario to be meaningful.
+    ip netns exec "$hop" sysctl -qw net.netfilter.nf_conntrack_udp_timeout=30 || return 1
+    ip netns exec "$hop" sysctl -qw net.netfilter.nf_conntrack_udp_timeout_stream=30 || return 1
 
-    # UDP conntrack ages out in 30 s by default, which IS the "silent killer"
-    # every mobile user meets. Pin it explicitly so the value is part of the
-    # scenario rather than a distro default that might differ on the runner.
-    ip netns exec "$hop" sysctl -qw net.netfilter.nf_conntrack_udp_timeout=30 \
-        2>/dev/null || true
 }
 
 # netsim_roam <slot>
@@ -371,7 +337,7 @@ netsim_roam() {
     [ "$NETSIM_HAVE_NAT" = 1 ] || return 1
     command -v conntrack >/dev/null 2>&1 || return 1
 
-    ip netns exec "$hop" ip addr add "${alt}/24" dev "$out" 2>/dev/null || true
+    ip netns exec "$hop" ip addr replace "${alt}/24" dev "$out" 2>/dev/null || return 1
 
     # Flush whatever translation is in place, then pin the new source. SNAT
     # rather than MASQUERADE: masquerade follows the interface's primary
@@ -379,7 +345,7 @@ netsim_roam() {
     ip netns exec "$hop" iptables -t nat -F POSTROUTING 2>/dev/null || return 1
     ip netns exec "$hop" iptables -t nat -A POSTROUTING -o "$out" \
         -j SNAT --to-source "$alt" 2>/dev/null || return 1
-    ip netns exec "$hop" conntrack -F >/dev/null 2>&1 || true
+    ip netns exec "$hop" conntrack -F >/dev/null 2>&1 || return 1
     return 0
 }
 
@@ -529,15 +495,15 @@ netsim_detect_caps() {
     fi
     if [ "$NETSIM_HAVE_PPS" != 1 ]; then
         echo "  note: no 'police pkts_rate' — carrier_qos/5g_throttled lose their" \
-             "packet-rate cap and become ordinary high-bandwidth profiles."
+             "packet-rate cap; rows requiring it will fail setup."
     fi
     if [ "$NETSIM_HAVE_NAT" != 1 ]; then
         echo "  note: no iptables nat table — every path degrades to 'public'," \
-             "so NAT-dependent scenarios measure something easier than intended."
+             "so NAT-dependent scenarios will fail setup."
     fi
     if [ "$NETSIM_HAVE_ICMP_DROP" != 1 ]; then
         echo "  note: cannot drop ICMP frag-needed — a 'bh' MTU degrades to an" \
-             "ordinary small MTU, measuring a slow path rather than a stalled one."
+             "unsupported scenario; blackhole setup will fail."
     fi
 }
 
@@ -556,6 +522,10 @@ netsim_seeded() {
 # ── Topology ───────────────────────────────────────────────────────────────
 
 netsim_teardown() {
+    local ns pid
+    for ns in "$NETSIM_NS_CLIENT" "$NETSIM_NS_SERVER" $(for ((j=0;j<NETSIM_MAX_PATHS;j++)); do netsim_hop_ns "$j"; done); do
+        for pid in $(ip netns pids "$ns" 2>/dev/null); do kill "$pid" 2>/dev/null || true; done
+    done
     local i
     ip netns del "$NETSIM_NS_CLIENT" 2>/dev/null || true
     ip netns del "$NETSIM_NS_SERVER" 2>/dev/null || true
@@ -581,8 +551,8 @@ netsim_setup() {
     netsim_teardown
     ip netns add "$NETSIM_NS_CLIENT" || return 1
     ip netns add "$NETSIM_NS_SERVER" || return 1
-    ip netns exec "$NETSIM_NS_CLIENT" ip link set lo up
-    ip netns exec "$NETSIM_NS_SERVER" ip link set lo up
+    ip netns exec "$NETSIM_NS_CLIENT" ip link set lo up || return 1
+    ip netns exec "$NETSIM_NS_SERVER" ip link set lo up || return 1
 
     # One address, many paths — matches how a real server is reached.
     ip netns exec "$NETSIM_NS_SERVER" \
@@ -595,39 +565,39 @@ netsim_setup() {
         vhs="$(netsim_veth_hop_srv "$i")"; vs="$(netsim_veth_srv "$i")"
 
         ip netns add "$hop" || return 1
-        ip netns exec "$hop" ip link set lo up
-        ip netns exec "$hop" sysctl -qw net.ipv4.ip_forward=1
+        ip netns exec "$hop" ip link set lo up || return 1
+        ip netns exec "$hop" sysctl -qw net.ipv4.ip_forward=1 || return 1
 
         # client <-> hop
         ip link add "$vc" type veth peer name "$vhc" || return 1
-        ip link set "$vc" netns "$NETSIM_NS_CLIENT"
-        ip link set "$vhc" netns "$hop"
-        ip netns exec "$NETSIM_NS_CLIENT" ip addr add "$(netsim_cli_ip "$i")/24" dev "$vc"
-        ip netns exec "$hop" ip addr add "$(netsim_hop_cli_ip "$i")/24" dev "$vhc"
-        ip netns exec "$NETSIM_NS_CLIENT" ip link set "$vc" up
-        ip netns exec "$hop" ip link set "$vhc" up
+        ip link set "$vc" netns "$NETSIM_NS_CLIENT" || return 1
+        ip link set "$vhc" netns "$hop" || return 1
+        ip netns exec "$NETSIM_NS_CLIENT" ip addr add "$(netsim_cli_ip "$i")/24" dev "$vc" || return 1
+        ip netns exec "$hop" ip addr add "$(netsim_hop_cli_ip "$i")/24" dev "$vhc" || return 1
+        ip netns exec "$NETSIM_NS_CLIENT" ip link set "$vc" up || return 1
+        ip netns exec "$hop" ip link set "$vhc" up || return 1
 
         # hop <-> server
         ip link add "$vhs" type veth peer name "$vs" || return 1
-        ip link set "$vhs" netns "$hop"
-        ip link set "$vs" netns "$NETSIM_NS_SERVER"
-        ip netns exec "$hop" ip addr add "$(netsim_hop_srv_ip "$i")/24" dev "$vhs"
-        ip netns exec "$NETSIM_NS_SERVER" ip addr add "$(netsim_srv_ip "$i")/24" dev "$vs"
-        ip netns exec "$hop" ip link set "$vhs" up
-        ip netns exec "$NETSIM_NS_SERVER" ip link set "$vs" up
+        ip link set "$vhs" netns "$hop" || return 1
+        ip link set "$vs" netns "$NETSIM_NS_SERVER" || return 1
+        ip netns exec "$hop" ip addr add "$(netsim_hop_srv_ip "$i")/24" dev "$vhs" || return 1
+        ip netns exec "$NETSIM_NS_SERVER" ip addr add "$(netsim_srv_ip "$i")/24" dev "$vs" || return 1
+        ip netns exec "$hop" ip link set "$vhs" up || return 1
+        ip netns exec "$NETSIM_NS_SERVER" ip link set "$vs" up || return 1
 
         # Client -> server, one route per path. mqvpn binds each path socket
         # with SO_BINDTODEVICE, so the oif-scoped lookup selects the route
         # whose dev matches; the metric only orders unbound traffic. Metrics
         # must differ or the kernel rejects the duplicate.
         ip netns exec "$NETSIM_NS_CLIENT" ip route add "${NETSIM_SERVER_ADDR}/32" \
-            via "$(netsim_hop_cli_ip "$i")" dev "$vc" metric "$((100 + i))" 2>/dev/null || true
+            via "$(netsim_hop_cli_ip "$i")" dev "$vc" metric "$((100 + i))" 2>/dev/null || return 1
 
         # Hop -> server address, and server -> client subnet. Return traffic
         # follows the same hop it arrived through, so each path stays
         # independent (a flap on one must not perturb the other).
         ip netns exec "$hop" ip route add "${NETSIM_SERVER_ADDR}/32" \
-            via "$(netsim_srv_ip "$i")" dev "$vhs" 2>/dev/null || true
+            via "$(netsim_srv_ip "$i")" dev "$vhs" 2>/dev/null || return 1
         # `src` is load-bearing, not cosmetic. mqvpn's server answers on ONE
         # wildcard-bound UDP socket with a plain sendto() and never sets
         # IP_PKTINFO, so the kernel chooses the reply's source address by
@@ -640,7 +610,7 @@ netsim_setup() {
         # a router hop.
         ip netns exec "$NETSIM_NS_SERVER" ip route add "10.${NETSIM_OCTETS[$i]}.1.0/24" \
             via "$(netsim_hop_srv_ip "$i")" dev "$vs" \
-            src "$NETSIM_SERVER_ADDR" 2>/dev/null || true
+            src "$NETSIM_SERVER_ADDR" 2>/dev/null || return 1
 
         # The same `src` problem, one translation later. The route above covers
         # the client's own subnet, which is the address the server replies to
@@ -656,7 +626,7 @@ netsim_setup() {
         local nat_src
         for nat_src in "$(netsim_hop_srv_ip "$i")" "$(netsim_hop_srv_ip_alt "$i")"; do
             ip netns exec "$NETSIM_NS_SERVER" ip route replace "${nat_src}/32" \
-                dev "$vs" scope link src "$NETSIM_SERVER_ADDR" 2>/dev/null || true
+                dev "$vs" scope link src "$NETSIM_SERVER_ADDR" 2>/dev/null || return 1
         done
     done
 
@@ -664,7 +634,7 @@ netsim_setup() {
     # is exactly the shape strict mode drops.
     local ns
     for ns in "$NETSIM_NS_CLIENT" "$NETSIM_NS_SERVER"; do
-        ip netns exec "$ns" sysctl -qw net.ipv4.conf.all.rp_filter=2
+        ip netns exec "$ns" sysctl -qw net.ipv4.conf.all.rp_filter=2 || return 1
     done
 
     # Verify each path end to end BEFORE any shaping is applied — an
@@ -692,11 +662,11 @@ netsim_setup() {
         for probe in "$(netsim_cli_ip "$i")" "$(netsim_hop_srv_ip "$i")" \
                      "$(netsim_hop_srv_ip_alt "$i")"; do
             want_src="$(ip netns exec "$NETSIM_NS_SERVER" ip -o route get "$probe" \
-                        2>/dev/null | sed -n 's/.* src \([0-9.][0-9.]*\).*/\1/p')"
+                        2>/dev/null | sed -n 's/.* src \([0-9.][0-9.]*\).*/\1/p')" || return 1
             if [ "$want_src" != "$NETSIM_SERVER_ADDR" ]; then
                 echo "netsim_setup: server would answer path $i at $probe from" \
                      "${want_src:-<none>}, not $NETSIM_SERVER_ADDR — the client" \
-                     "would drop the reply" >&2
+                     "would drop the reply" >&2 || return 1
                 return 1
             fi
         done
@@ -750,9 +720,9 @@ netsim_apply_path() {
     mtu="${mtu:-${NETSIM_LEG_MTU[$access]:-}}"
     if [ -n "$mtu" ]; then
         if [ "${mtu#bh}" != "$mtu" ]; then
-            netsim_set_pmtud_blackhole "$slot" "${mtu#bh}"
+            netsim_set_pmtud_blackhole "$slot" "${mtu#bh}" || return 1
         else
-            netsim_set_mtu "$slot" "$mtu"
+            netsim_set_mtu "$slot" "$mtu" || return 1
         fi
     fi
 
@@ -761,7 +731,7 @@ netsim_apply_path() {
     # Packet-rate cap, if either leg calls for one. Applied at the hop in both
     # directions, the way a subscriber-level carrier cap works.
     local pps="${NETSIM_PPS_CAP[$transit]:-${NETSIM_PPS_CAP[$access]:-}}"
-    if [ -n "$pps" ]; then netsim_apply_pps_cap "$slot" "$pps"; fi
+    if [ -n "$pps" ]; then netsim_apply_pps_cap "$slot" "$pps" || return 1; fi
 
     # Say out loud when a leg's MTU is below what the client emits. A row that
     # reads 15 Mbps because its packets do not fit is a different finding from
@@ -777,6 +747,7 @@ netsim_apply_path() {
                  "UDP/IP does not fit; this leg depends on the sender shrinking"
         fi
     fi
+    netsim_snapshot "$slot" "$spec" || return 1
     echo "  path $slot: ${access} + ${transit} + nat=${nat}${mtu_note}$([ -n "$pps" ] && echo " pps<=${pps}")"
 }
 
@@ -784,10 +755,10 @@ netsim_apply_path() {
 netsim_set_mtu() {
     local slot="$1" mtu="$2" hop
     hop="$(netsim_hop_ns "$slot")"
-    ip netns exec "$NETSIM_NS_CLIENT" ip link set "$(netsim_veth_cli "$slot")" mtu "$mtu"
-    ip netns exec "$hop" ip link set "$(netsim_veth_hop_cli "$slot")" mtu "$mtu"
-    ip netns exec "$hop" ip link set "$(netsim_veth_hop_srv "$slot")" mtu "$mtu"
-    ip netns exec "$NETSIM_NS_SERVER" ip link set "$(netsim_veth_srv "$slot")" mtu "$mtu"
+    ip netns exec "$NETSIM_NS_CLIENT" ip link set "$(netsim_veth_cli "$slot")" mtu "$mtu" || return 1
+    ip netns exec "$hop" ip link set "$(netsim_veth_hop_cli "$slot")" mtu "$mtu" || return 1
+    ip netns exec "$hop" ip link set "$(netsim_veth_hop_srv "$slot")" mtu "$mtu" || return 1
+    ip netns exec "$NETSIM_NS_SERVER" ip link set "$(netsim_veth_srv "$slot")" mtu "$mtu" || return 1
 }
 
 # netsim_set_pmtud_blackhole <slot> <hop_mtu>
@@ -813,17 +784,18 @@ netsim_set_pmtud_blackhole() {
     hop="$(netsim_hop_ns "$slot")"
 
     ip netns exec "$NETSIM_NS_CLIENT" \
-        ip link set "$(netsim_veth_cli "$slot")" mtu "$NETSIM_FULL_MTU"
+        ip link set "$(netsim_veth_cli "$slot")" mtu "$NETSIM_FULL_MTU" || return 1
     ip netns exec "$hop" \
-        ip link set "$(netsim_veth_hop_cli "$slot")" mtu "$NETSIM_FULL_MTU"
+        ip link set "$(netsim_veth_hop_cli "$slot")" mtu "$NETSIM_FULL_MTU" || return 1
     ip netns exec "$hop" \
-        ip link set "$(netsim_veth_hop_srv "$slot")" mtu "$mtu"
+        ip link set "$(netsim_veth_hop_srv "$slot")" mtu "$mtu" || return 1
     ip netns exec "$NETSIM_NS_SERVER" \
-        ip link set "$(netsim_veth_srv "$slot")" mtu "$mtu"
+        ip link set "$(netsim_veth_srv "$slot")" mtu "$mtu" || return 1
 
+    [ "$NETSIM_HAVE_ICMP_DROP" = 1 ] || { echo "required ICMP blackhole unavailable" >&2; return 1; }
     if [ "$NETSIM_HAVE_ICMP_DROP" = 1 ]; then
         ip netns exec "$hop" iptables -A OUTPUT -p icmp \
-            --icmp-type fragmentation-needed -j DROP 2>/dev/null || true
+            --icmp-type fragmentation-needed -j DROP 2>/dev/null || return 1
     fi
 }
 
@@ -843,16 +815,16 @@ netsim_set_pmtud_blackhole() {
 # device. Policing both ends removes the ambiguity.
 netsim_apply_pps_cap() {
     local slot="$1" pps="$2" hop dev
-    [ "$NETSIM_HAVE_PPS" = 1 ] || return 0
+    [ "$NETSIM_HAVE_PPS" = 1 ] || { echo "required PPS policing unavailable" >&2; return 1; }
     hop="$(netsim_hop_ns "$slot")"
 
     #   vhc ingress = packets from the client  -> uplink
     #   vhs ingress = packets from the server  -> downlink
     for dev in "$(netsim_veth_hop_cli "$slot")" "$(netsim_veth_hop_srv "$slot")"; do
-        ip netns exec "$hop" tc qdisc replace dev "$dev" handle ffff: ingress 2>/dev/null || true
+        ip netns exec "$hop" tc qdisc replace dev "$dev" handle ffff: ingress 2>/dev/null || return 1
         ip netns exec "$hop" tc filter add dev "$dev" parent ffff: protocol ip u32 \
             match ip protocol 17 0xff \
-            action police pkts_rate "$pps" pkts_burst "$((pps / 40 + 50))" drop 2>/dev/null || true
+            action police pkts_rate "$pps" pkts_burst "$((pps / 40 + 50))" drop 2>/dev/null || return 1
     done
 }
 
@@ -886,14 +858,16 @@ netsim_spike_start() {
     dev_up="$(netsim_veth_hop_srv "$slot")"
     dev_dn="$(netsim_veth_srv "$slot")"
 
+    NETSIM_SPIKE_ERRORS="${CI_BENCH_RAW_DIR}/spike-errors.log"
     (
+        trap - EXIT TERM INT
         while :; do
             sleep "$(( off_min + RANDOM % (off_max - off_min + 1) ))"
-            ip netns exec "$hop" tc qdisc change dev "$dev_up" root netem ${spike} 2>/dev/null
-            ip netns exec "$NETSIM_NS_SERVER" tc qdisc change dev "$dev_dn" root netem ${spike} 2>/dev/null
+            ip netns exec "$hop" tc qdisc change dev "$dev_up" root netem ${spike} 2>/dev/null || { echo spike_failed >>"$NETSIM_SPIKE_ERRORS"; exit 1; }
+            ip netns exec "$NETSIM_NS_SERVER" tc qdisc change dev "$dev_dn" root netem ${spike} 2>/dev/null || { echo spike_failed >>"$NETSIM_SPIKE_ERRORS"; exit 1; }
             sleep "$on_sec"
-            ip netns exec "$hop" tc qdisc change dev "$dev_up" root netem ${base} 2>/dev/null
-            ip netns exec "$NETSIM_NS_SERVER" tc qdisc change dev "$dev_dn" root netem ${base} 2>/dev/null
+            ip netns exec "$hop" tc qdisc change dev "$dev_up" root netem ${base} 2>/dev/null || { echo restore_failed >>"$NETSIM_SPIKE_ERRORS"; exit 1; }
+            ip netns exec "$NETSIM_NS_SERVER" tc qdisc change dev "$dev_dn" root netem ${base} 2>/dev/null || { echo restore_failed >>"$NETSIM_SPIKE_ERRORS"; exit 1; }
         done
     ) >/dev/null 2>&1 &
     NETSIM_SPIKE_PID=$!
@@ -1001,4 +975,20 @@ netsim_class_transit() {
     local leg
     if [ "$slot" = 0 ]; then leg="${spec%%|*}"; else leg="${spec##*|}"; fi
     netsim_path_field "$leg" transit
+}
+
+# Atomic per-path kernel evidence. Missing evidence fails setup.
+netsim_snapshot() {
+    local slot="$1" spec="$2" hop vc vs out
+    hop="$(netsim_hop_ns "$slot")"; vc="$(netsim_veth_cli "$slot")"; vs="$(netsim_veth_srv "$slot")"
+    mkdir -p "${CI_BENCH_RAW_DIR:-/tmp/netsim-evidence}"
+    out="$(mktemp -d "${CI_BENCH_RAW_DIR:-/tmp/netsim-evidence}/path-${slot}.XXXXXX")"
+    printf '%s\n' "$spec" >"$out/requested.txt"
+    ip netns exec "$NETSIM_NS_CLIENT" ip -j link show dev "$vc" >"$out/client-link.json" || return 1
+    ip netns exec "$NETSIM_NS_SERVER" ip -j link show dev "$vs" >"$out/server-link.json" || return 1
+    ip netns exec "$NETSIM_NS_CLIENT" tc -j -s qdisc show dev "$vc" >"$out/client-qdisc.json" || return 1
+    ip netns exec "$hop" tc -j -s qdisc show >"$out/hop-qdisc.json" || return 1
+    ip netns exec "$hop" tc -j -s filter show dev "$(netsim_veth_hop_cli "$slot")" parent ffff: >"$out/police.json" || return 1
+    ip netns exec "$hop" iptables-save >"$out/iptables.txt" || return 1
+    ip netns exec "$hop" sysctl net.netfilter.nf_conntrack_udp_timeout net.netfilter.nf_conntrack_udp_timeout_stream >"$out/nat-timeouts.txt" || return 1
 }

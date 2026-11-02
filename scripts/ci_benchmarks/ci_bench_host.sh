@@ -292,6 +292,7 @@ _cb_host_softirq_storm() {
 ci_bench_host_start() {
     local state="${1:-healthy}" tier="${2:-}"
     _CB_HOST_PIDS=""
+    export CI_BENCH_HOST_APPLIED=yes
 
     case "$state" in
         healthy)
@@ -302,7 +303,8 @@ ci_bench_host_start() {
             if [ -z "$cpus" ]; then
                 echo "  [host] no CPU outside tier '${tier:-none}';" \
                     "skipping neighbour load" >&2
-                return 0
+                export CI_BENCH_HOST_APPLIED=no
+                return 1
             fi
             _cb_host_burn "$cpus" 2
             ;;
@@ -320,21 +322,48 @@ ci_bench_host_start() {
             # throttle that lands on an already-running transfer.
             ;;
         *)
-            echo "  [host] unknown state '$state', running healthy" >&2
+            echo "  [host] unknown state '$state'" >&2
+            export CI_BENCH_HOST_APPLIED=no
+            return 1
             ;;
     esac
+    if [ -n "$_CB_HOST_PIDS" ]; then
+        sleep .2
+        local pid
+        for pid in $_CB_HOST_PIDS; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                export CI_BENCH_HOST_APPLIED=no
+                return 1
+            fi
+        done
+    fi
 }
 
 ci_bench_host_stop() {
     local p
+    # Snapshot only our recorded parents and descendants before killing the
+    # parents. A global stress-ng pkill would terminate unrelated workloads.
+    python3 - $_CB_HOST_PIDS <<'PY'
+from pathlib import Path
+import os, signal, sys
+pending = [int(p) for p in sys.argv[1:]]
+owned = set()
+while pending:
+    pid = pending.pop()
+    if pid in owned: continue
+    owned.add(pid)
+    try:
+        pending += [int(p) for p in Path(f'/proc/{pid}/task/{pid}/children').read_text().split()]
+    except OSError: pass
+for pid in sorted(owned, reverse=True):
+    try: os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError: pass
+PY
     for p in $_CB_HOST_PIDS; do
         kill "$p" 2>/dev/null || true
         wait "$p" 2>/dev/null || true
     done
     _CB_HOST_PIDS=""
-
-    # stress-ng forks workers that outlive the parent's SIGTERM.
-    pkill -f "stress-ng" 2>/dev/null || true
 
     ip netns del "$_CB_NOISE_NS_A" 2>/dev/null || true
     ip netns del "$_CB_NOISE_NS_B" 2>/dev/null || true

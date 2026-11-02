@@ -4,6 +4,12 @@
 # Real iperf3 JSON/schema integration, independent of a VPN build. Needs root.
 set -euo pipefail
 source "$(dirname "$0")/../scripts/ci_benchmarks/ci_bench_env.sh"
+[ "$(ci_bench_config_bool on)" = true ]
+[ "$(ci_bench_config_bool off)" = false ]
+if ci_bench_config_bool invalid >/dev/null 2>&1; then exit 1; fi
+echo 'PASS arm booleans use the actual config grammar'
+[ "$(python3 -c 'import os; print(os.environ["CI_BENCH_SCHEDULER"])')" = "$CI_BENCH_SCHEDULER" ]
+echo 'PASS child metadata sees the configured scheduler'
 work="$(mktemp -d)"
 NS_SERVER="bench-harness-$$"
 NS_CLIENT="$NS_SERVER"

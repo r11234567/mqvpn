@@ -19,7 +19,7 @@ on:
       netsim_modes:
         description: >-
           Comma-separated netsim modes to narrow to (e.g. "classes,sched,tiers").
-          Leave EMPTY for the full set of 14, which is what the schedule runs and
+          Leave EMPTY for the full set of 15, which is what the schedule runs and
           what any conclusion about coverage needs.
         required: false
         default: ''
@@ -42,12 +42,10 @@ on:
         default: false
       arms:
         description: >-
-          A/B arms, run as parallel matrix jobs in THIS one dispatch so every
-          side is measured against the same code on the same day — which is the
-          only way these numbers compare, since they move several percent
-          between runs. Comma-separated, from: default, reorder_on, reorder_off,
-          streams4, streams16, streams64. Empty means "default" only. Cells =
-          modes x arms, so pick modes too if you pick several arms.
+          Optional parallel arms: default, reorder_on, reorder_off, streams4,
+          streams16, streams64. Separate jobs can use different physical VMs;
+          those comparisons are observational. MTU and game comparisons run
+          paired serial arms on the same VM regardless of this input.
         required: false
         default: ''
       wlb_instr:
@@ -58,7 +56,7 @@ on:
           paths, was the limit), stopped with capacity still available on some
           path (so the scheduler declined it), or stopped with everything
           blocked. Raises both ends' log level to info; both are once-a-second
-          aggregates, so this does not move the throughput being measured.
+          aggregates; logging cost must still be measured before comparing arms.
         required: false
         type: boolean
         default: false
@@ -78,11 +76,8 @@ on:
       iperf_streams:
         description: >-
           Inner TCP streams per sample (CI_BENCH_IPERF_STREAMS). Empty keeps the
-          harness default of 4. The core suite's own sweep shows the aggregation
-          gain is a function of this and is the same for WLB and MinRTT (~0% at
-          4 streams, +15-25% at 16-64), so 4 is why the netsim rows read as a
-          scheduler failure. Raise it to test that reading. Changing it changes
-          what is measured, so do not compare such a run against the series.
+          harness default of 4. Stream count changes aggregation and fairness;
+          use 1/4/16/64 in the core sweep and compare matching configurations.
         required: false
         default: ''
 
@@ -121,7 +116,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3 netcat-openbsd \
+          sudo apt-get install -y cmake libevent-dev libssl-dev pkg-config golang iptables iproute2 iperf3 netcat-openbsd \
             conntrack stress-ng
 
       - name: Compute xquic SHA
@@ -177,6 +172,7 @@ jobs:
           make -j$(nproc)
 
       - name: Build mqvpn (Release)
+        id: benchmark-build
         run: |
           mkdir -p build && cd build
           cmake -DCMAKE_BUILD_TYPE=Release \
@@ -186,34 +182,44 @@ jobs:
       # --- Core benchmarks (same as push-to-main) ---
 
       - name: Raw throughput benchmark (TCP DL+UL)
+        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_raw_throughput.sh --full build/mqvpn
 
       - name: Failover benchmark (WLB + MinRTT)
+        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_failover.sh build/mqvpn
 
       - name: Aggregation benchmark (WLB + MinRTT)
+        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_aggregate.sh build/mqvpn
 
       # --- Extended benchmarks (weekly only) ---
 
       - name: Multipath scheduler benchmark (8 scenarios)
+        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_multipath_scheduler.sh build/mqvpn
 
       - name: UDP rate sweep benchmark
+        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_udp_sweep.sh build/mqvpn
 
       - name: NTN satellite benchmark
+        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_ntn.sh build/mqvpn
 
       - name: Backup FEC scheduler benchmark (lossy primary sweep)
+        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_backup_fec.sh build/mqvpn
 
+      - name: Make bench artifacts readable by the runner
+        if: always()
+        run: if [ -d ci_bench_results ]; then sudo chown -R "$(id -u):$(id -g)" ci_bench_results; fi
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: perf-weekly-${{ github.sha }}
-          path: ci_bench_results/*.json
+          path: ci_bench_results/
           retention-days: 90
 
       - name: Publish results to R2
@@ -239,7 +245,7 @@ jobs:
   # Builds the netsim matrix as modes x arms. A static matrix can be neither
   # narrowed nor doubled by an input, and both are wanted:
   #
-  #   - The full 14 modes are the default, because a conclusion about coverage
+  #   - The full 15 modes are the default, because a conclusion about coverage
   #     needs all of them. `netsim_modes` only narrows, and only on a dispatch.
   #   - `arms` runs the same modes twice in ONE dispatch, as parallel jobs. An
   #     A/B done as two dispatches is not just slower, it is weaker: these
@@ -261,6 +267,7 @@ jobs:
 
           # Kept in step with the comments on each mode below.
           modes = [
+              {"id": "paths",       "args": "paths"},
               {"id": "classes",     "args": "classes"},
               {"id": "combo",       "args": "combo"},
               {"id": "special",     "args": "special"},
@@ -343,7 +350,7 @@ jobs:
     # tunnel wait runs to its cap, which leaves no headroom at 60. Partial
     # results now survive a cancellation, but the tail of the mode still would
     # not.
-    timeout-minutes: 90
+    timeout-minutes: 180
     strategy:
       fail-fast: false   # one bad scenario must not hide the other five
       # Built by netsim-select so a dispatch can narrow it; the mode list and
@@ -393,7 +400,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libevent-dev golang iptables iproute2 iperf3 netcat-openbsd \
+          sudo apt-get install -y cmake libevent-dev libssl-dev pkg-config golang iptables iproute2 iperf3 netcat-openbsd \
             conntrack stress-ng
 
       - name: Compute xquic SHA
@@ -442,6 +449,7 @@ jobs:
           make -j$(nproc)
 
       - name: Build mqvpn (Release)
+        id: benchmark-build
         run: |
           mkdir -p build && cd build
           cmake -DCMAKE_BUILD_TYPE=Release \
@@ -458,7 +466,7 @@ jobs:
       # build_picoquic.sh does not generate them -- caching the binary alone
       # would restore a tree whose server cannot start.
       - name: Cache picoquic
-        if: matrix.id == 'quic'
+        if: startsWith(matrix.id, 'quic')
         id: picoquic-cache
         uses: actions/cache@v6
         with:
@@ -466,18 +474,21 @@ jobs:
           key: picoquic-${{ hashFiles('scripts/ci_interop/build_picoquic.sh') }}-linux-v1
 
       - name: Build picoquic
-        if: matrix.id == 'quic' && steps.picoquic-cache.outputs.cache-hit != 'true'
+        if: startsWith(matrix.id, 'quic') && steps.picoquic-cache.outputs.cache-hit != 'true'
         run: bash scripts/ci_interop/build_picoquic.sh
 
       - name: Scenario ${{ matrix.id }}
-        run: sudo -E bash scripts/ci_benchmarks/ci_bench_scenarios.sh ${{ matrix.args }} build/mqvpn
+        run: sudo -E bash scripts/ci_benchmarks/ci_bench_paired.sh ${{ matrix.args }} build/mqvpn
 
+      - name: Make bench artifacts readable by the runner
+        if: always()
+        run: if [ -d ci_bench_results ]; then sudo chown -R "$(id -u):$(id -g)" ci_bench_results; fi
       - name: Upload scenario results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: netsim-${{ matrix.id }}
-          path: ci_bench_results/*.json
+          path: ci_bench_results/
           retention-days: 90
 
   # Does the subtraction the arms were run for, in the run that produced them.

@@ -36,12 +36,30 @@ class NetsimTests(unittest.TestCase):
         self.assertFalse(doc["harness_valid"])
 
     def test_quic_substatus_and_repeats_are_required(self):
-        row = {"status": "ok", "quic_goodput_mbps": 100, "quic_status": "ok", "quic_samples": 3}
+        row = {"status": "ok", "quic_goodput_mbps": 100, "quic_status": "ok", "quic_samples": 3,
+               "quic_baselines": [{"phase": p, "status": "ok", "goodput_mbps": 50}
+                                  for p in ("direct_a", "solo_a", "solo_b") for _ in range(3)]}
         self.assertTrue(netsim.classify(row, "quic")["measurement_complete"])
         for status, count in (("quic_no_goodput", 0), ("ok", 1), ("quic_partial_failure", 2)):
             with self.subTest(status=status):
                 bad = dict(row, quic_status=status, quic_samples=count)
                 self.assertFalse(netsim.classify(bad, "quic")["measurement_complete"])
+
+    def test_quic_same_protocol_baselines_are_mandatory(self):
+        row = {"status": "ok", "quic_goodput_mbps": 100, "quic_status": "ok", "quic_samples": 3}
+        self.assertFalse(netsim.classify(row, "quic")["measurement_complete"])
+
+    def test_quic_repeat_count_is_self_describing_on_replay(self):
+        row = {"status": "ok", "quic_goodput_mbps": 100, "quic_status": "ok", "quic_samples": 1,
+               "quic_attempts": 1, "quic_baselines": [{"phase": p, "status": "ok", "goodput_mbps": 50}
+                   for p in ("direct_a", "solo_a", "solo_b")]}
+        self.assertTrue(netsim.classify(row, "quic")["measurement_complete"])
+        row['quic_baselines'] = [None]
+        self.assertFalse(netsim.classify(row, "quic")["measurement_complete"])
+
+    def test_path_scaling_manifest(self):
+        self.assertEqual([r['scenario'] for r in netsim.expected_rows('paths')],
+                         ['paths_1', 'paths_2', 'paths_4', 'paths_8'])
 
     def test_invalid_phase_is_null_not_zero_and_ratios_are_inconclusive(self):
         row = dict(pair(), status="a=ok b=measurement_incomplete mp=ok", solo_b_mbps=0)

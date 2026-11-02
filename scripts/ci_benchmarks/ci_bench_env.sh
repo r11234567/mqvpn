@@ -44,6 +44,7 @@ CI_BENCH_LOG_LEVEL="${CI_BENCH_LOG_LEVEL:-error}"
 # Stable across command substitutions; every sample retains its raw evidence.
 CI_BENCH_RAW_DIR="${CI_BENCH_RAW_DIR:-${CI_BENCH_RESULTS}/raw/$(date -u +%Y%m%d_%H%M%S)-$$}"
 CI_BENCH_RESULT_TOOL="${CI_BENCH_DIR}/ci_bench_results.py"
+export CI_BENCH_COMMIT CI_BENCH_RAW_DIR CI_BENCH_SCHEDULER
 
 # WLB scheduler instrumentation. With this set to 1 both ends run at
 # --log-level info and their output is captured, so the once-a-second
@@ -73,6 +74,14 @@ CI_BENCH_SERVER_LOG_MARK=0
 # across arms of an A/B inside a single run (see CI_BENCH_REORDER in
 # ci_bench_scenarios.sh) without a second workflow dispatch.
 CI_BENCH_CONFIG_FILE="${CI_BENCH_CONFIG_FILE:-}"
+
+ci_bench_config_bool() {
+    case "$1" in
+        on|true) printf 'true\n' ;;
+        off|false) printf 'false\n' ;;
+        *) echo "invalid boolean arm: $1" >&2; return 2 ;;
+    esac
+}
 
 # Byte offset of the server log at the start of the current measurement, so a
 # reader can skip the earlier measurements' counters. No-op when the log is not
@@ -120,10 +129,23 @@ ci_bench_check_deps() {
 
 # ── Stale state cleanup (run before setup) ──
 
+# A network namespace does not isolate /proc or pkill. Enumerate its actual
+# members, optionally matching comm, so another harness cannot be killed.
+ci_bench_kill_ns_processes() {
+    local ns="$1" comm="${2:-}" pid actual
+    for pid in $(ip netns pids "$ns" 2>/dev/null); do
+        actual="$(cat "/proc/$pid/comm" 2>/dev/null)" || continue
+        [ -z "$comm" ] || [ "$actual" = "$comm" ] || continue
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+}
+
 ci_bench_cleanup_stale() {
-    pkill -f "mqvpn.*ci-bench" 2>/dev/null || true
-    ip netns exec "$NS_SERVER" pkill -f "iperf3" 2>/dev/null || true
-    ip netns exec "$NS_CLIENT" pkill -f "iperf3" 2>/dev/null || true
+    ci_bench_kill_ns_processes "$NS_SERVER"
+    ci_bench_kill_ns_processes "$NS_CLIENT"
+    ci_bench_kill_ns_processes "$NS_SERVER" iperf3
+    ci_bench_kill_ns_processes "$NS_CLIENT" iperf3
     ip netns del "$NS_SERVER" 2>/dev/null || true
     ip netns del "$NS_CLIENT" 2>/dev/null || true
     ip link del "$VETH_A0" 2>/dev/null || true
@@ -505,7 +527,7 @@ ci_bench_run_iperf() {
         sleep 0.5
     done
 
-    ip netns exec "$NS_SERVER" iperf3 -s -B "$_cb_iperf_target" -1 &>/dev/null &
+    ip netns exec "$NS_SERVER" iperf3 -s -p "$IPERF3_PORT" -B "$_cb_iperf_target" -1 &>/dev/null &
     local iperf_srv_pid=$!
 
     for (( i=0; i<20; i++ )); do
@@ -514,7 +536,7 @@ ci_bench_run_iperf() {
         sleep 0.5
     done
 
-    local args="-c $_cb_iperf_target -t $duration -P $parallel --json"
+    local args="-c $_cb_iperf_target -p $IPERF3_PORT -t $duration -P $parallel --json"
     [ "$proto" = "UDP" ] && args="$args -u"
     [ -n "$target_bw" ] && args="$args -b $target_bw"
     [ "$dir" = "DL" ] && args="$args -R"
@@ -635,8 +657,8 @@ ci_bench_cleanup() {
     _CB_CLIENT_PID=""
     _CB_SERVER_PID=""
 
-    ip netns exec "$NS_SERVER" pkill -f "iperf3" 2>/dev/null || true
-    ip netns exec "$NS_CLIENT" pkill -f "iperf3" 2>/dev/null || true
+    ci_bench_kill_ns_processes "$NS_SERVER" iperf3
+    ci_bench_kill_ns_processes "$NS_CLIENT" iperf3
     sleep 1
 
     ip netns exec "$NS_CLIENT" tc qdisc del dev "$VETH_A0" root 2>/dev/null || true

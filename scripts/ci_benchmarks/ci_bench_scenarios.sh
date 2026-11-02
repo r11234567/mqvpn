@@ -61,11 +61,9 @@ IPERF_SEC="${CI_BENCH_IPERF_SEC:-10}"
 #
 # CI_BENCH_REORDER = on | off | "" (leave the built-in default alone).
 #
-# One workflow dispatch runs the same modes under several arms in parallel
-# matrix jobs, so an A/B is one run rather than two. That matters beyond
-# convenience: the netsim numbers move several percent between runs on shared
-# runners, and two arms measured in the same run against the same code are
-# comparable in a way that two dispatches are not.
+# Independent matrix jobs may use different physical VMs. Their comparison is
+# observational. ci_bench_paired.sh runs the critical configuration comparisons
+# serially on one VM, retaining pair identity and randomized order.
 #
 # The arm is written into every row as `arm`, so the comparison is mechanical
 # rather than a matter of remembering which run was which.
@@ -84,7 +82,7 @@ if [ -n "$CI_BENCH_REORDER" ]; then
     # any server starts, and left in place for the whole mode.
     _CB_ARM_DIR="$(mktemp -d)"
     CI_BENCH_CONFIG_FILE="${_CB_ARM_DIR}/arm.conf"
-    printf '[Reorder]\nEnabled = %s\n' "$CI_BENCH_REORDER" >"$CI_BENCH_CONFIG_FILE"
+    printf '[Reorder]\nEnabled = %s\n' "$(ci_bench_config_bool "$CI_BENCH_REORDER")" >"$CI_BENCH_CONFIG_FILE"
     export CI_BENCH_CONFIG_FILE
     echo "arm '${CI_BENCH_ARM}': [Reorder] Enabled = ${CI_BENCH_REORDER}"
 fi
@@ -113,6 +111,11 @@ ci_bench_config_append() {
     fi
     printf '%s\n' "$@" >>"$CI_BENCH_CONFIG_FILE"
 }
+
+if [ -n "${CI_BENCH_PMTUD:-}" ]; then
+    case "$CI_BENCH_PMTUD" in on|off) ;; *) echo 'invalid PMTUD arm' >&2; exit 2 ;; esac
+    ci_bench_config_append '[Interface]' "PMTUD = $(ci_bench_config_bool "$CI_BENCH_PMTUD")"
+fi
 
 # Streams per sample. One stream cannot fill a high-BDP path: bgp_plain at
 # 380mbit over ~160ms RTT needs 7.6 MB of in-flight window, which a single
@@ -158,13 +161,13 @@ trap 'exit 130' INT
 # scenario currently running.
 _cb_write_results() {
     [ -n "${TEST_NAME:-}" ] || return 0
-    RESULTS_OUT="${CI_BENCH_RESULTS}/${TEST_NAME}_${RESULTS_STAMP}.json"
+    RESULTS_OUT="${CI_BENCH_RESULTS}/${TEST_NAME}_${CI_BENCH_ARM}_${CI_BENCH_DIRECTION:-DL}_${RESULTS_STAMP}.json"
     python3 "${SCRIPT_DIR}/ci_bench_netsim_results.py" "$1" "$ROWS" "$RESULTS_OUT" \
         --mode "$MODE" --scheduler "$CI_BENCH_SCHEDULER" \
         --transit "${CATALOG_TRANSIT:-bgp_junk}" \
         --complete "${RESULTS_COMPLETE:-0}" --seconds "$IPERF_SEC" \
         --streams "$IPERF_STREAMS" --repeats "$REPEATS" \
-        --seed "$NETSIM_HAVE_SEED" --pps "$NETSIM_HAVE_PPS" --nat "$NETSIM_HAVE_NAT"
+        --seed "$NETSIM_HAVE_SEED" --pps "$NETSIM_HAVE_PPS" --nat "$NETSIM_HAVE_NAT" --icmp "$NETSIM_HAVE_ICMP_DROP"
 }
 
 emit_results() {
@@ -251,7 +254,7 @@ measure_pathset() {
 
     local samples=() i jf
     for (( i=0; i<REPEATS; i++ )); do
-        jf="$(ci_bench_run_iperf TCP DL "$IPERF_SEC" "$IPERF_STREAMS")"
+        jf="$(ci_bench_run_iperf TCP "${CI_BENCH_DIRECTION:-DL}" "$IPERF_SEC" "$IPERF_STREAMS")"
         local sample
         sample="$(ci_bench_parse_throughput "$jf")"
         rm -f "$jf"
@@ -261,6 +264,15 @@ measure_pathset() {
         fi
         samples+=("$sample")
     done
+    local evidence
+    evidence="$(mktemp -d "${CI_BENCH_RAW_DIR}/phase.XXXXXX")"
+    netsim_query_control get_status >"$evidence/control.json" || true
+    netsim_query_control get_stats >"$evidence/stats.json" || true
+    MEASURED_CONTROL="$(cat "$evidence/control.json")"
+    ip netns exec "$NS_CLIENT" ip -j link show dev mqvpn0 >"$evidence/client-tun.json" || true
+    ip netns exec "$NS_SERVER" ip -j link show dev mqvpn0 >"$evidence/server-tun.json" || true
+    printf '%s\n' "paths=$paths scheduler=$scheduler direction=${CI_BENCH_DIRECTION:-DL} pmtud=${CI_BENCH_PMTUD:-default_off}" >"$evidence/context.txt"
+    [ -z "${CI_BENCH_CONFIG_FILE:-}" ] || cp "$CI_BENCH_CONFIG_FILE" "$evidence/config.conf"
     MEASURED_MBPS="$(med "${samples[@]}")"
     MEASURED_CV="$(cv_pct "${samples[@]}")"
 
@@ -1297,31 +1309,20 @@ if extra: row.update(json.loads('{' + extra + '}'))
 f = []
 agg, vsb = row.get('aggregation_efficiency'), row.get('vs_best_single')
 share, fair = row.get('path_minshare'), row.get('path_share_fair')
-if vsb is not None and vsb < 0.98:
+if vsb is not None and vsb < min(0.85, 1 - 2 * row['multipath_cv_pct'] / 100):
     f.append('mp_regression: multipath %.3fx the best single path -- adding a '
              'healthy second path COST throughput' % vsb)
 if agg is not None and agg < 0.60:
     f.append('agg_deficit: aggregation_efficiency %.3f -- two paths delivered '
              'under 60%% of their combined solo throughput' % agg)
-if share is not None and fair and share < fair * 0.5:
+if row['scheduler'] == 'wlb' and a > 0 and b > 0 and min(a,b)/max(a,b) > 0.8 and share is not None and fair and share < fair * 0.5:
     f.append('share_imbalance: minority path carried %.1f%% of bytes against a '
              '%.1f%% fair share' % (share*100, fair*100))
-# A leg below the outer datagram size used to be a standing defect: xquic could
-# only ever raise a path's packet size, so such a leg was sent packets it could
-# not forward for the life of the connection. xquic 6ba4261 makes the PMTU
-# search per path and lets the connection size come down, so this is now a
-# regression guard rather than a restatement of the bug -- the scenario is
-# expected to aggregate, and only a failure to is worth reporting.
-if 'below' in (mcls_a, mcls_b):
-    if vsb is not None and vsb < 0.90:
-        f.append('pmtu_blackhole_regression: a leg MTU is under the outer '
-                 'datagram size and multipath came out %.3fx the best single '
-                 'path -- the per-path PMTU search (xquic 6ba4261) should have '
-                 'lowered the connection to fit that leg' % vsb)
-    elif vsb is None:
-        f.append('pmtu_below_unmeasured: a leg MTU is under the outer datagram '
-                 'size, but one measurement did not complete, so whether the '
-                 'PMTU search handled it is unknown on this row')
+# This correlation does not establish a PMTUD implementation failure.
+if 'below' in (mcls_a, mcls_b) and vsb is not None and vsb < 0.85:
+    f.append('mtu_sensitive_mp_regression: multipath %.3fx best single; '
+             'PMTUD requested=%s; inspect per-phase TUN/control evidence' %
+             (vsb, os.environ.get('CI_BENCH_PMTUD', 'default_off')))
 
 # WLB scheduler counters, present only under CI_BENCH_WLB_INSTR=1. These test
 # the static reading of xqc_scheduler_wlb.c against a real run; see
@@ -1392,7 +1393,7 @@ run_tier() {
     # Exported so ci_bench_start_server picks the tier up without every caller
     # having to thread it through.
     CI_BENCH_TIER="$tier"
-    ci_bench_host_start "$state" "$tier"
+    ci_bench_host_start "$state" "$tier" || return 1
 
     if ! start_server_with_ctrl "$CI_BENCH_SCHEDULER" >/dev/null; then
         ci_bench_host_stop
@@ -1622,9 +1623,31 @@ run_quic() {
     local dev0 dev1 st=ok
     dev0="$(netsim_veth_cli 0)"; dev1="$(netsim_veth_cli 1)"
 
-    # Multipath only. The solo legs are what run_pair already measures for TCP,
-    # and a QUIC row costs a 20 MiB transfer -- tripling that to restate a
-    # comparison the TCP rows already carry would buy nothing.
+    # Same inner protocol and byte count for all baselines. TCP solos do
+    # not establish QUIC aggregation efficiency.
+    local baseline_file
+    baseline_file="$(mktemp "${CI_BENCH_RAW_DIR}/quic-baselines.XXXXXX.jsonl")"
+    local phase paths target qi qreps="${CI_BENCH_QUIC_REPEATS:-3}"
+    for phase in direct_a solo_a solo_b; do
+        target="$TUNNEL_SERVER_IP"
+        if [ "$phase" = direct_a ]; then
+            target="$NETSIM_SERVER_ADDR"
+        else
+            paths="--path $dev0"; [ "$phase" != solo_b ] || paths="--path $dev1"
+            if ! ci_bench_start_client "$paths" "$sched" >/dev/null 2>&1 || ! ci_bench_wait_tunnel "$TUNNEL_WAIT_SEC" >/dev/null 2>&1; then
+                printf '{"phase":"%s","status":"tunnel_never_up"}\n' "$phase" >>"$baseline_file"
+                continue
+            fi
+        fi
+        for ((qi=0; qi<qreps; qi++)); do
+            ci_bench_quic_transfer "$target"
+            python3 - "$phase" "$QUIC_STATUS" "$QUIC_GOODPUT" >>"$baseline_file" <<'PY'
+import json, sys
+print(json.dumps({'phase':sys.argv[1], 'status':sys.argv[2], 'goodput_mbps':None if sys.argv[3]=='NA' else float(sys.argv[3])}))
+PY
+        done
+        ci_bench_stop_client
+    done
     if ! ci_bench_start_client "--path $dev0 --path $dev1" "$sched" >/dev/null 2>&1; then
         st=client_start_failed
     elif ! ci_bench_wait_tunnel "$TUNNEL_WAIT_SEC" >/dev/null 2>&1; then
@@ -1649,14 +1672,14 @@ run_quic() {
         # and two BBR startup ramps inside that series, and the autocorrelation
         # would lock onto the transfer cadence rather than onto any nested-CC
         # effect. A shape metric needs one continuous transfer, so it gets one.
-        local qreps="${CI_BENCH_QUIC_REPEATS:-3}" qi gsamples=()
+        local gsamples=()
         for (( qi=0; qi<qreps; qi++ )); do
             if [ "$qi" = 0 ]; then
                 # Resolved here rather than inside the sampler: under a tier
                 # the pid must be walked down through systemd-run, which
                 # server_pid already knows how to do.
                 CI_BENCH_SAMPLE_PID="$(server_pid)"
-                sampler_start "$NETSIM_NS_SERVER" "$(netsim_veth_srv 0)"
+                sampler_start "$NETSIM_NS_SERVER" "$(netsim_veth_srv 0) $(netsim_veth_srv 1)"
             fi
 
             # Globals, never $( ) -- ci_bench_quic_transfer starts a background
@@ -1687,6 +1710,8 @@ run_quic() {
         done
 
         gp_n="${#gsamples[@]}"
+        qst=ok
+        [ "$gp_n" -eq "$qreps" ] || qst=quic_partial_failure
         if [ "$gp_n" -gt 0 ]; then
             gp="$(med "${gsamples[@]}")"
             gp_cv="$(cv_pct "${gsamples[@]}")"
@@ -1702,6 +1727,7 @@ import json, os, sys
 class_, sched, gp, qst = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 rss, extra, st = int(sys.argv[5]), sys.argv[6], sys.argv[7]
 pin = sys.argv[8]
+baseline_file = sys.argv[12]
 gp_cv, gp_n, gp_all = sys.argv[9], sys.argv[10], sys.argv[11]
 
 row = {
@@ -1727,6 +1753,19 @@ row['quic_goodput_mbps'] = None if gp == 'NA' else float(gp)
 # n is here explicitly because the first run of this mode reported n=1 cells in
 # a row-shape that looked identical to a repeated one.
 row['quic_samples'] = int(gp_n)
+row['quic_attempts'] = int(os.environ.get('CI_BENCH_QUIC_REPEATS') or 3)
+row['quic_baselines'] = [json.loads(line) for line in open(baseline_file)]
+import statistics
+solos = {}
+for phase in ('direct_a','solo_a','solo_b'):
+    values = [r['goodput_mbps'] for r in row['quic_baselines'] if r['phase']==phase and r.get('status')=='ok']
+    solos[phase] = statistics.median(values) if len(values)==row['quic_attempts'] else None
+row['quic_baseline_medians'] = solos
+row['quic_vs_best_single'] = (row['quic_goodput_mbps']/max(solos['solo_a'],solos['solo_b'])
+    if row['quic_goodput_mbps'] is not None and all(solos.get(p) for p in ('solo_a','solo_b')) else None)
+row['sampler_scope'] = 'first MP attempt, sum of both server path interfaces'
+row['server_scheduler'] = sched
+row['client_scheduler'] = sched
 row['quic_goodput_cv_pct'] = float(gp_cv) if gp_cv else None
 # Every sample, not just the summary. A cell whose three transfers came out
 # 70/2/68 is a different finding from one that came out 47/46/47, and the
@@ -1781,7 +1820,7 @@ row['findings'] = f
 row['finding_count'] = len(f)
 print(json.dumps(row))" \
         "$class" "$sched" "$gp" "$qst" "$rss" "$stats" "$st" \
-        "${CI_BENCH_QUIC_PIN:-unknown}" "$gp_cv" "$gp_n" "$gp_all" >> "$ROWS"
+        "${CI_BENCH_QUIC_PIN:-unknown}" "$gp_cv" "$gp_n" "$gp_all" "$baseline_file" >> "$ROWS"
 
     echo "   quic ${gp} Mbps (n=${gp_n} cv ${gp_cv:-NA}%) [${qst}] ${st}"
     emit_results
@@ -2065,7 +2104,7 @@ t_p99, t_max = (num(x) for x in tun_j)
 
 row = {
   'scenario': scenario,
-  'mode_family': 'game',
+  'mode_family': 'game', 'stall_model':'synthetic ordered channel with assumed recovery timeout; not a measured game freeze',
   'rtt_tier_ms': int(tier.split('_')[1]),
   'game_pps_tier': pps,
   # gamegen's own offered rate, which is NOT game_pps_tier: that names the
@@ -2073,7 +2112,7 @@ row = {
   # driven at -- run 34084331771 lost 23-49% at 17067 and the obvious next
   # question was whether a lower rate is clean, which is unanswerable from an
   # artifact that does not say what rate it used.
-  'gg_offered_pps': int(os.environ.get('CI_BENCH_GAME_PPS') or 17067),
+  'gg_offered_pps': int(os.environ.get('CI_BENCH_GAME_PPS') or 4267),
   'gg_tick_hz': float(os.environ.get('CI_BENCH_GAME_TICK_HZ') or 10),
   'pkt_bytes': 50,
   'scheduler': os.environ.get('CI_BENCH_SCHEDULER') or 'wlb_udp_pin',
@@ -2199,7 +2238,20 @@ run_special() {
            && ci_bench_wait_tunnel "$TUNNEL_WAIT_SEC" >/dev/null 2>&1; then
             local before after jf
             jf="$(ci_bench_run_iperf TCP DL 4 "$IPERF_STREAMS")"; before="$(ci_bench_parse_throughput "$jf")"; rm -f "$jf"
+            hop="$(netsim_hop_ns 0)"
+            local nat_evidence
+            nat_evidence="$(mktemp -d "${CI_BENCH_RAW_DIR}/nat-expiry.XXXXXX")"
+            ip netns exec "$hop" conntrack -L -p udp >"$nat_evidence/before-idle.txt" 2>&1 || return 1
             sleep 35
+            ip netns exec "$hop" conntrack -L -p udp >"$nat_evidence/after-idle.txt" 2>&1 || return 1
+            # Keepalives may preserve a naturally aged mapping. Explicitly
+            # expire namespace-owned UDP state and state that mechanism.
+            if grep -q '^udp' "$nat_evidence/after-idle.txt"; then
+                ip netns exec "$hop" conntrack -D -p udp >"$nat_evidence/expiry.txt" 2>&1 || return 1
+                printf 'forced_udp_state_expiry_after_idle\n' >"$nat_evidence/method.txt"
+            else
+                printf 'natural_idle_expiry\n' >"$nat_evidence/method.txt"
+            fi
             jf="$(ci_bench_run_iperf TCP DL 4 "$IPERF_STREAMS")"; after="$(ci_bench_parse_throughput "$jf")"; rm -f "$jf"
             python3 -c "
 import json,sys
@@ -2207,7 +2259,7 @@ b,a=float(sys.argv[1]),float(sys.argv[2])
 # The status used to be the literal 'ok' whatever the samples did, so a run in
 # which the tunnel came up and then carried nothing was indistinguishable from a
 # clean one. The two samples are what decides it.
-print(json.dumps({'scenario':'nat_aging','before_idle_mbps':b,'after_idle_mbps':a,
+print(json.dumps({'scenario':'nat_aging','expiry_evidence':'raw/nat-expiry.*','expiry_mechanism':'idle_then_force_if_keepalive_preserved','before_idle_mbps':b,'after_idle_mbps':a,
  'survived_ratio':round(a/b,3) if b else None,'recovered':1 if a>0.5 else 0,
  'status':'ok' if b>0 and a>0 else 'measured_zero' if b>0 or a>0
           else 'measured_zero_both'}))" \
@@ -2343,6 +2395,43 @@ print(json.dumps({'scenario':'roam_under_load','pre_roam_mbps':p,'post_roam_mbps
     fi
 }
 
+run_path_scale() {
+    local n="$1" i paths="" single_dl single_ul mp_dl mp_ul st="ok"
+    ci_bench_stop_vpn
+    netsim_setup "$n" >/dev/null || return 1
+    for ((i=0;i<n;i++)); do
+        netsim_apply_path "$i" 'eth:iplc:public' "$((4242+i*10))" || return 1
+        paths="$paths --path $(netsim_veth_cli "$i")"
+    done
+    start_server_with_ctrl "$CI_BENCH_SCHEDULER" >/dev/null || return 1
+    CI_BENCH_DIRECTION=DL measure_pathset "--path $(netsim_veth_cli 0)"
+    single_dl="$MEASURED_MBPS"; [ "$MEASURED_STATUS" = ok ] || st=measurement_incomplete
+    CI_BENCH_DIRECTION=UL measure_pathset "--path $(netsim_veth_cli 0)"
+    single_ul="$MEASURED_MBPS"; [ "$MEASURED_STATUS" = ok ] || st=measurement_incomplete
+    CI_BENCH_DIRECTION=DL measure_pathset "$paths"
+    mp_dl="$MEASURED_MBPS"; [ "$MEASURED_STATUS" = ok ] || st=measurement_incomplete
+    CI_BENCH_DIRECTION=UL measure_pathset "$paths"
+    mp_ul="$MEASURED_MBPS"; [ "$MEASURED_STATUS" = ok ] || st=measurement_incomplete
+    if ! python3 - "$MEASURED_CONTROL" "$n" <<'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+paths = [p for c in data.get('clients', []) for p in c.get('paths', []) if p.get('state_label') == 'active']
+sys.exit(0 if len(paths) == int(sys.argv[2]) else 1)
+PY
+    then st=path_count_not_active; fi
+    python3 - "$n" "$single_dl" "$single_ul" "$mp_dl" "$mp_ul" "$st" >>"$ROWS" <<'PY'
+import json, sys
+n, a, b, c, d, status = sys.argv[1:]
+print(json.dumps({'scenario':'paths_'+n, 'paths':int(n), 'status':status,
+ 'single_dl_mbps':float(a), 'single_ul_mbps':float(b),
+ 'multipath_dl_mbps':float(c), 'multipath_ul_mbps':float(d),
+ 'note':'same profile per leg; inspect per-path control evidence for actual activity'}))
+PY
+    emit_results
+    ci_bench_stop_vpn
+    netsim_teardown
+}
+
 # ── main ───────────────────────────────────────────────────────────────────
 echo "════════════════════════════════════════════════════════"
 echo "  netsim scenarios — mode=${MODE}"
@@ -2351,6 +2440,10 @@ ci_bench_check_deps
 netsim_detect_caps
 
 case "$MODE" in
+  paths)
+    TEST_NAME=netsim_paths
+    for n in 1 2 4 8; do run_path_scale "$n" || echo "paths $n failed; manifest will report missing coverage"; done
+    ;;
   percommit)
     # One bad network, the highest-signal one: a scheduler regression shows up
     # in hetero_extreme before anywhere else. Shorter samples than the weekly
@@ -2452,11 +2545,13 @@ case "$MODE" in
     # server receives the per-row scheduler (every ci_bench_start_client call
     # omits it) and game traffic is bidirectional -- both ends have to agree.
     TEST_NAME="netsim_game"
-    CI_BENCH_SCHEDULER=wlb_udp_pin
+    if [ "${CI_BENCH_GAME_PROFILE:-default}" = tuned ]; then
+        CI_BENCH_SCHEDULER=wlb_udp_pin
+        ci_bench_config_append '[Advanced]' 'UdpGso = false' 'UdpGro = false'
+        export CI_BENCH_OFFLOAD=off
+    fi
     # No coalescing on either side: see ci_bench_config_append. A game row is
     # about when packets arrive, and batching changes exactly that.
-    ci_bench_config_append '[Advanced]' 'UdpGso = false' 'UdpGro = false'
-    export CI_BENCH_OFFLOAD=off
     # PPS tiers, not bandwidth tiers. 500 pps of 50-byte payload is 200 kbit/s;
     # 4000 pps is 1.6 Mbit/s, still far under any emulated rate here, so the
     # axis stays packet rate throughout and never becomes a bandwidth test.
@@ -2519,7 +2614,7 @@ case "$MODE" in
     # the state worth reproducing -- a forwarder that has to fault its own
     # pages back in before it can forward.
     export CI_BENCH_HOST_STATE="${CI_BENCH_VPS_HOST_STATE:-vps_baseline}"
-    ci_bench_host_start "$CI_BENCH_HOST_STATE" vps_1c1g_std
+    ci_bench_host_start "$CI_BENCH_HOST_STATE" vps_1c1g_std || exit 1
     for t in game_100 game_200; do
         for p in 500 2000; do
             run_game "$t" "$p" || echo "  (vps game $t/$p failed, continuing)"

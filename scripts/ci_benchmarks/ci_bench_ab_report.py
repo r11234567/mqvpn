@@ -11,7 +11,8 @@ the workflow appends to $GITHUB_STEP_SUMMARY.
 Why the comparison lives in the run rather than in a person's head: these
 numbers move several percent between runs on shared cloud vCPUs, so an arm
 measured on Tuesday is not comparable with an arm measured on Wednesday. Two
-arms measured in the same dispatch, on the same commit, are. Doing the
+arms measured in one dispatch may still use different physical VMs. Only
+serial paired arms carry the same-VM comparison identity. Doing the
 subtraction here also means the run states its own conclusion instead of leaving
 a pile of JSON for someone to diff by hand.
 
@@ -44,7 +45,7 @@ MOVE_PCT = 40.0
 CONTROL_MODES = {"catalog"}
 
 # Metric fields in preference order. A netsim row carries exactly one.
-METRIC_FIELDS = ("multipath_mbps", "single_path_mbps", "throughput_mbps")
+METRIC_FIELDS = ("quic_goodput_mbps", "multipath_mbps", "single_path_mbps", "throughput_mbps")
 
 
 def load_rows(root):
@@ -76,13 +77,17 @@ def load_rows(root):
                     continue
                 # The row's own arm wins: it is stamped at measurement time,
                 # while the document's is written at the end of the mode.
+                r = dict(r)
+                r['direction'] = r.get('direction', doc.get('direction', 'DL'))
+                r['pair_id'] = doc.get('pair_id')
                 rows.append((mode, r.get("arm") or doc_arm, r))
     return rows
 
 
 def key_of(mode, row):
     """What identifies one measurement across arms."""
-    return (mode, row.get("scenario") or "?", row.get("scheduler") or "")
+    scheduler = "configuration_bundle" if mode == 'game' else row.get("scheduler") or ""
+    return (mode, (row.get("scenario") or "?") + '/' + row.get("direction", "DL"), scheduler)
 
 
 def metric(row):
@@ -92,6 +97,8 @@ def metric(row):
     silently dropped the control group -- more than half the measurements -- out
     of the comparison.
     """
+    if row.get('measurement_complete') is False:
+        return None
     for f in METRIC_FIELDS:
         v = row.get(f)
         if isinstance(v, (int, float)):
@@ -177,7 +184,7 @@ def emit_ab(by_key, arms):
     else:
         print(
             f"No measurement moved more than {MOVE_PCT:.0f}% between arms — on "
-            "this evidence the varied setting is not what drives these numbers."
+            "this sample no large movement was detected; this does not establish equivalence."
         )
         print()
 
@@ -201,8 +208,8 @@ def emit_findings(by_key, arms):
     print("## Findings that differ between arms")
     print()
     print(
-        "A finding raised on both arms is not attributable to the varied "
-        "setting, so only the asymmetric ones are listed."
+        "Only asymmetric findings are listed. Shared findings do not rule out "
+        "an effect of the setting; this comparison alone does not establish causation."
     )
     print()
     print("| mode | scenario | sched | only on arm | findings |")
@@ -879,7 +886,7 @@ def emit_noise_floor(by_key, arms):
         for a in arms[1:]:
             if a not in per_arm:
                 continue
-            if mode in CONTROL_MODES:
+            if mode.split("/", 1)[0] in CONTROL_MODES:
                 m = pct_move(metric(per_arm[base]), metric(per_arm[a]))
                 if m is not None:
                     ctl.append(abs(m))

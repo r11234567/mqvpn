@@ -99,6 +99,8 @@ def exact_keys(actual, expected, label):
 
 
 def validate_core(data):
+    if data.get('measurement_complete') is False:
+        raise InvalidMeasurement('benchmark explicitly incomplete')
     test = data.get("test")
     results = data.get("results")
     checked = 0
@@ -166,6 +168,8 @@ def validate_core(data):
                 for key in ("pre_fault_avg_mbps", "degraded_avg_mbps", "recovery_avg_mbps"):
                     rate(row, key)
                 for key in ("ttf_sec", "ttr_sec"):
+                    if row.get(key) is None and sched.get('performance_health') == 'regression':
+                        continue  # valid censored recovery, separately failed by the performance gate
                     number(row.get(key), key)
     else:
         raise InvalidMeasurement(f"no schema for benchmark {test!r}")
@@ -192,6 +196,8 @@ def main():
         if args.command == "core":
             checked = validate_core(data)
             print(f"validated {checked} required throughput measurements")
+            if data.get('performance_health') == 'regression':
+                raise InvalidMeasurement('valid measurement reports a performance regression')
         else:
             sample = iperf_measurement(data)
             if args.command == "throughput":

@@ -60,92 +60,9 @@ sampler_start() {
     SAMPLED_STATUS=running
     SAMPLED_JSON=""
 
-    # Resolved once out here so the tick does no path arithmetic. A missing
-    # statistics dir leaves those columns at zero rather than killing the
-    # sampler: a gap in the series is not a failed measurement.
-    local stat_dir="/sys/class/net/${dev}/statistics"
-
-    # /proc is not namespaced the way /sys/class/net is, so the server's status
-    # file is readable from inside the netns by pid. Empty when there is no
-    # server yet (the baseline leg runs before one starts), which leaves the
-    # process columns at zero rather than failing the tick.
-    local srv_pid="${CI_BENCH_SAMPLE_PID:-}"
-
-    ip netns exec "$ns" bash -c '
-        csv="$1"; stat_dir="$2"; interval="$3"; srv_pid="$4"
-        while :; do
-            now="$(date +%s.%N)"
-            # /proc/stat line 1: cpu user nice system idle iowait irq softirq steal
-            read -r _ u n s idl iow irq sirq steal _ < /proc/stat
-
-            # /proc/net/snmp carries a header row and a value row per protocol.
-            # After `set -- $rest`: 1=InDatagrams 2=NoPorts 3=InErrors
-            # 4=OutDatagrams 5=RcvbufErrors 6=SndbufErrors
-            #
-            # RcvbufErrors was parsed and thrown away for three runs. Field
-            # data put 441 of them on a box that was dropping packets, so it
-            # is the receive-side counterpart of SndbufErrors and is now kept.
-            udp_in=0; udp_out=0; sndbuf=0; rcvbuf=0
-            while read -r label rest; do
-                [ "$label" = "Udp:" ] || continue
-                set -- $rest
-                # Header row has words where numbers go.
-                case "$1" in ""|*[!0-9]*) continue ;; esac
-                udp_in="$1"; udp_out="$4"; rcvbuf="$5"; sndbuf="$6"
-            done < /proc/net/snmp
-
-            # NET_RX per CPU. The VPS profile under test puts every queue and
-            # IRQ on CPU0, so CPU0 and the total are both kept to show whether
-            # that actually held.
-            netrx0=0; netrx=0
-            while read -r label rest; do
-                [ "$label" = "NET_RX:" ] || continue
-                set -- $rest
-                netrx0="$1"
-                netrx=0
-                for v in "$@"; do netrx=$((netrx + v)); done
-            done < /proc/softirqs
-
-            txp=0; rxp=0; txb=0; rxb=0
-            [ -r "$stat_dir/tx_packets" ] && read -r txp < "$stat_dir/tx_packets"
-            [ -r "$stat_dir/rx_packets" ] && read -r rxp < "$stat_dir/rx_packets"
-            [ -r "$stat_dir/tx_bytes" ]   && read -r txb < "$stat_dir/tx_bytes"
-            [ -r "$stat_dir/rx_bytes" ]   && read -r rxb < "$stat_dir/rx_bytes"
-
-            # Drops on the measured interface, per tick. The end-to-end delta
-            # is collected separately, but the series is what shows whether
-            # the loss was steady or arrived in bursts -- field data had 1.9%
-            # overall that was in fact six short bursts, and a single
-            # percentage cannot tell those apart.
-            txd=0; rxd=0
-            [ -r "$stat_dir/tx_dropped" ] && read -r txd < "$stat_dir/tx_dropped"
-            [ -r "$stat_dir/rx_dropped" ] && read -r rxd < "$stat_dir/rx_dropped"
-
-            # Preemption of the forwarding process, and how much of it is
-            # swapped out. Both are only meaningful as a series: a single
-            # end-of-run VmSwap says the process was paged out, while the
-            # series says whether it was paged out DURING the measurement.
-            nvcs=0; vmswap=0; vmrss=0; nthr=0
-            if [ -n "$srv_pid" ] && [ -r "/proc/$srv_pid/status" ]; then
-                while read -r k v _; do
-                    case "$k" in
-                        nonvoluntary_ctxt_switches:) nvcs="$v" ;;
-                        VmSwap:) vmswap="$v" ;;
-                        VmRSS:)  vmrss="$v" ;;
-                        Threads:) nthr="$v" ;;
-                    esac
-                done < "/proc/$srv_pid/status"
-            fi
-
-            printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
-                "$now" "$u" "$n" "$s" "$idl" "$iow" "$irq" "$sirq" "$steal" \
-                "$udp_in" "$udp_out" "$sndbuf" "$netrx0" "$netrx" \
-                "$txp" "$rxp" "$txb" "$rxb" \
-                "$rcvbuf" "$txd" "$rxd" "$nvcs" "$vmswap" "$vmrss" "$nthr" \
-                >> "$csv"
-            sleep "$interval"
-        done
-    ' _ "$_CB_SAMP_CSV" "$stat_dir" "$interval" "$srv_pid" &>/dev/null &
+    ip netns exec "$ns" python3 "${SCRIPT_DIR}/ci_bench_sample.py" "$_CB_SAMP_CSV" \
+        --interfaces "$dev" --interval "$interval" --pid "${CI_BENCH_SAMPLE_PID:-}" \
+        >"${_CB_SAMP_CSV}.log" 2>&1 &
     _CB_SAMP_PID=$!
 }
 
@@ -374,6 +291,10 @@ emit(out)
 ' "$_CB_SAMP_CSV" "$samp_cpu" "$CI_BENCH_SAMPLE_INTERVAL" 2>/dev/null \
         || echo ',"sampler":"parse_failed"')"
 
+    mkdir -p "$CI_BENCH_RAW_DIR"
+    cp "$_CB_SAMP_CSV" "${CI_BENCH_RAW_DIR}/$(basename "$_CB_SAMP_CSV").csv"
+    [ ! -f "${_CB_SAMP_CSV}.paths.jsonl" ] || cp "${_CB_SAMP_CSV}.paths.jsonl" "$CI_BENCH_RAW_DIR/"
+    [ ! -f "${_CB_SAMP_CSV}.log" ] || cp "${_CB_SAMP_CSV}.log" "$CI_BENCH_RAW_DIR/"
     SAMPLED_STATUS=ok
     SAMPLED_TICKS="$(wc -l < "$_CB_SAMP_CSV" 2>/dev/null || echo 0)"
     rm -f "$_CB_SAMP_CSV" 2>/dev/null || true

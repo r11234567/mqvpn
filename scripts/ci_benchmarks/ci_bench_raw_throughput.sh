@@ -71,16 +71,7 @@ for DIR in "${DIRECTIONS[@]}"; do
     echo ""
     echo "==> Direct (no VPN) — baseline"
 
-    ip netns exec "$NS_SERVER" iperf3 -s -B "$IP_A_SERVER_ADDR" -1 &>/dev/null &
-    _direct_srv=$!
-    sleep 1
-
-    direct_json="$(mktemp)"
-    ip netns exec "$NS_CLIENT" iperf3 \
-        -c "$IP_A_SERVER_ADDR" \
-        -t "$DURATION" -P "$PARALLEL" $IPERF_R_FLAG --json > "$direct_json" 2>&1 || true
-    wait "$_direct_srv" 2>/dev/null || true
-
+    direct_json="$(CI_BENCH_IPERF_TARGET="$IP_A_SERVER_ADDR" ci_bench_run_iperf TCP "$DIR" "$DURATION" "$PARALLEL")"
     R_DIRECT[$DIR]=$(ci_bench_parse_throughput "$direct_json")
     rm -f "$direct_json"
     echo "    Direct:  ${R_DIRECT[$DIR]} Mbps"
