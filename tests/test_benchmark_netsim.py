@@ -18,6 +18,23 @@ def pair(name="hetero_extreme"):
 
 
 class NetsimTests(unittest.TestCase):
+    def test_quic_completed_but_severely_slower_is_not_pass(self):
+        row = {'status':'ok', 'quic_status':'ok', 'quic_samples':3, 'quic_attempts':3,
+               'quic_goodput_mbps':14, 'quic_goodput_all':[13,14,15],
+               'quic_baselines':[{'phase':p,'status':'ok','goodput_mbps':v}
+                                 for p in ('direct_a','solo_a','solo_b') for v in (100,110,120)]}
+        result = netsim.classify(row, 'quic')
+        self.assertTrue(result['measurement_complete'])
+        self.assertEqual(result['performance_health'], 'regression')
+        self.assertAlmostEqual(result['quic_vs_best_single'], 14/110)
+        self.assertTrue(any('quic_mp_regression' in s for s in result['findings']))
+        # Replay must not duplicate the finding or trust a stale ratio.
+        self.assertEqual(netsim.classify(dict(result, quic_vs_best_single=99), 'quic'), result)
+        row['quic_goodput_all'] = [1,14,60]
+        self.assertEqual(netsim.classify(row,'quic')['performance_health'], 'degraded')
+        row['quic_baselines'][3]['status'] = 'measurement_incomplete'
+        self.assertEqual(netsim.classify(row,'quic')['performance_health'], 'inconclusive')
+
     def test_missing_setup_rows_cannot_disappear(self):
         doc = netsim.report([pair("homo_good")], "classes", execution_complete=True)
         self.assertEqual(doc["expected_count"], 13)

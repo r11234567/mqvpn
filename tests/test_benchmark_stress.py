@@ -5,10 +5,22 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts/ci_stress'))
-from ci_stress_results import resources, fairness
+from ci_stress_results import resources, fairness, fault_summary
 
 
 class ResourceEvidenceTests(unittest.TestCase):
+    def test_process_death_does_not_create_unattempted_fault_failures(self):
+        rows = [dict(cycle=i,ok=i<21) for i in range(1,22)]
+        result = fault_summary(rows,100,'vpn_client_exited_during_cycle_21')
+        self.assertEqual(result['cycles_attempted'],21)
+        self.assertEqual(result['cycles_not_run'],79)
+        self.assertEqual(result['first_failed_cycle'],21)
+        self.assertFalse(result['execution_complete'])
+        self.assertTrue(result['aborted'])
+        self.assertTrue(fault_summary([dict(cycle=1,ok=True)],1)['execution_complete'])
+        with self.assertRaises(ValueError):
+            fault_summary([dict(cycle=2,ok=True)],1)
+
     def test_fairness_preserves_incomplete_client_count(self):
         rows = [{'direction':'UL','receiver_mbps':2,'measurement_complete':True} for _ in range(3)]
         self.assertEqual(fairness(rows)['UL']['jain_index'],1)

@@ -17,6 +17,12 @@ from ci_bench_mixed_results import summarise as mixed_summary
 
 
 class ProtocolMetricsTests(unittest.TestCase):
+    def test_quic_different_work_budgets_cannot_be_compared(self):
+        row = {'scenario':'hetero_extreme','quic_object_bytes':134217728,'quic_timeout_s':90}
+        self.assertNotEqual(key_of('quic',row),key_of('quic',dict(row,quic_object_bytes=2097152)))
+        self.assertNotEqual(key_of('quic',row),key_of('quic',dict(row,quic_timeout_s=180)))
+        self.assertNotEqual(key_of('quic',row),key_of('quic',{'scenario':'hetero_extreme'}))
+
     def test_mixed_load_requires_receiver_progress_and_quic_overlap(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

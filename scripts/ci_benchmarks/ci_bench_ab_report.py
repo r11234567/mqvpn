@@ -90,7 +90,12 @@ def load_rows(root):
 def key_of(mode, row):
     """What identifies one measurement across arms."""
     scheduler = "configuration_bundle" if mode == 'game' else row.get("scheduler") or ""
-    return (mode, (row.get("scenario") or "?") + '/' + row.get("direction", "DL"), scheduler)
+    name = (row.get("scenario") or "?") + '/' + row.get("direction", "DL")
+    if mode == 'quic':
+        # Object size and timeout change the measurement, particularly on a
+        # slow leg. Never subtract old 128-MiB results from a 2-MiB profile.
+        name += f"/{row.get('quic_object_bytes','unknown')}B/{row.get('quic_timeout_s','unknown')}s"
+    return (mode, name, scheduler)
 
 
 def metric(row):

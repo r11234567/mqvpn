@@ -1605,6 +1605,10 @@ print(json.dumps(row))" \
 # collect_oscillation and ci_bench_quic.sh.
 run_quic() {
     local class="$1" sched="${2:-$CI_BENCH_SCHEDULER}"
+    ci_bench_quic_profile "$class" || return 1
+    # Dynamic scope passes the SAME profile to every solo/direct/MP repeat.
+    local CI_BENCH_QUIC_BYTES="$QUIC_PROFILE_BYTES"
+    export CI_BENCH_QUIC_BYTES
     local spec="${NETSIM_CLASS[$class]:-}"
     [ -n "$spec" ] || { echo "unknown class $class" >&2; return 1; }
 
@@ -1742,6 +1746,8 @@ row = {
   'server_rss_peak_kb': rss,
   'status': st,
   'quic_status': qst,
+  'quic_object_bytes': int(os.environ['CI_BENCH_QUIC_BYTES']),
+  'quic_timeout_s': int(os.environ.get('CI_BENCH_QUIC_TIMEOUT') or 90),
 }
 
 # NA is a sentinel, never 0: a transfer that failed and one that genuinely

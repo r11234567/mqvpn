@@ -141,6 +141,8 @@ echo "Monitoring VPN client (PID $_CS_CLIENT_PID) -> $CLIENT_MON_LOG"
 
 CYCLES_OK=0
 CYCLES_FAILED=0
+ABORT_REASON=""
+: >"${CI_STRESS_RAW_DIR}/fault-cycles.jsonl"
 declare -A KIND_OK KIND_FAILED
 for _kind in "${FAULT_KINDS[@]}"; do
     KIND_OK[$_kind]=0
@@ -162,6 +164,12 @@ echo ""
 echo "Starting $NUM_CYCLES fault/recover cycles..."
 
 for ((i = 1; i <= NUM_CYCLES; i++)); do
+    if ! ci_stress_check_workloads vpn_server "$_CS_SERVER_PID" vpn_client "$_CS_CLIENT_PID" \
+            iperf_server "$IPERF_SERVER_PID" iperf_client "$IPERF_CLIENT_PID"; then
+        ABORT_REASON="${_CS_DEAD_PROCESS}_exited_before_cycle_${i}"
+        echo "Aborting remaining cycles: $ABORT_REASON"
+        break
+    fi
     # Path alternates every cycle, kind every two (see the header).
     if (( i % 2 == 1 )); then
         FAULT_VETH_C="$VETH_A0"
@@ -291,6 +299,11 @@ for ((i = 1; i <= NUM_CYCLES; i++)); do
         CYCLE_OK=false
     fi
 
+    if ! ci_stress_check_workloads vpn_server "$_CS_SERVER_PID" vpn_client "$_CS_CLIENT_PID" \
+            iperf_server "$IPERF_SERVER_PID" iperf_client "$IPERF_CLIENT_PID"; then
+        ABORT_REASON="${_CS_DEAD_PROCESS}_exited_during_cycle_${i}"
+        CYCLE_OK=false
+    fi
     python3 - "$i" "$FAULT_LABEL" "$FAULT_KIND" "$CYCLE_OK" \
         "$BEFORE_FAULT_BYTES" "$DURING_FAULT_BYTES" "$RETURN_BYTES_0" "$RETURN_BYTES_1" \
         >>"${CI_STRESS_RAW_DIR}/fault-cycles.jsonl" <<'PY'
@@ -313,10 +326,14 @@ PY
     if (( i % 10 == 0 )); then
         echo "  [cycle $i/$NUM_CYCLES] ok=$CYCLES_OK failed=$CYCLES_FAILED"
     fi
+    if [ -n "$ABORT_REASON" ]; then
+        echo "Aborting remaining cycles: $ABORT_REASON"
+        break
+    fi
 done
 
 echo ""
-echo "All $NUM_CYCLES cycles complete: ok=$CYCLES_OK failed=$CYCLES_FAILED"
+echo "Requested=$NUM_CYCLES attempted=$((CYCLES_OK + CYCLES_FAILED)) ok=$CYCLES_OK failed=$CYCLES_FAILED"
 
 # ── Kill iperf3 ──
 
@@ -416,7 +433,9 @@ TIMESTAMP="$(date -Iseconds)"
 OUTPUT_FILE="${CI_STRESS_RESULTS}/failover_storm_${RUN_STAMP}.json"
 
 python3 -c "
-import json
+import json, sys
+sys.path.insert(0, '${SCRIPT_DIR}')
+from ci_stress_results import fault_summary
 
 result = {
     'test': 'failover_storm',
@@ -438,6 +457,9 @@ result = {
     },
     'status': '${STATUS}'
 }
+with open('${CI_STRESS_RAW_DIR}/fault-cycles.jsonl') as f:
+    result.update(fault_summary([json.loads(line) for line in f if line.strip()],
+                                ${NUM_CYCLES}, '${ABORT_REASON}'))
 
 with open('${OUTPUT_FILE}', 'w') as f:
     json.dump(result, f, indent=2)

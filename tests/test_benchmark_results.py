@@ -28,6 +28,19 @@ def aggregate():
 
 
 class MeasurementTests(unittest.TestCase):
+    def test_failed_server_cannot_pass_using_successful_client_summary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'iperf.json'
+            path.write_text(json.dumps(tcp()))
+            observation = Path(folder)/'server.json'
+            observation.write_text('{"cleanup_requested":false,"forced_kill":false}')
+            meta = bench.record_iperf(path,10,0,1,observation)
+            self.assertFalse(meta['measurement_complete'])
+            self.assertEqual(meta['server_exit_code'],1)
+            self.assertFalse(meta['server_process']['cleanup_requested'])
+            with self.assertRaises(bench.InvalidMeasurement):
+                bench.iperf_measurement(json.loads(path.read_text()))
+
     def test_receiver_not_sender(self):
         self.assertEqual(bench.iperf_measurement(tcp())["receiver_mbps"], 10)
 

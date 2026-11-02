@@ -37,11 +37,15 @@
 CI_BENCH_QUIC_DIR="${CI_BENCH_QUIC_DIR:-}"
 PICOQUICDEMO="${PICOQUICDEMO:-}"
 
-# Fixed 128 MiB object. Duration is recorded per attempt. A timeout is an
+# Default 128 MiB object. Duration is recorded per attempt. A timeout is an
 # incomplete transfer; short successful runs cannot establish steady-state
 # oscillation. The shape analysis has its own minimum sample requirement.
+# An explicit byte override applies to every profile. Otherwise the lossy
+# 12-Mbps leg uses 2 MiB: 128 MiB/90s requires 11.93 Mbps before any overhead.
+CI_BENCH_QUIC_BYTES_OVERRIDE="${CI_BENCH_QUIC_BYTES:-}"
 CI_BENCH_QUIC_BYTES="${CI_BENCH_QUIC_BYTES:-134217728}"
 CI_BENCH_QUIC_TIMEOUT="${CI_BENCH_QUIC_TIMEOUT:-90}"
+export CI_BENCH_QUIC_TIMEOUT
 CI_BENCH_QUIC_PORT="${CI_BENCH_QUIC_PORT:-5401}"
 CI_BENCH_QUIC_SNI="${CI_BENCH_QUIC_SNI:-test}"
 
@@ -54,6 +58,17 @@ _CB_QUIC_CLI_LOG=""
 QUIC_GOODPUT="NA"
 QUIC_STATUS=ok
 QUIC_DURATION=NA
+
+ci_bench_quic_profile() {
+    QUIC_PROFILE_BYTES="${CI_BENCH_QUIC_BYTES_OVERRIDE:-134217728}"
+    if [ "$1" = hetero_extreme ] && [ -z "$CI_BENCH_QUIC_BYTES_OVERRIDE" ]; then
+        QUIC_PROFILE_BYTES="${CI_BENCH_QUIC_SLOW_BYTES:-2097152}"
+    fi
+    [[ "$QUIC_PROFILE_BYTES" =~ ^[1-9][0-9]*$ ]] &&
+        [[ "$CI_BENCH_QUIC_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
+        echo 'QUIC bytes and timeout must be positive integers' >&2; return 2;
+    }
+}
 
 # ci_bench_quic_available -> 0 if an inner-QUIC transfer can be run
 #
@@ -104,7 +119,7 @@ ci_bench_quic_transfer() {
     # keeps the payload off disk at both ends, which matters on a 2-vCPU runner
     # where disk writes would land in the throughput being measured. qlog and
     # binlog stay off by omitting -q/-b/-l for the same reason.
-    ip netns exec "$NS_SERVER" "$PICOQUICDEMO" \
+    ip netns exec "$NS_SERVER" stdbuf -oL -eL "$PICOQUICDEMO" \
         -p "$CI_BENCH_QUIC_PORT" \
         -c "$PICO_CERT" -k "$PICO_KEY" \
         -G bbr -1 -D \
@@ -125,7 +140,7 @@ ci_bench_quic_transfer() {
     # 60 minutes while its siblings finished in six.
     local client_exit=0
     timeout -k 5 "$CI_BENCH_QUIC_TIMEOUT" \
-        ip netns exec "$NS_CLIENT" "$PICOQUICDEMO" \
+        ip netns exec "$NS_CLIENT" stdbuf -oL -eL "$PICOQUICDEMO" \
         -G bbr -D -n "$CI_BENCH_QUIC_SNI" \
         "$target" "$CI_BENCH_QUIC_PORT" "/${CI_BENCH_QUIC_BYTES}" \
         >"$_CB_QUIC_CLI_LOG" 2>&1 || client_exit=$?
@@ -140,6 +155,14 @@ ci_bench_quic_transfer() {
     result="${stem}.measurement.json"
     python3 "${SCRIPT_DIR}/ci_bench_metrics.py" quic "$_CB_QUIC_CLI_LOG" \
         --bytes "$CI_BENCH_QUIC_BYTES" --exit-code "$client_exit" >"$result" || true
+    python3 - "$result" "$CI_BENCH_QUIC_BYTES" "$CI_BENCH_QUIC_TIMEOUT" "$client_exit" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+d = json.loads(p.read_text())
+d.update(requested_bytes=int(sys.argv[2]), timeout_s=int(sys.argv[3]), client_exit_code=int(sys.argv[4]))
+p.write_text(json.dumps(d) + '\n')
+PY
     read -r QUIC_STATUS QUIC_GOODPUT QUIC_DURATION < <(python3 - "$result" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))

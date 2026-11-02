@@ -4,6 +4,18 @@
 # Real iperf3 JSON/schema integration, independent of a VPN build. Needs root.
 set -euo pipefail
 source "$(dirname "$0")/../scripts/ci_benchmarks/ci_bench_env.sh"
+source "$(dirname "$0")/../scripts/ci_benchmarks/ci_bench_quic.sh"
+ci_bench_quic_profile homo_good
+[ "$QUIC_PROFILE_BYTES" = 134217728 ]
+ci_bench_quic_profile hetero_extreme
+[ "$QUIC_PROFILE_BYTES" = 2097152 ]
+CI_BENCH_QUIC_BYTES_OVERRIDE=12345
+ci_bench_quic_profile hetero_extreme
+[ "$QUIC_PROFILE_BYTES" = 12345 ]
+CI_BENCH_QUIC_BYTES_OVERRIDE=0
+if ci_bench_quic_profile homo_good; then echo 'invalid QUIC budget accepted' >&2; exit 1; fi
+unset CI_BENCH_QUIC_BYTES_OVERRIDE
+echo 'PASS QUIC scenario budgets and explicit overrides'
 [ "$(ci_bench_config_bool on)" = true ]
 [ "$(ci_bench_config_bool off)" = false ]
 if ci_bench_config_bool invalid >/dev/null 2>&1; then exit 1; fi
@@ -15,9 +27,46 @@ NS_SERVER="bench-harness-$$"
 NS_CLIENT="$NS_SERVER"
 CI_BENCH_RAW_DIR="$work/raw"
 mkdir -p "$CI_BENCH_RAW_DIR"
-trap 'ip netns pids "$NS_SERVER" | xargs -r kill 2>/dev/null || true; ip netns del "$NS_SERVER"; rm -rf "$work"' EXIT
+trap 'ci_bench_stop_vpn; ip netns pids "$NS_SERVER" | xargs -r kill 2>/dev/null || true; ip netns del "$NS_SERVER"; rm -rf "$work"' EXIT
 ip netns add "$NS_SERVER"
 ip -n "$NS_SERVER" link set lo up
+ci_bench_vpn_evidence client wlb '--path test-a'
+first_evidence="$_CB_LAST_EVIDENCE"
+printf 'failed handshake\n' >"$first_evidence/vpn.log"
+ci_bench_record_vpn_exit client 123 1 "$first_evidence"
+ci_bench_vpn_evidence client wlb '--path test-b'
+[ "$first_evidence" != "$_CB_LAST_EVIDENCE" ]
+grep -q 'failed handshake' "$first_evidence/vpn.log"
+python3 - "$first_evidence" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+assert json.loads((p/'exit.json').read_text())['exit_code'] == 1
+assert json.loads((p/'context.json').read_text())['paths'] == '--path test-a'
+PY
+echo 'PASS failed phase evidence survives subsequent client starts'
+# Drive the actual start/stop helpers with a fixture that exits before forming
+# a tunnel; neither the next client nor cleanup may discard the first error.
+MQVPN="$work/exiting-vpn"
+cat >"$MQVPN" <<'SH'
+#!/bin/sh
+if [ "$1" = --genkey ]; then printf 'fixture-key\n'; exit 0; fi
+printf 'fixture early startup failure\n' >&2
+exit 23
+SH
+chmod +x "$MQVPN"
+if ci_bench_start_server wlb >/dev/null; then echo 'dead server accepted' >&2; exit 1; fi
+if ci_bench_start_client '--path fixture-a' wlb >/dev/null; then echo 'dead client accepted' >&2; exit 1; fi
+failed_client_log="$CI_BENCH_CLIENT_LOG"
+failed_client_evidence="$_CB_CLIENT_EVIDENCE"
+if ci_bench_start_client '--path fixture-b' wlb >/dev/null; then echo 'dead client accepted' >&2; exit 1; fi
+ci_bench_stop_vpn
+grep -q 'fixture early startup failure' "$failed_client_log"
+python3 - "$failed_client_evidence/exit.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))['exit_code'] == 23
+PY
+echo 'PASS actual start/stop preserves already-dead VPN startup diagnostics'
 CI_BENCH_IPERF_TARGET=127.0.0.1
 for proto in TCP UDP; do
     for direction in UL DL; do
@@ -39,5 +88,5 @@ PY
         rm -f "$sample"
     done
 done
-[ "$(find "$CI_BENCH_RAW_DIR" -name '*.json' | wc -l)" -eq 4 ]
+[ "$(find "$CI_BENCH_RAW_DIR" -maxdepth 1 -name '*.server-process.json' | wc -l)" -eq 4 ]
 echo 'PASS raw evidence survives caller cleanup'

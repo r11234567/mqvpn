@@ -309,6 +309,21 @@ ci_stress_wait_tunnel() {
 
 # ── Stop VPN ──
 
+# Check before injecting another fault. One dead process invalidates subsequent
+# cycles; record the first cause rather than manufacture repeated failures.
+ci_stress_check_workloads() {
+    _CS_DEAD_PROCESS=""
+    local label pid
+    while [ "$#" -ge 2 ]; do
+        label="$1"; pid="$2"; shift 2
+        if ! kill -0 "$pid" 2>/dev/null ||
+           ! awk '/^State:/ {found=1; if ($2 == "Z") exit 1} END {if (!found) exit 1}' "/proc/$pid/status" 2>/dev/null; then
+            _CS_DEAD_PROCESS="$label"
+            return 1
+        fi
+    done
+}
+
 # Sanitizer failure flags (set to 1 if any VPN process exits with ASan/UBSan error)
 _CS_CLIENT_SANITIZER_FAIL=0
 _CS_SERVER_SANITIZER_FAIL=0

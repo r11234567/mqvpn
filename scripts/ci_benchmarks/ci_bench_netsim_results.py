@@ -7,6 +7,7 @@ import datetime
 import json
 import math
 import os
+import statistics
 from pathlib import Path
 import sys
 
@@ -62,6 +63,8 @@ def row_key(row, mode):
 
 def classify(row, mode):
     row = dict(row)
+    row['findings'] = list(row.get('findings') or [])
+    quic_regression = False
     row.setdefault('pmtud_requested', os.environ.get('CI_BENCH_PMTUD', 'default_off'))
     row.setdefault('direction', os.environ.get('CI_BENCH_DIRECTION', 'DL'))
     row.setdefault('game_profile', os.environ.get('CI_BENCH_GAME_PROFILE', 'default'))
@@ -119,6 +122,38 @@ def classify(row, mode):
                 harness = False
         if row.get("quic_samples", 0) != attempts or attempts < 1:
             reasons.append("incomplete_quic_repeats")
+        # Recompute from same-protocol baseline evidence; a completed object
+        # alone is not a performance pass. Keep incomplete comparisons unknown.
+        if not reasons:
+            solo = {phase: statistics.median(p['goodput_mbps'] for p in baselines
+                                            if p['phase'] == phase)
+                    for phase in ('solo_a', 'solo_b')}
+            try:
+                rate = number(row.get('quic_goodput_mbps'), 'QUIC goodput')
+                ratio = rate / max(solo.values())
+                row['quic_vs_best_single'] = ratio
+                policy = {'degraded_below_ratio': 0.8, 'regression_below_ratio': 0.5,
+                          'min_repeats': 3, 'max_cv_pct': 25}
+                row['quic_performance_policy'] = policy
+                if ratio < policy['degraded_below_ratio']:
+                    message = f'quic_mp_regression: {ratio:.3f}x best same-protocol solo'
+                    if message not in row['findings']:
+                        row['findings'].append(message)
+                    # Severe degradation is a hard verdict only with repeated,
+                    # stable MP AND solo measurements; noisy cells stay degraded.
+                    mp_values = row.get('quic_goodput_all') or []
+                    groups = [mp_values] + [[p['goodput_mbps'] for p in baselines
+                                            if p['phase'] == phase]
+                                           for phase in ('solo_a', 'solo_b')]
+                    def stable(values):
+                        return (len(values) == attempts and attempts >= policy['min_repeats']
+                                and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                                        and math.isfinite(v) and v > 0 for v in values)
+                                and statistics.stdev(values) / statistics.mean(values) * 100
+                                <= policy['max_cv_pct'])
+                    quic_regression = ratio < policy['regression_below_ratio'] and all(map(stable, groups))
+            except InvalidMeasurement:
+                pass # Required numeric validation below records the actual error.
     elif mode in {"game", "vps"}:
         required = ["baseline_loss_pct", "tunnel_loss_pct", "pps_fidelity", "ggdl_received", "ggul_received"]
         if row.get("gamegen", "ok") != "ok":
@@ -142,7 +177,7 @@ def classify(row, mode):
         harness = False
     zero = any(p.startswith("measured_zero") for p in parts)
     zero |= any(row.get(k) == 0 for k in required if k.endswith("mbps") or k.endswith("received"))
-    health = "inconclusive" if reasons else "regression" if zero else "degraded" if row.get("findings") else "pass"
+    health = "inconclusive" if reasons else "regression" if zero or quic_regression else "degraded" if row.get("findings") else "pass"
     row.update(harness_valid=harness, measurement_complete=not reasons,
                performance_health=health, measurement_errors=reasons)
     return row
@@ -231,6 +266,7 @@ def main():
                arm_reorder=os.environ.get("CI_BENCH_REORDER") or "default",
                iperf_sec=args.seconds, iperf_streams=args.streams, repeats=args.repeats,
                caps={"netem_seed": args.seed, "pps_police": args.pps, "nat": args.nat,
+                     "nat_model": "linux_conntrack_outer_udp_mapping", "nat_filtering_verified": False,
                      "icmp_fragmentation_needed_drop": args.icmp})
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(".json.tmp")
@@ -242,6 +278,8 @@ def main():
         for row in doc["results"]:
             if not row["measurement_complete"]:
                 print(f"::error::{row['scenario']}: {row['measurement_errors']}")
+            elif row['performance_health'] == 'regression':
+                print(f"::error::{row['scenario']}: performance regression: {row.get('findings', [])}")
         if not doc["measurement_complete"] or doc["performance_health"] == "regression":
             return 1
         if doc["performance_health"] == "degraded":

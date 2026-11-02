@@ -1,0 +1,43 @@
+# Benchmark measurement contracts
+
+The harness validates measurements separately from product performance. Product
+crashes, sanitizer errors, missing required phases and incomplete transfers remain
+failures. Changing the harness must not make them disappear.
+
+- NAT profiles apply to the outer UDP tunnel. `full_cone` uses persistent SNAT;
+  `cgnat` uses UDP masquerade with the port block 20000–20255. Names are legacy
+  mapping approximations, not proof of RFC 3489 filtering behaviour. Unsupported
+  requested rules fail without substituting plain masquerade.
+- Inner QUIC uses the same object size for direct, solo-A, solo-B and MP repeats
+  in a scenario. The default is 128 MiB with a 90-second deadline. The lossy
+  12-Mbps `hetero_extreme` profile uses 2 MiB so the baseline is not asked to
+  deliver almost its entire nominal capacity as application data. Short fast
+  transfers are completion measurements, not steady-state oscillation evidence.
+  `CI_BENCH_QUIC_BYTES` explicitly overrides all scenarios;
+  `CI_BENCH_QUIC_SLOW_BYTES` overrides the slow profile only. Bytes and deadlines
+  are recorded, and A/B comparisons require matching budgets.
+- A complete QUIC MP rate below 80% of the best same-protocol solo adds a visible
+  degradation finding. Below 50% is a hard regression when MP and both solos each
+  have at least three samples with CV at most 25%. These are explicit harness
+  policy thresholds, not protocol guarantees. Missing baselines stay inconclusive.
+- Every VPN process instance has a separate `raw/.../vpn/<role>...` directory
+  with context, log and observed exit status, including startup failures. No auth
+  key, private key or full command line is copied into process context.
+- One-shot iperf servers get a bounded drain period after the client exits.
+  Server output, natural/forced cleanup and exit codes are retained; a nonzero
+  server exit cannot be reported as a complete receiver measurement.
+- Fault stress stops after a required VPN/traffic process exits. Requested,
+  attempted, failed and unexecuted cycles are distinct; aborting still fails the
+  run. The first failing cycle and abort cause remain in the summary.
+
+Run the harness regression checks on Linux:
+
+```sh
+python3 -m unittest discover -s tests -p 'test_benchmark*.py' -v
+sudo bash tests/test_benchmark_harness.sh
+bash tests/test_benchmark_processes.sh
+sudo bash tests/test_benchmark_netsim_setup.sh
+```
+
+These checks validate the harness and actual local TCP/UDP/NAT operations. They
+do not replace a full weekly/stress run of the product.

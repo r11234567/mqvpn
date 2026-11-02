@@ -47,7 +47,7 @@ CI_BENCH_RESULT_TOOL="${CI_BENCH_DIR}/ci_bench_results.py"
 export CI_BENCH_COMMIT CI_BENCH_RAW_DIR CI_BENCH_SCHEDULER
 
 # WLB scheduler instrumentation. With this set to 1 both ends run at
-# --log-level info and their output is captured, so the once-a-second
+# --log-level info, so the once-a-second
 # |wlb_instr| line xquic emits (pins, packets and round count per path) can be
 # read back after a measurement. Off by default: it raises the log level for
 # the whole run.
@@ -61,7 +61,8 @@ export CI_BENCH_COMMIT CI_BENCH_RAW_DIR CI_BENCH_SCHEDULER
 # attempt read the client log and would have reported the ACK split as though
 # it were the throughput split.
 CI_BENCH_WLB_INSTR="${CI_BENCH_WLB_INSTR:-0}"
-# Set by the start helpers when the above is on. The server log is NOT
+# Logs are always retained; instrumentation only changes their level.
+# Set by the start helpers. The server log is NOT
 # truncated per measurement -- one server serves solo-A, solo-B and multipath
 # in turn -- so readers must take a windowed delta; ci_bench_mark_server_log
 # records where the window starts.
@@ -106,6 +107,41 @@ _CB_SERVER_PID=""
 _CB_CLIENT_PID=""
 _CB_WORK_DIR=""
 _CB_PSK=""
+_CB_SERVER_EVIDENCE=""
+_CB_CLIENT_EVIDENCE=""
+
+# Keep every process instance, including clients which never form a tunnel.
+# Do not record argv/auth keys or the private key in these public artifacts.
+ci_bench_vpn_evidence() {
+    local role="$1" scheduler="$2" paths="${3:-}"
+    mkdir -p "$CI_BENCH_RAW_DIR/vpn"
+    _CB_LAST_EVIDENCE="$(mktemp -d "$CI_BENCH_RAW_DIR/vpn/${role}.XXXXXXXX")"
+    python3 - "$_CB_LAST_EVIDENCE/context.json" "$role" "$scheduler" "$paths" \
+        "${FUNCNAME[*]}" "$_CB_SERVER_EVIDENCE" "${class:-${CI_BENCH_SCENARIO:-unknown}}" <<'PY'
+import datetime, json, os, sys
+from pathlib import Path
+output, role, scheduler, paths, stack, server, scenario = sys.argv[1:]
+Path(output).write_text(json.dumps(dict(role=role, scheduler=scheduler, paths=paths,
+    scenario=scenario, caller_stack=stack, server_evidence=server if role=='client' else None,
+    started_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    arm=os.environ.get('CI_BENCH_ARM','default'),
+    direction=os.environ.get('CI_BENCH_DIRECTION','DL'),
+    pmtud=os.environ.get('CI_BENCH_PMTUD','default_off'))) + '\n')
+PY
+}
+
+ci_bench_record_vpn_exit() {
+    local role="$1" pid="$2" rc="$3" evidence="$4"
+    [ -n "$evidence" ] || return 0
+    python3 - "$evidence/exit.json" "$role" "$pid" "$rc" <<'PY'
+import datetime, json, sys
+from pathlib import Path
+p, role, pid, rc = sys.argv[1:]
+Path(p).write_text(json.dumps(dict(role=role,pid=int(pid),exit_code=int(rc),
+    exit_observed=int(rc)!=127,
+    recorded_at=datetime.datetime.now(datetime.timezone.utc).isoformat())) + '\n')
+PY
+}
 
 # ── Dependency checks ──
 
@@ -292,12 +328,12 @@ ci_bench_start_server() {
     fi
 
     local level="$CI_BENCH_LOG_LEVEL"
-    CI_BENCH_SERVER_LOG=""
     CI_BENCH_SERVER_LOG_MARK=0
+    ci_bench_vpn_evidence server "$scheduler"
+    _CB_SERVER_EVIDENCE="$_CB_LAST_EVIDENCE"
+    CI_BENCH_SERVER_LOG="$_CB_SERVER_EVIDENCE/vpn.log"
     if [ "$CI_BENCH_WLB_INSTR" = "1" ]; then
         level=info
-        CI_BENCH_SERVER_LOG="${_CB_WORK_DIR}/server-instr.log"
-        : >"$CI_BENCH_SERVER_LOG"
     fi
 
     if [ -n "$CI_BENCH_SERVER_LOG" ]; then
@@ -352,10 +388,11 @@ ci_bench_start_client() {
     fi
 
     local level="$CI_BENCH_LOG_LEVEL"
+    ci_bench_vpn_evidence client "$scheduler" "$paths"
+    _CB_CLIENT_EVIDENCE="$_CB_LAST_EVIDENCE"
+    CI_BENCH_CLIENT_LOG="$_CB_CLIENT_EVIDENCE/vpn.log"
     if [ "$CI_BENCH_WLB_INSTR" = "1" ] && [ -n "$_CB_WORK_DIR" ]; then
         level=info
-        CI_BENCH_CLIENT_LOG="${_CB_WORK_DIR}/client-instr.log"
-        : > "$CI_BENCH_CLIENT_LOG"
     fi
 
     if [ -n "$CI_BENCH_CLIENT_LOG" ]; then
@@ -429,12 +466,23 @@ _cb_pid_is_client() {
 }
 
 ci_bench_stop_client() {
-    local pid live=0
+    local pid live=0 rc=0
+    # Reap the directly owned child even if it already exited. Earlier logs
+    # remain independent when the next client starts.
+    if [ -n "$_CB_CLIENT_PID" ]; then
+        if kill -0 "$_CB_CLIENT_PID" 2>/dev/null && _cb_pid_is_client "$_CB_CLIENT_PID"; then
+            kill "$_CB_CLIENT_PID" 2>/dev/null || true
+            live=$((live + 1))
+        fi
+        wait "$_CB_CLIENT_PID" 2>/dev/null || rc=$?
+        ci_bench_record_vpn_exit client "$_CB_CLIENT_PID" "$rc" "$_CB_CLIENT_EVIDENCE"
+    fi
     # `wait` only works on our own children, and a pid from the file may be a
     # subshell's child -- hence the `|| true` and the settle sleep below.
     if [ -f "$_CB_CLIENT_PIDS" ]; then
         while read -r pid; do
             [ -n "$pid" ] || continue
+            [ "$pid" != "$_CB_CLIENT_PID" ] || continue
             kill -0 "$pid" 2>/dev/null || continue
             _cb_pid_is_client "$pid" || continue
             live=$((live + 1))
@@ -442,12 +490,6 @@ ci_bench_stop_client() {
             wait "$pid" 2>/dev/null || true
         done < "$_CB_CLIENT_PIDS"
         : > "$_CB_CLIENT_PIDS"
-    fi
-    if [ -n "$_CB_CLIENT_PID" ] && kill -0 "$_CB_CLIENT_PID" 2>/dev/null \
-       && _cb_pid_is_client "$_CB_CLIENT_PID"; then
-        kill "$_CB_CLIENT_PID" 2>/dev/null || true
-        wait "$_CB_CLIENT_PID" 2>/dev/null || true
-        live=$((live + 1))
     fi
     _CB_CLIENT_PID=""
 
@@ -463,10 +505,12 @@ ci_bench_stop_client() {
 }
 
 ci_bench_stop_vpn() {
+    local rc=0
     ci_bench_stop_client
     if [ -n "$_CB_SERVER_PID" ]; then
         kill "$_CB_SERVER_PID" 2>/dev/null || true
-        wait "$_CB_SERVER_PID" 2>/dev/null || true
+        wait "$_CB_SERVER_PID" 2>/dev/null || rc=$?
+        ci_bench_record_vpn_exit server "$_CB_SERVER_PID" "$rc" "$_CB_SERVER_EVIDENCE"
         _CB_SERVER_PID=""
         sleep 1
     fi
@@ -526,7 +570,9 @@ ci_bench_run_iperf() {
         sleep 0.5
     done
 
-    ip netns exec "$NS_SERVER" iperf3 -s -p "$IPERF3_PORT" -B "$_cb_iperf_target" -1 &>/dev/null &
+    local server_log="${json_file}.server.log" server_observation="${json_file}.server-process.json"
+    ip netns exec "$NS_SERVER" iperf3 -s -p "$IPERF3_PORT" -B "$_cb_iperf_target" -1 \
+        >"$server_log" 2>&1 &
     local iperf_srv_pid=$!
 
     for (( i=0; i<20; i++ )); do
@@ -564,11 +610,15 @@ ci_bench_run_iperf() {
     ip netns exec "$NS_CLIENT" timeout --kill-after=5 $((duration + 20)) \
         iperf3 $args > "$json_file" 2>&1 || iperf_exit=$?
 
-    kill "$iperf_srv_pid" 2>/dev/null || true
-    wait "$iperf_srv_pid" 2>/dev/null || true
+    # Allow the one-shot server to finish exchanging results before cleanup.
+    # Preserve a bounded forced-stop decision and its actual exit code.
+    python3 "${CI_BENCH_DIR}/ci_bench_process.py" "$iperf_srv_pid" "$server_observation"
+    local server_exit=0
+    wait "$iperf_srv_pid" 2>/dev/null || server_exit=$?
 
     python3 "$CI_BENCH_RESULT_TOOL" record "$json_file" \
-        --duration "$duration" --exit-code "$iperf_exit" --archive "$CI_BENCH_RAW_DIR"
+        --duration "$duration" --exit-code "$iperf_exit" --server-exit-code "$server_exit" \
+        --server-observation "$server_observation" --archive "$CI_BENCH_RAW_DIR"
     echo "$json_file"
 }
 

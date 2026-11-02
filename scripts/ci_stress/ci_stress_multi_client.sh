@@ -309,11 +309,15 @@ for direction in UL DL; do
         i="${connected_indices[$index]}"
         rc=0
         wait "${TRAFFIC_CLIENT_PIDS[$index]}" || rc=$?
-        kill "${TRAFFIC_SERVER_PIDS[$index]}" 2>/dev/null || true
-        wait "${TRAFFIC_SERVER_PIDS[$index]}" 2>/dev/null || true
+        server_observation="${CI_STRESS_RAW_DIR}/iperf-server-${i}-${direction}.process.json"
+        python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_process.py" \
+            "${TRAFFIC_SERVER_PIDS[$index]}" "$server_observation"
+        server_rc=0
+        wait "${TRAFFIC_SERVER_PIDS[$index]}" 2>/dev/null || server_rc=$?
         sample="${CI_STRESS_RAW_DIR}/iperf-client-${i}-${direction}.json"
         python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" record "$sample" \
-            --duration "$TRAFFIC_SEC" --exit-code "$rc"
+            --duration "$TRAFFIC_SEC" --exit-code "$rc" --server-exit-code "$server_rc" \
+            --server-observation "$server_observation"
         rate="$(python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" throughput "$sample")"
         if [ "$rate" = NA ] || ! awk -v r="$rate" 'BEGIN {exit !(r+0>0)}'; then
             traffic_failed=$((traffic_failed + 1))

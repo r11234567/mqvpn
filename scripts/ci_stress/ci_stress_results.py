@@ -8,6 +8,17 @@ from pathlib import Path
 import sys
 
 
+def fault_summary(rows, requested, abort_reason=""):
+    if requested < 1 or len(rows) > requested or any(r.get('cycle') != i+1 for i,r in enumerate(rows)):
+        raise ValueError('invalid fault cycle manifest')
+    failed = [r['cycle'] for r in rows if not r.get('ok')]
+    attempted = len(rows)
+    return dict(cycles_attempted=attempted, cycles_not_run=requested-attempted,
+                first_failed_cycle=failed[0] if failed else None,
+                execution_complete=attempted==requested and not abort_reason,
+                aborted=bool(abort_reason), abort_reason=abort_reason or None)
+
+
 def fairness(rows):
     """Delivered per-client fairness; incomplete clients cannot disappear."""
     output = {}

@@ -258,16 +258,10 @@ declare -gA NETSIM_LEG_MTU=(
 # preferred source too — see the host routes it installs. Without them no NAT'd
 # path can complete a handshake at all.
 #
-# These are the four RFC 3489 behaviours plus no-NAT. What separates them for a
-# QUIC tunnel is whether the source port stays put: `symmetric` allocates a new
-# port per destination, so a path that re-resolves or migrates looks like a
-# different peer to the server and has to be re-validated.
-# `full_cone` used to carry `--random-fully --persistent`, which asks for two
-# opposite things: --random-fully picks a fresh random source port per flow,
-# and full-cone is defined by the mapping NOT moving. With both set, full_cone
-# and symmetric differed only in degree, so the level tested nothing of its own.
-# --persistent alone is what the design doc specifies and what a full-cone CPE
-# does.
+# Legacy profile names describe UDP mapping approximations: persistent SNAT,
+# ordinary conntrack masquerade, randomized mapping, or a subscriber port block.
+# They do not assert RFC 3489 endpoint filtering/cone semantics; proving those
+# needs multi-destination and unsolicited-return probes, not a flag name.
 #
 # `cgnat` is ONE translation, not two. The topology has exactly one hop
 # namespace per path, and the two masquerade rules the old code appended went
@@ -279,18 +273,17 @@ declare -gA NETSIM_LEG_MTU=(
 # shared by the whole flow set, so port exhaustion and reuse are reachable.
 declare -gA NETSIM_NAT=(
   [public]=""                                  # routed, no translation
-  [full_cone]="--persistent"                   # one stable mapping for all peers
+  [full_cone]="--persistent"                   # persistent SNAT approximation
   [port_restricted]=""                         # plain masquerade (conntrack default)
-  [symmetric]="--random"                       # fresh port per destination
+  [symmetric]="--random"                       # randomized masquerade approximation
   [cgnat]="--random --to-ports 20000-20255"    # carrier port block, single NAT
 )
 
 # netsim_apply_nat <slot> <nat_type>
 #
-# Idempotent per slot: the rule is added once at path-build time. `|| true`
-# throughout because a kernel without a given masquerade flag must degrade to a
-# plainer NAT rather than abort the whole scenario — netsim_detect_caps reports
-# what was actually available.
+# UDP mapping profiles for the outer tunnel. These are Linux conntrack
+# approximations, not a certification of all RFC 3489 filtering behaviours.
+# Unsupported requested rules fail; never substitute a different NAT profile.
 netsim_apply_nat() {
     local slot="$1" nat="${2:-public}"
     local hop; hop="$(netsim_hop_ns "$slot")"
@@ -304,12 +297,20 @@ netsim_apply_nat() {
     # Requested NAT must be installed exactly; capability loss fails this row.
     [ "$NETSIM_HAVE_NAT" = 1 ] || { echo "required NAT unavailable: $nat" >&2; return 1; }
 
-    # Preserve the requested rule, including its port range. A fallback
-    # MASQUERADE rule would emulate a different scenario.
-    ip netns exec "$hop" iptables -t nat -C POSTROUTING -o "$out" \
-        -j MASQUERADE ${NETSIM_NAT[$nat]} 2>/dev/null ||
-    ip netns exec "$hop" iptables -t nat -A POSTROUTING -o "$out" \
-        -j MASQUERADE ${NETSIM_NAT[$nat]} || return 1
+    # --to-ports requires an explicit transport protocol. --persistent belongs
+    # to SNAT, not MASQUERADE; the hop owns a stable address in this topology.
+    local -a rule=(-o "$out" -p udp)
+    if [ "$nat" = full_cone ]; then
+        rule+=(-j SNAT --to-source "$(netsim_hop_srv_ip "$slot")" --persistent)
+    else
+        rule+=(-j MASQUERADE)
+        # Values come exclusively from the profile table above.
+        local -a flags=()
+        read -r -a flags <<< "${NETSIM_NAT[$nat]}"
+        rule+=("${flags[@]}")
+    fi
+    ip netns exec "$hop" iptables -t nat -C POSTROUTING "${rule[@]}" 2>/dev/null ||
+    ip netns exec "$hop" iptables -t nat -A POSTROUTING "${rule[@]}" || return 1
     # Bidirectional UDP entries use the stream timeout, not the unreplied
     # timeout. Both must expire for the idle-aging scenario to be meaningful.
     ip netns exec "$hop" sysctl -qw net.netfilter.nf_conntrack_udp_timeout=30 || return 1

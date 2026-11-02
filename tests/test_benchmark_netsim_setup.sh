@@ -11,6 +11,41 @@ work="$(mktemp -d)"
 CI_BENCH_RAW_DIR="$work"
 trap 'netsim_teardown; rm -rf "$work"' EXIT
 netsim_detect_caps
+# Exercise every scheduled NAT rule on real UDP traffic. In particular, CGNAT
+# must actually select its subscriber port block, not silently use masquerade.
+for nat in public port_restricted symmetric cgnat full_cone; do
+    netsim_setup 1
+    netsim_apply_nat 0 "$nat"
+    netsim_apply_nat 0 "$nat" # idempotent
+    ip netns exec "$NETSIM_NS_SERVER" python3 -u - "$NETSIM_SERVER_ADDR" >"$work/nat-server.log" <<'PY' &
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind((sys.argv[1], 5498))
+s.settimeout(5)
+print('ready', flush=True)
+data, peer = s.recvfrom(1024)
+s.sendto(str(peer[1]).encode(), peer)
+PY
+    echo_pid=$!
+    for ((attempt=0; attempt<50; attempt++)); do
+        grep -q '^ready' "$work/nat-server.log" && break
+        sleep .05
+    done
+    ip netns exec "$NETSIM_NS_CLIENT" python3 - "$NETSIM_SERVER_ADDR" "$nat" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(('', 41000))
+s.settimeout(5)
+s.sendto(b'probe', (sys.argv[1], 5498))
+port = int(s.recvfrom(1024)[0])
+if sys.argv[2] == 'cgnat':
+    assert 20000 <= port <= 20255, port
+elif sys.argv[2] in ('public', 'port_restricted', 'full_cone'):
+    assert port == 41000, port
+PY
+    wait "$echo_pid"
+    echo "PASS real UDP NAT profile $nat"
+done
 netsim_setup 1
 netsim_apply_path 0 'eth:iplc:public' 4242
 ip netns exec "$NETSIM_NS_CLIENT" ping -c 1 -W 2 "$NETSIM_SERVER_ADDR" >/dev/null

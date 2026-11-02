@@ -11,6 +11,8 @@ trap 'rm -rf "$work"' EXIT
 bash -c 'exit 23' &
 _CS_CLIENT_PID=$!
 sleep 0.1
+if ci_stress_check_workloads vpn_client "$_CS_CLIENT_PID"; then echo 'dead workload accepted' >&2; exit 1; fi
+[ "$_CS_DEAD_PROCESS" = vpn_client ]
 ci_stress_stop_client
 [ "$_CS_CLIENT_SANITIZER_FAIL" -eq 1 ]
 echo 'PASS already-exited child failure is collected'

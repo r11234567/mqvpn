@@ -47,6 +47,8 @@ def iperf_measurement(data, requested=None, exit_code=None):
         exit_code = meta.get("exit_code", 0)
     if exit_code != 0:
         raise InvalidMeasurement(f"iperf exited {exit_code}")
+    if meta.get('server_exit_code') not in (None, 0):
+        raise InvalidMeasurement(f"iperf server exited {meta['server_exit_code']}")
     if requested is None:
         requested = meta.get("requested_duration_s")
     summary = receiver_summary(data)
@@ -63,7 +65,7 @@ def iperf_measurement(data, requested=None, exit_code=None):
             "observed_duration_s": seconds, "receiver": summary}
 
 
-def record_iperf(path, duration, exit_code):
+def record_iperf(path, duration, exit_code, server_exit_code=None, server_observation=None):
     try:
         def reject_constant(value):
             raise ValueError(f"non-finite JSON value {value}")
@@ -76,6 +78,11 @@ def record_iperf(path, duration, exit_code):
         raw.write_bytes(path.read_bytes())
         data = {"error": f"invalid iperf JSON: {exc}", "invalid_output": str(raw)}
     meta = {"requested_duration_s": duration, "exit_code": exit_code}
+    if server_exit_code is not None:
+        meta['server_exit_code'] = server_exit_code
+    if server_observation is not None:
+        meta['server_process'] = json.loads(server_observation.read_text())
+    data['_mqvpn'] = meta
     try:
         parsed = iperf_measurement(data, duration, exit_code)
         meta.update({k: v for k, v in parsed.items() if k != "receiver"})
@@ -183,9 +190,11 @@ def main():
     parser.add_argument("--duration", type=float)
     parser.add_argument("--exit-code", type=int, default=0)
     parser.add_argument("--archive", type=Path)
+    parser.add_argument('--server-exit-code', type=int)
+    parser.add_argument('--server-observation', type=Path)
     args = parser.parse_args()
     if args.command == "record":
-        record_iperf(args.file, args.duration, args.exit_code)
+        record_iperf(args.file, args.duration, args.exit_code, args.server_exit_code, args.server_observation)
         if args.archive:
             args.archive.mkdir(parents=True, exist_ok=True)
             for path in args.file.parent.glob(args.file.name + "*"):
