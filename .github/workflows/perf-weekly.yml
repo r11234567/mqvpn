@@ -1,8 +1,7 @@
 name: Performance Tests (Weekly)
 
-# Full benchmark suite — every Sunday at 3:00 UTC. stress.yml's schedule
-# comment ("after perf-weekly at 3:00") is written relative to this slot, so
-# keep the two in step if either moves.
+# Full benchmark suite, Sunday at 3:00 UTC. Stress has its own independent
+# schedule; clock order does not create a completion dependency.
 #
 # Runs on a GitHub-hosted runner for the same reason perf.yml does, and its
 # results carry the same caveat: shared cloud vCPUs, so read the series as a
@@ -25,18 +24,10 @@ on:
         default: ''
       skip_core:
         description: >-
-          Skip the core benchmark job (raw throughput, failover, aggregation,
-          multipath scheduler, UDP sweep, NTN, backup FEC) and run only the
-          netsim matrix. Narrowing `netsim_modes` alone does NOT make a dispatch
-          faster: the netsim modes run as parallel jobs whose longest is about
-          31 minutes, while the core job takes 57 and sets the whole dispatch's
-          wall clock on its own — run 34026833126 finished in exactly the core
-          job's 57 minutes with that day's 11 netsim modes hidden inside it.
-          Use this together with `netsim_modes` when the question is about a
-          netsim mode, which turns an hour into roughly 20 minutes. Leave it
-          OFF for anything
-          published as a series: the core numbers are what the dashboard tracks,
-          and a run missing them is not comparable with one that has them.
+          Skip the seven core benchmark families and run only the selected
+          netsim jobs. Pairing, QUIC baselines, generator timeouts and path
+          conditions determine the actual duration. A narrowed or core-skipped
+          dispatch is partial coverage and must not be presented as a full weekly.
         required: false
         type: boolean
         default: false
@@ -285,8 +276,8 @@ jobs:
               # proxy leaves the protocol most of its traffic actually is
               # unmeasured -- and leaves wlb and wlb_udp_pin indistinguishable,
               # since the two differ only on inner UDP (flow_sched.c:61).
-              # Modes run as parallel jobs, so these cost no wall clock as long
-              # as each stays under the ~31 min `classes` takes.
+              # Jobs run in parallel, but each added mode can become the
+              # longest job; no fixed wall-clock saving is assumed.
               {"id": "quic",        "args": "quic"},
               {"id": "game",        "args": "game"},
               {"id": "vps",         "args": "vps"},
@@ -457,8 +448,8 @@ jobs:
                 -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
           make -j$(nproc)
 
-      # picoquicdemo generates the INNER QUIC traffic for the `quic` mode. Only
-      # that mode needs it, so the build is gated -- it is a clone plus two
+      # picoquicdemo supplies INNER QUIC for `quic` and `mixed`. The build is
+      # gated to those modes -- it is a clone plus two
       # cmake builds (picotls, then picoquicdemo) and every other mode would
       # pay for a binary it never runs.
       #
