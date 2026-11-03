@@ -148,39 +148,5 @@ for suffix in ('.server.log','.context.json','.server-process.json',
 PY
 echo 'PASS control failure retains all 12002 stderr lines and separate stdout'
 if command -v tcpdump >/dev/null; then
-    # A sub-second control close must reach disk BEFORE stopping tcpdump.
-    # Writer flushing (-U) alone leaves these packets in libpcap's input ring.
-    burst="$(mktemp)"
-    printf '{"protocol":"UDP"}\n' >"${burst}.context.json"
-    ci_bench_control_capture_start "$NS_SERVER" "${burst}.client"; burst_client="$_CB_CAPTURE_PID"
-    ci_bench_control_capture_start "$NS_SERVER" "${burst}.server"; burst_server="$_CB_CAPTURE_PID"
-    ip netns exec "$NS_SERVER" python3 - <<'PY'
-import socket
-listener = socket.socket(); listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-listener.bind(('127.0.0.1',5201)); listener.listen(1)
-client = socket.create_connection(('127.0.0.1',5201))
-server,_ = listener.accept()
-client.sendall(b'fast-control-close')
-assert server.recv(1024)==b'fast-control-close'
-server.close(); client.close(); listener.close()
-PY
-    for ((attempt=0; attempt<40; attempt++)); do
-        if [ "$(stat -c %s "${burst}.client.control.pcap")" -gt 24 ] &&
-           [ "$(stat -c %s "${burst}.server.control.pcap")" -gt 24 ]; then break; fi
-        sleep .01
-    done
-    [ "$(stat -c %s "${burst}.client.control.pcap")" -gt 24 ]
-    [ "$(stat -c %s "${burst}.server.control.pcap")" -gt 24 ]
-    ci_bench_control_capture_stop "$burst_client" "${burst}.client"
-    ci_bench_control_capture_stop "$burst_server" "${burst}.server"
-    python3 - "$burst" "$CI_BENCH_DIR" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0,sys.argv[2])
-from ci_bench_iperf_evidence import capture_status
-status = capture_status(Path(sys.argv[1]))
-assert status['status']=='complete',status
-PY
-    rm -f "$burst" "${burst}."*
-    echo 'PASS rapid control close reaches both pcaps before capture shutdown'
+    bash "${CI_BENCH_DIR}/../../tests/test_benchmark_udp_capture.sh"
 fi

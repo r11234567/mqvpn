@@ -1,4 +1,5 @@
 name: Performance Tests (Weekly)
+run-name: ${{ github.event.inputs.quick_udp == 'true' && 'UDP control quick check' || 'Performance Tests (Weekly)' }}
 
 # Full benchmark suite, Sunday at 3:00 UTC. Stress has its own independent
 # schedule; clock order does not create a completion dependency.
@@ -15,6 +16,11 @@ on:
     - cron: '0 3 * * 0'
   workflow_dispatch:
     inputs:
+      quick_udp:
+        description: 'Only fast control-close capture regression and six 5-second UDP DL/50B samples; skips core/netsim suites and publishing.'
+        required: false
+        type: boolean
+        default: false
       netsim_modes:
         description: >-
           Comma-separated netsim modes to narrow to (e.g. "classes,sched,tiers").
@@ -81,14 +87,14 @@ permissions:
 # read-modify-write cycles cannot collide either. cancel-in-progress stays off
 # so a manual re-run queues behind a suite in flight instead of killing it.
 concurrency:
-  group: perf-weekly
+  group: ${{ github.event.inputs.quick_udp == 'true' && 'perf-weekly-udp-quick' || 'perf-weekly' }}
   cancel-in-progress: false
 
 jobs:
   perf-weekly:
-    if: github.event.inputs.skip_core != 'true'
+    if: github.event.inputs.quick_udp == 'true' || github.event.inputs.skip_core != 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: ${{ github.event.inputs.quick_udp == 'true' && 15 || 180 }}
     env:
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -173,34 +179,66 @@ jobs:
       # --- Core benchmarks (same as push-to-main) ---
 
       - name: Raw throughput benchmark (TCP DL+UL)
-        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
+        if: ${{ !cancelled() && github.event.inputs.quick_udp != 'true' && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_raw_throughput.sh --full build/mqvpn
 
       - name: Failover benchmark (WLB + MinRTT)
-        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
+        if: ${{ !cancelled() && github.event.inputs.quick_udp != 'true' && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_failover.sh build/mqvpn
 
       - name: Aggregation benchmark (WLB + MinRTT)
-        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
+        if: ${{ !cancelled() && github.event.inputs.quick_udp != 'true' && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_aggregate.sh build/mqvpn
 
       # --- Extended benchmarks (weekly only) ---
 
       - name: Multipath scheduler benchmark (8 scenarios)
-        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
+        if: ${{ !cancelled() && github.event.inputs.quick_udp != 'true' && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_multipath_scheduler.sh build/mqvpn
 
       - name: UDP rate sweep benchmark
-        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
+        if: ${{ !cancelled() && github.event.inputs.quick_udp != 'true' && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_udp_sweep.sh build/mqvpn
 
       - name: NTN satellite benchmark
-        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
+        if: ${{ !cancelled() && github.event.inputs.quick_udp != 'true' && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_ntn.sh build/mqvpn
 
       - name: Backup FEC scheduler benchmark (lossy primary sweep)
-        if: ${{ !cancelled() && steps.benchmark-build.outcome == 'success' }}
+        if: ${{ !cancelled() && github.event.inputs.quick_udp != 'true' && steps.benchmark-build.outcome == 'success' }}
         run: sudo bash scripts/ci_benchmarks/ci_bench_backup_fec.sh build/mqvpn
+
+      - name: Fast control-close capture regression
+        id: quick_capture
+        if: ${{ !cancelled() && github.event.inputs.quick_udp == 'true' && steps.benchmark-build.outcome == 'success' }}
+        run: sudo env CI_BENCH_CAPTURE_TEST_DIR="$PWD/ci_bench_results/quick-capture" bash tests/test_benchmark_udp_capture.sh
+
+      - name: Focused UDP control reproduction (six samples)
+        id: quick_udp
+        if: ${{ !cancelled() && github.event.inputs.quick_udp == 'true' && steps.quick_capture.outcome == 'success' }}
+        run: |
+          echo '> Partial diagnostic run: rapid control-close capture and UDP DL/50B at 5/10 Mbps, single/WLB/MinRTT. Not a full weekly.' >> "$GITHUB_STEP_SUMMARY"
+          sudo env CI_BENCH_TEST_SCOPE=quick_udp_control CI_BENCH_UDP_SEC=5 \
+            CI_BENCH_UDP_DIRECTIONS=DL CI_BENCH_UDP_SIZES=50 CI_BENCH_UDP_SMALL_RATES='5 10' \
+            bash scripts/ci_benchmarks/ci_bench_udp_sweep.sh build/mqvpn
+
+      - name: Verify quick capture evidence independently of transfer outcome
+        if: ${{ !cancelled() && github.event.inputs.quick_udp == 'true' && steps.benchmark-build.outcome == 'success' && steps.quick_udp.outcome != 'skipped' }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          manifests = list(Path('ci_bench_results/raw').rglob('*.evidence.json'))
+          assert len(manifests)==6, f'expected six sample manifests, got {len(manifests)}'
+          for p in manifests:
+              d=json.loads(p.read_text())
+              assert d['capture']['status']=='complete', (str(p),d['capture'])
+              assert not d['copy_errors'], (str(p),d['copy_errors'])
+              for item in d['files']:
+                  b=(p.parent/item['name']).read_bytes()
+                  assert len(b)==item['bytes'] and hashlib.sha256(b).hexdigest()==item['sha256'],item['name']
+          print('PASS all six UDP samples retained complete control pcaps and matching artifact hashes')
+          PY
 
       - name: Make bench artifacts readable by the runner
         if: always()
@@ -209,16 +247,16 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: perf-weekly-${{ github.sha }}
+          name: ${{ github.event.inputs.quick_udp == 'true' && 'perf-udp-quick' || 'perf-weekly' }}-${{ github.sha }}
           path: ci_bench_results/
           retention-days: 90
 
       - name: Publish results to R2
-        if: ${{ success() && env.R2_ACCOUNT_ID != '' }}
+        if: ${{ success() && github.event.inputs.quick_udp != 'true' && env.R2_ACCOUNT_ID != '' }}
         run: bash scripts/ci_publish/publish_to_r2.sh perf-data/weekly weekly
 
       - name: Note that R2 publishing was skipped
-        if: ${{ success() && env.R2_ACCOUNT_ID == '' }}
+        if: ${{ success() && github.event.inputs.quick_udp != 'true' && env.R2_ACCOUNT_ID == '' }}
         run: |
           echo "::notice::R2_* secrets are not set — results are in this run's" \
                "artifact only, and the dashboard will not show this run."
@@ -243,6 +281,7 @@ jobs:
   #     numbers move several percent run to run on shared runners, so the two
   #     sides have to be measured in the same run to be compared at all.
   netsim-select:
+    if: github.event.inputs.quick_udp != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -333,6 +372,7 @@ jobs:
 
   netsim:
     needs: netsim-select
+    if: github.event.inputs.quick_udp != 'true'
     runs-on: ubuntu-latest
     # 90, not 60. The three fixes in docs/network_emulation_matrix.md §0.3
     # each cost wall-clock: run_pair now performs three real measurements
@@ -492,7 +532,7 @@ jobs:
   # docs/network_emulation_matrix.md 0.4 L).
   netsim-compare:
     needs: netsim
-    if: always()
+    if: ${{ always() && github.event.inputs.quick_udp != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -533,7 +573,7 @@ jobs:
   # benchmark job failed.
   netsim-publish:
     needs: [netsim, perf-weekly]
-    if: always()
+    if: ${{ always() && github.event.inputs.quick_udp != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:

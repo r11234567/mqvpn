@@ -57,6 +57,7 @@ doc = {'test': 'udp_sweep', 'measurement_version': 2, 'commit': os.environ.get('
        'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat(),
        'direction': direction, 'packet_size_bytes': int(size), 'duration_sec': int(duration),
        'sweep_rates_mbps': [float(r) for r in rates.split()], 'results': {},
+       'scope': os.environ.get('CI_BENCH_TEST_SCOPE','udp_sweep'),
        'measurement': 'receiver bytes/time; ascending first loss crossing, one sample per point'}
 for cond in ('single', 'wlb', 'minrtt'):
     pts = [p for p in points if p['condition'] == cond]

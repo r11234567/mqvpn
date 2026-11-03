@@ -59,3 +59,12 @@ sudo bash tests/test_benchmark_netsim_setup.sh
 
 These checks validate the harness and actual local TCP/UDP/NAT operations. They
 do not replace a full weekly/stress run of the product.
+
+For a focused hosted check, dispatch `perf-weekly.yml` with `quick_udp=true`.
+It uses a separate concurrency group and a 15-minute job limit, reuses the
+Release build/cache, runs only the standalone rapid control-close regression
+and six five-second UDP DL/50-byte samples (5/10 Mbps, single/WLB/MinRTT).
+Capture integrity is checked even if a transfer fails. Core/netsim suites,
+comparisons and R2 publishing are skipped; results are explicitly partial and
+uploaded as `perf-udp-quick-<commit>`. Build/queue time still counts toward wall
+time; this does not promise a fixed completion time.
