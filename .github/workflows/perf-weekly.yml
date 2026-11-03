@@ -222,6 +222,10 @@ jobs:
             CI_BENCH_UDP_DIRECTIONS=DL CI_BENCH_UDP_SIZES=50 CI_BENCH_UDP_SMALL_RATES='5 10' \
             bash scripts/ci_benchmarks/ci_bench_udp_sweep.sh build/mqvpn
 
+      - name: Make bench artifacts readable by the runner
+        if: always()
+        run: if [ -d ci_bench_results ]; then sudo chown -R "$(id -u):$(id -g)" ci_bench_results; fi
+
       - name: Verify quick capture evidence independently of transfer outcome
         if: ${{ !cancelled() && github.event.inputs.quick_udp == 'true' && steps.benchmark-build.outcome == 'success' && steps.quick_udp.outcome != 'skipped' }}
         run: |
@@ -240,9 +244,6 @@ jobs:
           print('PASS all six UDP samples retained complete control pcaps and matching artifact hashes')
           PY
 
-      - name: Make bench artifacts readable by the runner
-        if: always()
-        run: if [ -d ci_bench_results ]; then sudo chown -R "$(id -u):$(id -g)" ci_bench_results; fi
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
