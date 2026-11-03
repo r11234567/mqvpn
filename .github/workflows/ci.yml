@@ -177,7 +177,7 @@ jobs:
           actual=$(build/mqvpn --version)
           printf '%s\n' "$actual"
           [ "${actual%%$'\n'*}" = "mqvpn $VERSION_DISPLAY" ]
-          printf '%s\n' "$actual" | grep -Fx 'core 0.19.0; callback ABI 3'
+          printf '%s\n' "$actual" | grep -Fx 'core 0.19.1; callback ABI 3'
 
       # Needs the resolved mqvpn_lib source list, which the configure inside
       # "Build mqvpn" writes to build/mqvpn_lib_sources.txt.
@@ -442,6 +442,12 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: sudo -E scripts/ci_e2e/test_multiclient.sh
+
+      - name: E2E multi-client isolation test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_multiclient_isolation_test.sh
 
       - name: E2E NAT test (netns)
         env:
@@ -802,6 +808,9 @@ jobs:
       - name: Multi-client test (netns)
         run: sudo scripts/ci_e2e/test_multiclient.sh
 
+      - name: Multi-client isolation test (netns)
+        run: sudo scripts/ci_e2e/run_multiclient_isolation_test.sh
+
       - name: NAT test (netns)
         run: sudo scripts/ci_e2e/run_nat_test.sh
 
@@ -1013,7 +1022,7 @@ jobs:
           actual=$(build-darwin/mqvpn --version)
           printf '%s\n' "$actual"
           [ "${actual%%$'\n'*}" = "mqvpn $VERSION_DISPLAY" ]
-          printf '%s\n' "$actual" | grep -Fx 'core 0.19.0; callback ABI 3'
+          printf '%s\n' "$actual" | grep -Fx 'core 0.19.1; callback ABI 3'
 
       - name: Run Darwin unit tests
         run: ctest --test-dir build-darwin --no-tests=error --output-on-failure
@@ -1339,7 +1348,7 @@ jobs:
         run: |
           $out = & build/Release/mqvpn.exe --version
           if ($LASTEXITCODE -ne 0 -or @($out)[0] -cne "mqvpn $env:VERSION_DISPLAY" -or
-              @($out) -cnotcontains 'core 0.19.0; callback ABI 3') {
+              @($out) -cnotcontains 'core 0.19.1; callback ABI 3') {
             throw "Snapshot binary identity/core metadata mismatch: $out"
           }
           $out
