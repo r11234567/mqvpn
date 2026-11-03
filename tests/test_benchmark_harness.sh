@@ -90,3 +90,60 @@ PY
 done
 [ "$(find "$CI_BENCH_RAW_DIR" -maxdepth 1 -name '*.server-process.json' | wc -l)" -eq 4 ]
 echo 'PASS raw evidence survives caller cleanup'
+# Reproduce iperf's real MTU warning. stderr must remain separate from JSON.
+ip -n "$NS_SERVER" link set lo mtu 1400
+sample="$(CI_BENCH_IPERF_LEN=1400 ci_bench_run_iperf UDP DL 2 1 2000000)"
+[ "$(ci_bench_parse_throughput "$sample")" != NA ]
+grep -q 'warning: UDP block size' "${sample}.client.stderr.log"
+python3 - "$sample" "$CI_BENCH_RAW_DIR" <<'PY'
+import json,sys
+from pathlib import Path
+p = Path(sys.argv[1]); archive = Path(sys.argv[2])
+doc = json.loads(p.read_text())
+assert doc['_mqvpn']['measurement_complete'], doc
+assert json.loads(Path(str(p)+'.client.stdout.log').read_text())['end']['sum_received']['bytes']>0
+manifest = json.loads((archive/(p.name+'.evidence.json')).read_text())
+assert any(f['name'].endswith('.client.stderr.log') for f in manifest['files'])
+PY
+echo 'PASS real iperf warning preserves valid JSON and full stderr'
+if command -v tcpdump >/dev/null; then
+    tcpdump -n -r "${sample}.client.control.pcap" >"$work/decoded-control.log" 2>&1
+    grep -q '5201' "$work/decoded-control.log"
+    echo 'PASS full TCP control packets retained in pcap'
+fi
+# Inject a client control failure with a long stderr stream. The real one-shot
+# server remains owned by this call and must still be cleaned up and reaped.
+real_iperf="$(command -v iperf3)"
+mkdir "$work/bin"
+cat >"$work/bin/iperf3" <<SH
+#!/bin/sh
+if [ "\$1" = -s ]; then exec "$real_iperf" "\$@"; fi
+python3 - <<'PY'
+import sys
+print('BEGIN-CONTROL-FAILURE',file=sys.stderr)
+for i in range(12000): print('full failure detail %d' % i,file=sys.stderr)
+print('END-CONTROL-FAILURE',file=sys.stderr)
+print('{"error":"unable to read from stream socket","end":{}}')
+PY
+exit 1
+SH
+chmod +x "$work/bin/iperf3"
+sample="$(PATH="$work/bin:$PATH" ci_bench_run_iperf UDP DL 1 1 1000000)"
+[ "$(ci_bench_parse_throughput "$sample")" = NA ]
+python3 - "$sample" "$CI_BENCH_RAW_DIR" <<'PY'
+import hashlib,json,sys
+from pathlib import Path
+p = Path(sys.argv[1]); archive = Path(sys.argv[2])
+d = json.loads(p.read_text()); assert not d['_mqvpn']['measurement_complete']
+stderr = archive/(p.name+'.client.stderr.log')
+assert len(stderr.read_text().splitlines())==12002
+assert stderr.read_text().endswith('END-CONTROL-FAILURE\n')
+assert json.loads((archive/(p.name+'.client.stdout.log')).read_text())['error']
+manifest = json.loads((archive/(p.name+'.evidence.json')).read_text())
+entry = next(f for f in manifest['files'] if f['name']==stderr.name)
+assert entry['sha256']==hashlib.sha256(stderr.read_bytes()).hexdigest()
+for suffix in ('.server.log','.context.json','.server-process.json',
+               '.network-before.log','.network-after-client.log'):
+    assert (archive/(p.name+suffix)).exists(), suffix
+PY
+echo 'PASS control failure retains all 12002 stderr lines and separate stdout'

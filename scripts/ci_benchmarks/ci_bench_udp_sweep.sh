@@ -4,6 +4,9 @@
 # Receiver goodput and loss, UL/DL, small packets and bulk. Keep every raw run.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Keep full application diagnostics for the intermittent control-channel error.
+# No packet-level trace logging is enabled during throughput measurements.
+CI_BENCH_LOG_LEVEL="${CI_BENCH_LOG_LEVEL:-info}"
 source "${SCRIPT_DIR}/ci_bench_env.sh"
 MQVPN="${1:-${MQVPN}}"
 DURATION="${CI_BENCH_UDP_SEC:-10}"

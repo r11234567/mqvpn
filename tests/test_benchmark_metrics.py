@@ -17,6 +17,20 @@ from ci_bench_mixed_results import summarise as mixed_summary
 
 
 class ProtocolMetricsTests(unittest.TestCase):
+    def test_failed_udp_point_links_to_full_evidence(self):
+        script = Path(__file__).resolve().parents[1]/'scripts/ci_benchmarks/ci_bench_metrics.py'
+        with tempfile.TemporaryDirectory() as folder:
+            sample = Path(folder)/'failed.json'
+            sample.write_text(json.dumps({'error':'unable to read from stream socket',
+                '_mqvpn':{'evidence_manifest':'failed.json.evidence.json'}}))
+            result = subprocess.run([sys.executable,str(script),'udp',str(sample),'--rate','10'],
+                                    capture_output=True,text=True)
+            self.assertEqual(result.returncode,1)
+            doc = json.loads(result.stdout)
+            self.assertEqual(doc['raw_sample'],'failed.json')
+            self.assertEqual(doc['evidence_manifest'],'failed.json.evidence.json')
+            self.assertIsNone(doc['throughput'])
+
     def test_quic_different_work_budgets_cannot_be_compared(self):
         row = {'scenario':'hetero_extreme','quic_object_bytes':134217728,'quic_timeout_s':90}
         self.assertNotEqual(key_of('quic',row),key_of('quic',dict(row,quic_object_bytes=2097152)))

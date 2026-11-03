@@ -108,7 +108,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake libevent-dev libssl-dev pkg-config golang iptables iproute2 iperf3 netcat-openbsd \
-            conntrack stress-ng
+            conntrack stress-ng tcpdump
 
       - name: Compute xquic SHA
         id: xqsha
@@ -393,7 +393,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake libevent-dev libssl-dev pkg-config golang iptables iproute2 iperf3 netcat-openbsd \
-            conntrack stress-ng
+            conntrack stress-ng tcpdump
 
       - name: Compute xquic SHA
         id: xqsha

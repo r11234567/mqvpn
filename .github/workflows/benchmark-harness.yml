@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install harness dependencies
-        run: sudo apt-get update && sudo apt-get install -y iperf3 iproute2 shellcheck iptables conntrack
+        run: sudo apt-get update && sudo apt-get install -y iperf3 iproute2 shellcheck iptables conntrack tcpdump
       - name: Measurement and result regression tests
         run: python3 -m unittest discover -s tests -p 'test_benchmark*.py' -v
       - name: Shell syntax and errors

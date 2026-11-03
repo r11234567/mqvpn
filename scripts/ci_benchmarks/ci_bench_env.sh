@@ -524,6 +524,34 @@ ci_bench_stop_vpn() {
 
 # ── iperf3 helpers ──
 
+ci_bench_control_capture_start() {
+    local ns="$1" prefix="$2" i
+    _CB_CAPTURE_PID=""
+    if ! command -v tcpdump >/dev/null; then
+        printf 'CAPTURE UNAVAILABLE: tcpdump not installed\n' >"${prefix}.capture.log"
+        return 0
+    fi
+    ip netns exec "$ns" tcpdump -n -i any -s 0 -U -B 8192 \
+        -w "${prefix}.control.pcap" "tcp port ${IPERF3_PORT} or icmp or icmp6" \
+        >"${prefix}.capture.log" 2>&1 &
+    _CB_CAPTURE_PID=$!
+    for ((i=0; i<50; i++)); do
+        grep -q 'listening on' "${prefix}.capture.log" && return 0
+        kill -0 "$_CB_CAPTURE_PID" 2>/dev/null || break
+        sleep .05
+    done
+    printf '\nCAPTURE NOT READY before client start\n' >>"${prefix}.capture.log"
+}
+
+ci_bench_control_capture_stop() {
+    local pid="$1" prefix="$2" rc=0
+    [ -n "$pid" ] || return 0
+    kill -INT "$pid" 2>/dev/null || true
+    python3 "${CI_BENCH_DIR}/ci_bench_process.py" "$pid" "${prefix}.capture-process.json" --grace 1 --stop-grace 1
+    wait "$pid" 2>/dev/null || rc=$?
+    printf '%s\n' "$rc" >"${prefix}.capture-exit.txt"
+}
+
 # Run iperf3 and return JSON file path.
 # Usage: ci_bench_run_iperf TCP DL 10 4
 #        ci_bench_run_iperf UDP UL 10 4 500M
@@ -571,7 +599,7 @@ ci_bench_run_iperf() {
     done
 
     local server_log="${json_file}.server.log" server_observation="${json_file}.server-process.json"
-    ip netns exec "$NS_SERVER" iperf3 -s -p "$IPERF3_PORT" -B "$_cb_iperf_target" -1 \
+    ip netns exec "$NS_SERVER" iperf3 -s -p "$IPERF3_PORT" -B "$_cb_iperf_target" -1 --forceflush \
         >"$server_log" 2>&1 &
     local iperf_srv_pid=$!
 
@@ -591,6 +619,15 @@ ci_bench_run_iperf() {
     # Per-second interval samples, so a caller that needs the shape of the
     # transfer can read intervals[] the way ci_bench_failover.sh:180 does.
     [ -n "${CI_BENCH_IPERF_INTERVAL:-}" ] && args="$args -i ${CI_BENCH_IPERF_INTERVAL}"
+    local evidence_tool="${CI_BENCH_DIR}/ci_bench_iperf_evidence.py" capture_client="" capture_server=""
+    python3 "$evidence_tool" context "$json_file" --client "$NS_CLIENT" --server "$NS_SERVER" \
+        --target "$_cb_iperf_target" --proto "$proto" --direction "$dir" --client-args="$args" \
+        --scenario "${class:-${CI_BENCH_SCENARIO:-unknown}}"
+    if [ "$proto" = UDP ]; then
+        python3 "$evidence_tool" snapshot "$json_file" --phase before --client "$NS_CLIENT" --server "$NS_SERVER" --target "$_cb_iperf_target"
+        ci_bench_control_capture_start "$NS_CLIENT" "${json_file}.client"; capture_client="$_CB_CAPTURE_PID"
+        ci_bench_control_capture_start "$NS_SERVER" "${json_file}.server"; capture_server="$_CB_CAPTURE_PID"
+    fi
 
     # Two hang guards, both mandatory once the emulated path is allowed to be
     # genuinely broken (see tests/test_e2e_hybrid_h2.sh, which documents the
@@ -608,17 +645,27 @@ ci_bench_run_iperf() {
     # minutes while its siblings finished in six.
     local iperf_exit=0
     ip netns exec "$NS_CLIENT" timeout --kill-after=5 $((duration + 20)) \
-        iperf3 $args > "$json_file" 2>&1 || iperf_exit=$?
+        iperf3 $args > "$json_file" 2>"${json_file}.client.stderr.log" || iperf_exit=$?
+    cp "$json_file" "${json_file}.client.stdout.log"
+    if [ "$proto" = UDP ]; then
+        python3 "$evidence_tool" snapshot "$json_file" --phase after-client --client "$NS_CLIENT" --server "$NS_SERVER" --target "$_cb_iperf_target"
+    fi
 
     # Allow the one-shot server to finish exchanging results before cleanup.
     # Preserve a bounded forced-stop decision and its actual exit code.
-    python3 "${CI_BENCH_DIR}/ci_bench_process.py" "$iperf_srv_pid" "$server_observation"
+    local server_grace="${CI_BENCH_IPERF_SERVER_GRACE:-30}"
+    [ "$iperf_exit" -eq 0 ] || server_grace=2
+    python3 "${CI_BENCH_DIR}/ci_bench_process.py" "$iperf_srv_pid" "$server_observation" --grace "$server_grace"
     local server_exit=0
     wait "$iperf_srv_pid" 2>/dev/null || server_exit=$?
+    ci_bench_control_capture_stop "$capture_client" "${json_file}.client"
+    ci_bench_control_capture_stop "$capture_server" "${json_file}.server"
 
     python3 "$CI_BENCH_RESULT_TOOL" record "$json_file" \
         --duration "$duration" --exit-code "$iperf_exit" --server-exit-code "$server_exit" \
-        --server-observation "$server_observation" --archive "$CI_BENCH_RAW_DIR"
+        --server-observation "$server_observation"
+    python3 "$evidence_tool" finalize "$json_file" --archive "$CI_BENCH_RAW_DIR" \
+        --vpn-client "$CI_BENCH_CLIENT_LOG" --vpn-server "$CI_BENCH_SERVER_LOG"
     echo "$json_file"
 }
 

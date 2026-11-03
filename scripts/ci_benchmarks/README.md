@@ -23,9 +23,24 @@ failures. Changing the harness must not make them disappear.
 - Every VPN process instance has a separate `raw/.../vpn/<role>...` directory
   with context, log and observed exit status, including startup failures. No auth
   key, private key or full command line is copied into process context.
-- One-shot iperf servers get a bounded drain period after the client exits.
-  Server output, natural/forced cleanup and exit codes are retained; a nonzero
-  server exit cannot be reported as a complete receiver measurement.
+- One-shot iperf servers get a 30-second drain period after a successful client
+  (`CI_BENCH_IPERF_SERVER_GRACE` overrides it), then a separate two-second stop
+  deadline. A failed client uses a short drain. Natural server errors and
+  SIGKILL still invalidate the sample. An observed harness SIGTERM after a
+  successful client and complete receiver result is recorded as
+  `server_teardown=harness_cleanup`, rather than fabricating a transfer failure.
+- iperf JSON stdout and stderr warnings are separate; pristine stdout survives
+  JSON metadata updates. Every UDP call also records before/after namespace
+  addresses, routes, TCP/UDP socket details, qdisc/counter/firewall state, and
+  full-snaplen PCAPs of TCP control-port/ICMP packets at both endpoints. No
+  packet rotation or head/tail clipping is used. Capture startup, drops and
+  shutdown are retained in capture logs; unavailable captures and timed-out
+  diagnostic commands are explicit. Bulk UDP payload is outside the filter.
+- On failure, the full current client/server VPN logs are copied beside the
+  raw traffic logs. `*.evidence.json` inventories artifact names, sizes, SHA-256,
+  exit codes, timing/context links and copy errors. These files live under the
+  existing always-uploaded raw artifact tree. Extra evidence helps diagnose
+  control resets but does not by itself prove a particular product root cause.
 - Fault stress stops after a required VPN/traffic process exits. Requested,
   attempted, failed and unexecuted cycles are distinct; aborting still fails the
   run. The first failing cycle and abort cause remain in the summary.

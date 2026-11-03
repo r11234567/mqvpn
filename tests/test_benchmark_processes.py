@@ -12,6 +12,16 @@ from ci_bench_process import drain
 
 @unittest.skipUnless(sys.platform == 'linux', 'requires Linux process identity')
 class ServerLifecycleTests(unittest.TestCase):
+    def test_slow_normal_teardown_gets_more_than_two_seconds(self):
+        child = subprocess.Popen([sys.executable,'-c','import time; time.sleep(2.2)'])
+        try:
+            result = drain(child.pid,3)
+            self.assertFalse(result['cleanup_requested'])
+            self.assertEqual(child.wait(),0)
+        finally:
+            if child.poll() is None: child.kill()
+            child.wait()
+
     def test_one_shot_server_can_finish_without_being_killed(self):
         child = subprocess.Popen([sys.executable,'-c','import time; time.sleep(.1)'])
         try:
@@ -30,7 +40,7 @@ class ServerLifecycleTests(unittest.TestCase):
         os.close(write_fd)
         try:
             self.assertEqual(os.read(read_fd,5),b'ready')
-            result = drain(child.pid,.15)
+            result = drain(child.pid,.15,.15)
             self.assertTrue(result['cleanup_requested'])
             self.assertTrue(result['forced_kill'])
             self.assertEqual(child.wait(),-9)

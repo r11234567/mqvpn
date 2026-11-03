@@ -28,6 +28,20 @@ def aggregate():
 
 
 class MeasurementTests(unittest.TestCase):
+    def test_own_cleanup_does_not_invalidate_completed_receiver(self):
+        for code in (1,143,-15):
+            with self.subTest(code=code):
+                data = tcp()
+                data['_mqvpn'] = dict(exit_code=0, requested_duration_s=10, server_exit_code=code,
+                    server_process=dict(cleanup_requested=True,forced_kill=False,signals_sent=['SIGTERM']))
+                self.assertEqual(bench.iperf_measurement(data)['receiver_mbps'],10)
+                for key,value in [('exit_code',1),('requested_duration_s',900)]:
+                    bad = copy.deepcopy(data); bad['_mqvpn'][key] = value
+                    with self.assertRaises(bench.InvalidMeasurement): bench.iperf_measurement(bad)
+                for field,value in [('forced_kill',True),('signals_sent',[]),('cleanup_requested',False)]:
+                    bad = copy.deepcopy(data); bad['_mqvpn']['server_process'][field] = value
+                    with self.assertRaises(bench.InvalidMeasurement): bench.iperf_measurement(bad)
+
     def test_failed_server_cannot_pass_using_successful_client_summary(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder)/'iperf.json'

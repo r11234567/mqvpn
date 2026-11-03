@@ -302,7 +302,8 @@ for direction in UL DL; do
         ip netns exec "ci-stress-c${i}" timeout --kill-after=5 $((TRAFFIC_SEC + 30)) \
             iperf3 -c "$TUNNEL_SERVER_IP" -p "$((5300 + i))" -t "$TRAFFIC_SEC" \
             -b "${CI_STRESS_CLIENT_RATE:-2M}" "${reverse[@]}" --json \
-            >"${CI_STRESS_RAW_DIR}/iperf-client-${i}-${direction}.json" 2>&1 &
+            >"${CI_STRESS_RAW_DIR}/iperf-client-${i}-${direction}.json" \
+            2>"${CI_STRESS_RAW_DIR}/iperf-client-${i}-${direction}.stderr.log" &
         TRAFFIC_CLIENT_PIDS+=("$!")
     done
     for index in "${!connected_indices[@]}"; do
@@ -310,11 +311,14 @@ for direction in UL DL; do
         rc=0
         wait "${TRAFFIC_CLIENT_PIDS[$index]}" || rc=$?
         server_observation="${CI_STRESS_RAW_DIR}/iperf-server-${i}-${direction}.process.json"
+        server_grace="${CI_BENCH_IPERF_SERVER_GRACE:-30}"
+        [ "$rc" -eq 0 ] || server_grace=2
         python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_process.py" \
-            "${TRAFFIC_SERVER_PIDS[$index]}" "$server_observation"
+            "${TRAFFIC_SERVER_PIDS[$index]}" "$server_observation" --grace "$server_grace"
         server_rc=0
         wait "${TRAFFIC_SERVER_PIDS[$index]}" 2>/dev/null || server_rc=$?
         sample="${CI_STRESS_RAW_DIR}/iperf-client-${i}-${direction}.json"
+        cp "$sample" "${sample}.client.stdout.log"
         python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" record "$sample" \
             --duration "$TRAFFIC_SEC" --exit-code "$rc" --server-exit-code "$server_rc" \
             --server-observation "$server_observation"

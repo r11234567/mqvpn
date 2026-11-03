@@ -47,8 +47,6 @@ def iperf_measurement(data, requested=None, exit_code=None):
         exit_code = meta.get("exit_code", 0)
     if exit_code != 0:
         raise InvalidMeasurement(f"iperf exited {exit_code}")
-    if meta.get('server_exit_code') not in (None, 0):
-        raise InvalidMeasurement(f"iperf server exited {meta['server_exit_code']}")
     if requested is None:
         requested = meta.get("requested_duration_s")
     summary = receiver_summary(data)
@@ -61,6 +59,18 @@ def iperf_measurement(data, requested=None, exit_code=None):
         # not; even short smoke samples must cover at least 90% of the request.
         if seconds < requested * 0.9:
             raise InvalidMeasurement(f"short transfer: {seconds:.3f}/{requested}s")
+    process = meta.get('server_process') or {}
+    if process.get('forced_kill'):
+        raise InvalidMeasurement('iperf server required SIGKILL after drain/stop deadlines')
+    if meta.get('server_exit_code') not in (None, 0):
+        # Only accept our observed SIGTERM of a still-live one-shot server
+        # AFTER a successful client and complete receiver result. A natural
+        # server error, other signal or missing receiver evidence still fails.
+        expected_cleanup = (process.get('cleanup_requested') is True
+                            and process.get('signals_sent') == ['SIGTERM']
+                            and meta['server_exit_code'] in (1, 143, -15))
+        if not expected_cleanup:
+            raise InvalidMeasurement(f"iperf server exited {meta['server_exit_code']}")
     return {"receiver_mbps": bps / 1e6, "receiver_bytes": received,
             "observed_duration_s": seconds, "receiver": summary}
 
@@ -82,6 +92,11 @@ def record_iperf(path, duration, exit_code, server_exit_code=None, server_observ
         meta['server_exit_code'] = server_exit_code
     if server_observation is not None:
         meta['server_process'] = json.loads(server_observation.read_text())
+    process = meta.get('server_process') or {}
+    meta['server_teardown'] = ('forced_kill' if process.get('forced_kill') else
+                               'harness_cleanup' if process.get('cleanup_requested') else
+                               'natural_exit' if server_exit_code == 0 else
+                               'server_error' if server_exit_code is not None else 'not_observed')
     data['_mqvpn'] = meta
     try:
         parsed = iperf_measurement(data, duration, exit_code)

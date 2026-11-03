@@ -73,6 +73,15 @@ def main():
     except (OSError, ValueError, TypeError) as exc:
         result = {"status": "measurement_incomplete", "failure_reason": str(exc),
                   "rate": args.rate, "throughput": None, "loss_pct": None, "jitter_ms": None}
+    if args.command == 'udp':
+        # A failing rate cell must point directly to its unabridged artifact,
+        # rather than require guessing among many randomly named raw files.
+        result['raw_sample'] = args.file.name
+        try:
+            meta = json.loads(args.file.read_text()).get('_mqvpn') or {}
+            result['evidence_manifest'] = meta.get('evidence_manifest')
+        except (OSError, ValueError, AttributeError):
+            result['evidence_manifest'] = None
     print(json.dumps(result, allow_nan=False))
     return int(result["status"] != "ok")
 
