@@ -7,14 +7,56 @@ import hashlib
 import json
 from pathlib import Path
 import platform
+import re
 import shutil
+import struct
 import subprocess
+import sys
 import time
 
 
 def stamp():
     return dict(utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 monotonic_ns=time.monotonic_ns())
+
+
+def capture_status(prefix):
+    context = Path(str(prefix)+'.context.json')
+    if not context.exists() or json.loads(context.read_text()).get('protocol') != 'UDP':
+        return dict(status='not_requested',endpoints={},issues=[])
+    endpoints, issues = {}, []
+    for role in ('client','server'):
+        log = Path(str(prefix)+f'.{role}.capture.log')
+        pcap = Path(str(prefix)+f'.{role}.control.pcap')
+        text = log.read_text(errors='replace') if log.exists() else ''
+        stats = {}
+        for key, label in [('captured','packets captured'),('received','packets received by filter'),
+                           ('dropped','packets dropped by kernel')]:
+            matches = re.findall(r'(\d+) '+label,text)
+            stats[key] = int(matches[-1]) if matches else None
+        packets = 0
+        try:
+            data = pcap.read_bytes()
+            if len(data)<24 or data[:4] not in (b'\xd4\xc3\xb2\xa1',b'\xa1\xb2\xc3\xd4'):
+                raise ValueError('missing or unsupported pcap header')
+            order = '<' if data[:4] == b'\xd4\xc3\xb2\xa1' else '>'
+            offset = 24
+            while offset < len(data):
+                if offset+16>len(data): raise ValueError('truncated pcap record header')
+                _,_,captured,original = struct.unpack(order+'IIII',data[offset:offset+16])
+                offset += 16
+                if captured!=original or offset+captured>len(data): raise ValueError('truncated captured packet')
+                offset += captured
+                packets += 1
+            if packets == 0: issues.append(f'{role}: no packets saved (filter received {stats["received"]})')
+            if stats['captured'] != packets: issues.append(f'{role}: pcap/capture count mismatch')
+        except (OSError,ValueError) as exc:
+            issues.append(f'{role}: {exc}')
+        if 'CAPTURE NOT READY' in text or 'listening on' not in text:
+            issues.append(f'{role}: capture not ready')
+        if stats['dropped'] != 0: issues.append(f'{role}: kernel drops missing or nonzero')
+        endpoints[role] = dict(**stats,pcap_packets=packets)
+    return dict(status='incomplete' if issues else 'complete',endpoints=endpoints,issues=issues)
 
 
 def snapshot(prefix, phase, client, server, target):
@@ -45,6 +87,7 @@ def finalize(prefix, archive, vpn_client='', vpn_server=''):
     meta = sample['_mqvpn']
     manifest = Path(str(prefix)+'.evidence.json')
     copy_errors = []
+    capture = capture_status(prefix)
     if not meta['measurement_complete']:
         for role, source in [('client',vpn_client),('server',vpn_server)]:
             if source:
@@ -65,7 +108,9 @@ def finalize(prefix, archive, vpn_client='', vpn_server=''):
         failure_reason=meta.get('failure_reason'),client_exit_code=meta.get('exit_code'),
         server_exit_code=meta.get('server_exit_code'),server_teardown=meta.get('server_teardown'),
         no_log_clipping=True,packet_scope='UDP tests: complete TCP control-port and ICMP packets only; not bulk UDP',
-        files=files,copy_errors=copy_errors),indent=2)+'\n')
+        files=files,copy_errors=copy_errors,capture=capture),indent=2)+'\n')
+    if capture['issues']:
+        print(f'::warning::UDP capture evidence incomplete: {manifest.name}: {capture["issues"]}',file=sys.stderr)
     archive.mkdir(parents=True,exist_ok=True)
     for path in prefix.parent.glob(prefix.name+'*'):
         if path.is_file() and path.resolve() != (archive/path.name).resolve():

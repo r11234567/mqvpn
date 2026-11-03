@@ -3,15 +3,35 @@
 from pathlib import Path
 import hashlib
 import json
+import struct
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts/ci_benchmarks'))
-from ci_bench_iperf_evidence import finalize
+from ci_bench_iperf_evidence import finalize, capture_status
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_received_packets_without_saved_packets_are_not_complete(self):
+        with tempfile.TemporaryDirectory() as folder:
+            prefix = Path(folder)/'sample.json'
+            Path(str(prefix)+'.context.json').write_text('{"protocol":"UDP"}')
+            header = struct.pack('<IHHIIII',0xa1b2c3d4,2,4,0,0,262144,276)
+            for role in ('client','server'):
+                Path(str(prefix)+f'.{role}.control.pcap').write_bytes(header)
+                Path(str(prefix)+f'.{role}.capture.log').write_text(
+                    'listening on any\n0 packets captured\n26 packets received by filter\n0 packets dropped by kernel\n')
+            status = capture_status(prefix)
+            self.assertEqual(status['status'],'incomplete')
+            self.assertEqual(status['endpoints']['client']['received'],26)
+            self.assertTrue(any('no packets saved' in issue for issue in status['issues']))
+            for role in ('client','server'):
+                Path(str(prefix)+f'.{role}.control.pcap').write_bytes(header+struct.pack('<IIII',0,0,4,4)+b'abcd')
+                Path(str(prefix)+f'.{role}.capture.log').write_text(
+                    'listening on any\n1 packets captured\n2 packets received by filter\n0 packets dropped by kernel\n')
+            self.assertEqual(capture_status(prefix)['status'],'complete')
+
     def test_failure_archives_entire_streams_and_vpn_logs(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

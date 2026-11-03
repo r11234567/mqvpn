@@ -32,9 +32,12 @@ failures. Changing the harness must not make them disappear.
 - iperf JSON stdout and stderr warnings are separate; pristine stdout survives
   JSON metadata updates. Every UDP call also records before/after namespace
   addresses, routes, TCP/UDP socket details, qdisc/counter/firewall state, and
-  full-snaplen PCAPs of TCP control-port/ICMP packets at both endpoints. No
+  full-snaplen PCAPs of TCP control-port/ICMP packets at both endpoints, using
+  libpcap immediate mode so fast failures do not stay buffered at shutdown. No
   packet rotation or head/tail clipping is used. Capture startup, drops and
-  shutdown are retained in capture logs; unavailable captures and timed-out
+  shutdown are retained in capture logs. The manifest validates saved packet
+  records against tcpdump statistics; header-only captures, truncation and
+  kernel drops are explicitly marked incomplete. Unavailable captures and timed-out
   diagnostic commands are explicit. Bulk UDP payload is outside the filter.
 - On failure, the full current client/server VPN logs are copied beside the
   raw traffic logs. `*.evidence.json` inventories artifact names, sizes, SHA-256,

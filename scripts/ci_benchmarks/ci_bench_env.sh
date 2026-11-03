@@ -531,7 +531,9 @@ ci_bench_control_capture_start() {
         printf 'CAPTURE UNAVAILABLE: tcpdump not installed\n' >"${prefix}.capture.log"
         return 0
     fi
-    ip netns exec "$ns" tcpdump -n -i any -s 0 -U -B 8192 \
+    # -U flushes the output writer only. Immediate mode also releases short
+    # control exchanges from libpcap before a fast failure stops the capture.
+    ip netns exec "$ns" tcpdump --immediate-mode -n -i any -s 0 -U -B 8192 \
         -w "${prefix}.control.pcap" "tcp port ${IPERF3_PORT} or icmp or icmp6" \
         >"${prefix}.capture.log" 2>&1 &
     _CB_CAPTURE_PID=$!
