@@ -1,7 +1,7 @@
 # xquic Baseline for mqvpn
 
 The v0.19.1-beta1 upstream synchronization pins `third_party/xquic` to
-`9b8f27e63cf827077012513780237dcfcb1d148e` from
+`72ddb14fa2bc905f9b69e19e3d5ad17f9d3e7138` from
 [r11234567/xquic#11](https://github.com/r11234567/xquic/pull/11).
 It merges upstream `1e117b540cd78914ea8216ebc7653bf04fc3f01f` and retains
 this fork's proxy, PMTU, and sanitizer fixes. BoringSSL is pinned by xquic
@@ -15,3 +15,7 @@ merge commit to preserve its history.
 After checkout, run `git submodule update --init --recursive --checkout`.
 A pin update must reference its published dependency PR or tag, rebuild
 both projects, and run the Debug sanitizer and applicable netns tests.
+
+The dependency follow-up changes only the migration test client: it waits
+for application data on an active spare path before closing the initial
+path. The production xquic library is unchanged by that follow-up.
