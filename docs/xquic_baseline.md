@@ -1,33 +1,17 @@
 # xquic Baseline for mqvpn
 
-This project pins a forked `xquic` as a git submodule.
+The v0.19.1-beta1 upstream synchronization pins `third_party/xquic` to
+`9b8f27e63cf827077012513780237dcfcb1d148e` from
+[r11234567/xquic#11](https://github.com/r11234567/xquic/pull/11).
+It merges upstream `1e117b540cd78914ea8216ebc7653bf04fc3f01f` and retains
+this fork's proxy, PMTU, and sanitizer fixes. BoringSSL is pinned by xquic
+to 0.20261020.0.
 
-## Fixed Upstream
+The configured fork is `r11234567/xquic`, with `main` as its long-term
+tracking branch. Until the dependency PR merges, the pin is published on
+`perf/sync-upstream-0.19.1-beta1`. Merge the dependency PR first, using a
+merge commit to preserve its history.
 
-- Submodule path: `third_party/xquic`
-- Fork repository: `https://github.com/mp0rta/xquic.git`
-- Branch: `feature/masque`
-- Pinned commit hash: `0677b6c835c5f284ac167c89f8bc1622be47fa95`
-
-## Reproducible Checkout
-
-```bash
-git clone --recurse-submodules https://github.com/mp0rta/mqvpn.git
-cd mqvpn
-git submodule update --init --recursive --checkout
-git submodule status
-```
-
-Expected submodule status includes:
-
-```text
-0677b6c835c5f284ac167c89f8bc1622be47fa95 third_party/xquic
-```
-
-## Update Policy
-
-When updating xquic:
-
-1. Update `third_party/xquic` to a new tested commit in `feature/masque`.
-2. Run smoke and multipath tests (`scripts/ci_e2e/run_test.sh`, `scripts/run_multipath_test.sh`).
-3. Update this file with the new pinned commit hash.
+After checkout, run `git submodule update --init --recursive --checkout`.
+A pin update must reference its published dependency PR or tag, rebuild
+both projects, and run the Debug sanitizer and applicable netns tests.

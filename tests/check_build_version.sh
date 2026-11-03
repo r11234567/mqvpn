@@ -43,7 +43,7 @@ int main(void) { puts(mqvpn_version_string()); return 0; }
 C
 cat > "$WORK/src/CMakeLists.txt" <<'CMAKE'
 cmake_minimum_required(VERSION 3.10)
-project(mqvpn VERSION 0.19.0 LANGUAGES C)
+project(mqvpn VERSION 0.19.1 LANGUAGES C)
 include(BuildVersion.cmake)
 add_executable(probe probe.c mqvpn_util.c)
 target_include_directories(probe PRIVATE include)
@@ -98,31 +98,31 @@ GITHUB_REF=refs/heads/main GITHUB_SHA="$sha" TZ=America/Los_Angeles \
 cmp "$WORK/snapshot.env" "$WORK/repeat.env"
 configure snapshot -C "$version_file"
 check_binary snapshot "$display"
-printf '%s\n' "$display" "0~$expected" '0.19.0' > "$WORK/expected.metadata"
+printf '%s\n' "$display" "0~$expected" '0.19.1' > "$WORK/expected.metadata"
 cmp "$WORK/expected.metadata" "$WORK/snapshot/metadata"
 
 # A tag in the same workspace clears any cached snapshot identity.
-GITHUB_REF=refs/tags/v0.19.0 bash scripts/resolve_build_version.sh > "$WORK/tag.env"
-grep -Fx 'VERSION=0.19.0' "$WORK/tag.env"
+GITHUB_REF=refs/tags/v0.19.1 bash scripts/resolve_build_version.sh > "$WORK/tag.env"
+grep -Fx 'VERSION=0.19.1' "$WORK/tag.env"
 configure snapshot -C "$version_file"
 grep -Fx 'MQVPN_BUILD_VERSION:STRING=' "$WORK/snapshot/CMakeCache.txt"
 grep -Fx 'MQVPN_VERSION_SUFFIX:STRING=' "$WORK/snapshot/CMakeCache.txt"
-printf '%s\n' '0.19.0' '0.19.0' '0.19.0' > "$WORK/expected.metadata"
+printf '%s\n' '0.19.1' '0.19.1' '0.19.1' > "$WORK/expected.metadata"
 cmp "$WORK/expected.metadata" "$WORK/snapshot/metadata"
-check_binary snapshot 0.19.0
+check_binary snapshot 0.19.1
 configure default
-check_binary default 0.19.0
+check_binary default 0.19.1
 configure legacy -DMQVPN_VERSION_SUFFIX=+downstream.1
-check_binary legacy 0.19.0+downstream.1
+check_binary legacy 0.19.1+downstream.1
 if GITHUB_REF=refs/tags/v0.18.0 bash scripts/resolve_build_version.sh > "$WORK/tag.log" 2>&1; then
     echo 'Mismatched tag accepted'; exit 1
 fi
 grep -F 'does not match CMake version' "$WORK/tag.log"
-GITHUB_REF=refs/tags/v0.19.0-rc.1 bash scripts/resolve_build_version.sh > "$WORK/tag.env"
-grep -Fx 'VERSION=0.19.0-rc.1' "$WORK/tag.env"
+GITHUB_REF=refs/tags/v0.19.1-rc.1 bash scripts/resolve_build_version.sh > "$WORK/tag.env"
+grep -Fx 'VERSION=0.19.1-rc.1' "$WORK/tag.env"
 configure prerelease -C "$version_file"
-check_binary prerelease 0.19.0-rc.1
-printf '%s\n' '0.19.0-rc.1' '0.19.0~rc.1' '0.19.0' > "$WORK/expected.metadata"
+check_binary prerelease 0.19.1-rc.1
+printf '%s\n' '0.19.1-rc.1' '0.19.1~rc.1' '0.19.1' > "$WORK/expected.metadata"
 cmp "$WORK/expected.metadata" "$WORK/prerelease/metadata"
 if GITHUB_REF=refs/tags/v0.18.0-rc.1 bash scripts/resolve_build_version.sh > "$WORK/tag.log" 2>&1; then
     echo 'Mismatched prerelease tag accepted'; exit 1
@@ -130,7 +130,7 @@ fi
 if MQVPN_BUILD_CHANNEL=release GITHUB_REF=refs/heads/main bash scripts/resolve_build_version.sh > "$WORK/tag.log" 2>&1; then
     echo 'Branch accepted as a release'; exit 1
 fi
-if MQVPN_BUILD_CHANNEL=snapshot GITHUB_REF=refs/tags/v0.19.0 bash scripts/resolve_build_version.sh > "$WORK/tag.log" 2>&1; then
+if MQVPN_BUILD_CHANNEL=snapshot GITHUB_REF=refs/tags/v0.19.1 bash scripts/resolve_build_version.sh > "$WORK/tag.log" 2>&1; then
     echo 'Tag accepted as a snapshot'; exit 1
 fi
 reject malformed -DMQVPN_BUILD_VERSION=snapshot+invalid
@@ -150,6 +150,6 @@ if command -v dpkg-deb > /dev/null 2>&1 && command -v dpkg > /dev/null 2>&1; the
     [ -f "$WORK/snapshot/mqvpn_${expected}_amd64.deb" ]
     [ "$package_version" = "0~$expected" ]
     dpkg --validate-version "$package_version"
-    dpkg --compare-versions "$package_version" lt 0.19.0
+    dpkg --compare-versions "$package_version" lt 0.19.1
 fi
 echo 'PASS: snapshot/tag identities, UTC determinism, library version, cache reset, validation and Debian metadata'

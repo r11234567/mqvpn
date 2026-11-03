@@ -5,7 +5,7 @@
  * libmqvpn — Multipath QUIC VPN library
  *
  * Public API header (single file).
- * Version: 0.19.0 (callback ABI version 3)
+ * Version: 0.19.1 (callback ABI version 3)
  *
  * Thread safety: All functions must be called from a single thread
  * (the "tick thread"). Debug builds assert this (ASSERT_TICK_THREAD inside the library).
@@ -39,7 +39,7 @@ extern "C" {
 
 #define MQVPN_VERSION_MAJOR 0
 #define MQVPN_VERSION_MINOR 19
-#define MQVPN_VERSION_PATCH 0
+#define MQVPN_VERSION_PATCH 1
 
 /* ─── ABI ─── */
 
@@ -1171,7 +1171,9 @@ MQVPN_API int mqvpn_server_egress_fd_budget(mqvpn_server_t *server);
 /* Feed data from platform into the engine. Same accepted-not-sent contract
  * as mqvpn_client_on_tun_packet: with the batched send path engaged the
  * datagram may wait for the caller's next mqvpn_server_tick() — feed, then
- * tick promptly. */
+ * tick promptly. Unlike the client, it never returns MQVPN_ERR_AGAIN for
+ * backpressure: the TUN is shared by every client, so a packet xquic cannot
+ * take for its client right now is dropped and the TUN keeps being read. */
 MQVPN_API int mqvpn_server_on_tun_packet(mqvpn_server_t *server, const uint8_t *pkt,
                                          size_t len);
 
