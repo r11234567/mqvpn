@@ -891,9 +891,12 @@ test_scheduler_udp_affinity(void)
     uint8_t pkt[40] = {0};
     pkt[0] = 0x45;
     pkt[9] = 17;
-    pkt[12] = 10; pkt[16] = 11;
-    pkt[20] = 0x14; pkt[21] = 0x51;
-    pkt[22] = 0x23; pkt[23] = 0x45;
+    pkt[12] = 10;
+    pkt[16] = 11;
+    pkt[20] = 0x14;
+    pkt[21] = 0x51;
+    pkt[22] = 0x23;
+    pkt[23] = 0x45;
     uint32_t h = flow_hash_for_scheduler(pkt, sizeof(pkt), MQVPN_SCHED_WLB);
     assert(h != 0 && h != MQVPN_FLOW_HASH_UNPINNED);
     assert(h == flow_hash_for_scheduler(pkt, sizeof(pkt), MQVPN_SCHED_WLB_UDP_PIN));
@@ -904,7 +907,8 @@ test_scheduler_udp_affinity(void)
     assert(flow_hash_for_scheduler(pkt, 21, MQVPN_SCHED_WLB) == MQVPN_FLOW_HASH_UNPINNED);
     assert(flow_hash_for_scheduler(NULL, 0, MQVPN_SCHED_WLB) == 0);
     pkt[9] = 1;
-    assert(flow_hash_for_scheduler(pkt, sizeof(pkt), MQVPN_SCHED_WLB) == MQVPN_FLOW_HASH_UNPINNED);
+    assert(flow_hash_for_scheduler(pkt, sizeof(pkt), MQVPN_SCHED_WLB) ==
+           MQVPN_FLOW_HASH_UNPINNED);
 }
 
 int

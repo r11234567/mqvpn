@@ -4171,8 +4171,7 @@ tun_send_datagram(mqvpn_client_t *c, cli_conn_t *conn, const uint8_t *pkt, size_
     }
 
     uint64_t dgram_id;
-    uint32_t fh =
-        flow_hash_for_scheduler(pkt, (int)len, c->config.scheduler);
+    uint32_t fh = flow_hash_for_scheduler(pkt, (int)len, c->config.scheduler);
     xret = tun_xqc_send(c, conn, frame_buf, frame_written, &dgram_id, fh, UINT64_MAX);
     if (frame_buf != stack_buf) free(frame_buf);
 
