@@ -42,6 +42,15 @@ class NetsimTests(unittest.TestCase):
         self.assertFalse(doc["measurement_complete"])
         self.assertEqual(sum(r["status"] == "missing_row" for r in doc["results"]), 12)
 
+    def test_wire_time_variability_is_not_repeat_variability(self):
+        # osc_cv_pct describes samples within one transfer, including startup.
+        # Its independent wire-stall findings remain authoritative; it cannot
+        # be labelled as repeat CV merely because its field shares a suffix.
+        result = netsim.classify(dict(pair(), osc_cv_pct=90), 'classes')
+        self.assertEqual(result['performance_health'], 'pass')
+        result = netsim.classify(dict(pair(), multipath_cv_pct=90), 'classes')
+        self.assertEqual(result['performance_health'], 'degraded')
+
     def test_no_rows_still_produces_full_manifest(self):
         doc = netsim.report([], "mtu", execution_complete=True)
         self.assertEqual(len(doc["results"]), 6)

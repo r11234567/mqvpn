@@ -204,7 +204,8 @@ def classify(row, mode):
     zero |= any(row.get(k) == 0 for k in required if k.endswith("mbps") or k.endswith("received"))
     if not reasons:
         for metric, value in list(row.items()):
-            if (metric == 'cv_pct' or metric.endswith('_cv_pct')) and isinstance(value, (int, float)) and value > 25:
+            if (metric in {'cv_pct', 'multipath_cv_pct', 'quic_goodput_cv_pct'}
+                    and isinstance(value, (int, float)) and value > 25):
                 finding = metric + ': repeat variability exceeds 25%'
                 if finding not in row['findings']:
                     row['findings'].append(finding)
