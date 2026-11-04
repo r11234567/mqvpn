@@ -126,3 +126,10 @@ flow_hash_pkt(const uint8_t *pkt, int len, bool udp_pin)
 
     return 0; /* Unknown IP version */
 }
+
+uint32_t
+flow_hash_for_scheduler(const uint8_t *pkt, int len, int scheduler)
+{
+    return flow_hash_pkt(pkt, len, scheduler == MQVPN_SCHED_WLB
+                                  || scheduler == MQVPN_SCHED_WLB_UDP_PIN);
+}

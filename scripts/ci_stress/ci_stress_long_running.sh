@@ -8,7 +8,7 @@ source "${SCRIPT_DIR}/ci_stress_env.sh"
 MQVPN="${1:-$MQVPN}"
 DURATION="${CI_STRESS_LONG_DURATION:-900}"
 IPERF_PARALLEL="${CI_STRESS_IPERF_PARALLEL:-4}"
-MAX_STALL="${CI_STRESS_MAX_STALL_SEC:-30}"
+MAX_STALL="${CI_STRESS_MAX_STALL_SEC:-3}"
 DIRECTION="${CI_STRESS_DIRECTION:-UL}"
 [[ "$DIRECTION" = UL || "$DIRECTION" = DL ]] || { echo 'invalid direction' >&2; exit 2; }
 REVERSE=()
@@ -91,11 +91,13 @@ ci_stress_stop_vpn
 ci_stress_check_sanitizer || RESOURCE_FAILED=1
 
 OUTPUT_FILE="${CI_STRESS_RESULTS}/long_running_${DIRECTION}_$(date -u +%Y%m%d_%H%M%S).json"
-python3 - "$IPERF_JSON" "$SERVER_MON_LOG" "$CLIENT_MON_LOG" "$OUTPUT_FILE" \
+PYTHONPATH="${SCRIPT_DIR}/../ci_benchmarks" python3 - "$IPERF_JSON" "$SERVER_MON_LOG" "$CLIENT_MON_LOG" "$OUTPUT_FILE" \
     "$CI_STRESS_COMMIT" "$BUSINESS_FAILED" "$RESOURCE_FAILED" "$MAX_GAP" "$DIRECTION" <<'PY'
 import datetime, json, pathlib, sys
+from ci_bench_health import tcp_health
 raw, server, client, output, commit, business, resource, gap, direction = sys.argv[1:]
 sample = json.load(open(raw))['_mqvpn']
+health = tcp_health(json.load(open(raw)))
 def resources(path):
     return json.load(open(path + '.resources.json'))
 result = {
@@ -112,9 +114,11 @@ result = {
     'measurement_error': sample.get('failure_reason'),
     'server_rss': resources(server), 'client_rss': resources(client),
     'raw_artifact': raw,
-    'status': 'fail' if int(business) or int(resource) else 'pass'
+    'performance_health': health,
+    'status': 'fail' if int(business) or int(resource) or health['status'] != 'pass' else 'pass'
 }
 pathlib.Path(output).write_text(json.dumps(result, indent=2) + '\n')
 print(json.dumps(result, indent=2))
+sys.exit(result['status'] != 'pass')
 PY
 [ "$BUSINESS_FAILED" -eq 0 ] && [ "$RESOURCE_FAILED" -eq 0 ]

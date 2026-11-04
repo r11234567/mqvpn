@@ -177,6 +177,18 @@ def classify(row, mode):
         harness = False
     zero = any(p.startswith("measured_zero") for p in parts)
     zero |= any(row.get(k) == 0 for k in required if k.endswith("mbps") or k.endswith("received"))
+    if not reasons:
+        for metric, value in list(row.items()):
+            if (metric == 'cv_pct' or metric.endswith('_cv_pct')) and isinstance(value, (int, float)) and value > 25:
+                row['findings'].append(metric + ': repeat variability exceeds 25%')
+        if mode in PAIRS:
+            best = max(row['solo_a_mbps'], row['solo_b_mbps'])
+            if best > 0 and row['multipath_mbps'] < 0.8 * best:
+                row['findings'].append('multipath_below_80pct_best_solo')
+        if mode == 'special' and row.get('scenario') == 'ack_starvation':
+            idle = row.get('dl_idle_mbps', 0)
+            if idle > 0 and row['dl_under_ul_load_mbps'] < idle * 0.8:
+                row['findings'].append('download_retention_below_80pct')
     health = "inconclusive" if reasons else "regression" if zero or quic_regression else "degraded" if row.get("findings") else "pass"
     row.update(harness_valid=harness, measurement_complete=not reasons,
                performance_health=health, measurement_errors=reasons)
@@ -284,7 +296,8 @@ def main():
             return 1
         if doc["performance_health"] == "degraded":
             print("::warning::performance findings present; this is not a healthy-performance verdict")
-            return int(os.environ.get("CI_BENCH_STRICT_PERF") == "1")
+            return int(os.environ.get("CI") == "true"
+                       or os.environ.get("CI_BENCH_STRICT_PERF", "1") != "0")
     return 0
 
 

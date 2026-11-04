@@ -42,7 +42,7 @@ class ProtocolMetricsTests(unittest.TestCase):
             root = Path(folder)
             for name in ('baseline_dl','baseline_ul','udp_dl','udp_ul','tcp'):
                 duration = 12 if name=='tcp' else 4
-                raw = {'end':{'sum_received':{'seconds':duration,'bytes':1000000,'bits_per_second':2000000,
+                raw = {'end':{'sum_received':{'seconds':duration,'bytes':duration*250000,'bits_per_second':2000000,
                                              'lost_percent':0,'jitter_ms':1}},
                        'intervals':[{'sum':{'start':i,'end':i+1,'seconds':1,'bits_per_second':2000000}} for i in range(duration)]}
                 (root/(name+'.json')).write_text(json.dumps(raw))
