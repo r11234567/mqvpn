@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 mp0rta and mqvpn contributors
 from pathlib import Path
+import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts/ci_stress'))
@@ -9,6 +14,41 @@ from ci_stress_results import resources, fairness, fault_summary
 
 
 class ResourceEvidenceTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'posix' and shutil.which('bash'), 'requires POSIX bash')
+    def test_interrupted_runner_emits_failed_incomplete_result(self):
+        source = Path(__file__).resolve().parents[1] / 'scripts/ci_stress'
+        for action, reason, code in [('kill -HUP $$', 'signal_HUP', 129),
+                                     ('kill -TERM $$', 'signal_TERM', 143),
+                                     ('exit 0', 'shell_exit_0', 1)]:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name in ('ci_stress_failover.sh', 'ci_stress_results.py'):
+                    shutil.copyfile(source / name, root / name)
+                (root / 'ci_stress_env.sh').write_text('''
+CI_STRESS_RESULTS="$PWD/results"
+CI_STRESS_RAW_DIR="$CI_STRESS_RESULTS/raw"
+CI_STRESS_COMMIT=interruption-fixture
+MQVPN=unused
+ci_stress_cleanup() { touch "$CI_STRESS_RESULTS/cleanup-ran"; }
+ci_stress_check_deps() {
+    mkdir -p "$CI_STRESS_RAW_DIR"
+    echo '{"cycle":1,"ok":true}' > "$CI_STRESS_RAW_DIR/fault-cycles.jsonl"
+    ''' + action + '''
+}
+''')
+                result = subprocess.run(['bash', str(root / 'ci_stress_failover.sh')],
+                                        cwd=root, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, code, result.stderr.decode())
+                files = list((root / 'results').glob('failover_storm_*.json'))
+                self.assertEqual(len(files), 1)
+                doc = json.loads(files[0].read_text())
+                self.assertEqual(doc['status'], 'fail')
+                self.assertEqual(doc['abort_reason'], reason)
+                self.assertEqual(doc['cycles_attempted'], 1)
+                self.assertEqual(doc['cycles_not_run'], 99)
+                self.assertFalse(doc['execution_complete'])
+                self.assertTrue((root / 'results/cleanup-ran').exists())
+
     def test_process_death_does_not_create_unattempted_fault_failures(self):
         rows = [dict(cycle=i,ok=i<21) for i in range(1,22)]
         result = fault_summary(rows,100,'vpn_client_exited_during_cycle_21')

@@ -27,6 +27,14 @@ retry until success, replace errors with zeroes, or discard slow repeats.
   is three seconds. This does not claim absence of individual-flow stalls.
 - Release memory growth and descriptor checks remain independent of these
   performance checks. ASan RSS is not proof of bounded Release memory.
+- Reorder e2e requires complete UDP receiver reports with the feature enabled
+  and disabled under the same explicit per-path packet disorder. A ping cannot
+  replace a failed UDP transfer. Retain both iperf reports, exits and VPN logs;
+  keep the 0.1% late-drop ceiling and verify the disabled control actually
+  reorders packets. An interrupted fault runner writes a failed, incomplete
+  summary with attempted and unattempted cycles rather than losing its verdict.
+- Branch validation retains workflow artifacts without publishing experimental
+  measurements into the main branch's R2 performance history.
 
 These thresholds are acceptance criteria, not proof that all deployment
 conditions are safe. Low-MTU PMTUD, repeated reconnect cleanup, game traffic,

@@ -257,7 +257,7 @@ jobs:
           retention-days: 90
 
       - name: Publish results to R2
-        if: ${{ success() && github.event.inputs.quick_udp != 'true' && env.R2_ACCOUNT_ID != '' }}
+        if: ${{ success() && github.ref == 'refs/heads/main' && github.event.inputs.quick_udp != 'true' && env.R2_ACCOUNT_ID != '' }}
         run: bash scripts/ci_publish/publish_to_r2.sh perf-data/weekly weekly
 
       - name: Note that R2 publishing was skipped
@@ -578,7 +578,7 @@ jobs:
   # benchmark job failed.
   netsim-publish:
     needs: [netsim, perf-weekly]
-    if: ${{ always() && github.event.inputs.quick_udp != 'true' }}
+    if: ${{ always() && github.ref == 'refs/heads/main' && github.event.inputs.quick_udp != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
