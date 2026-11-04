@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'scripts/ci_benchmarks'))
 from ci_bench_health import tcp_health, findings
@@ -12,6 +13,16 @@ from ci_bench_metrics import saturation
 
 
 class HealthTests(unittest.TestCase):
+    def test_health_cli_rejects_missing_and_empty_families(self):
+        script = Path(__file__).resolve().parents[1]/'scripts/ci_benchmarks/ci_bench_health.py'
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertNotEqual(subprocess.run([sys.executable, str(script), directory],
+                                capture_output=True).returncode, 0)
+            for kind in ('aggregate', 'multipath_scheduler', 'ntn'):
+                (Path(directory)/(kind+'.json')).write_text(json.dumps({'test': kind}))
+            self.assertNotEqual(subprocess.run([sys.executable, str(script), directory],
+                                capture_output=True).returncode, 0)
+
     def test_udp_coverage_requires_all_repeats(self):
         doc = {'test': 'udp_sweep', 'repeats': 3, 'sweep_rates_mbps': [2, 5],
                'results': {c: {'points': [dict(rate=r, repeat=i, throughput=r,

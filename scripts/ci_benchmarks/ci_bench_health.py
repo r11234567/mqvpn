@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import sys
+from ci_bench_results import validate_core
 
 
 def tcp_health(data):
@@ -49,6 +50,8 @@ if __name__ == '__main__':
         try:
             doc = json.loads(path.read_text())
             seen.add(doc.get('test'))
+            if doc.get('test') in {'aggregate', 'multipath_scheduler', 'ntn'}:
+                validate_core(doc)
             errors.extend(str(path) + ': ' + e for e in findings(doc))
         except (ValueError, TypeError, KeyError) as exc:
             errors.append(str(path) + ': ' + str(exc))
