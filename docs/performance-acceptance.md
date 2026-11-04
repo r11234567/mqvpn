@@ -19,7 +19,7 @@ retry until success, replace errors with zeroes, or discard slow repeats.
   exact coverage and fail on any invalid repetition. Startup failures are not
   capacity crossings. Captures retain four-byte UDP startup messages, TCP
   control and ICMP to diagnose reply/data races without capturing bulk load.
-- iperf receiver duration must cover at least 98% of the requested interval;
+- iperf receiver duration may fall short by at most 2% or one second, whichever is smaller;
   positive receiver bytes/time and reported bitrate must agree within 2%.
   Server error logs invalidate a result even when the process exits zero.
 - Continuous TCP stress requires positive receiver evidence for every stream

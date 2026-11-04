@@ -66,6 +66,10 @@ class HealthTests(unittest.TestCase):
         doc = {'end': {'sum_received': {'seconds': 10, 'bytes': 12500000,
                                         'bits_per_second': 10000000}}}
         self.assertEqual(iperf_measurement(doc, requested=10)['receiver_mbps'], 10)
+        long_run = {'end': {'sum_received': {'seconds': 7198,
+                    'bytes': 7198 * 1250000, 'bits_per_second': 10000000}}}
+        with self.assertRaises(InvalidMeasurement):
+            iperf_measurement(long_run, requested=7200)
         for field, value in [('seconds', 9.7), ('bytes', 1), ('bits_per_second', 0)]:
             bad = copy.deepcopy(doc)
             bad['end']['sum_received'][field] = value

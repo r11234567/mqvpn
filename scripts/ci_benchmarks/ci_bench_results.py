@@ -55,9 +55,9 @@ def iperf_measurement(data, requested=None, exit_code=None):
     bps = number(summary.get("bits_per_second"), "receiver bitrate", positive=True)
     if requested is not None:
         number(requested, "requested duration", positive=True)
-        # Small scheduling/clock differences are normal. A partial transfer is
-        # not; even short smoke samples must cover at least 90% of the request.
-        if seconds < requested * 0.98:
+        # Bound both relative and absolute shortfall: a percentage alone would
+        # let a two-hour soak silently lose minutes of receiver coverage.
+        if seconds < requested - min(requested * 0.02, 1.0):
             raise InvalidMeasurement(f"short transfer: {seconds:.3f}/{requested}s")
     if abs(bps - received * 8 / seconds) > max(1, bps * 0.02):
         raise InvalidMeasurement('receiver bytes/time disagree with bitrate')
