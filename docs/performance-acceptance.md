@@ -12,7 +12,9 @@ retry until success, replace errors with zeroes, or discard slow repeats.
   Independent runner or protocol results are not interchangeable baselines.
 - Inner-QUIC measurements require all requested objects and same-protocol
   baselines to complete. Unstable or incomplete repetitions cannot pass by
-  their median. WLB and `wlb_udp_pin` now use the same UDP affinity policy;
+  their median. A healthy verdict requires at least three repeats for MP and
+  every baseline; recompute their medians and CV from retained samples and
+  reject CV above 25% in any group. WLB and `wlb_udp_pin` now use the same UDP affinity policy;
   retain both names in historical reports, but do not interpret their rows as
   a packet-striping experiment after this change.
 - UDP sweeps retain at least three repetitions per condition/rate, require

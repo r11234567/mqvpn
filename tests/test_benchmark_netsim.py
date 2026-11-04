@@ -54,6 +54,7 @@ class NetsimTests(unittest.TestCase):
 
     def test_quic_substatus_and_repeats_are_required(self):
         row = {"status": "ok", "quic_goodput_mbps": 100, "quic_status": "ok", "quic_samples": 3,
+               "quic_goodput_all": [100, 100, 100],
                "quic_baselines": [{"phase": p, "status": "ok", "goodput_mbps": 50}
                                   for p in ("direct_a", "solo_a", "solo_b") for _ in range(3)]}
         self.assertTrue(netsim.classify(row, "quic")["measurement_complete"])
@@ -68,11 +69,37 @@ class NetsimTests(unittest.TestCase):
 
     def test_quic_repeat_count_is_self_describing_on_replay(self):
         row = {"status": "ok", "quic_goodput_mbps": 100, "quic_status": "ok", "quic_samples": 1,
+               "quic_goodput_all": [100],
                "quic_attempts": 1, "quic_baselines": [{"phase": p, "status": "ok", "goodput_mbps": 50}
                    for p in ("direct_a", "solo_a", "solo_b")]}
         self.assertTrue(netsim.classify(row, "quic")["measurement_complete"])
+        self.assertEqual(netsim.classify(row, "quic")["performance_health"], 'degraded')
         row['quic_baselines'] = [None]
         self.assertFalse(netsim.classify(row, "quic")["measurement_complete"])
+
+    def test_quic_health_recomputes_mp_and_solo_variability(self):
+        row = {'status': 'ok', 'quic_status': 'ok', 'quic_samples': 3,
+               'quic_attempts': 3, 'quic_goodput_mbps': 100,
+               'quic_goodput_all': [100, 100, 100], 'quic_goodput_cv_pct': 0,
+               'quic_baselines': [{'phase': p, 'status': 'ok', 'goodput_mbps': 100}
+                                 for p in ('direct_a', 'solo_a', 'solo_b') for _ in range(3)]}
+        self.assertEqual(netsim.classify(row, 'quic')['performance_health'], 'pass')
+        row['quic_baselines'][3]['goodput_mbps'] = 1
+        result = netsim.classify(row, 'quic')
+        self.assertTrue(result['measurement_complete'])
+        self.assertEqual(result['performance_health'], 'degraded')
+        self.assertGreater(result['quic_baseline_cv_pct']['solo_a'], 25)
+        self.assertEqual(netsim.classify(result, 'quic'), result)
+        row['quic_baselines'][3]['goodput_mbps'] = 100
+        row['quic_goodput_all'] = [1, 100, 100]
+        self.assertEqual(netsim.classify(row, 'quic')['performance_health'], 'degraded')
+        # Aggregate numbers cannot contradict retained repeats and still pass.
+        row['quic_goodput_all'] = [10, 10, 10]
+        result = netsim.classify(row, 'quic')
+        self.assertEqual(result['quic_goodput_mbps'], 10)
+        self.assertEqual(result['performance_health'], 'regression')
+        row['quic_goodput_all'] = [100]
+        self.assertFalse(netsim.classify(row, 'quic')['measurement_complete'])
 
     def test_path_scaling_manifest(self):
         self.assertEqual([r['scenario'] for r in netsim.expected_rows('paths')],
