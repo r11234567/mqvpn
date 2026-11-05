@@ -75,11 +75,17 @@ done
 if [ "$BUSINESS_FAILED" -ne 0 ]; then kill "$IPERF_CLIENT_PID" 2>/dev/null || true; fi
 IPERF_EXIT=0
 wait "$IPERF_CLIENT_PID" || IPERF_EXIT=$?
-kill "$IPERF_SERVER_PID" 2>/dev/null || true
-wait "$IPERF_SERVER_PID" 2>/dev/null || true
+IPERF_SERVER_OBSERVATION="${CI_STRESS_RAW_DIR}/iperf-server.process.json"
+IPERF_SERVER_GRACE="${CI_BENCH_IPERF_SERVER_GRACE:-30}"
+[ "$IPERF_EXIT" -eq 0 ] || IPERF_SERVER_GRACE=2
+python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_process.py" \
+    "$IPERF_SERVER_PID" "$IPERF_SERVER_OBSERVATION" --grace "$IPERF_SERVER_GRACE"
+IPERF_SERVER_EXIT=0
+wait "$IPERF_SERVER_PID" 2>/dev/null || IPERF_SERVER_EXIT=$?
 cp "$IPERF_JSON" "${IPERF_JSON}.client.stdout.log"
 python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" record "$IPERF_JSON" \
     --duration "$DURATION" --exit-code "$IPERF_EXIT" \
+    --server-exit-code "$IPERF_SERVER_EXIT" --server-observation "$IPERF_SERVER_OBSERVATION" \
     --server-log "${CI_STRESS_RAW_DIR}/iperf-server.log"
 THROUGHPUT="$(python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" throughput "$IPERF_JSON")"
 if [ "$THROUGHPUT" = NA ] || ! awk -v r="$THROUGHPUT" 'BEGIN {exit !(r+0>0)}'; then

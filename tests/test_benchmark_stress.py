@@ -75,9 +75,13 @@ class ResourceEvidenceTests(unittest.TestCase):
                     (root / 'iperf-server.log').write_text(
                         'iperf3: error - unable to receive results: Bad file descriptor\n'
                         if server_state == 'error' else 'Server listening on 5201\n')
+                observation = root / 'server-process.json'
+                observation.write_text(json.dumps(dict(cleanup_requested=False,
+                                                      forced_kill=False, signals_sent=[])))
                 environment = dict(os.environ, SCRIPT_DIR=str(scripts / 'ci_stress'),
                                    CI_STRESS_RAW_DIR=str(root), IPERF_JSON=str(sample),
-                                   DURATION='10', IPERF_EXIT='0')
+                                   DURATION='10', IPERF_EXIT='0', IPERF_SERVER_EXIT='0',
+                                   IPERF_SERVER_OBSERVATION=str(observation))
                 result = subprocess.run(['bash', '-c', command], env=environment,
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -88,6 +92,53 @@ class ResourceEvidenceTests(unittest.TestCase):
                 original = json.loads(Path(str(sample) + '.client.stdout.log').read_text())
                 self.assertEqual(original['end']['sum_received']['bytes'], 12500000)
                 self.assertNotIn('_mqvpn', original)
+
+    @unittest.skipUnless(os.name == 'posix' and shutil.which('bash'), 'requires POSIX bash')
+    def test_long_running_rejects_failed_server_exit(self):
+        scripts = Path(__file__).resolve().parents[1] / 'scripts'
+        runner = (scripts / 'ci_stress/ci_stress_long_running.sh').read_text()
+        start = runner.index('IPERF_EXIT=0\n')
+        end = runner.index('ci_stress_monitor_stop', start)
+        command = '''set -euo pipefail
+BUSINESS_FAILED=0
+bash -c 'exit 0' &
+IPERF_CLIENT_PID=$!
+if [ "$FIXTURE_SERVER_MODE" = natural ]; then
+    bash -c 'exit "$1"' _ "$FIXTURE_SERVER_EXIT" &
+elif [ "$FIXTURE_SERVER_MODE" = cleanup ]; then
+    sleep 5 &
+else
+    bash -c 'trap "" TERM; exec sleep 5' &
+fi
+IPERF_SERVER_PID=$!
+sleep .1
+''' + runner[start:end] + '\nprintf "%s\\n" "$BUSINESS_FAILED"\n'
+        cases = [('natural', 0, True), ('natural', 42, False),
+                 ('cleanup', 143, True), ('forced', 137, False)]
+        for mode, server_exit, complete in cases:
+            with self.subTest(mode=mode, server_exit=server_exit), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                sample = root / 'iperf.json'
+                sample.write_text(json.dumps({'end': {'sum_received': {
+                    'seconds': 10, 'bytes': 12500000, 'bits_per_second': 10000000}}}))
+                (root / 'iperf-server.log').write_text('Server finished\n')
+                environment = dict(os.environ, SCRIPT_DIR=str(scripts / 'ci_stress'),
+                                   CI_STRESS_RAW_DIR=str(root), IPERF_JSON=str(sample),
+                                   DURATION='10', FIXTURE_SERVER_EXIT=str(server_exit),
+                                   FIXTURE_SERVER_MODE=mode, CI_BENCH_IPERF_SERVER_GRACE='.1')
+                result = subprocess.run(['bash', '-c', command], env=environment,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines()[-1], '0' if complete else '1')
+                meta = json.loads(sample.read_text())['_mqvpn']
+                self.assertEqual(meta['server_exit_code'], server_exit)
+                self.assertEqual(meta['measurement_complete'], complete)
+                process = meta['server_process']
+                self.assertEqual(process['cleanup_requested'], mode in ('cleanup', 'forced'))
+                self.assertEqual(process['forced_kill'], mode == 'forced')
+                if mode == 'forced':
+                    self.assertEqual(process['signals_sent'], ['SIGTERM', 'SIGKILL'])
+                    self.assertLess(process['drain_elapsed_s'], 4)
 
     @unittest.skipUnless(os.name == 'posix' and shutil.which('bash'), 'requires POSIX bash')
     def test_interrupted_runner_emits_failed_incomplete_result(self):
