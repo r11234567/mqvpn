@@ -93,7 +93,8 @@ class ResourceEvidenceTests(unittest.TestCase):
                 self.assertEqual(original['end']['sum_received']['bytes'], 12500000)
                 self.assertNotIn('_mqvpn', original)
 
-    @unittest.skipUnless(os.name == 'posix' and shutil.which('bash'), 'requires POSIX bash')
+    @unittest.skipUnless(sys.platform == 'linux' and shutil.which('bash'),
+                         'requires Linux process identity and bash')
     def test_long_running_rejects_failed_server_exit(self):
         scripts = Path(__file__).resolve().parents[1] / 'scripts'
         runner = (scripts / 'ci_stress/ci_stress_long_running.sh').read_text()
