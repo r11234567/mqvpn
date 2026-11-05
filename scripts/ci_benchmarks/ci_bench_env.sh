@@ -682,7 +682,7 @@ ci_bench_run_iperf() {
 
     python3 "$CI_BENCH_RESULT_TOOL" record "$json_file" \
         --duration "$duration" --exit-code "$iperf_exit" --server-exit-code "$server_exit" \
-        --server-observation "$server_observation"
+        --server-observation "$server_observation" --server-log "$server_log"
     python3 "$evidence_tool" finalize "$json_file" --archive "$CI_BENCH_RAW_DIR" \
         --vpn-client "$CI_BENCH_CLIENT_LOG" --vpn-server "$CI_BENCH_SERVER_LOG"
     echo "$json_file"

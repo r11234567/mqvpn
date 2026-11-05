@@ -321,7 +321,8 @@ for direction in UL DL; do
         cp "$sample" "${sample}.client.stdout.log"
         python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" record "$sample" \
             --duration "$TRAFFIC_SEC" --exit-code "$rc" --server-exit-code "$server_rc" \
-            --server-observation "$server_observation"
+            --server-observation "$server_observation" \
+            --server-log "${CI_STRESS_RAW_DIR}/iperf-server-${i}-${direction}.log"
         rate="$(python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" throughput "$sample")"
         if [ "$rate" = NA ] || ! awk -v r="$rate" 'BEGIN {exit !(r+0>0)}'; then
             traffic_failed=$((traffic_failed + 1))

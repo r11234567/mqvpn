@@ -15,6 +15,81 @@ from ci_stress_results import resources, fairness, fault_summary
 
 class ResourceEvidenceTests(unittest.TestCase):
     @unittest.skipUnless(os.name == 'posix' and shutil.which('bash'), 'requires POSIX bash')
+    def test_multi_client_rejects_server_only_error_and_missing_log(self):
+        scripts = Path(__file__).resolve().parents[1] / 'scripts'
+        runner = (scripts / 'ci_stress/ci_stress_multi_client.sh').read_text()
+        # Exercise the runner's recording and traffic-counting statements.
+        # The fixture keeps valid client JSON and a zero server exit status.
+        start = runner.index('        python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" record "$sample"')
+        end = runner.index('        python3 - "$sample" "$i" "$direction"', start)
+        command = ('set -euo pipefail\ntraffic_ok=0\ntraffic_failed=0\n'
+                   + runner[start:end]
+                   + '\nprintf "%s %s\\n" "$traffic_ok" "$traffic_failed"\n')
+        for direction in ('UL', 'DL'):
+            for server_state in ('clean', 'error', 'missing'):
+                with self.subTest(direction=direction, server_state=server_state), tempfile.TemporaryDirectory() as folder:
+                    root = Path(folder)
+                    sample = root / f'iperf-client-1-{direction}.json'
+                    sample.write_text(json.dumps({'end': {'sum_received': {
+                        'seconds': 10, 'bytes': 12500000,
+                        'bits_per_second': 10000000}}}))
+                    server_log = root / f'iperf-server-1-{direction}.log'
+                    if server_state != 'missing':
+                        server_log.write_text('iperf3: error - unable to receive results: Bad file descriptor\n'
+                                              if server_state == 'error' else 'Server listening on 5301\n')
+                    else:
+                        Path(str(sample) + '.server.log').write_text('Unrelated default log\n')
+                    observation = root / 'server-process.json'
+                    observation.write_text(json.dumps(dict(cleanup_requested=False,
+                                                          forced_kill=False,
+                                                          signals_sent=[])))
+                    environment = dict(os.environ, SCRIPT_DIR=str(scripts / 'ci_stress'),
+                                       CI_STRESS_RAW_DIR=str(root), sample=str(sample),
+                                       server_observation=str(observation), TRAFFIC_SEC='10',
+                                       rc='0', server_rc='0', i='1', direction=direction)
+                    result = subprocess.run(['bash', '-c', command], env=environment,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    expected = '1 0' if server_state == 'clean' else '0 1'
+                    self.assertEqual(result.stdout.splitlines()[-1], expected)
+                    meta = json.loads(sample.read_text())['_mqvpn']
+                    self.assertEqual(meta['measurement_complete'], server_state == 'clean')
+                    self.assertEqual(meta['server_exit_code'], 0)
+                    self.assertEqual(meta['server_log'], str(server_log))
+
+    @unittest.skipUnless(os.name == 'posix' and shutil.which('bash'), 'requires POSIX bash')
+    def test_long_running_rejects_server_only_error_and_missing_log(self):
+        scripts = Path(__file__).resolve().parents[1] / 'scripts'
+        runner = (scripts / 'ci_stress/ci_stress_long_running.sh').read_text()
+        start = runner.index('cp "$IPERF_JSON" "${IPERF_JSON}.client.stdout.log"')
+        end = runner.index('ci_stress_monitor_stop', start)
+        command = ('set -euo pipefail\nBUSINESS_FAILED=0\n' + runner[start:end]
+                   + '\nprintf "%s\\n" "$BUSINESS_FAILED"\n')
+        for server_state in ('clean', 'error', 'missing'):
+            with self.subTest(server_state=server_state), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                sample = root / 'iperf.json'
+                sample.write_text(json.dumps({'end': {'sum_received': {
+                    'seconds': 10, 'bytes': 12500000, 'bits_per_second': 10000000}}}))
+                if server_state != 'missing':
+                    (root / 'iperf-server.log').write_text(
+                        'iperf3: error - unable to receive results: Bad file descriptor\n'
+                        if server_state == 'error' else 'Server listening on 5201\n')
+                environment = dict(os.environ, SCRIPT_DIR=str(scripts / 'ci_stress'),
+                                   CI_STRESS_RAW_DIR=str(root), IPERF_JSON=str(sample),
+                                   DURATION='10', IPERF_EXIT='0')
+                result = subprocess.run(['bash', '-c', command], env=environment,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines()[-1],
+                                 '0' if server_state == 'clean' else '1')
+                meta = json.loads(sample.read_text())['_mqvpn']
+                self.assertEqual(meta['measurement_complete'], server_state == 'clean')
+                original = json.loads(Path(str(sample) + '.client.stdout.log').read_text())
+                self.assertEqual(original['end']['sum_received']['bytes'], 12500000)
+                self.assertNotIn('_mqvpn', original)
+
+    @unittest.skipUnless(os.name == 'posix' and shutil.which('bash'), 'requires POSIX bash')
     def test_interrupted_runner_emits_failed_incomplete_result(self):
         source = Path(__file__).resolve().parents[1] / 'scripts/ci_stress'
         for action, reason, code in [('kill -HUP $$', 'signal_HUP', 129),

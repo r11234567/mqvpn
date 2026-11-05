@@ -77,7 +77,8 @@ def iperf_measurement(data, requested=None, exit_code=None):
             "observed_duration_s": seconds, "receiver": summary}
 
 
-def record_iperf(path, duration, exit_code, server_exit_code=None, server_observation=None):
+def record_iperf(path, duration, exit_code, server_exit_code=None,
+                 server_observation=None, server_log=None):
     try:
         def reject_constant(value):
             raise ValueError(f"non-finite JSON value {value}")
@@ -89,13 +90,21 @@ def record_iperf(path, duration, exit_code, server_exit_code=None, server_observ
         raw = path.with_suffix(path.suffix + ".invalid.log")
         raw.write_bytes(path.read_bytes())
         data = {"error": f"invalid iperf JSON: {exc}", "invalid_output": str(raw)}
-    server_log = Path(str(path) + '.server.log')
-    if server_log.exists():
-        errors = [line for line in server_log.read_text(errors='replace').splitlines()
-                  if line.startswith('iperf3: error')]
-        if errors:
-            data['error'] = 'server reported: ' + '; '.join(errors)
+    default_server_log = Path(str(path) + '.server.log')
+    if server_log is None and default_server_log.exists():
+        server_log = default_server_log
+    if server_log is not None:
+        try:
+            lines = server_log.read_text(errors='replace').splitlines()
+        except OSError as exc:
+            data['error'] = f'server log unavailable: {exc}'
+        else:
+            errors = [line for line in lines if line.startswith('iperf3: error')]
+            if errors:
+                data['error'] = 'server reported: ' + '; '.join(errors)
     meta = {"requested_duration_s": duration, "exit_code": exit_code}
+    if server_log is not None:
+        meta['server_log'] = str(server_log)
     if server_exit_code is not None:
         meta['server_exit_code'] = server_exit_code
     if server_observation is not None:
@@ -220,9 +229,11 @@ def main():
     parser.add_argument("--archive", type=Path)
     parser.add_argument('--server-exit-code', type=int)
     parser.add_argument('--server-observation', type=Path)
+    parser.add_argument('--server-log', type=Path, help='Path to the required iperf server log')
     args = parser.parse_args()
     if args.command == "record":
-        record_iperf(args.file, args.duration, args.exit_code, args.server_exit_code, args.server_observation)
+        record_iperf(args.file, args.duration, args.exit_code, args.server_exit_code,
+                     args.server_observation, args.server_log)
         if args.archive:
             args.archive.mkdir(parents=True, exist_ok=True)
             for path in args.file.parent.glob(args.file.name + "*"):

@@ -77,8 +77,10 @@ IPERF_EXIT=0
 wait "$IPERF_CLIENT_PID" || IPERF_EXIT=$?
 kill "$IPERF_SERVER_PID" 2>/dev/null || true
 wait "$IPERF_SERVER_PID" 2>/dev/null || true
+cp "$IPERF_JSON" "${IPERF_JSON}.client.stdout.log"
 python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" record "$IPERF_JSON" \
-    --duration "$DURATION" --exit-code "$IPERF_EXIT"
+    --duration "$DURATION" --exit-code "$IPERF_EXIT" \
+    --server-log "${CI_STRESS_RAW_DIR}/iperf-server.log"
 THROUGHPUT="$(python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" throughput "$IPERF_JSON")"
 if [ "$THROUGHPUT" = NA ] || ! awk -v r="$THROUGHPUT" 'BEGIN {exit !(r+0>0)}'; then
     BUSINESS_FAILED=1
