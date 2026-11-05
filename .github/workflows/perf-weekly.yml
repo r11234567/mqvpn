@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       quick_udp:
-        description: 'Only fast control-close capture regression and six 5-second UDP DL/50B samples; skips core/netsim suites and publishing.'
+        description: 'Only fast control-close capture regression and eighteen 5-second UDP DL/50B samples; skips core/netsim suites and publishing.'
         required: false
         type: boolean
         default: false
@@ -213,7 +213,7 @@ jobs:
         if: ${{ !cancelled() && github.event.inputs.quick_udp == 'true' && steps.benchmark-build.outcome == 'success' }}
         run: sudo env CI_BENCH_CAPTURE_TEST_DIR="$PWD/ci_bench_results/quick-capture" bash tests/test_benchmark_udp_capture.sh
 
-      - name: Focused UDP control reproduction (six samples)
+      - name: Focused UDP control reproduction (eighteen samples)
         id: quick_udp
         if: ${{ !cancelled() && github.event.inputs.quick_udp == 'true' && steps.quick_capture.outcome == 'success' }}
         run: |
@@ -221,6 +221,10 @@ jobs:
           sudo env CI_BENCH_TEST_SCOPE=quick_udp_control CI_BENCH_UDP_SEC=5 \
             CI_BENCH_UDP_DIRECTIONS=DL CI_BENCH_UDP_SIZES=50 CI_BENCH_UDP_SMALL_RATES='5 10' \
             bash scripts/ci_benchmarks/ci_bench_udp_sweep.sh build/mqvpn
+
+      - name: Enforce relative throughput health
+        if: ${{ !cancelled() && github.event.inputs.quick_udp != 'true' && steps.benchmark-build.outcome == 'success' }}
+        run: python3 scripts/ci_benchmarks/ci_bench_health.py ci_bench_results
 
       - name: Make bench artifacts readable by the runner
         if: always()
@@ -233,7 +237,7 @@ jobs:
           import hashlib,json
           from pathlib import Path
           manifests = list(Path('ci_bench_results/raw').rglob('*.evidence.json'))
-          assert len(manifests)==6, f'expected six sample manifests, got {len(manifests)}'
+          assert len(manifests)==18, f'expected eighteen sample manifests, got {len(manifests)}'
           for p in manifests:
               d=json.loads(p.read_text())
               assert d['capture']['status']=='complete', (str(p),d['capture'])
@@ -241,7 +245,7 @@ jobs:
               for item in d['files']:
                   b=(p.parent/item['name']).read_bytes()
                   assert len(b)==item['bytes'] and hashlib.sha256(b).hexdigest()==item['sha256'],item['name']
-          print('PASS all six UDP samples retained complete control pcaps and matching artifact hashes')
+          print('PASS all eighteen UDP samples retained complete startup/control pcaps and matching artifact hashes')
           PY
 
       - name: Upload results
@@ -253,7 +257,7 @@ jobs:
           retention-days: 90
 
       - name: Publish results to R2
-        if: ${{ success() && github.event.inputs.quick_udp != 'true' && env.R2_ACCOUNT_ID != '' }}
+        if: ${{ success() && github.ref == 'refs/heads/main' && github.event.inputs.quick_udp != 'true' && env.R2_ACCOUNT_ID != '' }}
         run: bash scripts/ci_publish/publish_to_r2.sh perf-data/weekly weekly
 
       - name: Note that R2 publishing was skipped
@@ -574,7 +578,7 @@ jobs:
   # benchmark job failed.
   netsim-publish:
     needs: [netsim, perf-weekly]
-    if: ${{ always() && github.event.inputs.quick_udp != 'true' }}
+    if: ${{ always() && github.ref == 'refs/heads/main' && github.event.inputs.quick_udp != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:

@@ -37,4 +37,8 @@
  * only recognizes packets whose base header points directly at TCP or UDP. */
 uint32_t flow_hash_pkt(const uint8_t *pkt, int len, bool udp_pin);
 
+/* WLB preserves UDP flow affinity by default. The legacy udp_pin name is
+ * retained as an alias; one UDP flow is limited to one preferred path. */
+uint32_t flow_hash_for_scheduler(const uint8_t *pkt, int len, int scheduler);
+
 #endif /* MQVPN_FLOW_SCHED_H */

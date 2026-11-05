@@ -107,7 +107,7 @@ def finalize(prefix, archive, vpn_client='', vpn_server=''):
     manifest.write_text(json.dumps(dict(**stamp(),measurement_complete=meta['measurement_complete'],
         failure_reason=meta.get('failure_reason'),client_exit_code=meta.get('exit_code'),
         server_exit_code=meta.get('server_exit_code'),server_teardown=meta.get('server_teardown'),
-        no_log_clipping=True,packet_scope='UDP tests: complete TCP control-port and ICMP packets only; not bulk UDP',
+        no_log_clipping=True,packet_scope='UDP tests: complete TCP control-port, ICMP and four-byte UDP startup messages; not bulk UDP',
         files=files,copy_errors=copy_errors,capture=capture),indent=2)+'\n')
     if capture['issues']:
         print(f'::warning::UDP capture evidence incomplete: {manifest.name}: {capture["issues"]}',file=sys.stderr)

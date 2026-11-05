@@ -24,10 +24,9 @@
 #     assert ON == OFF - 8.
 #
 #   Phase B (data path): an inner UDP workload (iperf3 -u) runs across the
-#     tunnel on the ReorderRule Port, over two paths with an RTT spread applied
-#     by netem so striping produces reordering. We assert the transfer completes
-#     and data is delivered. (If iperf3 is unavailable the data check degrades
-#     to a tunnel ping, like tests/test_e2e_backup_fec.sh.)
+#     tunnel on the ReorderRule Port with explicit netem packet reordering.
+#     This must exercise recovery even when WLB preserves UDP flow affinity.
+#     iperf3 is required: a ping is not equivalent data-path coverage.
 #
 #   Phase C (regression / wire-compat): a second full run with
 #     [Reorder] Enabled=false confirms the tunnel still works unchanged and that
@@ -45,7 +44,7 @@
 # INI containing ONLY [Reorder]/[ReorderRule] and pass it via --config alongside
 # the harness's existing --listen/--server/--path/--auth-key flags.
 #
-# Requires: root, netns support, netcat-openbsd, jq, iperf3 (iperf3 optional).
+# Requires: root, netns support, netcat-openbsd, jq, iperf3.
 # Usage:    sudo ./test_e2e_reorder.sh [mqvpn-binary]
 
 set -eu
@@ -59,24 +58,23 @@ N_PATHS=2
 CTRL_PORT=9094
 INNER_UDP_PORT=5301   # ReorderRule Port + iperf3 -u server port (inner workload)
 
-CLIENT_LOG="$(mktemp)"
-SERVER_LOG="$(mktemp)"
-CLIENT_LOG_OFF="$(mktemp)"
-SERVER_LOG_OFF="$(mktemp)"
-CLIENT_LOG_MIX="$(mktemp)"
-SERVER_LOG_MIX="$(mktemp)"
-INI_ON="$(mktemp --suffix=.ini)"
-INI_OFF="$(mktemp --suffix=.ini)"
-IPERF_SRV_JSON="$(mktemp --suffix=.json)"
+REORDER_RESULTS_DIR="${REORDER_RESULTS_DIR:-$(mktemp -d -t mqvpn-reorder.XXXXXX)}"
+mkdir -p "$REORDER_RESULTS_DIR"
+CLIENT_LOG="${REORDER_RESULTS_DIR}/client-on.log"
+SERVER_LOG="${REORDER_RESULTS_DIR}/server-on.log"
+CLIENT_LOG_OFF="${REORDER_RESULTS_DIR}/client-off.log"
+SERVER_LOG_OFF="${REORDER_RESULTS_DIR}/server-off.log"
+CLIENT_LOG_MIX="${REORDER_RESULTS_DIR}/client-mixed.log"
+SERVER_LOG_MIX="${REORDER_RESULTS_DIR}/server-mixed.log"
+INI_ON="${REORDER_RESULTS_DIR}/on.ini"
+INI_OFF="${REORDER_RESULTS_DIR}/off.ini"
 
-trap 'bench_cleanup; rm -f "$CLIENT_LOG" "$SERVER_LOG" "$CLIENT_LOG_OFF" \
-    "$SERVER_LOG_OFF" "$CLIENT_LOG_MIX" "$SERVER_LOG_MIX" "$INI_ON" "$INI_OFF" \
-    "$IPERF_SRV_JSON"' EXIT
+trap 'bench_cleanup; echo "Reorder evidence: $REORDER_RESULTS_DIR"' EXIT
 
 fail=0
 
 echo "[reorder] N=$N_PATHS binary=$MQVPN inner-udp-port=$INNER_UDP_PORT"
-bench_check_test_deps nc jq
+bench_check_test_deps nc jq iperf3
 
 # ── Generate the reorder INI (config mechanism: --config base + CLI override) ──
 # Keys/values cross-checked against src/config.c:
@@ -86,12 +84,9 @@ bench_check_test_deps nc jq
 #   [ReorderRule] Port  <P>      -> handle_kv SEC_REORDER_RULE arm
 #   [ReorderRule] Profile quic_bulk -> parse_reorder_profile
 #
-# MaxWaitMs = 60 is chosen ABOVE the 40ms path-B spread (netem below) on purpose:
-# the late packet from the slow path then arrives WITHIN the reorder wait window,
-# so packets buffered behind it are released by its arrival (~40ms), inside the
-# configured wait. This lets Phase B prove the engine genuinely re-orders
-# packets, not merely that it activates. (The default 30ms wait < 40ms spread is
-# the §24 H5 "wait < RTT spread" regime; Phase B's too-late check rejects it.)
+# Payload netem releases selected packets immediately and delays the rest by
+# 40ms on either path. MaxWaitMs=60 must absorb that spread. The late-drop
+# limit is unchanged; packet loss or waits beyond the configured budget fail.
 MAX_WAIT_MS=60
 PATH_B_DELAY_MS=40
 cat >"$INI_ON" <<EOF
@@ -110,18 +105,19 @@ cat >"$INI_OFF" <<EOF
 Enabled = false
 EOF
 
-# ── Topology: 2 paths, RTT spread on path 1 so striping reorders inner pkts ──
+# ── Topology: two paths; each lifecycle starts without explicit disorder ──
 bench_setup_netns_n "$N_PATHS"
 bench_add_server_host_routes "$N_PATHS"
-# Path A (slot 0): low latency. Path B (slot 1): +40ms one-way delay. The RTT
-# asymmetry across the two striped paths is what produces out-of-order arrival
-# at the receiver, which is exactly what the reorder buffer must absorb.
+# Payload disorder is independent of UDP flow affinity or path selection.
 bench_apply_netem "delay 1ms" "delay ${PATH_B_DELAY_MS}ms"
 
 # Helper: run one full server+client lifecycle with a given INI + log files.
 # $1 = INI path, $2 = server log, $3 = client log, $4 = server INI (default $1)
 reorder_run() {
     local ini="$1" slog="$2" clog="$3" sini="${4:-$1}"
+    # Every lifecycle starts under the same handshake conditions. Payload
+    # disorder is enabled only after tunnel establishment.
+    bench_apply_netem "delay 1ms" "delay ${PATH_B_DELAY_MS}ms"
     bench_start_vpn_server "--control-port ${CTRL_PORT} --config ${sini}" "$slog"
 
     local paths_arg=""
@@ -143,60 +139,47 @@ extract_client_mtu() {
         | grep -oE 'mtu=[0-9]+' | tail -1 | cut -d= -f2
 }
 
-# Run an inner UDP workload on the ReorderRule port across the tunnel. iperf3
-# server binds inside NS_SERVER on the tunnel IP; client drives it from
-# NS_CLIENT. Returns 0 if the transfer completed (or fell back to ping OK).
-# Sets WORKLOAD_KIND to "iperf3" (high-rate UDP, reliably exercises the reorder
-# engine) or "ping" (low-rate fallback that may NOT generate enough in-flight
-# packets to arm a reorder period) so the caller can decide whether the
-# "engine fired" (gap_count>0) check is a hard assertion or informational.
-# Under iperf3 it also sets WORKLOAD_OOO / WORKLOAD_PKTS from the iperf3 SERVER's
-# report — what the inner receiver saw, i.e. the ordering the shim exists to fix.
-# (The client's copy of out_of_order is the sender side and always 0.)
-WORKLOAD_KIND=""
+# Preserve both iperf reports and process exits. A failed UDP workload must
+# never become a successful ping-only test. Ordering comes from the receiver.
 WORKLOAD_OOO=""
 WORKLOAD_PKTS=""
 run_inner_udp_workload() {
+    local phase="$1" srv_pid client_rc=0 server_rc=0
+    local srv_json="${REORDER_RESULTS_DIR}/iperf-${phase}-server.json"
+    local cli_json="${REORDER_RESULTS_DIR}/iperf-${phase}-client.json"
     WORKLOAD_OOO=""
     WORKLOAD_PKTS=""
-    if command -v iperf3 >/dev/null 2>&1; then
-        : >"$IPERF_SRV_JSON"
-        ip netns exec "$NS_SERVER" iperf3 -s -p "$INNER_UDP_PORT" -1 -D -J \
-            --logfile "$IPERF_SRV_JSON" \
-            --pidfile /tmp/iperf3-reorder.pid >/dev/null 2>&1 || true
-        sleep 1
-        # -u UDP, modest rate, short run; --cport pins client src port too so the
-        # 4-tuple's dst port matches the ReorderRule. dst port = INNER_UDP_PORT.
-        if ip netns exec "$NS_CLIENT" iperf3 -c "$TUNNEL_SERVER_IP" \
-                -p "$INNER_UDP_PORT" -u -b 20M -l 1200 -t 6 >/dev/null 2>&1; then
-            # -1 makes the server exit on its own once it has written the report;
-            # give it a moment before the kill below, or the JSON is truncated.
-            srv_pid="$(cat /tmp/iperf3-reorder.pid 2>/dev/null || true)"
-            for _ in 1 2 3 4 5 6 7 8 9 10; do
-                if [ -z "$srv_pid" ] || ! kill -0 "$srv_pid" 2>/dev/null; then
-                    break
-                fi
-                sleep 0.3
-            done
-            kill "$srv_pid" 2>/dev/null || true
-            rm -f /tmp/iperf3-reorder.pid
-            WORKLOAD_OOO=$(jq '.end.streams[0].udp.out_of_order // empty' \
-                "$IPERF_SRV_JSON" 2>/dev/null || true)
-            WORKLOAD_PKTS=$(jq '.end.streams[0].udp.packets // empty' \
-                "$IPERF_SRV_JSON" 2>/dev/null || true)
-            WORKLOAD_KIND="iperf3"
-            return 0
-        fi
-        kill "$(cat /tmp/iperf3-reorder.pid 2>/dev/null)" 2>/dev/null || true
-        rm -f /tmp/iperf3-reorder.pid
-        echo "  (iperf3 transfer failed; falling back to tunnel ping)" >&2
-    else
-        echo "  (iperf3 not installed; falling back to tunnel ping)" >&2
+    # Inject disorder within each path; do not depend on the scheduler
+    # striping a single flow. ON and OFF receive the identical impairment.
+    bench_apply_netem "delay ${PATH_B_DELAY_MS}ms reorder 25% 50% gap 5" \
+                      "delay ${PATH_B_DELAY_MS}ms reorder 25% 50% gap 5"
+    ip netns exec "$NS_SERVER" timeout 30 iperf3 -s -B "$TUNNEL_SERVER_IP" \
+        -p "$INNER_UDP_PORT" -1 -J >"$srv_json" 2>"${srv_json}.stderr" &
+    srv_pid=$!
+    sleep 1
+    ip netns exec "$NS_CLIENT" timeout 20 iperf3 -c "$TUNNEL_SERVER_IP" \
+        -p "$INNER_UDP_PORT" -u -b 20M -l 1200 -t 6 -J \
+        >"$cli_json" 2>"${cli_json}.stderr" || client_rc=$?
+    wait "$srv_pid" || server_rc=$?
+    printf 'client=%s server=%s\n' "$client_rc" "$server_rc" \
+        >"${REORDER_RESULTS_DIR}/iperf-${phase}-exits.log"
+    if [ "$client_rc" -ne 0 ] || [ "$server_rc" -ne 0 ]; then
+        echo "FAIL: iperf ${phase} process exits client=$client_rc server=$server_rc"
+        cat "$cli_json" "$srv_json" "${cli_json}.stderr" "${srv_json}.stderr"
+        return 1
     fi
-    # Fallback: prove inner data still flows across the RTT-spread paths.
-    WORKLOAD_KIND="ping"
-    ip netns exec "$NS_CLIENT" ping -c 10 -i 0.2 -W 2 "$TUNNEL_SERVER_IP" \
-        >/dev/null 2>&1
+    if ! PYTHONPATH="${SCRIPT_DIR}/../scripts/ci_benchmarks" python3 - "$cli_json" <<'PY'
+import json, sys
+from ci_bench_results import iperf_measurement
+iperf_measurement(json.load(open(sys.argv[1])), requested=6)
+PY
+    then
+        echo "FAIL: incomplete UDP receiver evidence for $phase"
+        return 1
+    fi
+    WORKLOAD_OOO=$(jq -er '.end.streams[0].udp.out_of_order | numbers' "$srv_json") || return 1
+    WORKLOAD_PKTS=$(jq -er '.end.streams[0].udp.packets | numbers | select(. > 0)' "$srv_json") || return 1
+    bench_apply_netem "delay 1ms" "delay ${PATH_B_DELAY_MS}ms"
 }
 
 # ─── Phase A + B: reorder ENABLED ──────────────────────────────────────────
@@ -237,7 +220,7 @@ fi
 
 echo ""
 echo "=== Phase B: inner UDP data path (reorder ON, RTT-spread paths) ==="
-if run_inner_udp_workload; then
+if run_inner_udp_workload on; then
     echo "PASS: inner UDP workload completed across reordering paths"
 else
     echo "FAIL: inner UDP workload did not complete"
@@ -256,12 +239,8 @@ else
     fail=1
 fi
 
-# ── Prove the reorder ENGINE actually fired in-tunnel (not just that the
-#    capability was negotiated). The inner UDP flow is striped across the
-#    1ms vs 40ms paths, so packets MUST arrive out of order at the server's
-#    RX engine; every reorder period it arms increments gap_count. A non-zero
-#    gap_count is therefore the load-bearing evidence that the engine observed
-#    and acted on real in-tunnel reordering.
+# ── Prove the reorder ENGINE actually fired under explicit packet disorder,
+#    independently of whether the scheduler stripes a single UDP flow.
 #
 #    JSON shape (control_socket.c get_reorder_stats):
 #      {"ok":true,"reorder":{"gap_count":N,"gap_filled_count":N,
@@ -286,17 +265,13 @@ echo "INFO: reorder stats — gap_filled=$gap_filled gap_timeout=$gap_timeout de
 # bidirectional asymmetric inner flow (real inner QUIC = §24 eval-harness
 # scope); its correctness is covered by the unit test test_rx_ack_demote_small_flow.
 
-# The "engine fired" (gap_count>0) check is a HARD assertion only under the
-# high-rate iperf3 workload, which reliably produces concurrent in-flight
-# packets across the 1ms vs 40ms paths. The ping fallback (-c 10 -i 0.2) is
-# too low-rate/serialized to guarantee a reorder period, so there it is
-# informational only (don't fail a host that merely lacks iperf3).
-if [ "$WORKLOAD_KIND" = "iperf3" ]; then
+# All data-path checks require the complete iperf receiver report.
+if [ -n "$WORKLOAD_PKTS" ]; then
     if [ "${gap_count:-0}" -gt 0 ]; then
         echo "PASS: reorder engine fired in-tunnel (gap_count=$gap_count)"
     else
         echo "FAIL: reorder engine never armed (gap_count=$gap_count) — was the inner"
-        echo "      flow actually striped across the RTT-spread paths? raw=$reorder_stats"
+        echo "      impairment actually applied? raw=$reorder_stats"
         fail=1
     fi
     # Stronger evidence: the engine did not just activate, it actually RE-ORDERED.
@@ -355,8 +330,8 @@ if [ "$WORKLOAD_KIND" = "iperf3" ]; then
         fail=1
     fi
 else
-    echo "SKIP: engine-fired/re-ordered checks need iperf3; ping fallback is too low-rate"
-    echo "      to guarantee reordering. gap_count=$gap_count added_latency_max_ms=$lat_max_ms (info)."
+    echo "FAIL: cannot verify reorder behavior without the UDP receiver report"
+    fail=1
 fi
 
 # Non-fatal breakdown for the human reading the run. How periods split between
@@ -397,7 +372,7 @@ else
 fi
 
 # Inner data still flows with reorder OFF.
-if run_inner_udp_workload; then
+if run_inner_udp_workload off; then
     echo "PASS: inner UDP workload completed with reorder OFF"
 else
     echo "FAIL: inner UDP workload failed with reorder OFF"
@@ -425,11 +400,9 @@ if [ -n "$ooo_on" ] && [ -n "$ooo_off" ]; then
         echo "FAIL: inner receiver saw out_of_order=$ooo_on with reorder ON (OFF=$ooo_off)"
         fail=1
     fi
-elif [ "$WORKLOAD_KIND" = "iperf3" ]; then
+else
     echo "FAIL: iperf3 ran but its server report was unreadable (ON='$ooo_on' OFF='$ooo_off')"
     fail=1
-else
-    echo "SKIP: in-order check needs iperf3; ping fallback reports no ordering."
 fi
 
 # Behavioral MTU check: reorder ON inner MTU should be exactly 8 (the wire
@@ -446,7 +419,8 @@ if [ -n "$mtu_on" ] && [ -n "$mtu_off" ]; then
         fail=1
     fi
 else
-    echo "WARN: skipping MTU -8 check (ON='$mtu_on' OFF='$mtu_off' — one not parsed)"
+    echo "FAIL: missing MTU evidence (ON='$mtu_on' OFF='$mtu_off')"
+    fail=1
 fi
 
 # ─── Phase D: client reorder ON, server OFF (not negotiated) ──────────────
@@ -480,7 +454,8 @@ if [ -n "$mtu_mix" ] && [ -n "$mtu_off" ]; then
         fail=1
     fi
 else
-    echo "WARN: skipping the Phase D MTU check (MIX='$mtu_mix' OFF='$mtu_off' — one not parsed)"
+    echo "FAIL: missing Phase D MTU evidence (MIX='$mtu_mix' OFF='$mtu_off')"
+    fail=1
 fi
 
 # ─── Verdict ───────────────────────────────────────────────────────────────

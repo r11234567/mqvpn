@@ -79,7 +79,40 @@ case "$CI_STRESS_LOG_LEVEL" in
     *) ASSERT_PATH_RETURN=0 ;;
 esac
 
-trap ci_stress_cleanup EXIT
+OUTPUT_FILE="${CI_STRESS_RESULTS}/failover_storm_${RUN_STAMP}.json"
+failover_exit() {
+    local rc=$?
+    local reason="${ABORT_REASON:-shell_exit_$rc}"
+    trap - EXIT
+    set +e
+    # A terminated runner must leave an explicit incomplete verdict, not just
+    # orphaned logs or the successful prefix of its cycle records.
+    if [ ! -f "$OUTPUT_FILE" ]; then
+        [ "$rc" -ne 0 ] || rc=1
+        PYTHONPATH="$SCRIPT_DIR" python3 - "$OUTPUT_FILE" \
+            "${CI_STRESS_RAW_DIR}/fault-cycles.jsonl" "$NUM_CYCLES" \
+            "$reason" "$CI_STRESS_COMMIT" <<'PY'
+import datetime, json, pathlib, sys
+from ci_stress_results import fault_summary
+output, raw, requested, reason, commit = sys.argv[1:]
+p = pathlib.Path(raw)
+rows = [json.loads(line) for line in p.read_text().splitlines() if line.strip()] if p.exists() else []
+result = dict(test='failover_storm', commit=commit, status='fail',
+              timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              num_cycles=int(requested), cycles_ok=sum(bool(r.get('ok')) for r in rows),
+              cycles_failed=sum(not r.get('ok') for r in rows))
+result.update(fault_summary(rows, int(requested), reason or 'incomplete_finalization'))
+pathlib.Path(output).parent.mkdir(parents=True, exist_ok=True)
+pathlib.Path(output).write_text(json.dumps(result, indent=2) + '\n')
+PY
+    fi
+    ci_stress_cleanup
+    exit "$rc"
+}
+trap failover_exit EXIT
+trap 'ABORT_REASON=signal_HUP; exit 129' HUP
+trap 'ABORT_REASON=signal_INT; exit 130' INT
+trap 'ABORT_REASON=signal_TERM; exit 143' TERM
 
 ci_stress_check_deps
 
@@ -294,7 +327,8 @@ for ((i = 1; i <= NUM_CYCLES; i++)); do
         CYCLE_OK=false
     fi
 
-    if ! ip netns exec "$NS_CLIENT" ping -c 1 -W 2 "$TUNNEL_SERVER_IP" >/dev/null 2>&1; then
+    if ! ip netns exec "$NS_CLIENT" ping -D -O -c 1 -W 2 "$TUNNEL_SERVER_IP" \
+            >"${CI_STRESS_RAW_DIR}/probe-recovered-cycle-${i}.log" 2>&1; then
         echo "  [$TAG] FAIL: tunnel ping failed"
         CYCLE_OK=false
     fi

@@ -565,7 +565,16 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          REORDER_RESULTS_DIR: ${{ github.workspace }}/build/reorder-evidence
         run: sudo -E tests/test_e2e_reorder.sh build/mqvpn
+
+      - name: Upload reorder evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sanitizer-reorder-evidence
+          path: build/reorder-evidence/
+          if-no-files-found: ignore
 
       - name: E2E backup_fec scheduler test (netns)
         env:

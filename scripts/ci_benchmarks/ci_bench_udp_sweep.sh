@@ -10,6 +10,9 @@ CI_BENCH_LOG_LEVEL="${CI_BENCH_LOG_LEVEL:-info}"
 source "${SCRIPT_DIR}/ci_bench_env.sh"
 MQVPN="${1:-${MQVPN}}"
 DURATION="${CI_BENCH_UDP_SEC:-10}"
+REPEATS="${CI_BENCH_UDP_REPEATS:-3}"
+[[ "$REPEATS" =~ ^[0-9]+$ ]] && [ "$REPEATS" -ge 3 ] || exit 2
+export CI_BENCH_UDP_REPEATS="$REPEATS"
 read -r -a DIRECTIONS <<< "${CI_BENCH_UDP_DIRECTIONS:-DL UL}"
 read -r -a SIZES <<< "${CI_BENCH_UDP_SIZES:-1100 50}"
 trap ci_bench_cleanup EXIT
@@ -35,14 +38,17 @@ for dir in "${DIRECTIONS[@]}"; do
             ci_bench_start_client "$paths" "$sched"
             ci_bench_wait_tunnel 30
             for rate in "${RATES[@]}"; do
+              for ((sample=1; sample<=REPEATS; sample++)); do
                 jf="$(CI_BENCH_IPERF_LEN="$size" ci_bench_run_iperf UDP "$dir" "$DURATION" 1 "${rate}M")"
-                point="$(python3 "${SCRIPT_DIR}/ci_bench_metrics.py" udp "$jf" --rate "$rate" || true)"
-                python3 - "$cond" "$point" >>"$ROWS" <<'PY'
+                point="$(python3 "${SCRIPT_DIR}/ci_bench_metrics.py" udp "$jf" --rate "$rate")" || FAILED=1
+                python3 - "$cond" "$point" "$sample" >>"$ROWS" <<'PY'
 import json, sys
 p = json.loads(sys.argv[2]); p['condition'] = sys.argv[1]
+p['repeat'] = int(sys.argv[3])
 print(json.dumps(p))
 PY
                 rm -f "$jf"
+              done
             done
             ci_bench_stop_vpn
             ci_bench_cleanup_stale
@@ -53,16 +59,20 @@ import datetime, json, os, sys
 from ci_bench_metrics import saturation
 rows, output, direction, size, duration, rates = sys.argv[1:]
 points = [json.loads(s) for s in open(rows)]
-doc = {'test': 'udp_sweep', 'measurement_version': 2, 'commit': os.environ.get('CI_BENCH_COMMIT'),
+doc = {'test': 'udp_sweep', 'measurement_version': 3, 'repeats': int(os.environ['CI_BENCH_UDP_REPEATS']), 'commit': os.environ.get('CI_BENCH_COMMIT'),
        'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat(),
        'direction': direction, 'packet_size_bytes': int(size), 'duration_sec': int(duration),
        'sweep_rates_mbps': [float(r) for r in rates.split()], 'results': {},
        'scope': os.environ.get('CI_BENCH_TEST_SCOPE','udp_sweep'),
-       'measurement': 'receiver bytes/time; ascending first loss crossing, one sample per point'}
+       'measurement': 'receiver bytes/time; all repeated samples retained; any incomplete repeat fails'}
 for cond in ('single', 'wlb', 'minrtt'):
     pts = [p for p in points if p['condition'] == cond]
     doc['results'][cond] = {'points': pts, **saturation(pts)}
-doc['measurement_complete'] = all(p['status'] == 'ok' for p in points)
+expected = {(c, float(rate), i) for c in ('single', 'wlb', 'minrtt')
+            for rate in rates.split() for i in range(1, int(os.environ['CI_BENCH_UDP_REPEATS'])+1)}
+actual = [(p['condition'], p['rate'], p['repeat']) for p in points]
+doc['measurement_complete'] = (len(actual) == len(expected) and set(actual) == expected
+                               and all(p['status'] == 'ok' for p in points))
 with open(output, 'w') as f: json.dump(doc, f, indent=2, allow_nan=False)
 PY
         ci_bench_sanity_check "$output" 'UDP receiver sweep' || FAILED=1
