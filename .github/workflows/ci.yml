@@ -485,6 +485,26 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: sudo -E scripts/ci_e2e/run_pmtud_multipath_test.sh
 
+      - name: E2E PMTUD initial small-MTU gates (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          for scenario in ipv4 ipv6 mixed-small-first mixed-large-first reject-inner-ipv6; do
+            args=()
+            if [ "$scenario" != ipv4 ]; then args=("--$scenario"); fi
+            sudo -E env MQVPN_E2E_LOG_DIR="$PWD/pmtud-small-mtu/$scenario" \
+              timeout 180 bash scripts/ci_e2e/run_pmtud_small_mtu_test.sh "${args[@]}"
+          done
+
+      - name: Upload initial small-MTU evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sanitizer-pmtud-small-mtu-evidence
+          path: pmtud-small-mtu/
+          if-no-files-found: ignore
+
       - name: E2E reconnect test (netns)
         env:
           ASAN_OPTIONS: detect_leaks=1
