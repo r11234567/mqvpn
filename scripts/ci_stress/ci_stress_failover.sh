@@ -8,7 +8,7 @@
 # verifies that the path itself came back — not merely that the surviving
 # path still answers. Monitors RSS/fd for both VPN processes.
 #
-# Three fault kinds, one per way a path dies in the field:
+# Five fault kinds, including directional silent blackholes:
 #
 #   admin_down    the interface is switched off (UI / config change). The
 #                 client's own veth loses IFF_UP and the kernel flushes
@@ -20,9 +20,10 @@
 #                 route all stay valid and NO netlink event is emitted, so
 #                 the platform layer cannot react at all: staying connected
 #                 is entirely up to loss detection and the scheduler.
+#   blackhole_up / blackhole_down discard only one direction of that path.
 #
 # The path alternates every cycle and the kind every two, so no path is
-# faulted twice in a row and each kind gets a third of the cycles.
+# faulted twice in a row and each kind gets both paths.
 #
 # Flow:
 #   1. Setup dual-path netns with netem (Path A = 300Mbps/10ms, Path B = 80Mbps/30ms)
@@ -63,6 +64,13 @@ fi
 for kind in "${FAULT_KINDS[@]}"; do
     case "$kind" in admin_down|carrier_loss|blackhole|blackhole_up|blackhole_down) ;; *) echo "invalid fault: $kind" >&2; exit 2 ;; esac
 done
+if [ "$(printf '%s\n' "${FAULT_KINDS[@]}" | sort -u | wc -l)" -ne "${#FAULT_KINDS[@]}" ]; then
+    echo 'duplicate fault kinds' >&2; exit 2
+fi
+if { [ "${CI:-}" = true ] || [ "${GITHUB_ACTIONS:-}" = true ]; } \
+    && { [ "$NUM_CYCLES" -lt 100 ] || [ "${#FAULT_KINDS[@]}" -ne 5 ]; }; then
+    echo 'CI requires 100 cycles covering all five fault kinds' >&2; exit 2
+fi
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 
 # Capture the VPN logs instead of letting them flood the console: the
@@ -71,6 +79,7 @@ RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 # every line of a 30-minute run.
 VPN_SERVER_LOG="${CI_STRESS_RAW_DIR}/vpn-server.log"
 VPN_CLIENT_LOG="${CI_STRESS_RAW_DIR}/vpn-client.log"
+ECHO_LOG="${CI_STRESS_RAW_DIR}/fault-echo.jsonl"
 export CI_STRESS_SERVER_LOG="$VPN_SERVER_LOG"
 export CI_STRESS_CLIENT_LOG="$VPN_CLIENT_LOG"
 
@@ -91,17 +100,19 @@ failover_exit() {
         [ "$rc" -ne 0 ] || rc=1
         PYTHONPATH="$SCRIPT_DIR" python3 - "$OUTPUT_FILE" \
             "${CI_STRESS_RAW_DIR}/fault-cycles.jsonl" "$NUM_CYCLES" \
-            "$reason" "$CI_STRESS_COMMIT" <<'PY'
+            "$reason" "$CI_STRESS_COMMIT" "$ECHO_LOG" "${FAULT_KINDS[*]}" <<'PY'
 import datetime, json, pathlib, sys
 from ci_stress_results import fault_summary
-output, raw, requested, reason, commit = sys.argv[1:]
+output, raw, requested, reason, commit, echo_log, kinds = sys.argv[1:]
 p = pathlib.Path(raw)
 rows = [json.loads(line) for line in p.read_text().splitlines() if line.strip()] if p.exists() else []
 result = dict(test='failover_storm', commit=commit, status='fail',
               timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
               num_cycles=int(requested), cycles_ok=sum(bool(r.get('ok')) for r in rows),
               cycles_failed=sum(not r.get('ok') for r in rows))
-result.update(fault_summary(rows, int(requested), reason or 'incomplete_finalization'))
+echoes = pathlib.Path(echo_log)
+result.update(fault_summary(rows, int(requested), reason or 'incomplete_finalization',
+                           echoes.read_text() if echoes.exists() else '', kinds.split()))
 pathlib.Path(output).parent.mkdir(parents=True, exist_ok=True)
 pathlib.Path(output).write_text(json.dumps(result, indent=2) + '\n')
 PY
@@ -159,6 +170,16 @@ ip netns exec "$NS_CLIENT" iperf3 \
 IPERF_CLIENT_PID=$!
 sleep 2
 
+# Reuse the independent monotonic 10 Hz probe. Start before injection so the
+# first two seconds of switching cannot disappear from quality acceptance.
+ECHO_HELPER="${SCRIPT_DIR}/../ci_benchmarks/ci_bench_failover_measure.py"
+ip netns exec "$NS_SERVER" python3 "$ECHO_HELPER" echo --target "$TUNNEL_SERVER_IP" \
+    >"${CI_STRESS_RAW_DIR}/echo-server.log" 2>&1 &
+ECHO_SERVER_PID=$!
+ip netns exec "$NS_CLIENT" python3 "$ECHO_HELPER" probe --target "$TUNNEL_SERVER_IP" \
+    --duration "$((LOAD_DURATION + 30))" >"$ECHO_LOG" 2>&1 &
+ECHO_PROBE_PID=$!
+
 # ── Start RSS/fd monitors ──
 
 SERVER_MON_LOG="${CI_STRESS_RAW_DIR}/server-monitor.log"
@@ -198,7 +219,8 @@ echo "Starting $NUM_CYCLES fault/recover cycles..."
 
 for ((i = 1; i <= NUM_CYCLES; i++)); do
     if ! ci_stress_check_workloads vpn_server "$_CS_SERVER_PID" vpn_client "$_CS_CLIENT_PID" \
-            iperf_server "$IPERF_SERVER_PID" iperf_client "$IPERF_CLIENT_PID"; then
+            iperf_server "$IPERF_SERVER_PID" iperf_client "$IPERF_CLIENT_PID" \
+            echo_server "$ECHO_SERVER_PID" echo_probe "$ECHO_PROBE_PID"; then
         ABORT_REASON="${_CS_DEAD_PROCESS}_exited_before_cycle_${i}"
         echo "Aborting remaining cycles: $ABORT_REASON"
         break
@@ -232,6 +254,7 @@ for ((i = 1; i <= NUM_CYCLES; i++)); do
     BEFORE_FAULT_BYTES="$(ci_stress_tun_rx_bytes || echo 0)"
 
     # (b) FAULT
+    FAULT_START="$(python3 -c 'import time; print(time.monotonic())')"
     case "$FAULT_KIND" in
     admin_down)
         # Local veth loses IFF_UP; the kernel flushes routes through it.
@@ -270,6 +293,7 @@ for ((i = 1; i <= NUM_CYCLES; i++)); do
 
     # (d) RECOVER. IPv4 addresses survive a link down, so the addr add is a
     #     no-op safety net rather than a restore.
+    RECOVERY_START="$(python3 -c 'import time; print(time.monotonic())')"
     case "$FAULT_KIND" in
     admin_down)
         ip netns exec "$NS_CLIENT" ip link set "$FAULT_VETH_C" up
@@ -303,6 +327,7 @@ for ((i = 1; i <= NUM_CYCLES; i++)); do
     # Observe recovery and real bytes on the restored path, not only a marker.
     sleep "${CI_STRESS_RECOVERY_SEC:-10}"
     RETURN_BYTES_1="$(ip netns exec "$NS_SERVER" cat "/sys/class/net/${FAULT_VETH_S}/statistics/rx_bytes")"
+    RECOVERY_END="$(python3 -c 'import time; print(time.monotonic())')"
     if [ "$((RETURN_BYTES_1 - RETURN_BYTES_0))" -lt "${CI_STRESS_MIN_RESTORED_BYTES:-50000}" ]; then
         echo "  [$TAG] FAIL: restored path carried no sustained data"
         CYCLE_OK=false
@@ -334,18 +359,22 @@ for ((i = 1; i <= NUM_CYCLES; i++)); do
     fi
 
     if ! ci_stress_check_workloads vpn_server "$_CS_SERVER_PID" vpn_client "$_CS_CLIENT_PID" \
-            iperf_server "$IPERF_SERVER_PID" iperf_client "$IPERF_CLIENT_PID"; then
+            iperf_server "$IPERF_SERVER_PID" iperf_client "$IPERF_CLIENT_PID" \
+            echo_server "$ECHO_SERVER_PID" echo_probe "$ECHO_PROBE_PID"; then
         ABORT_REASON="${_CS_DEAD_PROCESS}_exited_during_cycle_${i}"
         CYCLE_OK=false
     fi
     python3 - "$i" "$FAULT_LABEL" "$FAULT_KIND" "$CYCLE_OK" \
         "$BEFORE_FAULT_BYTES" "$DURING_FAULT_BYTES" "$RETURN_BYTES_0" "$RETURN_BYTES_1" \
+        "$FAULT_START" "$RECOVERY_START" "$RECOVERY_END" \
         >>"${CI_STRESS_RAW_DIR}/fault-cycles.jsonl" <<'PY'
 import json, sys
-i, path, kind, ok, before, during, r0, r1 = sys.argv[1:]
+i, path, kind, ok, before, during, r0, r1, fault, recovery, end = sys.argv[1:]
 print(json.dumps({'cycle': int(i), 'path': path, 'kind': kind, 'ok': ok == 'true',
                   'fault_receiver_bytes': int(during) - int(before),
-                  'restored_path_bytes': int(r1) - int(r0)}))
+                  'restored_path_bytes': int(r1) - int(r0),
+                  'fault_start_s': float(fault), 'recovery_start_s': float(recovery),
+                  'recovery_end_s': float(end)}))
 PY
     # (g) Record result
     if [ "$CYCLE_OK" = true ]; then
@@ -368,6 +397,12 @@ done
 
 echo ""
 echo "Requested=$NUM_CYCLES attempted=$((CYCLES_OK + CYCLES_FAILED)) ok=$CYCLES_OK failed=$CYCLES_FAILED"
+
+# Drain the final one-second probe deadlines before freezing the evidence.
+sleep 1.1
+kill "$ECHO_PROBE_PID" "$ECHO_SERVER_PID" 2>/dev/null || true
+wait "$ECHO_PROBE_PID" 2>/dev/null || true
+wait "$ECHO_SERVER_PID" 2>/dev/null || true
 
 # ── Kill iperf3 ──
 
@@ -451,7 +486,7 @@ for _kind in "${FAULT_KINDS[@]}"; do
 done
 echo "  Server RSS (KB):    initial=${SERVER_RSS_INITIAL} final=${SERVER_RSS_FINAL} max=${SERVER_RSS_MAX}"
 echo "  Client RSS (KB):    initial=${CLIENT_RSS_INITIAL} final=${CLIENT_RSS_FINAL} max=${CLIENT_RSS_MAX}"
-echo "  Status:             ${STATUS}"
+echo "  Liveness/resources: ${STATUS} (quality assessment follows)"
 
 # ── Generate JSON output ──
 
@@ -492,14 +527,29 @@ result = {
     'status': '${STATUS}'
 }
 with open('${CI_STRESS_RAW_DIR}/fault-cycles.jsonl') as f:
-    result.update(fault_summary([json.loads(line) for line in f if line.strip()],
-                                ${NUM_CYCLES}, '${ABORT_REASON}'))
+    cycle_rows = [json.loads(line) for line in f if line.strip()]
+    result.update(fault_summary(cycle_rows,
+                                ${NUM_CYCLES}, '${ABORT_REASON}',
+                                open('${ECHO_LOG}').read(), '${FAULT_KINDS[*]}'.split()))
+result['liveness_fault_kinds'] = result['fault_kinds'].copy()
+for kind in result['fault_kinds']:
+    cycles = [r for r in result['fault_quality']['cycles'] if r['kind'] == kind]
+    live = {r['cycle']: r['ok'] for r in cycle_rows if r['kind'] == kind}
+    accepted = sum(live[r['cycle']] and r['status'] == 'pass' for r in cycles)
+    result['fault_kinds'][kind] = dict(
+        ok=accepted, failed=len(cycles)-accepted,
+        quality_failed=sum(r['status'] != 'pass' for r in cycles),
+        cycles=len(cycles))
+if result['fault_quality']['status'] != 'pass' or not result['execution_complete']:
+    result['status'] = 'fail'
 
 with open('${OUTPUT_FILE}', 'w') as f:
     json.dump(result, f, indent=2)
 
 print(json.dumps(result, indent=2))
 "
+STATUS="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["status"])' "$OUTPUT_FILE")"
+echo "  Final status including fault quality: $STATUS"
 
 # ── Archive the VPN logs on a red run ──
 #
