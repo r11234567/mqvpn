@@ -144,7 +144,7 @@ extract_client_mtu() {
 WORKLOAD_OOO=""
 WORKLOAD_PKTS=""
 run_inner_udp_workload() {
-    local phase="$1" srv_pid client_rc=0 server_rc=0
+    local phase="$1" srv_pid client_rc=0 server_rc=0 quality_rc=0
     local srv_json="${REORDER_RESULTS_DIR}/iperf-${phase}-server.json"
     local cli_json="${REORDER_RESULTS_DIR}/iperf-${phase}-client.json"
     WORKLOAD_OOO=""
@@ -153,6 +153,16 @@ run_inner_udp_workload() {
     # striping a single flow. ON and OFF receive the identical impairment.
     bench_apply_netem "delay ${PATH_B_DELAY_MS}ms reorder 25% 50% gap 5" \
                       "delay ${PATH_B_DELAY_MS}ms reorder 25% 50% gap 5"
+    # iperf's TCP TEST_END can overtake its last UDP packets and the shim's
+    # bounded drain. Delay ONLY that inner TCP control flow by 200ms on both
+    # ON/OFF runs: 2*MaxWait (120ms) + outer delay (40ms) + 40ms slack.
+    # UDP load, outer disorder, shim deadlines and acceptance limits stay
+    # identical. Receiver bitrate still includes this drain, so >=19M must
+    # pass with the complete delivered-byte and <=0.1% loss checks.
+    ip netns exec "$NS_CLIENT" tc qdisc replace dev mqvpn0 root handle 1: prio bands 3
+    ip netns exec "$NS_CLIENT" tc qdisc add dev mqvpn0 parent 1:3 handle 30: netem delay 200ms
+    ip netns exec "$NS_CLIENT" tc filter add dev mqvpn0 protocol ip parent 1: prio 1 u32 \
+        match ip protocol 6 0xff match ip dport "$INNER_UDP_PORT" 0xffff flowid 1:3
     ip netns exec "$NS_SERVER" timeout 30 iperf3 -s -B "$TUNNEL_SERVER_IP" \
         -p "$INNER_UDP_PORT" -1 -J >"$srv_json" 2>"${srv_json}.stderr" &
     srv_pid=$!
@@ -161,25 +171,35 @@ run_inner_udp_workload() {
         -p "$INNER_UDP_PORT" -u -b 20M -l 1200 -t 6 -J \
         >"$cli_json" 2>"${cli_json}.stderr" || client_rc=$?
     wait "$srv_pid" || server_rc=$?
+    ip netns exec "$NS_CLIENT" tc -s qdisc show dev mqvpn0 \
+        >"${REORDER_RESULTS_DIR}/inner-control-${phase}-qdisc.log"
+    ip netns exec "$NS_CLIENT" tc -s filter show dev mqvpn0 parent 1: \
+        >"${REORDER_RESULTS_DIR}/inner-control-${phase}-filter.log"
+    ip netns exec "$NS_CLIENT" tc qdisc del dev mqvpn0 root
     printf 'client=%s server=%s\n' "$client_rc" "$server_rc" \
         >"${REORDER_RESULTS_DIR}/iperf-${phase}-exits.log"
+    # Restore the same post-workload conditions even when a quality gate fails.
+    bench_apply_netem "delay 1ms" "delay ${PATH_B_DELAY_MS}ms"
     if [ "$client_rc" -ne 0 ] || [ "$server_rc" -ne 0 ]; then
         echo "FAIL: iperf ${phase} process exits client=$client_rc server=$server_rc"
         cat "$cli_json" "$srv_json" "${cli_json}.stderr" "${srv_json}.stderr"
         return 1
     fi
-    if ! PYTHONPATH="${SCRIPT_DIR}/../scripts/ci_benchmarks" python3 - "$cli_json" <<'PY'
+    if ! PYTHONPATH="${SCRIPT_DIR}/../scripts/ci_benchmarks" python3 - "$cli_json" "$srv_json" <<'PY'
 import json, sys
-from ci_bench_results import iperf_measurement
-iperf_measurement(json.load(open(sys.argv[1])), requested=6)
+from ci_bench_results import reorder_udp_measurement
+result = reorder_udp_measurement(json.load(open(sys.argv[1])),
+                                 json.load(open(sys.argv[2])))
+print('UDP receiver quality:', {key: value for key, value in result.items()
+                                if key != 'receiver'})
 PY
     then
-        echo "FAIL: incomplete UDP receiver evidence for $phase"
-        return 1
+        echo "FAIL: UDP receiver completeness/rate/loss gate for $phase"
+        quality_rc=1
     fi
     WORKLOAD_OOO=$(jq -er '.end.streams[0].udp.out_of_order | numbers' "$srv_json") || return 1
     WORKLOAD_PKTS=$(jq -er '.end.streams[0].udp.packets | numbers | select(. > 0)' "$srv_json") || return 1
-    bench_apply_netem "delay 1ms" "delay ${PATH_B_DELAY_MS}ms"
+    return "$quality_rc"
 }
 
 # ─── Phase A + B: reorder ENABLED ──────────────────────────────────────────

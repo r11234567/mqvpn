@@ -77,6 +77,42 @@ def iperf_measurement(data, requested=None, exit_code=None):
             "observed_duration_s": seconds, "receiver": summary}
 
 
+def reorder_udp_measurement(client, server):
+    """Gate the six-second, 20-Mbit/s no-loss reorder workload at both ends.
+
+    Allow the fixed control/drain overhead in the rate (95% of offered load)
+    and at most 0.1% missing bytes. Sequence-reported loss stays <=0.1%.
+    iperf's loss counter alone does not account for a missing final sequence.
+    """
+    client_result = iperf_measurement(client, requested=6)
+    result = iperf_measurement(server, requested=6)
+    received = result['receiver']
+    sent = (client.get('end') or {}).get('sum_sent') or {}
+    if (sent.get('sender') is not True or received.get('sender') is not False
+            or client_result['receiver'].get('sender') is not False):
+        raise InvalidMeasurement('explicit UDP sender and receiver required')
+    sent_bytes = number(sent.get('bytes'), 'sender bytes', positive=True)
+    sent_seconds = number(sent.get('seconds'), 'sender seconds', positive=True)
+    if sent_seconds < 5.88 or not 14_850_000 <= sent_bytes <= 15_750_000:
+        raise InvalidMeasurement('UDP sender did not offer the complete 20M workload')
+    if result['receiver_mbps'] < 19 or client_result['receiver_mbps'] < 19:
+        raise InvalidMeasurement('UDP receiver below 95% of offered 20M rate')
+    if not sent_bytes * 0.999 <= result['receiver_bytes'] <= sent_bytes:
+        raise InvalidMeasurement('UDP receiver missing more than 0.1% of sent bytes')
+    if client_result['receiver_bytes'] != result['receiver_bytes']:
+        raise InvalidMeasurement('client and server receiver byte counts disagree')
+    packets = number(received.get('packets'), 'receiver packets', positive=True)
+    lost = number(received.get('lost_packets'), 'receiver lost packets')
+    loss = number(received.get('lost_percent'), 'receiver loss percent')
+    if packets != int(packets) or lost != int(lost) or lost > packets:
+        raise InvalidMeasurement('invalid UDP receiver packet counts')
+    if loss > 0.1 or lost * 1000 > packets:
+        raise InvalidMeasurement('UDP receiver loss exceeds 0.1%')
+    if abs(loss - lost * 100 / packets) > 0.01:
+        raise InvalidMeasurement('UDP receiver loss counters disagree')
+    return result
+
+
 def record_iperf(path, duration, exit_code, server_exit_code=None,
                  server_observation=None, server_log=None):
     try:

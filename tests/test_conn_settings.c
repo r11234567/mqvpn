@@ -503,6 +503,31 @@ test_stream_unsent_cap_both_sides(void)
     return 0;
 }
 
+/* Loss learning is transport-wide, including single-path and reorder-off
+ * connections. It must not silently enable reliable DATAGRAM delivery. */
+static int
+test_spurious_loss_learning(void)
+{
+    for (int server = 0; server <= 1; server++) {
+        for (int multipath = 0; multipath <= 1; multipath++) {
+            for (int reorder = 0; reorder <= 1; reorder++) {
+                xqc_conn_settings_t cs;
+                mqvpn_conn_settings_input_t in = {
+                    .is_server = server,
+                    .enable_multipath = multipath,
+                    .reorder = reorder,
+                    .scheduler = MQVPN_SCHED_WLB,
+                };
+                mqvpn_build_conn_settings(&in, &cs);
+                ASSERT_EQ(cs.spurious_loss_detect_on, 1);
+                ASSERT_EQ(cs.datagram_force_retrans_on, 0);
+                ASSERT_EQ(cs.max_datagram_unsent_packets, MQVPN_DATAGRAM_UNSENT_PACKETS);
+            }
+        }
+    }
+    return 0;
+}
+
 int
 main(void)
 {
@@ -518,6 +543,7 @@ main(void)
     failed += test_recv_rate_limit_wiring();
     failed += test_reinjection_mapping();
     failed += test_stream_unsent_cap_both_sides();
+    failed += test_spurious_loss_learning();
     if (failed) {
         fprintf(stderr, "test_conn_settings: %d FAILED\n", failed);
         return 1;
