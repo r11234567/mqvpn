@@ -77,8 +77,9 @@ cleanup() {
     ip netns del "$NS_CLIENT" 2>/dev/null || true
     ip netns del "$NS_SERVER" 2>/dev/null || true
     if [ -n "${MQVPN_E2E_LOG_DIR:-}" ]; then
-        mkdir -p "$MQVPN_E2E_LOG_DIR"
-        cp -a "$WORK_DIR/." "$MQVPN_E2E_LOG_DIR/"
+        install -d -m 0755 "$MQVPN_E2E_LOG_DIR"
+        find "$WORK_DIR" -maxdepth 1 -type f ! -name server.key \
+            -exec install -m 0644 -t "$MQVPN_E2E_LOG_DIR" {} +
     fi
     rm -rf "$WORK_DIR"
     exit "$rc"
