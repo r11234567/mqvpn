@@ -52,7 +52,7 @@ if [ ! -f "$MQVPN" ]; then
     exit 1
 fi
 
-for cmd in iperf3 openssl python3 tc; do
+for cmd in iperf3 openssl python3 tc timeout; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "error: required dependency $cmd not on PATH"
         exit 2
@@ -61,6 +61,10 @@ done
 
 MQVPN="$(realpath "$MQVPN")"
 WORK_DIR="$(mktemp -d)"
+RESULTS_DIR="${THROUGHPUT_RESULTS_DIR:-${PWD}/throughput-floor-results}"
+mkdir -p "$RESULTS_DIR"
+RESULTS_DIR="$(realpath "$RESULTS_DIR")"
+CURRENT_PHASE="single"
 
 # Unique names so this test can run alongside other e2e tests that use
 # `veth-a0` / `vpn-server` etc.
@@ -78,6 +82,7 @@ IP_B_SERVER="10.200.0.1/24"
 SERVER_ADDR="10.100.0.1"
 TUNNEL_IP="10.0.0.1"
 VPN_PORT="4433"
+CONTROL_PORT="4434"
 
 NETEM_A="delay 10ms rate 300mbit"
 NETEM_B="delay 30ms rate 80mbit"
@@ -108,8 +113,7 @@ IPERF_STREAMS=16
 # ~330 Mbps. The regression we are guarding against produced multi ~84 Mbps
 # (single unchanged). The ratio assertion is what actually catches the
 # regression class (healthy ~1.22 vs regressed ~0.32 — wide margin against
-# either floor). The absolute floors are only a sanity check; relax them to
-# ~30 if a noisy CI runner trips them on a healthy build.
+# either floor). Keep the absolute sanity floors and relative gate fixed.
 FLOOR_SINGLE_MBPS=60
 FLOOR_MULTI_MBPS=60
 FLOOR_MULTI_OVER_SINGLE_RATIO=0.8
@@ -120,7 +124,7 @@ SANITIZER_FAIL=0
 
 stop_client() {
     stop_and_check_sanitizer "$CLIENT_PID" "client" \
-        "${WORK_DIR}/client.log" || SANITIZER_FAIL=1
+        "${WORK_DIR}/client-${CURRENT_PHASE}.log" || SANITIZER_FAIL=1
     CLIENT_PID=""
     sleep 1
 }
@@ -134,20 +138,28 @@ stop_all() {
 }
 
 cleanup() {
+    local result=$?
     echo ""
     echo "Cleaning up..."
     stop_all
+    if [ "$SANITIZER_FAIL" -ne 0 ]; then
+        result=1
+    fi
     ip netns exec "$NS_SERVER" pkill -f iperf3 2>/dev/null || true
     ip netns exec "$NS_CLIENT" pkill -f iperf3 2>/dev/null || true
     ip netns del "$NS_SERVER" 2>/dev/null || true
     ip netns del "$NS_CLIENT" 2>/dev/null || true
     ip link del "$VETH_A0" 2>/dev/null || true
     ip link del "$VETH_B0" 2>/dev/null || true
+    # Copy only endpoint logs. Certificate/private-key material stays temporary.
+    cp "${WORK_DIR}"/*.log "$RESULTS_DIR/" 2>/dev/null || true
+    printf '%s\n' "$result" >"${RESULTS_DIR}/script-exit.txt"
+    chmod -R a+rX "$RESULTS_DIR"
     rm -rf "$WORK_DIR"
     if [ "$SANITIZER_FAIL" -ne 0 ]; then
         echo "FAIL: sanitizer errors detected"
-        exit 1
     fi
+    exit "$result"
 }
 trap cleanup EXIT
 
@@ -220,6 +232,7 @@ start_server() {
         --cert "${WORK_DIR}/server.crt" \
         --key "${WORK_DIR}/server.key" \
         --auth-key "$PSK" \
+        --control-port "$CONTROL_PORT" \
         --scheduler wlb \
         --log-level "$LOG_LEVEL" >"${WORK_DIR}/server.log" 2>&1 &
     SERVER_PID=$!
@@ -244,12 +257,12 @@ start_client() {
         --auth-key "$PSK" \
         --insecure \
         --scheduler wlb \
-        --log-level "$LOG_LEVEL" >"${WORK_DIR}/client.log" 2>&1 &
+        --log-level "$LOG_LEVEL" >"${WORK_DIR}/client-${CURRENT_PHASE}.log" 2>&1 &
     CLIENT_PID=$!
     sleep 3
     if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
         echo "  client died"
-        cat "${WORK_DIR}/client.log"
+        cat "${WORK_DIR}/client-${CURRENT_PHASE}.log"
         return 1
     fi
 }
@@ -267,44 +280,70 @@ wait_tunnel() {
     return 1
 }
 
-# Run one iperf3 TCP DL run and print Mbps as a single number to stdout.
-# The `|| true` on the client and the silenced `wait` are intentional:
-# garbage JSON or a torn-down server feed into the python parser which
-# returns 0.0, letting the throughput-floor assert step fail cleanly
-# rather than the script aborting under `set -e`.
-run_iperf3_mbps() {
-    local json_file
-    json_file="$(mktemp)"
+snapshot_network() {
+    local phase="$1" ns
+    for ns in "$NS_SERVER" "$NS_CLIENT"; do
+        {
+            ip netns exec "$ns" ip -s link
+            ip netns exec "$ns" tc -s qdisc show
+            ip netns exec "$ns" ss -tin
+            ip netns exec "$ns" cat /proc/net/snmp
+        } >"${RESULTS_DIR}/${phase}-${ns}.network.log" 2>&1 || true
+    done
+    ip netns exec "$NS_SERVER" "$MQVPN" --status --control-port "$CONTROL_PORT" \
+        >"${RESULTS_DIR}/${phase}-server-status.json" \
+        2>"${RESULTS_DIR}/${phase}-server-status.stderr" || true
+}
 
-    ip netns exec "$NS_SERVER" iperf3 -s -B "$TUNNEL_IP" -1 >/dev/null 2>&1 &
+# Print only Mbps to stdout so callers can capture it. Keep both endpoint
+# reports, process exits and network observations even when validation fails.
+run_iperf3_mbps() {
+    local phase="$1" client_rc=0 server_rc=0
+    local json_file="${RESULTS_DIR}/${phase}-client.json"
+    local server_file="${RESULTS_DIR}/${phase}-server.json"
+
+    snapshot_network "${phase}-before"
+    ip netns exec "$NS_SERVER" timeout --foreground --kill-after=2s 30s \
+        iperf3 -s -B "$TUNNEL_IP" -1 -J >"$server_file" \
+        2>"${RESULTS_DIR}/${phase}-server.stderr" &
     local srv_pid=$!
     sleep 1
 
-    ip netns exec "$NS_CLIENT" iperf3 \
+    ip netns exec "$NS_CLIENT" timeout --foreground --kill-after=2s 30s iperf3 \
         -c "$TUNNEL_IP" \
         -t "$IPERF_DURATION" \
         -P "$IPERF_STREAMS" \
         -R \
-        --json >"$json_file" 2>&1 || true
+        --json >"$json_file" 2>"${RESULTS_DIR}/${phase}-client.stderr" || client_rc=$?
 
-    wait "$srv_pid" 2>/dev/null || true
+    wait "$srv_pid" || server_rc=$?
+    printf 'client=%s server=%s\n' "$client_rc" "$server_rc" \
+        >"${RESULTS_DIR}/${phase}-exits.log"
+    snapshot_network "${phase}-after"
 
-    python3 -c "
-import json
-try:
-    with open('${json_file}') as f:
-        data = json.load(f)
-    end = data.get('end', {})
-    if 'sum_received' in end:
-        print(f\"{end['sum_received']['bits_per_second'] / 1e6:.1f}\")
-    elif 'sum' in end:
-        print(f\"{end['sum']['bits_per_second'] / 1e6:.1f}\")
-    else:
-        print('0.0')
-except Exception:
-    print('0.0')
-"
-    rm -f "$json_file"
+    PYTHONPATH="${SCRIPT_DIR}/../ci_benchmarks" python3 - \
+        "$json_file" "$server_file" "$IPERF_DURATION" "$client_rc" "$server_rc" <<'PY'
+import json, sys
+from pathlib import Path
+from ci_bench_results import InvalidMeasurement, iperf_measurement, number
+client_path, server_path, duration, client_rc, server_rc = sys.argv[1:]
+for path in (client_path, server_path):
+    if any(line.startswith('iperf3: error')
+           for line in Path(path).with_suffix('.stderr').read_text().splitlines()):
+        raise InvalidMeasurement('iperf stderr reported an error')
+result = iperf_measurement(json.load(open(client_path)), requested=float(duration),
+                           exit_code=int(client_rc))
+server = json.load(open(server_path))
+if int(server_rc) != 0 or server.get('error'):
+    raise InvalidMeasurement('iperf server failed: ' + str(server.get('error', server_rc)))
+sent = (server.get('end') or {}).get('sum_sent') or {}
+if (number(sent.get('bytes'), 'server sent bytes', positive=True)
+        < result['receiver_bytes']
+        or number(sent.get('seconds'), 'server send duration', positive=True)
+        < float(duration) * 0.98):
+    raise InvalidMeasurement('incomplete server sender evidence')
+print(f"{result['receiver_mbps']:.9f}")
+PY
 }
 
 # ----- Run -----
@@ -312,6 +351,7 @@ except Exception:
 echo "================================================================"
 echo "  mqvpn throughput-floor regression smoke"
 echo "  Binary:   $MQVPN"
+echo "  Evidence: $RESULTS_DIR"
 echo "  Topology: A=300mbit/10ms, B=80mbit/30ms, theoretical sum=380mbit"
 echo "  Probe:    WLB, $IPERF_STREAMS streams, ${IPERF_DURATION}s iperf3 TCP DL"
 echo "  Coverage: WLB only. Stability/Recovery timer is scheduler-agnostic,"
@@ -332,7 +372,7 @@ if ! wait_tunnel 15; then
     echo "FAIL: single-path tunnel did not come up within 15s"
     exit 1
 fi
-SINGLE_MBPS="$(run_iperf3_mbps)"
+SINGLE_MBPS="$(run_iperf3_mbps single)"
 echo "      single-path throughput: ${SINGLE_MBPS} Mbps"
 stop_client  # only the single-path client; server stays up for the multi probe
 sleep 2      # match ci_bench_aggregate.sh's inter-iteration grace period
@@ -340,12 +380,13 @@ sleep 2      # match ci_bench_aggregate.sh's inter-iteration grace period
 # Multipath probe (Path A + Path B) — the cell that catches the regression
 echo ""
 echo "[2/2] multipath (Path A + Path B)..."
+CURRENT_PHASE="multi"
 start_client "$VETH_A0 $VETH_B0"
 if ! wait_tunnel 15; then
     echo "FAIL: multipath tunnel did not come up within 15s"
     exit 1
 fi
-MULTI_MBPS="$(run_iperf3_mbps)"
+MULTI_MBPS="$(run_iperf3_mbps multi)"
 echo "      multipath throughput:   ${MULTI_MBPS} Mbps"
 
 # ----- Assert -----
@@ -375,7 +416,7 @@ if multi < floor_multi:
 if single > 0 and ratio < ratio_floor:
     failures.append(
         f"multi/single ratio {ratio:.2f} < {ratio_floor:.2f} "
-        "(multipath is tanking — likely a tick/pacing regression)"
+        "(multipath is below the same-run single-path baseline)"
     )
 
 if failures:
