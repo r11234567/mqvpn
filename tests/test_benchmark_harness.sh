@@ -27,7 +27,24 @@ NS_SERVER="bench-harness-$$"
 NS_CLIENT="$NS_SERVER"
 CI_BENCH_RAW_DIR="$work/raw"
 mkdir -p "$CI_BENCH_RAW_DIR"
-trap 'ci_bench_stop_vpn; ip netns pids "$NS_SERVER" | xargs -r kill 2>/dev/null || true; ip netns del "$NS_SERVER"; rm -rf "$work"' EXIT
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    ci_bench_stop_vpn
+    ip netns pids "$NS_SERVER" | xargs -r kill 2>/dev/null || true
+    ip netns del "$NS_SERVER" || true
+    if [ -n "${CI_BENCH_HARNESS_EVIDENCE_DIR:-}" ]; then
+        mkdir -p "$CI_BENCH_HARNESS_EVIDENCE_DIR"
+        cp -a "$work/." "$CI_BENCH_HARNESS_EVIDENCE_DIR/"
+    fi
+    if [ "$rc" -ne 0 ]; then
+        find "$CI_BENCH_RAW_DIR" -name '*.server.log' -type f \
+            -exec sh -c 'printf "\\nServer diagnostics: %s\\n" "$1"; cat "$1"' sh {} \;
+    fi
+    rm -rf "$work"
+    exit "$rc"
+}
+trap cleanup EXIT
 ip netns add "$NS_SERVER"
 ip -n "$NS_SERVER" link set lo up
 ci_bench_vpn_evidence client wlb '--path test-a'
