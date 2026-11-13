@@ -36,6 +36,9 @@ cleanup() {
     if [ -n "${CI_BENCH_HARNESS_EVIDENCE_DIR:-}" ]; then
         mkdir -p "$CI_BENCH_HARNESS_EVIDENCE_DIR"
         cp -a "$work/." "$CI_BENCH_HARNESS_EVIDENCE_DIR/"
+        # mktemp and archived logs retain root-only modes through cp -a.
+        # The unprivileged Actions artifact uploader must traverse/read them.
+        chmod -R a+rX "$CI_BENCH_HARNESS_EVIDENCE_DIR"
     fi
     if [ "$rc" -ne 0 ]; then
         find "$CI_BENCH_RAW_DIR" -name '*.server.log' -type f \
