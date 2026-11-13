@@ -48,6 +48,20 @@ failures. Changing the harness must not make them disappear.
   attempted, failed and unexecuted cycles are distinct; aborting still fails the
   run. The first failing cycle and abort cause remain in the summary.
 
+The reorder E2E uses a six-second UDP load at 20 Mbit/s with explicit
+per-path disorder. Both processes must exit successfully and both receiver
+reports must be complete and agree on delivered bytes. The receiver must
+sustain at least 19 Mbit/s, retain at least 99.9% of sender bytes, and report
+at most 0.1% sequence loss. The separate reorder-buffer late-drop limit stays
+at 0.1%, ON must deliver in order, and OFF must demonstrate actual disorder.
+Missing tail bytes are checked separately because iperf's reported loss can
+remain zero when the last datagrams do not arrive before its control exchange.
+The inner iperf TCP control flow has a 200 ms delay in both ON and OFF runs,
+allowing the UDP tail and the bounded reorder wait to drain before TEST_END.
+This delay does not affect UDP packets or the outer path impairment, and the
+19 Mbit/s receiver floor includes its completion overhead. Qdisc and filter
+counters are retained with the reports so the control-only delay is auditable.
+
 Run the harness regression checks on Linux:
 
 ```sh

@@ -20,6 +20,9 @@
  * mqvpn_conn_settings.c explains the number. */
 #define MQVPN_STREAM_UNSENT_PACKETS 1024
 
+/* Bound the DATAGRAM backlog independently of legitimate in-flight BDP. */
+#define MQVPN_DATAGRAM_UNSENT_PACKETS 1024
+
 /* Caller-driven inputs. The bools are parameterised (not a single
  * `is_server` flag) so each call site documents its intent. */
 typedef struct {

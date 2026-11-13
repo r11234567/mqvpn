@@ -48,11 +48,12 @@ def saturation(points, threshold=5):
     if not points or any(p.get("status") != "ok" for p in points):
         return {"saturation_mbps": None, "saturation_status": "incomplete"}
     last = None
-    for p in sorted(points, key=lambda p: p["rate"]):
-        if p["loss_pct"] >= threshold:
+    for rate in sorted({p['rate'] for p in points}):
+        group = [p for p in points if p['rate'] == rate]
+        if any(p['loss_pct'] >= threshold or p.get('throughput', rate) < rate * 0.9 for p in group):
             return {"saturation_mbps": last, "saturation_status": "bracketed" if last is not None else "below_sweep",
-                    "first_exceeded_mbps": p["rate"]}
-        last = p["rate"]
+                    "first_exceeded_mbps": rate}
+        last = rate
     return {"saturation_mbps": last, "saturation_status": "above_sweep",
             "capacity_lower_bound_mbps": last}
 

@@ -8,7 +8,7 @@ source "${SCRIPT_DIR}/ci_stress_env.sh"
 MQVPN="${1:-$MQVPN}"
 DURATION="${CI_STRESS_LONG_DURATION:-900}"
 IPERF_PARALLEL="${CI_STRESS_IPERF_PARALLEL:-4}"
-MAX_STALL="${CI_STRESS_MAX_STALL_SEC:-30}"
+MAX_STALL="${CI_STRESS_MAX_STALL_SEC:-3}"
 DIRECTION="${CI_STRESS_DIRECTION:-UL}"
 [[ "$DIRECTION" = UL || "$DIRECTION" = DL ]] || { echo 'invalid direction' >&2; exit 2; }
 REVERSE=()
@@ -75,10 +75,18 @@ done
 if [ "$BUSINESS_FAILED" -ne 0 ]; then kill "$IPERF_CLIENT_PID" 2>/dev/null || true; fi
 IPERF_EXIT=0
 wait "$IPERF_CLIENT_PID" || IPERF_EXIT=$?
-kill "$IPERF_SERVER_PID" 2>/dev/null || true
-wait "$IPERF_SERVER_PID" 2>/dev/null || true
+IPERF_SERVER_OBSERVATION="${CI_STRESS_RAW_DIR}/iperf-server.process.json"
+IPERF_SERVER_GRACE="${CI_BENCH_IPERF_SERVER_GRACE:-30}"
+[ "$IPERF_EXIT" -eq 0 ] || IPERF_SERVER_GRACE=2
+python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_process.py" \
+    "$IPERF_SERVER_PID" "$IPERF_SERVER_OBSERVATION" --grace "$IPERF_SERVER_GRACE"
+IPERF_SERVER_EXIT=0
+wait "$IPERF_SERVER_PID" 2>/dev/null || IPERF_SERVER_EXIT=$?
+cp "$IPERF_JSON" "${IPERF_JSON}.client.stdout.log"
 python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" record "$IPERF_JSON" \
-    --duration "$DURATION" --exit-code "$IPERF_EXIT"
+    --duration "$DURATION" --exit-code "$IPERF_EXIT" \
+    --server-exit-code "$IPERF_SERVER_EXIT" --server-observation "$IPERF_SERVER_OBSERVATION" \
+    --server-log "${CI_STRESS_RAW_DIR}/iperf-server.log"
 THROUGHPUT="$(python3 "${SCRIPT_DIR}/../ci_benchmarks/ci_bench_results.py" throughput "$IPERF_JSON")"
 if [ "$THROUGHPUT" = NA ] || ! awk -v r="$THROUGHPUT" 'BEGIN {exit !(r+0>0)}'; then
     BUSINESS_FAILED=1
@@ -91,11 +99,13 @@ ci_stress_stop_vpn
 ci_stress_check_sanitizer || RESOURCE_FAILED=1
 
 OUTPUT_FILE="${CI_STRESS_RESULTS}/long_running_${DIRECTION}_$(date -u +%Y%m%d_%H%M%S).json"
-python3 - "$IPERF_JSON" "$SERVER_MON_LOG" "$CLIENT_MON_LOG" "$OUTPUT_FILE" \
+PYTHONPATH="${SCRIPT_DIR}/../ci_benchmarks" python3 - "$IPERF_JSON" "$SERVER_MON_LOG" "$CLIENT_MON_LOG" "$OUTPUT_FILE" \
     "$CI_STRESS_COMMIT" "$BUSINESS_FAILED" "$RESOURCE_FAILED" "$MAX_GAP" "$DIRECTION" <<'PY'
 import datetime, json, pathlib, sys
+from ci_bench_health import tcp_health
 raw, server, client, output, commit, business, resource, gap, direction = sys.argv[1:]
 sample = json.load(open(raw))['_mqvpn']
+health = tcp_health(json.load(open(raw)))
 def resources(path):
     return json.load(open(path + '.resources.json'))
 result = {
@@ -112,9 +122,11 @@ result = {
     'measurement_error': sample.get('failure_reason'),
     'server_rss': resources(server), 'client_rss': resources(client),
     'raw_artifact': raw,
-    'status': 'fail' if int(business) or int(resource) else 'pass'
+    'performance_health': health,
+    'status': 'fail' if int(business) or int(resource) or health['status'] != 'pass' else 'pass'
 }
 pathlib.Path(output).write_text(json.dumps(result, indent=2) + '\n')
 print(json.dumps(result, indent=2))
+sys.exit(result['status'] != 'pass')
 PY
 [ "$BUSINESS_FAILED" -eq 0 ] && [ "$RESOURCE_FAILED" -eq 0 ]

@@ -885,6 +885,32 @@ test_udp_pin_ipv4_truncated(void)
 
 /* ── Main ── */
 
+static void
+test_scheduler_udp_affinity(void)
+{
+    uint8_t pkt[40] = {0};
+    pkt[0] = 0x45;
+    pkt[9] = 17;
+    pkt[12] = 10;
+    pkt[16] = 11;
+    pkt[20] = 0x14;
+    pkt[21] = 0x51;
+    pkt[22] = 0x23;
+    pkt[23] = 0x45;
+    uint32_t h = flow_hash_for_scheduler(pkt, sizeof(pkt), MQVPN_SCHED_WLB);
+    assert(h != 0 && h != MQVPN_FLOW_HASH_UNPINNED);
+    assert(h == flow_hash_for_scheduler(pkt, sizeof(pkt), MQVPN_SCHED_WLB_UDP_PIN));
+    pkt[24] = 0xff; /* Payload changes never migrate the flow. */
+    assert(h == flow_hash_for_scheduler(pkt, sizeof(pkt), MQVPN_SCHED_WLB));
+    pkt[23]++;
+    assert(h != flow_hash_for_scheduler(pkt, sizeof(pkt), MQVPN_SCHED_WLB));
+    assert(flow_hash_for_scheduler(pkt, 21, MQVPN_SCHED_WLB) == MQVPN_FLOW_HASH_UNPINNED);
+    assert(flow_hash_for_scheduler(NULL, 0, MQVPN_SCHED_WLB) == 0);
+    pkt[9] = 1;
+    assert(flow_hash_for_scheduler(pkt, sizeof(pkt), MQVPN_SCHED_WLB) ==
+           MQVPN_FLOW_HASH_UNPINNED);
+}
+
 int
 main(void)
 {
@@ -926,6 +952,7 @@ main(void)
     test_hash_ipv4_udp_fragments_respect_udp_pin();
 
     /* UDP pin gate (Chunk 1) */
+    test_scheduler_udp_affinity();
     test_udp_pin_ipv4_gate();
     test_udp_pin_ipv6_gate();
     test_udp_pin_tcp_unchanged();

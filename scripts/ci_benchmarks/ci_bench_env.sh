@@ -534,7 +534,7 @@ ci_bench_control_capture_start() {
     # -U flushes the output writer only. Immediate mode also releases short
     # control exchanges from libpcap before a fast failure stops the capture.
     ip netns exec "$ns" tcpdump --immediate-mode -n -i any -s 0 -U -B 8192 \
-        -w "${prefix}.control.pcap" "tcp port ${IPERF3_PORT} or icmp or icmp6" \
+        -w "${prefix}.control.pcap" "tcp port ${IPERF3_PORT} or icmp or icmp6 or (udp port ${IPERF3_PORT} and udp[4:2] = 12)" \
         >"${prefix}.capture.log" 2>&1 &
     _CB_CAPTURE_PID=$!
     for ((i=0; i<50; i++)); do
@@ -579,14 +579,27 @@ ci_bench_run_iperf() {
     # reaches a listener that is not there.
     local _cb_iperf_target="${CI_BENCH_IPERF_TARGET:-$TUNNEL_SERVER_IP}"
 
+    local iperf_server_ns="$NS_SERVER" iperf_client_ns="$NS_CLIENT"
+    # iperf3 3.16 reverse UDP can deliver data before UDP_CONNECT_REPLY and
+    # exhaust the client's bounded startup reader. Swap application roles
+    # for DL instead: the ordinary UDP client completes its handshake before
+    # it sends data. The measured direction is still VPN server -> client.
+    # Route-selected source also handles the direct (non-tunnel) baseline.
+    if [ "$proto" = UDP ] && [ "$dir" = DL ]; then
+        _cb_iperf_target="$(ip netns exec "$NS_CLIENT" ip -j route get "$_cb_iperf_target" |
+            python3 -c 'import json,sys; r=json.load(sys.stdin)[0]; print(r.get("prefsrc") or r.get("src") or "")')"
+        [ -n "$_cb_iperf_target" ] || { echo 'receiver address unavailable' >&2; return 2; }
+        iperf_server_ns="$NS_CLIENT"
+        iperf_client_ns="$NS_SERVER"
+    fi
+
     local json_file
     json_file="$(mktemp --suffix=.json)"
 
-    # iperf3 server always in NS_SERVER (bound to the target address).
-    # iperf3 client always in NS_CLIENT.
-    # Direction controlled by -R flag:
-    #   DL (server→client): -R (reverse)
-    #   UL (client→server): no flag (default iperf3 direction)
+    # The application receiver owns the listener (roles swap for UDP DL).
+    # TCP retains the conventional client/server roles.
+    # TCP DL uses -R; UDP DL swaps application roles to avoid reverse startup.
+    # UL retains the ordinary forward application roles for both protocols.
     # Wait for the port to come free, then for the new server to own it. A
     # scenario issues many samples back to back on this one port, and the
     # previous sample's one-shot server can still be releasing its listener:
@@ -595,26 +608,30 @@ ci_bench_run_iperf() {
     # "Broken pipe" that looks like the emulated path failed.
     local i
     for (( i=0; i<20; i++ )); do
-        ip netns exec "$NS_SERVER" ss -ltn 2>/dev/null \
+        ip netns exec "$iperf_server_ns" ss -ltn 2>/dev/null \
             | grep -q ":${IPERF3_PORT} " || break
         sleep 0.5
     done
 
     local server_log="${json_file}.server.log" server_observation="${json_file}.server-process.json"
-    ip netns exec "$NS_SERVER" iperf3 -s -p "$IPERF3_PORT" -B "$_cb_iperf_target" -1 --forceflush \
+    ip netns exec "$iperf_server_ns" iperf3 -s -p "$IPERF3_PORT" -B "$_cb_iperf_target" -1 --forceflush \
         >"$server_log" 2>&1 &
     local iperf_srv_pid=$!
 
     for (( i=0; i<20; i++ )); do
-        ip netns exec "$NS_SERVER" ss -ltn 2>/dev/null \
+        ip netns exec "$iperf_server_ns" ss -ltn 2>/dev/null \
             | grep -q ":${IPERF3_PORT} " && break
         sleep 0.5
     done
 
+    if ! kill -0 "$iperf_srv_pid" 2>/dev/null || [ "$i" -eq 20 ]; then
+        printf 'iperf3: error - listener did not become ready\n' >>"$server_log"
+    fi
+
     local args="-c $_cb_iperf_target -p $IPERF3_PORT -t $duration -P $parallel --json"
     [ "$proto" = "UDP" ] && args="$args -u"
     [ -n "$target_bw" ] && args="$args -b $target_bw"
-    [ "$dir" = "DL" ] && args="$args -R"
+    [ "$dir" = "DL" ] && [ "$proto" != UDP ] && args="$args -R"
     # Payload size, for the small-packet profiles. Left unset by every bulk
     # caller so iperf3's own default applies and their numbers do not move.
     [ -n "${CI_BENCH_IPERF_LEN:-}" ] && args="$args -l ${CI_BENCH_IPERF_LEN}"
@@ -622,13 +639,13 @@ ci_bench_run_iperf() {
     # transfer can read intervals[] the way ci_bench_failover.sh:180 does.
     [ -n "${CI_BENCH_IPERF_INTERVAL:-}" ] && args="$args -i ${CI_BENCH_IPERF_INTERVAL}"
     local evidence_tool="${CI_BENCH_DIR}/ci_bench_iperf_evidence.py" capture_client="" capture_server=""
-    python3 "$evidence_tool" context "$json_file" --client "$NS_CLIENT" --server "$NS_SERVER" \
+    python3 "$evidence_tool" context "$json_file" --client "$iperf_client_ns" --server "$iperf_server_ns" \
         --target "$_cb_iperf_target" --proto "$proto" --direction "$dir" --client-args="$args" \
         --scenario "${class:-${CI_BENCH_SCENARIO:-unknown}}"
     if [ "$proto" = UDP ]; then
-        python3 "$evidence_tool" snapshot "$json_file" --phase before --client "$NS_CLIENT" --server "$NS_SERVER" --target "$_cb_iperf_target"
-        ci_bench_control_capture_start "$NS_CLIENT" "${json_file}.client"; capture_client="$_CB_CAPTURE_PID"
-        ci_bench_control_capture_start "$NS_SERVER" "${json_file}.server"; capture_server="$_CB_CAPTURE_PID"
+        python3 "$evidence_tool" snapshot "$json_file" --phase before --client "$iperf_client_ns" --server "$iperf_server_ns" --target "$_cb_iperf_target"
+        ci_bench_control_capture_start "$iperf_client_ns" "${json_file}.client"; capture_client="$_CB_CAPTURE_PID"
+        ci_bench_control_capture_start "$iperf_server_ns" "${json_file}.server"; capture_server="$_CB_CAPTURE_PID"
     fi
 
     # Two hang guards, both mandatory once the emulated path is allowed to be
@@ -646,11 +663,11 @@ ci_bench_run_iperf() {
     # timeout — which is exactly how the weekly netsim `classes` job burned 60
     # minutes while its siblings finished in six.
     local iperf_exit=0
-    ip netns exec "$NS_CLIENT" timeout --kill-after=5 $((duration + 20)) \
+    ip netns exec "$iperf_client_ns" timeout --kill-after=5 $((duration + 20)) \
         iperf3 $args > "$json_file" 2>"${json_file}.client.stderr.log" || iperf_exit=$?
     cp "$json_file" "${json_file}.client.stdout.log"
     if [ "$proto" = UDP ]; then
-        python3 "$evidence_tool" snapshot "$json_file" --phase after-client --client "$NS_CLIENT" --server "$NS_SERVER" --target "$_cb_iperf_target"
+        python3 "$evidence_tool" snapshot "$json_file" --phase after-client --client "$iperf_client_ns" --server "$iperf_server_ns" --target "$_cb_iperf_target"
     fi
 
     # Allow the one-shot server to finish exchanging results before cleanup.
@@ -665,7 +682,7 @@ ci_bench_run_iperf() {
 
     python3 "$CI_BENCH_RESULT_TOOL" record "$json_file" \
         --duration "$duration" --exit-code "$iperf_exit" --server-exit-code "$server_exit" \
-        --server-observation "$server_observation"
+        --server-observation "$server_observation" --server-log "$server_log"
     python3 "$evidence_tool" finalize "$json_file" --archive "$CI_BENCH_RAW_DIR" \
         --vpn-client "$CI_BENCH_CLIENT_LOG" --vpn-server "$CI_BENCH_SERVER_LOG"
     echo "$json_file"

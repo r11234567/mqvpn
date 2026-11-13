@@ -191,9 +191,10 @@ INFO stays one level lower. Users who want xquic's detail use
 
 The WLB scheduler is production-grade. It learns path weights from
 acknowledged goodput, spreads traffic with smooth weighted round-robin, pins
-each inner TCP flow to one path, and spills over softly when a pinned path
-is cwnd-blocked. `Scheduler = wlb_udp_pin` also pins inner UDP flows (by a
-5-tuple hash), so the packets of one flow are not spread across paths.
+each inner TCP and UDP flow to one path, and spills over softly when a pinned path
+is cwnd-blocked. `Scheduler = wlb_udp_pin` is retained as an alias. UDP affinity is now the WLB
+default: repeated inner-QUIC measurements showed severe degradation when a
+single UDP flow was striped. Single-flow UDP aggregation is no longer promised.
 
 WLB's measured performance is in the benchmark results: see
 `docs/benchmarks_netns.md` and the benchmark pages on the website, which are

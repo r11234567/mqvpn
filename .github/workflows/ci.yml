@@ -485,6 +485,26 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: sudo -E scripts/ci_e2e/run_pmtud_multipath_test.sh
 
+      - name: E2E PMTUD initial small-MTU gates (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          for scenario in ipv4 ipv6 mixed-small-first mixed-large-first reject-inner-ipv6; do
+            args=()
+            if [ "$scenario" != ipv4 ]; then args=("--$scenario"); fi
+            sudo -E env MQVPN_E2E_LOG_DIR="$PWD/pmtud-small-mtu/$scenario" \
+              timeout 180 bash scripts/ci_e2e/run_pmtud_small_mtu_test.sh "${args[@]}"
+          done
+
+      - name: Upload initial small-MTU evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sanitizer-pmtud-small-mtu-evidence
+          path: pmtud-small-mtu/
+          if-no-files-found: ignore
+
       - name: E2E reconnect test (netns)
         env:
           ASAN_OPTIONS: detect_leaks=1
@@ -565,7 +585,16 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          REORDER_RESULTS_DIR: ${{ github.workspace }}/build/reorder-evidence
         run: sudo -E tests/test_e2e_reorder.sh build/mqvpn
+
+      - name: Upload reorder evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sanitizer-reorder-evidence
+          path: build/reorder-evidence/
+          if-no-files-found: ignore
 
       - name: E2E backup_fec scheduler test (netns)
         env:
@@ -830,7 +859,28 @@ jobs:
         run: sudo scripts/ci_e2e/run_addr_del_failover_test.sh
 
       - name: Throughput-floor regression test (netns)
+        id: throughput-floor
         run: sudo scripts/ci_e2e/run_throughput_floor_test.sh
+
+      - name: Additional throughput-floor coverage with INFO logs
+        if: ${{ !cancelled() && (steps.throughput-floor.outcome == 'success' || steps.throughput-floor.outcome == 'failure') }}
+        timeout-minutes: 3
+        run: |
+          result=0
+          for sample in 1 2 3; do
+            sudo env THROUGHPUT_RESULTS_DIR="$GITHUB_WORKSPACE/throughput-floor-results/diagnostic-$sample" \
+              scripts/ci_e2e/run_throughput_floor_test.sh --log-level info || result=1
+          done
+          exit "$result"
+
+      - name: Upload throughput-floor evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: throughput-floor-evidence
+          path: throughput-floor-results/
+          if-no-files-found: warn
+          retention-days: 14
 
   ipv6-tests:
     needs: build

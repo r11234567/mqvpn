@@ -122,6 +122,31 @@ def classify(row, mode):
                 harness = False
         if row.get("quic_samples", 0) != attempts or attempts < 1:
             reasons.append("incomplete_quic_repeats")
+        mp_values = row.get('quic_goodput_all')
+        if (not isinstance(mp_values, list) or len(mp_values) != attempts
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) or v < 0 for v in mp_values)):
+            reasons.append('incomplete_quic_sample_manifest')
+        if not reasons:
+            # Derive summaries from retained samples. A declared CV of zero
+            # or an optimistic median cannot hide a slow repeat or noisy solo.
+            row['quic_goodput_mbps'] = statistics.median(mp_values)
+            groups = {'mp': mp_values, **{
+                phase: [p['goodput_mbps'] for p in baselines if p['phase'] == phase]
+                for phase in ('direct_a', 'solo_a', 'solo_b')}}
+            variability = {}
+            for phase, values in groups.items():
+                mean = statistics.mean(values)
+                variability[phase] = (statistics.stdev(values) / mean * 100
+                                      if len(values) > 1 and mean > 0 else 0)
+                if variability[phase] > 25:
+                    finding = f'quic_{phase}_repeat_variability_exceeds_25pct'
+                    if finding not in row['findings']:
+                        row['findings'].append(finding)
+            row['quic_goodput_cv_pct'] = variability['mp']
+            row['quic_baseline_cv_pct'] = {p: v for p, v in variability.items() if p != 'mp'}
+            if attempts < 3 and 'quic_requires_at_least_3_repeats' not in row['findings']:
+                row['findings'].append('quic_requires_at_least_3_repeats')
         # Recompute from same-protocol baseline evidence; a completed object
         # alone is not a performance pass. Keep incomplete comparisons unknown.
         if not reasons:
@@ -177,6 +202,21 @@ def classify(row, mode):
         harness = False
     zero = any(p.startswith("measured_zero") for p in parts)
     zero |= any(row.get(k) == 0 for k in required if k.endswith("mbps") or k.endswith("received"))
+    if not reasons:
+        for metric, value in list(row.items()):
+            if (metric in {'cv_pct', 'multipath_cv_pct', 'quic_goodput_cv_pct'}
+                    and isinstance(value, (int, float)) and value > 25):
+                finding = metric + ': repeat variability exceeds 25%'
+                if finding not in row['findings']:
+                    row['findings'].append(finding)
+        if mode in PAIRS:
+            best = max(row['solo_a_mbps'], row['solo_b_mbps'])
+            if best > 0 and row['multipath_mbps'] < 0.8 * best:
+                row['findings'].append('multipath_below_80pct_best_solo')
+        if mode == 'special' and row.get('scenario') == 'ack_starvation':
+            idle = row.get('dl_idle_mbps', 0)
+            if idle > 0 and row['dl_under_ul_load_mbps'] < idle * 0.8:
+                row['findings'].append('download_retention_below_80pct')
     health = "inconclusive" if reasons else "regression" if zero or quic_regression else "degraded" if row.get("findings") else "pass"
     row.update(harness_valid=harness, measurement_complete=not reasons,
                performance_health=health, measurement_errors=reasons)
@@ -284,7 +324,8 @@ def main():
             return 1
         if doc["performance_health"] == "degraded":
             print("::warning::performance findings present; this is not a healthy-performance verdict")
-            return int(os.environ.get("CI_BENCH_STRICT_PERF") == "1")
+            return int(os.environ.get("CI") == "true"
+                       or os.environ.get("CI_BENCH_STRICT_PERF", "1") != "0")
     return 0
 
 

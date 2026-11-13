@@ -119,6 +119,10 @@ mqvpn_build_conn_settings(const mqvpn_conn_settings_input_t *in, xqc_conn_settin
     out->max_datagram_frame_size = 65535;
     out->proto_version = XQC_VERSION_V1;
     out->pacing_on = 1;
+    /* RFC 9002 6.1.1/6.1.2 permits learning from late ACKs. The pinned xquic
+     * retains bounded DATAGRAM loss records so reordering does not starve
+     * delivery samples. RFC 9221 5.2 keeps payloads unretransmitted. */
+    out->spurious_loss_detect_on = 1;
     out->max_pkt_out_size = mqvpn_pkt_out_size(in->path_mtu);
     /* PMTUD: start at the smallest size that still gives an IPv6 inner MTU
      * of 1280, with the reorder header when reorder may be negotiated, and
@@ -162,6 +166,11 @@ mqvpn_build_conn_settings(const mqvpn_conn_settings_input_t *in, xqc_conn_settin
      * These were measured before mp0rta/xquic#85 changed how a multipath
      * path is marked app-limited, and have not been re-measured since. */
     out->max_stream_unsent_packets = MQVPN_STREAM_UNSENT_PACKETS;
+    /* DATAGRAM writes otherwise queue up to 18,000 allocated records.
+     * Under fault load that FIFO delays independent low-rate flows by
+     * seconds even after a healthy path has resumed ACK progress.
+     * Bound only unsent packets; the in-flight BDP remains CC-controlled. */
+    out->max_datagram_unsent_packets = MQVPN_DATAGRAM_UNSENT_PACKETS;
 
     /* Caller-gated, never derived here: see the field comment in
      * mqvpn_conn_settings.h for why this must equal the batched-send

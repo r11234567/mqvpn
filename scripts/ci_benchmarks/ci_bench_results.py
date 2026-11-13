@@ -51,14 +51,16 @@ def iperf_measurement(data, requested=None, exit_code=None):
         requested = meta.get("requested_duration_s")
     summary = receiver_summary(data)
     seconds = number(summary.get("seconds"), "receiver seconds", positive=True)
-    received = number(summary.get("bytes"), "receiver bytes")
-    bps = number(summary.get("bits_per_second"), "receiver bitrate")
+    received = number(summary.get("bytes"), "receiver bytes", positive=True)
+    bps = number(summary.get("bits_per_second"), "receiver bitrate", positive=True)
     if requested is not None:
         number(requested, "requested duration", positive=True)
-        # Small scheduling/clock differences are normal. A partial transfer is
-        # not; even short smoke samples must cover at least 90% of the request.
-        if seconds < requested * 0.9:
+        # Bound both relative and absolute shortfall: a percentage alone would
+        # let a two-hour soak silently lose minutes of receiver coverage.
+        if seconds < requested - min(requested * 0.02, 1.0):
             raise InvalidMeasurement(f"short transfer: {seconds:.3f}/{requested}s")
+    if abs(bps - received * 8 / seconds) > max(1, bps * 0.02):
+        raise InvalidMeasurement('receiver bytes/time disagree with bitrate')
     process = meta.get('server_process') or {}
     if process.get('forced_kill'):
         raise InvalidMeasurement('iperf server required SIGKILL after drain/stop deadlines')
@@ -75,7 +77,44 @@ def iperf_measurement(data, requested=None, exit_code=None):
             "observed_duration_s": seconds, "receiver": summary}
 
 
-def record_iperf(path, duration, exit_code, server_exit_code=None, server_observation=None):
+def reorder_udp_measurement(client, server):
+    """Gate the six-second, 20-Mbit/s no-loss reorder workload at both ends.
+
+    Allow the fixed control/drain overhead in the rate (95% of offered load)
+    and at most 0.1% missing bytes. Sequence-reported loss stays <=0.1%.
+    iperf's loss counter alone does not account for a missing final sequence.
+    """
+    client_result = iperf_measurement(client, requested=6)
+    result = iperf_measurement(server, requested=6)
+    received = result['receiver']
+    sent = (client.get('end') or {}).get('sum_sent') or {}
+    if (sent.get('sender') is not True or received.get('sender') is not False
+            or client_result['receiver'].get('sender') is not False):
+        raise InvalidMeasurement('explicit UDP sender and receiver required')
+    sent_bytes = number(sent.get('bytes'), 'sender bytes', positive=True)
+    sent_seconds = number(sent.get('seconds'), 'sender seconds', positive=True)
+    if sent_seconds < 5.88 or not 14_850_000 <= sent_bytes <= 15_750_000:
+        raise InvalidMeasurement('UDP sender did not offer the complete 20M workload')
+    if result['receiver_mbps'] < 19 or client_result['receiver_mbps'] < 19:
+        raise InvalidMeasurement('UDP receiver below 95% of offered 20M rate')
+    if not sent_bytes * 0.999 <= result['receiver_bytes'] <= sent_bytes:
+        raise InvalidMeasurement('UDP receiver missing more than 0.1% of sent bytes')
+    if client_result['receiver_bytes'] != result['receiver_bytes']:
+        raise InvalidMeasurement('client and server receiver byte counts disagree')
+    packets = number(received.get('packets'), 'receiver packets', positive=True)
+    lost = number(received.get('lost_packets'), 'receiver lost packets')
+    loss = number(received.get('lost_percent'), 'receiver loss percent')
+    if packets != int(packets) or lost != int(lost) or lost > packets:
+        raise InvalidMeasurement('invalid UDP receiver packet counts')
+    if loss > 0.1 or lost * 1000 > packets:
+        raise InvalidMeasurement('UDP receiver loss exceeds 0.1%')
+    if abs(loss - lost * 100 / packets) > 0.01:
+        raise InvalidMeasurement('UDP receiver loss counters disagree')
+    return result
+
+
+def record_iperf(path, duration, exit_code, server_exit_code=None,
+                 server_observation=None, server_log=None):
     try:
         def reject_constant(value):
             raise ValueError(f"non-finite JSON value {value}")
@@ -87,7 +126,21 @@ def record_iperf(path, duration, exit_code, server_exit_code=None, server_observ
         raw = path.with_suffix(path.suffix + ".invalid.log")
         raw.write_bytes(path.read_bytes())
         data = {"error": f"invalid iperf JSON: {exc}", "invalid_output": str(raw)}
+    default_server_log = Path(str(path) + '.server.log')
+    if server_log is None and default_server_log.exists():
+        server_log = default_server_log
+    if server_log is not None:
+        try:
+            lines = server_log.read_text(errors='replace').splitlines()
+        except OSError as exc:
+            data['error'] = f'server log unavailable: {exc}'
+        else:
+            errors = [line for line in lines if line.startswith('iperf3: error')]
+            if errors:
+                data['error'] = 'server reported: ' + '; '.join(errors)
     meta = {"requested_duration_s": duration, "exit_code": exit_code}
+    if server_log is not None:
+        meta['server_log'] = str(server_log)
     if server_exit_code is not None:
         meta['server_exit_code'] = server_exit_code
     if server_observation is not None:
@@ -162,12 +215,17 @@ def validate_core(data):
         expected = data.get("sweep_rates_mbps") or []
         if not expected or len(set(expected)) != len(expected):
             raise InvalidMeasurement("invalid UDP rate manifest")
+        repeats = data.get('repeats')
+        if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 3:
+            raise InvalidMeasurement('UDP sweep requires at least three repeats')
+        cells = {(r, i) for r in expected for i in range(1, repeats+1)}
         for condition in results.values():
             points = condition.get("points") or []
-            if len(points) != len(expected):
+            if len(points) != len(cells) or {(p.get('rate'), p.get('repeat')) for p in points} != cells:
                 raise InvalidMeasurement("UDP sweep missing/duplicate points")
-            exact_keys([p.get("rate") for p in points], expected, "UDP rates")
             for row in points:
+                if row.get('status') != 'ok':
+                    raise InvalidMeasurement('UDP repeat did not complete')
                 rate(row, "throughput")
                 loss = number(row.get("loss_pct"), "loss_pct")
                 if loss > 100:
@@ -207,9 +265,11 @@ def main():
     parser.add_argument("--archive", type=Path)
     parser.add_argument('--server-exit-code', type=int)
     parser.add_argument('--server-observation', type=Path)
+    parser.add_argument('--server-log', type=Path, help='Path to the required iperf server log')
     args = parser.parse_args()
     if args.command == "record":
-        record_iperf(args.file, args.duration, args.exit_code, args.server_exit_code, args.server_observation)
+        record_iperf(args.file, args.duration, args.exit_code, args.server_exit_code,
+                     args.server_observation, args.server_log)
         if args.archive:
             args.archive.mkdir(parents=True, exist_ok=True)
             for path in args.file.parent.glob(args.file.name + "*"):

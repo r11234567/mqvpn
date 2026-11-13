@@ -26,8 +26,17 @@ jobs:
           find scripts/ci_benchmarks scripts/ci_stress -name '*.sh' -exec bash -n {} \;
           shellcheck -S error scripts/ci_benchmarks/*.sh scripts/ci_stress/*.sh scripts/ci_publish/publish_to_r2.sh scripts/ci_interop/build_picoquic.sh tests/test_benchmark*.sh
       - name: Real TCP and UDP receiver measurements
-        run: sudo bash tests/test_benchmark_harness.sh
+        env:
+          CI_BENCH_HARNESS_EVIDENCE_DIR: ${{ runner.temp }}/benchmark-harness-evidence
+        run: sudo --preserve-env=CI_BENCH_HARNESS_EVIDENCE_DIR bash tests/test_benchmark_harness.sh
       - name: Child exit, forced shutdown and sanitizer detection
         run: bash tests/test_benchmark_processes.sh
       - name: Real netsim setup and unsupported capability failures
         run: sudo bash tests/test_benchmark_netsim_setup.sh
+      - name: Upload real measurement diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-harness-evidence
+          path: ${{ runner.temp }}/benchmark-harness-evidence
+          if-no-files-found: warn
