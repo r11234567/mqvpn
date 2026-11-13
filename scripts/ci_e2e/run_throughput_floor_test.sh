@@ -291,7 +291,7 @@ snapshot_network() {
         } >"${RESULTS_DIR}/${phase}-${ns}.network.log" 2>&1 || true
     done
     ip netns exec "$NS_SERVER" "$MQVPN" --status --control-port "$CONTROL_PORT" \
-        >"${RESULTS_DIR}/${phase}-server-status.json" \
+        >"${RESULTS_DIR}/${phase}-server-status.txt" \
         2>"${RESULTS_DIR}/${phase}-server-status.stderr" || true
 }
 

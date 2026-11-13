@@ -862,7 +862,7 @@ jobs:
         id: throughput-floor
         run: sudo scripts/ci_e2e/run_throughput_floor_test.sh
 
-      - name: Additional throughput-floor coverage with scheduler summaries
+      - name: Additional throughput-floor coverage with INFO logs
         if: ${{ !cancelled() && (steps.throughput-floor.outcome == 'success' || steps.throughput-floor.outcome == 'failure') }}
         timeout-minutes: 3
         run: |
